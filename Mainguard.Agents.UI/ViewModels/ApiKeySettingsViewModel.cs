@@ -1,10 +1,12 @@
 using System;
 using System.Collections.ObjectModel;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Mainguard.Agents;
+using Mainguard.Agents.Agents.Adapters;
 using Mainguard.Git;
 using Mainguard.Git.Exceptions;
 using Mainguard.Git.Security;
@@ -75,6 +77,58 @@ public partial class ApiKeySettingsViewModel : ViewModelBase, ISettingsPage
         RefreshRows();
     }
 
+    /// <summary>
+    /// <b>F51 — what actually happens to a stored key, said on the page that stores it.</b>
+    ///
+    /// <para>Mainguard can keep a provider key OUT of the jail only when the CLI can be pointed
+    /// somewhere else: the spawn path fronts it with the model gateway and gives the container an
+    /// <c>mg_sess_</c> token instead of the key. A CLI that declares no base-URL variable and no model
+    /// host cannot be pointed anywhere, so the RAW KEY is written into its jail and its spend is not
+    /// metered. That is a property of the vendor's CLI, not a misconfiguration — but until now the only
+    /// place it was said was a daemon log line, while the page that took the key said nothing.</para>
+    ///
+    /// <para>Read out of the SHIPPED manifest rather than from a table kept by hand here, because a
+    /// hand-kept copy of "which CLIs can be fronted" is a claim about security that goes stale the day
+    /// a vendor adds a base-URL variable — and it goes stale silently, in the reassuring direction.</para>
+    ///
+    /// <para>Null when the answer is not known (a manifest that will not parse). The caller then shows
+    /// the warning anyway: a warning shown when a key would in fact have been confined costs the reader
+    /// a moment, and the opposite mistake is the finding.</para>
+    /// </summary>
+    internal static bool? ProviderCanBeGatewayConfined(string provider)
+    {
+        try
+        {
+            var manifest = AdapterManifest.Parse(BundledAdapterChannelSource.StarterManifestJson());
+            var forProvider = manifest.Adapters
+                .Where(a => string.Equals(
+                    Services.ApiKeyProviderMap.ProviderForEnvVar(a.ApiKeyEnvVar), provider, StringComparison.Ordinal))
+                .ToArray();
+
+            if (forProvider.Length == 0)
+            {
+                return null;
+            }
+
+            // ALL of them, not any: the key is stored per provider and every CLI that reads it gets it,
+            // so the honest answer for the provider is the weakest of its CLIs.
+            return forProvider.All(a =>
+                !string.IsNullOrWhiteSpace(a.BaseUrlEnvVar) && !string.IsNullOrWhiteSpace(a.ModelHost));
+        }
+        catch (Exception e) when (e is InvalidOperationException or System.Text.Json.JsonException or ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>The sentence shown for a provider whose CLI cannot be fronted, or null when it can.
+    /// One place, so the save message and the stored-key row cannot describe the same key differently.</summary>
+    internal static string? ConfinementNoticeFor(string provider) =>
+        ProviderCanBeGatewayConfined(provider) == true
+            ? null
+            : "This CLI cannot be pointed at Mainguard's model gateway, so this key is written into the "
+              + "agent's sandbox as-is and its spend is not metered. Anything running in that sandbox can read it.";
+
     private void RefreshRows()
     {
         Providers.Clear();
@@ -115,7 +169,11 @@ public partial class ApiKeySettingsViewModel : ViewModelBase, ISettingsPage
             {
                 _keyStore.Set($"llm_{provider}", key);
                 IsHealthError = false;
-                HealthMessage = $"Key valid — supports ~{health.EstimatedConcurrentAgents} concurrent agents.";
+                // F51: say where the key ends up, at the moment it is taken. The confinable case says
+                // nothing extra — a page that warns about everything is a page nobody reads.
+                var notice = ConfinementNoticeFor(provider);
+                HealthMessage = $"Key valid — supports ~{health.EstimatedConcurrentAgents} concurrent agents."
+                    + (notice is null ? string.Empty : " " + notice);
                 RefreshRows();
             }
             else
@@ -196,7 +254,11 @@ public partial class ApiKeySettingsViewModel : ViewModelBase, ISettingsPage
         // EXTERNAL pull request's code is spawned withoutHostCredentials and deliberately inherits none
         // of these — see AgentSpawnService.SpawnAsync. Say the exception rather than let a reader who
         // checks it conclude the whole feature is broken.
-        HealthMessage = $"Stored {name} (custom keys are stored without provider validation) — it is injected into the environment of every agent you start, except jails running an external pull request's code.";
+        // F51: a custom env-var key is by definition one no adapter declares, so the gateway has no
+        // base-URL variable to redirect and no model host to forward to. It is ALWAYS written into the
+        // jail as-is and never metered — there is no confinable case here to leave unsaid.
+        HealthMessage = $"Stored {name} (custom keys are stored without provider validation) — it is injected into the environment of every agent you start, except jails running an external pull request's code. "
+            + "Mainguard cannot front a custom variable with its model gateway, so this key is written into the agent's sandbox as-is and its spend is not metered.";
         RefreshRows();
     }
 
@@ -287,6 +349,16 @@ public partial class ApiKeyProviderRowViewModel : ViewModelBase
     }
 
     public string StatusLabel => HasKey ? "Key stored" : "No key stored";
+
+    /// <summary>F51: the sentence about where this provider's key ends up, or empty when its CLI can be
+    /// fronted by the gateway. On the ROW as well as in the save message, because the save message is
+    /// gone by the next time the user opens this page and the key is still in the jail.</summary>
+    public string ConfinementNotice =>
+        ApiKeySettingsViewModel.ConfinementNoticeFor(Provider) ?? string.Empty;
+
+    /// <summary>Shown only for a stored key that will really travel — an unconfinable provider the user
+    /// has not given a key to has nothing to warn about yet.</summary>
+    public bool ShowsConfinementNotice => HasKey && ConfinementNotice.Length > 0;
 
     [RelayCommand]
     private void Delete() => _parent.DeleteKey(Provider);
