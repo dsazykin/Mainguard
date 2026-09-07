@@ -121,8 +121,11 @@ public class AgentCliUpdateServiceTests
         public Fixture()
         {
             Source.PayloadToServe = PayloadOld;
+            // The channel gets the SAME fake gate as the updater (audit F47): EnsureAsync now runs the
+            // provenance gate on every override-governed install, so a channel with pins and no gate
+            // would fall back to the real registry-backed one and reach the network.
             Channel = new AdapterChannel(Source, Host, new AdapterChannelTests.FakeCache(ManifestJson()),
-                delay: (_, _) => Task.CompletedTask, pins: Pins);
+                delay: (_, _) => Task.CompletedTask, pins: Pins, provenance: Provenance);
             Updater = new AgentCliUpdateService(Channel, Pins, Npm, Log.Add, Provenance);
         }
     }

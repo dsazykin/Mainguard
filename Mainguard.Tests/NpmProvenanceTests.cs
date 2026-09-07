@@ -450,7 +450,7 @@ public class NpmProvenanceTests
 
             Source = new AdapterChannelTests.FakeSource { ManifestToServe = manifest, PayloadToServe = PayloadOld };
             var channel = new AdapterChannel(Source, Host, new AdapterChannelTests.FakeCache(manifest),
-                delay: (_, _) => Task.CompletedTask, pins: Pins);
+                delay: (_, _) => Task.CompletedTask, pins: Pins, provenance: Provenance);
             Updater = new AgentCliUpdateService(
                 channel, Pins, new NpmStub(PayloadNew), Log.Add, Provenance);
         }

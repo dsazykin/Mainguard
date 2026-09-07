@@ -92,9 +92,14 @@ public sealed class AgentCliUpdateService
     public static AgentCliUpdateService CreateDefault(IAdapterInstallHost host)
     {
         var pins = new FileAdapterPinOverrideStore();
+        // ONE gate for both halves (audit F47): the channel now runs it on every override-governed
+        // install, not just where a pin moves, and sharing the instance means the update path and the
+        // install path can never end up holding different npm trust anchors.
+        var provenance = new NpmProvenanceGate(new HttpNpmProvenanceSource(new HttpClient()));
         var channel = new AdapterChannel(
-            new BundledAdapterChannelSource(), host, new FileAdapterManifestCache(), pins: pins);
-        return new AgentCliUpdateService(channel, pins);
+            new BundledAdapterChannelSource(), host, new FileAdapterManifestCache(),
+            pins: pins, provenance: provenance);
+        return new AgentCliUpdateService(channel, pins, provenance: provenance);
     }
 
     /// <summary>
@@ -246,20 +251,23 @@ public sealed class AgentCliUpdateService
         _log?.Invoke(provenance.Reason);
 
         var sha256 = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
-
-        var before = _pins.TryGet(adapterId);
-        _pins.Set(adapterId, new AdapterPinOverride(
+        var pin = new AdapterPinOverride(
             version, tarballUrl, sha256,
-            new AdapterPinSnapshot(current.Version, current.PayloadUrl!, current.Sha256)));
-        try
-        {
-            await _channel.EnsureAsync(adapterId, ct).ConfigureAwait(false);
-        }
-        catch
-        {
-            RestorePin(adapterId, before);
-            throw;
-        }
+            new AdapterPinSnapshot(current.Version, current.PayloadUrl!, current.Sha256));
+
+        // Audit F54: INSTALL FIRST, then persist the pin.
+        //
+        // This used to write the override to pin-overrides.json and only then install, unwinding with a
+        // best-effort RestorePin in a catch. A catch does not run when the process dies — a crash, a
+        // kill, a power loss between the two left the NEW pin active on disk over the OLD binary, and
+        // the next EnsureAsync then installed the new version silently, with no user accept and no
+        // second confirmation. Passing the pin down as an already-provenance-verified value keeps the
+        // user-writable file untouched until an install has actually succeeded, so the window closes
+        // rather than shrinking: there is no interval in which a pin nobody installed is authoritative.
+        await _channel.EnsureAsync(adapterId, new AdapterChannel.VerifiedPin(pin, provenance), ct)
+            .ConfigureAwait(false);
+
+        _pins.Set(adapterId, pin);
     }
 
     /// <summary>
