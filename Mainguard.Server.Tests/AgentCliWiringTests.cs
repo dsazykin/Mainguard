@@ -74,7 +74,9 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         // and the binder marks the agent dead): `docker exec -i -t` (attached stdin + tty), an
         // explicit sane TERM on BOTH sides of the exec, a positive size, and no secret in the env.
         var plan = AgentCliBinder.BuildPtyLaunch(rig.LastSpec);
-        Assert.Equal(SandboxCliLaunch.DockerBinary, plan.Command);
+        // Audit F54: the resolved absolute docker path, and a PATH the daemon did not inherit.
+        Assert.Equal(TrustedDockerBinary.Resolve(), plan.Command);
+        Assert.Equal(TrustedDockerBinary.TrustedChildPath, plan.Environment["PATH"]);
         Assert.Equal("exec", plan.Args[0]);
         Assert.Contains("-i", plan.Args);
         Assert.Contains("-t", plan.Args);

@@ -131,11 +131,19 @@ public sealed class AgentCliBinder
     {
         ArgumentNullException.ThrowIfNull(spec);
         var (command, args) = SandboxCliLaunch.BuildDockerExecArgv(spec.ContainerId, spec.Launch, AgentUid);
+
+        // Audit F54: the daemon's INHERITED PATH used to be forwarded verbatim, and `command` used to be
+        // the bare name "docker" resolved against it — so whoever controlled the environment the daemon
+        // was started with chose the program that owns every jail. `command` is now an absolute
+        // allow-listed path (TrustedDockerBinary), and the child's PATH is the matching fixed list
+        // rather than ours. PATH is not simply dropped: the docker CLI needs one for its credential
+        // helpers and plugins, and an empty PATH would trade a real hole for a support burden.
         var env = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["TERM"] = SandboxCliLaunch.InJailTerm,
+            ["PATH"] = TrustedDockerBinary.TrustedChildPath,
         };
-        foreach (var name in new[] { "PATH", "HOME", "DOCKER_HOST" })
+        foreach (var name in new[] { "HOME", "DOCKER_HOST" })
         {
             if (Environment.GetEnvironmentVariable(name) is { Length: > 0 } value)
             {
