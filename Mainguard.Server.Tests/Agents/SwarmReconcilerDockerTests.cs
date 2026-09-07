@@ -40,17 +40,16 @@ public class SwarmReconcilerDockerTests
         public IReadOnlyList<WorktreeItem> List(string repoHash) => Array.Empty<WorktreeItem>();
     }
 
-    [RequiresDockerDaemonFact]
+    // The busybox availability check used to be an inline `if (!await EnsureTrivialImageAsync(...))
+    // return;` — an early return, which xunit reports as Passed. On a registry-less runner this test
+    // therefore reported green having asserted nothing. Same condition (daemon up + busybox present
+    // or pullable), now carried by the attribute so the outcome reads as Skipped with a reason.
+    [RequiresDockerBusyboxFact]
     public async Task Reconciler_OutOfBandDockerRm_ShouldConvergeOnBoot()
     {
         using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
         var ct = cts.Token;
-
-        if (!await EnsureTrivialImageAsync(docker, ct))
-        {
-            return; // Docker present but the trivial image is unavailable (no registry) — nothing to prove.
-        }
 
         var suffix = Guid.NewGuid().ToString("N")[..8];
         var repoHash = "recon-" + suffix;
@@ -118,30 +117,4 @@ public class SwarmReconcilerDockerTests
     }
 
     /// <summary>Ensures the trivial image is present (inspect, else pull). False if it can't be obtained.</summary>
-    private static async Task<bool> EnsureTrivialImageAsync(IDockerClient docker, CancellationToken ct)
-    {
-        try
-        {
-            await docker.Images.InspectImageAsync(TrivialImage, ct);
-            return true; // already present
-        }
-        catch (DockerImageNotFoundException)
-        {
-            // fall through to pull
-        }
-
-        try
-        {
-            await docker.Images.CreateImageAsync(
-                new ImagesCreateParameters { FromImage = "busybox", Tag = "latest" },
-                authConfig: null,
-                progress: new Progress<JSONMessage>(),
-                cancellationToken: ct);
-            return true;
-        }
-        catch
-        {
-            return false; // Docker up but no registry access — the caller returns without asserting.
-        }
-    }
 }

@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using Mainguard.Agents.Agents.Ipc;
+using Mainguard.Tests.TestTools;
 using Xunit;
 
 namespace Mainguard.Tests;
@@ -182,7 +183,10 @@ public class AgentIpcProtocolTests
     /// simply never called. Compiled with the real interpreter; skipped where there is none, because a
     /// missing python3 on a dev box is not evidence about the script.
     /// </summary>
-    [Fact]
+    // The "where there is none" half used to be two silent `return;`s inside the loop, which xunit
+    // reports as Passed: a box without python3 got a green result for a check that compiled nothing.
+    // Same condition, now expressed as a skip, so the absence is visible in the run.
+    [RequiresPython3Fact("both shims are python living inside a C# string literal")]
     public void BothShims_AreValidPython()
     {
         foreach (var (name, source) in new[]
@@ -205,19 +209,14 @@ public class AgentIpcProtocolTests
                 start.ArgumentList.Add("py_compile");
                 start.ArgumentList.Add(path);
 
+                // The attribute already proved python3 launches on this box, so a null process or a
+                // Win32Exception here is an anomaly worth failing on — not a reason to report green.
                 using var process = System.Diagnostics.Process.Start(start);
-                if (process is null)
-                {
-                    return; // no python3 on this box — nothing measured, nothing claimed
-                }
+                Assert.NotNull(process);
 
-                var stderr = process.StandardError.ReadToEnd();
+                var stderr = process!.StandardError.ReadToEnd();
                 process.WaitForExit();
                 Assert.True(process.ExitCode == 0, $"{name} is not valid python: {stderr}");
-            }
-            catch (System.ComponentModel.Win32Exception)
-            {
-                return; // python3 is not installed here
             }
             finally
             {

@@ -1,3 +1,5 @@
+using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Xunit;
 
@@ -93,6 +95,73 @@ public sealed class RequiresNetworkFactAttribute : FactAttribute
             Skip = because is null
                 ? $"Network-gated test — set {EnableVariable}=1 to run (nightly leg)."
                 : $"Network-gated: {because} — set {EnableVariable}=1 to run (nightly leg).";
+        }
+    }
+}
+
+/// <summary>
+/// A <see cref="FactAttribute"/> for tests that drive the shim scripts through the REAL python
+/// interpreter, skipping with a reason where there is none.
+///
+/// <para>These tests used to open with <c>if (no python3) return;</c> — which reports <b>Passed</b>.
+/// A permanently-green test that measured nothing is worse than no test, because the green is read as
+/// evidence. The condition is unchanged (can <c>python3</c> be launched at all?); only its expression
+/// moves, from a silent early return to a skip xunit reports as Skipped with the reason attached.</para>
+///
+/// <para>Skipping is expressed by setting <see cref="FactAttribute.Skip"/> from the constructor, NOT by
+/// throwing: this repo is on xunit 2.9.3 (v2 core), where <c>Assert.Skip</c> reports as a FAILURE.</para>
+/// </summary>
+public sealed class RequiresPython3FactAttribute : FactAttribute
+{
+    public RequiresPython3FactAttribute(string? because = null)
+    {
+        if (!Python3Availability.IsAvailable)
+        {
+            Skip = because is null
+                ? "python3 is not launchable on this box — the shim scripts cannot be compiled or run here."
+                : $"python3 is not launchable on this box: {because}.";
+        }
+    }
+}
+
+/// <summary>
+/// Probes once (and caches) whether <c>python3</c> can actually be STARTED. A PATH scan would report
+/// a name that exists but is not executable as present; launching it is the condition the tests
+/// really depend on, and is exactly what their old inline guards were catching (a null
+/// <see cref="Process"/> or a <see cref="System.ComponentModel.Win32Exception"/> from
+/// <see cref="Process.Start(ProcessStartInfo)"/>).
+/// </summary>
+internal static class Python3Availability
+{
+    private static readonly Lazy<bool> _probe = new(Probe);
+
+    public static bool IsAvailable => _probe.Value;
+
+    private static bool Probe()
+    {
+        try
+        {
+            var start = new ProcessStartInfo("python3")
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+            };
+            start.ArgumentList.Add("--version");
+
+            using var process = Process.Start(start);
+            if (process is null)
+            {
+                return false;
+            }
+
+            process.StandardOutput.ReadToEnd();
+            process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            return process.ExitCode == 0;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return false; // python3 is not installed here
         }
     }
 }

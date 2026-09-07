@@ -40,6 +40,30 @@ public sealed class RequiresDockerDaemonFactAttribute : FactAttribute
 }
 
 /// <summary>
+/// A <see cref="FactAttribute"/> that skips unless the Docker daemon is reachable <b>and</b> the trivial
+/// <c>busybox:latest</c> image those suites stand their own containers up from is obtainable (already
+/// pulled, or pullable from a registry this box can reach).
+///
+/// <para>Both suites used to open with <c>if (!await EnsureTrivialImageAsync(...)) return;</c> — an
+/// early return, which xunit reports as <b>Passed</b>. A registry-less runner therefore produced a
+/// green result for a test that had asserted nothing, which is the one outcome worse than a red one.
+/// The condition is unchanged (daemon up + busybox obtainable); it moves to the attribute so the
+/// outcome is reported as <b>Skipped</b>, with the reason, instead.</para>
+///
+/// <para>Skipping is expressed by setting <see cref="FactAttribute.Skip"/> from the constructor, NOT by
+/// throwing: this repo is on xunit 2.9.3 (v2 core), where <c>Assert.Skip</c> reports as a FAILURE.</para>
+/// </summary>
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class RequiresDockerBusyboxFactAttribute : FactAttribute
+{
+    public RequiresDockerBusyboxFactAttribute()
+    {
+        if (!DockerAvailability.IsBusyboxReady)
+            Skip = DockerAvailability.BusyboxSkipReason;
+    }
+}
+
+/// <summary>
 /// MG-43 — a <see cref="RequiresDockerFactAttribute"/> that ALSO requires <c>MAINGUARD_VERIFY_E2E=1</c>.
 ///
 /// <para>It gates the one test that runs a repository's real <c>.mainguard/verify</c> end to end inside
@@ -76,8 +100,12 @@ internal static class DockerAvailability
     private static readonly string AgentImage =
         Environment.GetEnvironmentVariable("MAINGUARD_AGENT_IMAGE") ?? "mainguard-agent-base:latest";
 
+    /// <summary>The trivial image the daemon-only suites build their own stand-in containers from.</summary>
+    private const string TrivialImage = "busybox:latest";
+
     private static readonly Lazy<(bool Ready, string Reason)> _probe = new(Probe);
     private static readonly Lazy<(bool Ready, string Reason)> _daemonProbe = new(ProbeDaemon);
+    private static readonly Lazy<(bool Ready, string Reason)> _busyboxProbe = new(ProbeBusybox);
 
     public static bool IsReady => _probe.Value.Ready;
     public static string SkipReason => _probe.Value.Reason;
@@ -85,6 +113,10 @@ internal static class DockerAvailability
     /// <summary>Docker daemon reachable — no image requirement (for tests that stand up their own).</summary>
     public static bool IsDaemonReady => _daemonProbe.Value.Ready;
     public static string DaemonSkipReason => _daemonProbe.Value.Reason;
+
+    /// <summary>Docker daemon reachable AND <c>busybox:latest</c> present or pullable.</summary>
+    public static bool IsBusyboxReady => _busyboxProbe.Value.Ready;
+    public static string BusyboxSkipReason => _busyboxProbe.Value.Reason;
 
     private static (bool, string) Probe()
     {
@@ -102,6 +134,46 @@ internal static class DockerAvailability
         catch
         {
             return (false, $"Docker is up but the '{AgentImage}' image is not built (CI builds images/ first).");
+        }
+    }
+
+    /// <summary>
+    /// The exact condition the two suites' inline <c>EnsureTrivialImageAsync</c> helpers expressed:
+    /// inspect <c>busybox:latest</c>, and on a miss try one pull. A registry-less box fails the pull
+    /// and the leg skips rather than passing vacuously.
+    /// </summary>
+    private static (bool, string) ProbeBusybox()
+    {
+        var (daemonReady, daemonReason) = _daemonProbe.Value;
+        if (!daemonReady)
+            return (false, daemonReason);
+
+        using var client = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
+
+        try
+        {
+            using var inspect = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            client.Images.InspectImageAsync(TrivialImage, inspect.Token).GetAwaiter().GetResult();
+            return (true, string.Empty); // already present
+        }
+        catch
+        {
+            // fall through to a pull
+        }
+
+        try
+        {
+            using var pull = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+            client.Images.CreateImageAsync(
+                new Docker.DotNet.Models.ImagesCreateParameters { FromImage = "busybox", Tag = "latest" },
+                authConfig: null,
+                progress: new Progress<Docker.DotNet.Models.JSONMessage>(),
+                cancellationToken: pull.Token).GetAwaiter().GetResult();
+            return (true, string.Empty);
+        }
+        catch
+        {
+            return (false, $"Docker is up but '{TrivialImage}' is neither present nor pullable (no registry access).");
         }
     }
 
