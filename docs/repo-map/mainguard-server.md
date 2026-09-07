@@ -269,7 +269,11 @@
     factory spawns `docker exec -i -t` under a daemon-side forkpty PTY from the pure `BuildPtyLaunch`
     plan (`CliPtyLaunch`: `SandboxCliLaunch` argv, interactive tty + attached stdin, explicit `TERM` on
     both sides of the exec, positive size — the TTY contract `AgentCliWiringTests` pins so an
-    unauthenticated CLI opens interactive login instead of dying non-interactive), registers the bound
+    unauthenticated CLI opens interactive login instead of dying non-interactive; **audit F54** also
+    pins that the command is `TrustedDockerBinary.Resolve()` (an absolute allow-listed path) and that the
+    child's `PATH` is `TrustedDockerBinary.TrustedChildPath` rather than the daemon's inherited one —
+    forwarding our own `PATH` while invoking a bare `"docker"` let whoever controlled the daemon's
+    environment choose the program that owns every jail), registers the bound
     session with `TerminalSessionManager` + the P2-09 `SessionLeader` (PTY-fd ownership + kill), audits
     `cli_bound`/`cli_bind_failed` (bind failure degrades to session-only + echo, never fails the spawn),
     and marks the session `Dead` when the CLI exits — auditing `cli_exited` with the exit code + the

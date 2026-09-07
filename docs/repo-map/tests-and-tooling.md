@@ -900,6 +900,29 @@
     `RequiresNpmRegistryFactAttribute.cs` gates the ONE test that hits the real registry — it verifies
     npm's actual signature under the compiled-in key for all five shipped adapters and skips VISIBLY
     when offline, because an early `return` would report a green "Passed" while asserting nothing).
+    `NpmProvenanceTests` also pins `NpmProvenancePolicy.BuildProvenanceLimitation` verbatim in the
+    accepting verdict (audit F48), so the "DSSE signature / Fulcio chain / Rekor proof are NOT checked"
+    caveat cannot be tidied out of a message that would then read like full SLSA verification.
+  - `ReleaseBuildCarriesPinsTests.cs` (**audit F57 — the test the audit says did not exist**: a release
+    build carries signing pins. Two halves, because either alone is defeatable — the runtime implication
+    (`MainguardAttestedRelease` stamped ⇒ `SigningPolicy.HasUsablePins`, plus "no malformed pins" and
+    "the selected verifier agrees with the policy"), and the build-time guard read back out of
+    `Mainguard.Agents.csproj` so deleting the `MainguardRequirePinsOnReleaseBuild` target / `MG0057`
+    error fails CI instead of silently disarming it. Also drives `PayloadSignatureGate` through its whole
+    table: `Rejected` always refuses, `NotAvailable` refuses for a pin-covered kind once the build can
+    check, and `NotAvailable` still proceeds for kinds Authenticode structurally cannot cover.)
+  - `TrustedResultPathTests.cs` (**audit F58** — the elevated helper's `--result` path: the real
+    `%LocalAppData%\Mainguard\elevated-result.json` and a second account's equivalent are accepted; an
+    arbitrary system path, a different file name in the right directory, traversal, UNC/device forms,
+    NTFS ADS spellings, relative paths and quoting/wildcard metacharacters are refused. Data root is
+    injected so the Windows cases run identically on Linux CI.)
+  - `AdapterPinOverrideHostTests.cs` (**audit F47** — `AdapterPinHosts` allows only the shipped channel's
+    own host; `Set` throws and, load-bearingly, the READ path drops a hand-edited entry, including the
+    self-consistent case where the attacker supplied both the redirected URL and a hash of their own
+    bytes. Its sibling `AdapterOverrideProvenanceGateTests` covers the other half: `EnsureAsync` runs the
+    provenance gate on every install an override governs, refuses on its verdict with nothing staged,
+    takes the rung from the MANIFEST rather than the override, and does NOT gate a plain bundled-pin
+    install — that sha256 is a reviewed constant, and gating it would break every offline install.)
 - **`Mainguard.Tests/Terminal/` + `Mainguard.Tests/Transcripts/`** — the **P2-04 VT conformance &
   replay harness**, since P2-18 parametrized over BOTH engines through `EngineCatalog.cs` (engine
   roster + per-engine allowlist/golden/input-encoder resolution; `MAINGUARD_REQUIRE_LIBVTERM=1` in CI
