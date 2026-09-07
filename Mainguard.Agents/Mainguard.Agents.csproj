@@ -85,7 +85,7 @@
   <Target Name="MainguardRequirePinsOnReleaseBuild" BeforeTargets="CoreCompile">
     <Error Condition="'$(MainguardPinsRequired)' == 'true' AND '$(MainguardPinnedThumbprints)' == ''"
            Code="MG0057"
-           Text="This build is marked as a Mainguard RELEASE (MainguardAttestedRelease/MainguardPinsRequired) but $(MainguardPinnedThumbprints) is empty. A release with no pins ships UnsignedBuildSignatureVerifier, whose verdict is never Rejected, so every privileged promote proceeds unverified (audit F57). Pass -p:MainguardPinnedThumbprints=&lt;thumbprint&gt; (build/velopack/pack.ps1 derives it from the signing certificate; build/signing/README.md is the recipe)." />
+           Text="This build is marked as a Mainguard RELEASE (MainguardAttestedRelease/MainguardPinsRequired) but the MainguardPinnedThumbprints property is empty. A release with no pins ships UnsignedBuildSignatureVerifier, whose verdict is never Rejected, so every privileged promote proceeds unverified (audit F57). Pass -p:MainguardPinnedThumbprints=&lt;thumbprint&gt; (build/velopack/pack.ps1 derives it from the signing certificate; build/signing/README.md is the recipe)." />
   </Target>
 
   <!-- Step 2a (ADR-0001): the pure git engine + persistence now lives in Mainguard.Git; Mainguard.Agents
