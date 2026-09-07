@@ -909,7 +909,7 @@ public sealed class SandboxAgentLauncher
             .Where(f => f.Content is { Length: > 0 }
                         && f.Content.Length <= AdapterSettingsPolicy.MaxFileBytes
                         && allowed.Contains((f.Root, f.RelativePath)))
-            .Select(f => CliSettingsGrantScrub.Scrub(f.Content) is { Length: > 0 } clean
+            .Select(f => CliSettingsGrantScrub.CarryOnly(f.Content) is { Length: > 0 } clean
                 ? f with { Content = clean }
                 : null)
             .Where(f => f is not null)
@@ -1259,11 +1259,17 @@ public sealed class SandboxAgentLauncher
                 // anything in the next one — and a coordinator's `Bash(<its shim> *)`, persisted per REPO,
                 // is one role's tool grant queued up for every later jail of that repository. An
                 // unparseable file that names the mount is dropped whole rather than carried unread.
-                var scrubbed = CliSettingsGrantScrub.Scrub(content);
+                //
+                // F45: and the same call now also reduces the file to the keys a settings file may
+                // carry at all. Everything else — hooks, apiKeyHelper, statusLine, mcpServers, env,
+                // permissions.defaultMode — is executable configuration that was crossing between jails
+                // byte-identical, into workers whose terminals nobody is watching.
+                var scrubbed = CliSettingsGrantScrub.CarryOnly(content);
                 if (scrubbed is null)
                 {
                     _log.LogWarning(
-                        "cli settings harvest refused (names {Mount} and could not be scrubbed): kind={Kind} root={Root} path={Path}",
+                        "cli settings harvest refused (nothing carriable survived the allowlist, or it names "
+                        + "{Mount} and could not be scrubbed): kind={Kind} root={Root} path={Path}",
                         CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind,
                         AdapterSettingsPath.SpellRoot(root), entry.Path);
                     continue;
@@ -1272,7 +1278,8 @@ public sealed class SandboxAgentLauncher
                 if (scrubbed.Length != content.Length)
                 {
                     _log.LogInformation(
-                        "cli settings harvest scrubbed a role-scoped grant for {Mount}: kind={Kind} root={Root} path={Path}",
+                        "cli settings harvest carried only the allowlisted keys (and no {Mount} rule): "
+                        + "kind={Kind} root={Root} path={Path}",
                         CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind,
                         AdapterSettingsPath.SpellRoot(root), entry.Path);
                 }
