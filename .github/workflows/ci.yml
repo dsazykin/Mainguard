@@ -604,15 +604,25 @@ jobs:
   #
   # ADVISORY ON ITS FIRST OUTING — AND WHAT THAT COSTS TO KEEP
   # ----------------------------------------------------------
-  # Its first run MEASURED the backlog nobody could see: Mainguard.Tests on windows-latest is
-  # 3998 tests, 3903 passed, 17 skipped, **78 failed**, in 19m26s. By class:
+  # Its first runs MEASURED the backlog nobody could see — 93 failures on windows-latest:
   #
+  #   Mainguard.Tests        3998 tests, 3903 passed, 17 skipped, **78 failed** (19m26s)
   #     52  MergeQueueProvisionerTests            3  DaemonAuthTests
   #      8  QueueRowRequiresApprovedPlanTests     2  AutoFetchFailureSurfacingTests
   #      5  DeadPortAllocationTests               1  WslConfigMergerTests
   #      4  MergeQueueRestartResumeTests          1  DaemonStreamTests
   #                                               1  AgentWorkCommitTests
   #                                               1  AgentIpcProtocolTests
+  #
+  #   Mainguard.Server.Tests  874 tests, 832 passed, 27 skipped, **15 failed** (8m)
+  #      7  AgentWorktreeManagerTests             1  MergeDiffRpcTests
+  #      3  LockfileAdvisoryCockpitTests          1  AgentRepoTests
+  #      3  AgentBranchGuardTests
+  #
+  # And it delivered what it was added for: all three [WindowsOnlyFact] tests EXECUTED and PASSED for
+  # the first time — TerminalPtyAttachTests.Attach_WithPtyFactory_ShouldStreamConPtyOutput,
+  # PtySessionTests.PtySession_ConPty_ShouldCaptureOutput_AndComplete, and
+  # WindowsIntegrationTests.RegExe_InstallThenUninstall_ShouldRoundTrip.
   #
   # None of that is caused by the PR that added this job; it is what had accumulated while no job
   # ran a single test on Windows. Failing every PR on a 78-test backlog nobody is scoped to fix is
@@ -623,8 +633,13 @@ jobs:
   # THE ONLY acceptable way to remove `continue-on-error` is to fix those tests. Narrowing the
   # `--filter` so the job goes green would recreate exactly the blindness this job exists to end, and
   # the counts above are here so a future reader can tell the two apart.
+  # NOTE ON WHAT `continue-on-error` DOES AND DOES NOT DO, measured on this job rather than assumed:
+  # it stops the JOB's failure from failing the workflow RUN, but the job's own check still reports
+  # red in the PR checks list (verified — it shows as "fail" there). So the signal stays visible while
+  # the run stays green. It follows that this job must NOT be added to the branch's required status
+  # checks until the inventory above is empty, or the advisory framing is undone from the other side.
   windows-tests:
-    name: Non-Docker tests (Windows, ADVISORY — 78 known failures, see note)
+    name: Non-Docker tests (Windows, ADVISORY — 93 known failures, see note)
     runs-on: windows-latest
     timeout-minutes: 45
     continue-on-error: true

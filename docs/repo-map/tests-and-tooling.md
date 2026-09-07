@@ -1408,12 +1408,21 @@
   the decay mode #65 exists to prevent. It deliberately does NOT set `MAINGUARD_REQUIRE_LIBVTERM`:
   `build/libvterm/build.sh` emits `.so`/`.dylib` only (the Windows daemon lives in WSL2), so there is
   no library to load and requiring one would hard-fail every libvterm leg on a platform that cannot
-  have it. Its first run measured the backlog nobody could see — `Mainguard.Tests` on Windows is
-  3903/3998 passing with **78 failures** (52 `MergeQueueProvisionerTests`, 8
+  have it. Its first runs measured the backlog nobody could see — **93 failures** on Windows:
+  `Mainguard.Tests` 3903/3998 with **78** (52 `MergeQueueProvisionerTests`, 8
   `QueueRowRequiresApprovedPlanTests`, 5 `DeadPortAllocationTests`, 4 `MergeQueueRestartResumeTests`,
   3 `DaemonAuthTests`, 2 `AutoFetchFailureSurfacingTests`, 1 each in `WslConfigMergerTests`,
-  `DaemonStreamTests`, `AgentWorkCommitTests`, `AgentIpcProtocolTests`) — so the job is
-  `continue-on-error` until that inventory is empty. It still runs and reports on every PR; failing
+  `DaemonStreamTests`, `AgentWorkCommitTests`, `AgentIpcProtocolTests`) and `Mainguard.Server.Tests`
+  832/874 with **15** (7 `AgentWorktreeManagerTests`, 3 `LockfileAdvisoryCockpitTests`, 3
+  `AgentBranchGuardTests`, 1 each `MergeDiffRpcTests`/`AgentRepoTests`) — so the job is
+  `continue-on-error` until that inventory is empty. It nevertheless delivered what it was added for:
+  **all three `[WindowsOnlyFact]` tests executed and passed for the first time**
+  (`TerminalPtyAttachTests.Attach_WithPtyFactory_ShouldStreamConPtyOutput`,
+  `PtySessionTests.PtySession_ConPty_ShouldCaptureOutput_AndComplete`,
+  `WindowsIntegrationTests.RegExe_InstallThenUninstall_ShouldRoundTrip`). Measured, not assumed:
+  `continue-on-error` stops the JOB from failing the workflow RUN but the job's own check still
+  reports red in the PR checks list, so the signal stays visible — which also means the job must not
+  be added to the branch's required status checks until the inventory is empty. It still runs and reports on every PR; failing
   every PR on a backlog nobody is scoped to fix is how a check gets deleted, the same reasoning
   `verify-repo-map-complete.sh` sets out for its allowlist. The **only** acceptable way to drop
   `continue-on-error` is fixing those tests — narrowing the `--filter` would recreate the blindness
@@ -1442,13 +1451,17 @@
   list including `feat/**`/`fix/**` so a stacked PR still gets a macOS check, same `push` list, same
   concurrency shape). It is the ONE workflow with a NuGet package cache, keyed on the committed
   lockfiles: macOS runner minutes bill at 10x, so a cold restore per PR is the largest avoidable cost
-  here. `timeout-minutes: 45` caps a hung leg. Its first PR run measured 4015/4026 passing with **one**
-  failure — `SpawnWatchdogWiringTests.LaunchProgressDeltas_KeepASpawnAliveWellPastTheSilenceBudget`, a
-  timing flake (300 ms silence budget beaten every 40 ms; a cold first iteration on a loaded runner
-  overshoots) rather than anything macOS-specific — so the job is `continue-on-error` until that test
-  is made time-independent. Its later steps carry `if: !cancelled()`: a failing step aborts the rest,
-  so that one flake stopped the run before `Mainguard.Server.Tests`, which is where all three
-  `[MacOnlyFact]` tests live — the entire point of the promotion.
+  here. `timeout-minutes: 45` caps a hung leg. Measured on the promoting PR: `Mainguard.Tests`
+  4016/4026 (10 skipped, 0 failed, ~20 min) and `Mainguard.Server.Tests` 865/874 (9 skipped, 0 failed,
+  ~9 min), daemon smoke green — and **all three `[MacOnlyFact]` tests executed and passed for the
+  first time**. It is a real gate (no `continue-on-error`). One known INTERMITTENT flake is recorded
+  in the file rather than gated around: `SpawnWatchdogWiringTests.LaunchProgressDeltas_...` failed on
+  the first run and passed on the re-run — a 300 ms silence budget beaten every 40 ms, so a cold
+  first iteration on a loaded runner overshoots. The Linux `build-and-test` gate carries a flake of
+  the same species (`PromptDeliveryBinderTests.WhenTheEchoWaitReturnsInstantly_...`) and blocks
+  anyway. Its later steps carry `if: !cancelled()`: a failing step aborts the rest, so that one flake
+  stopped the first run before `Mainguard.Server.Tests`, which is where all three `[MacOnlyFact]`
+  tests live — the entire point of the promotion.
 - **`.github/workflows/nightly-network.yml`** — the nightly leg `RequiresNetworkFact` had always
   claimed and never had. It is the **only** place `MAINGUARD_NETWORK_TESTS=1` is set, so it is the
   only thing that runs `Rfc3161AnchorTests.AnchorRoundTrip_ShouldValidateAgainstRealTsa` — the sole

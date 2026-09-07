@@ -54,27 +54,35 @@ concurrency:
   group: macos-${{ github.ref }}
   cancel-in-progress: true
 
-# ADVISORY ON ITS FIRST OUTING — AND WHAT THAT COSTS TO KEEP
-# -----------------------------------------------------------
-# The first PR run measured Mainguard.Tests on macos-15 at 4026 tests, 4015 passed, 10 skipped,
-# **1 failed**, in 20m01s. The one failure is
-# `SpawnWatchdogWiringTests.LaunchProgressDeltas_KeepASpawnAliveWellPastTheSilenceBudget`, and it is
-# a TIMING flake rather than anything macOS-specific: the test sets a 300 ms silence budget and beats
-# the watchdog every 40 ms, so a cold first iteration (JIT + timer granularity on a loaded hosted
-# runner) overshoots the budget and the spawn is cancelled — it failed "after 2 progress lines".
+# WHAT THE PROMOTION MEASURED, AND THE ONE KNOWN FLAKE
+# -----------------------------------------------------
+# Measured across the two PR runs that promoted this file, so the numbers are observations, not
+# estimates:
 #
-# That is one flaky test, not a broken platform, and it is not this PR's to fix. But an intermittently
-# red REQUIRED check is the surest way to get a leg switched off again, which is the exact history
-# this file is climbing out of. So the leg runs and reports on every PR and is `continue-on-error`
-# until that test is made time-independent, at which point this line goes and the leg becomes a real
-# gate. Removing it by narrowing the `--filter` instead would be the wrong fix, and the note above is
-# here so a future reader can tell the two apart.
+#   Mainguard.Tests         4026 tests — 4016 passed, 10 skipped, 0 failed  (~20 min)
+#   Mainguard.Server.Tests   874 tests —  865 passed,  9 skipped, 0 failed  (~9 min)
+#   Daemon --local-dev smoke: green.
+#
+# And the point of the promotion: all three [MacOnlyFact] tests EXECUTED and PASSED for the first
+# time — AgentEnvironmentFactoryTests.MacHost_SyncRemote_ShouldBeTheLocalBarePath,
+# AgentEnvironmentFactoryTests.MacHost_Toolchains_ShouldInstallViaContainers_AndMountTheMacRoot, and
+# SubstrateConformanceTests.GitObjectsRoundTrip_ShouldBeByteIdentical.
+#
+# The leg is therefore a REAL GATE — no `continue-on-error`. One caveat is worth writing down rather
+# than discovering twice: the earlier of the two runs failed on
+# `SpawnWatchdogWiringTests.LaunchProgressDeltas_KeepASpawnAliveWellPastTheSilenceBudget`, which
+# passed on the re-run. It is an INTERMITTENT timing flake, not a macOS defect — the test sets a
+# 300 ms silence budget and beats the watchdog every 40 ms, so a cold first iteration (JIT + timer
+# granularity on a loaded hosted runner) can overshoot and the spawn is cancelled. It should be made
+# time-independent; until then expect an occasional red here. The Linux `build-and-test` gate carries
+# a flake of the same species (`PromptDeliveryBinderTests.WhenTheEchoWaitReturnsInstantly_...`) and is
+# blocking anyway, so weakening THIS leg for a flake both platforms share would be inconsistent as
+# well as unearned.
 jobs:
   mac-build-and-test:
-    name: Build & non-Docker tests (macOS, ADVISORY — 1 known flake, see note)
+    name: Build & non-Docker tests (macOS)
     runs-on: macos-15
     timeout-minutes: 45
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
