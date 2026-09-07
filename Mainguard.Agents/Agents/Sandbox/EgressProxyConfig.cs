@@ -424,6 +424,13 @@ public static class EgressProxyConfig
         sb.Append(":INPUT DROP [0:0]\n");
         sb.Append(":FORWARD DROP [0:0]\n");
         sb.Append(":OUTPUT ACCEPT [0:0]\n");
+        sb.Append("MAINGUARD_BACKSTOP_EOF\n");
+        // F26: emitted HERE, between the chain declarations and the rules, because the gateway's address
+        // is only known at apply time (it is a name Docker put in /etc/hosts). Rules within a table may
+        // be declared in any order — ordering only matters within one chain — so the INPUT/FORWARD block
+        // below is untouched, literally, by this insertion.
+        sb.Append("if [ -n \"$mg_gateway_rules\" ]; then printf '%s\\n' \"$mg_gateway_rules\"; fi\n");
+        sb.Append("cat <<'MAINGUARD_BACKSTOP_EOF'\n");
 
         sb.Append("-A INPUT -i lo -j ACCEPT\n");
         sb.Append("-A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT\n");
@@ -445,10 +452,8 @@ public static class EgressProxyConfig
         }
 
         sb.Append("-A FORWARD -j DROP\n");
+        sb.Append("COMMIT\n");
         sb.Append("MAINGUARD_BACKSTOP_EOF\n");
-        // Rendered at apply time from the resolved gateway address (empty when there is none).
-        sb.Append("if [ -n \"$mg_gateway_rules\" ]; then printf '%s\\n' \"$mg_gateway_rules\"; fi\n");
-        sb.Append("echo COMMIT\n");
         sb.Append("} | iptables-restore\n");
         return sb.ToString();
     }

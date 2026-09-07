@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Net;
 using Mainguard.Server.Gateway;
 using Xunit;
@@ -95,10 +96,85 @@ public sealed class GatewayBindPolicyTests
         if (resolved is not null)
         {
             Assert.True(GatewayBindPolicy.IsPermitted(IPAddress.Parse(resolved), out var reason), reason);
-            Assert.False(IPAddress.IsLoopback(IPAddress.Parse(resolved)),
-                "loopback is unreachable from a container, so it must never be the auto-resolved default");
         }
     }
+
+    // ---- F25: the default bind is narrow, not LAN-facing ------------------------------------------
+
+    /// <summary>
+    /// F25 — the default must never be an address the operator's LAN can reach.
+    ///
+    /// <para>The finding: the resolver picked the lexicographically lowest private IPv4 on any up NIC,
+    /// which on a Mac without a 10.x/172.x interface is the Wi-Fi address. The daemon therefore
+    /// published a plaintext HTTP gateway, authenticated by a token the agent itself can read and
+    /// commit, on whatever network the laptop was on. The default is now loopback on Docker Desktop
+    /// (reached through <c>host.docker.internal</c>) and the Docker bridge on Linux — both reachable
+    /// only from this machine and its containers.</para>
+    ///
+    /// <para>Asserted as a property of the resolved address rather than by mocking the platform, so it
+    /// holds on whichever host runs the suite.</para>
+    /// </summary>
+    [Fact]
+    public void DefaultBind_IsNeverALanFacingAddress()
+    {
+        var resolved = GatewayBindPolicy.TryResolvePrivateHostAddress();
+        if (resolved is null)
+        {
+            return; // no bridge and not Docker Desktop — disabled is the correct answer.
+        }
+
+        var address = IPAddress.Parse(resolved);
+        if (IPAddress.IsLoopback(address))
+        {
+            return; // narrowest possible; nothing off the box can reach it at all.
+        }
+
+        // Otherwise it must be an address a Docker bridge holds on THIS host — never a Wi-Fi/Ethernet
+        // address the LAN shares. "Assigned to an interface named docker0 or br-*" is the check, because
+        // that is precisely the property the resolver now selects on.
+        var bridges = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+            .Where(n => n.Name == "docker0" || n.Name.StartsWith("br-", System.StringComparison.Ordinal))
+            .SelectMany(n => n.GetIPProperties().UnicastAddresses)
+            .Select(u => u.Address.ToString())
+            .ToArray();
+
+        Assert.Contains(resolved, bridges);
+    }
+
+    /// <summary>
+    /// F25 — the bind address and the address a CONTAINER dials are the same string except for
+    /// loopback, and loopback is the case that matters: a jail's <c>NO_PROXY</c> covers
+    /// <c>127.0.0.1</c>, so a jail pointed at loopback dials ITSELF rather than the daemon.
+    /// </summary>
+    [Theory]
+    [InlineData("127.0.0.1", "host.docker.internal")]
+    [InlineData("127.0.0.53", "host.docker.internal")]
+    [InlineData("::1", "host.docker.internal")]
+    [InlineData("172.17.0.1", "172.17.0.1")]
+    [InlineData("10.202.0.1", "10.202.0.1")]
+    [InlineData(null, null)]
+    [InlineData("", null)]
+    public void ProxyReachableHostFor_TranslatesOnlyLoopback(string? bind, string? expected) =>
+        Assert.Equal(expected, GatewayBindPolicy.ProxyReachableHostFor(bind));
+
+    /// <summary>The alias is one contract stated in two assemblies (the daemon names it, the proxy is
+    /// created with it). A drift would silently disable confinement, so it is pinned.</summary>
+    [Fact]
+    public void ProxyReachableAlias_MatchesTheOneTheProxyIsCreatedWith() =>
+        Assert.Equal(
+            Mainguard.Agents.Agents.Sandbox.EgressProxyConfigurator.GatewayHostAlias,
+            GatewayBindPolicy.ProxyReachableHostAlias);
+
+    /// <summary>
+    /// The memoization contract, unchanged by F25 and restated because the doc comment depends on it:
+    /// the chosen address is written into every confined jail's base-URL variable, so it has to stay
+    /// stable for the life of the process.
+    /// </summary>
+    [Fact]
+    public void DefaultBind_IsMemoized_SoItCannotDriftUnderARunningDaemon() =>
+        Assert.Equal(
+            GatewayBindPolicy.TryResolvePrivateHostAddress(),
+            GatewayBindPolicy.TryResolvePrivateHostAddress());
 
     /// <summary>
     /// The escape hatch has to keep working, from either source, or "purely additive" is not true for an
