@@ -615,10 +615,15 @@ public static class GatewayServiceRegistration
     /// <summary>
     /// The base URL a confined jail's CLI is pointed at, or null when the gateway is disabled.
     ///
-    /// <para>The address is the daemon's own gateway bind address — MEASURED to be reachable from a jail
-    /// only via that jail's egress proxy, never directly (a container on an <c>Internal=true</c> network
-    /// can reach its own bridge's host-side address and nothing else; see
-    /// <c>docs/design/oauth-budgeting.md</c> for the measurements). Plain <c>http</c> is deliberate: the
+    /// <para>The address is the daemon's own gateway bind address, translated by
+    /// <see cref="GatewayBindPolicy.ProxyReachableHostFor"/> into the form a container can dial — MEASURED
+    /// to be reachable from a jail only via that jail's egress proxy, never directly. A container on an
+    /// <c>Internal=true</c> network has no default route, so it cannot reach <c>docker0</c> or anything
+    /// off-subnet, but its OWN segment's bridge address is on-link and does answer. That is precisely why
+    /// the gateway binds <c>docker0</c> and never a segment's bridge: binding a segment bridge would let
+    /// that segment's jail dial the gateway directly, bypassing tinyproxy and with it both the egress
+    /// allowlist and the budget metering. See <c>docs/design/oauth-budgeting.md</c> for the measurements.
+    /// Plain <c>http</c> is deliberate: the
     /// hop is jail → its own segment proxy → daemon, entirely inside the VM's private networking, and
     /// the credential it carries is a Mainguard session token rather than a provider key. The TLS that
     /// matters is the daemon → provider leg, which the forwarder establishes.</para>
@@ -633,11 +638,17 @@ public static class GatewayServiceRegistration
     /// configured so the address the jail is pointed at and the address the proxy is told to permit cannot
     /// drift apart; a drift there would be invisible until a confined agent silently lost its egress.
     /// Null when the gateway is disabled.
+    ///
+    /// <para>The bind address is translated through <see cref="GatewayBindPolicy.ProxyReachableHostFor"/>
+    /// first. On macOS and Windows the gateway binds loopback, which a container cannot dial by that
+    /// literal — it has its own loopback — so the proxy-reachable form is the host alias instead. Skipping
+    /// the translation points both the jail's base URL and the proxy's allowlist entry at
+    /// <c>127.0.0.1</c> and confinement silently fails.</para>
     /// </summary>
     public static string? BuildGatewayUpstream(DaemonOptions? options) =>
         options is null || string.IsNullOrWhiteSpace(options.GatewayBindAddress)
             ? null
-            : $"{options.GatewayBindAddress}:{options.GatewayPort}";
+            : $"{GatewayBindPolicy.ProxyReachableHostFor(options.GatewayBindAddress)}:{options.GatewayPort}";
 
     /// <summary>
     /// Where the P2-10 verification log artifacts land: beside the daemon DB, so the in-proc test tier's
