@@ -127,8 +127,27 @@
     cap, the line format, mask fidelity, swallowed IO, and the
     `DaemonLogCategories`↔`DaemonLogSubsystems` lockstep; plus the Lifecycle "bound" + Migration
     ("preparing db / stale migration lock cleared / migrate ok / watchdog fired") milestones (the
-    watchdog fallback driven through `TryPrepareDatabase` directly).
-  - `LoggingMaskTests` gains a non-`RpcException`-under-`Rpc` handler-fault test;
+    watchdog fallback driven through `TryPrepareDatabase` directly). **F56** adds the owner-only
+    permission tests (`[UnixOnlyFact]`: the logs dir is not group/world readable, the FIRST line lands
+    in an already-`0600` file, and a rolled file stays `0600`).
+  - `LoggingMaskTests` gains a non-`RpcException`-under-`Rpc` handler-fault test; **F56** reworks its
+    assertions from "the field was masked" to "the body was never rendered", and adds
+    `FreeTextRequestFields_AreNeverRendered_EvenThoughTheyAreNotMarkedSecret` — a `task_prompt`
+    carrying a pasted API key, which the old six-field denylist wrote to `rpc.log` verbatim.
+  - **`Mainguard.Server.Tests/SecretFieldMaskAllowlistTests.cs`** (F56) — the allowlist itself, on
+    `SecretFieldMask.Summarize` directly: task prompts and audit payloads render `<str:LEN>` / a
+    record count, registered `// SECRET` fields render nothing at all, nested messages recurse under
+    the same rules, bytes render `<bytes:LEN>`, bounded scalars still render (an access log has to
+    stay worth reading), and an allowlisted NAME with an un-handle-like VALUE still renders a length.
+  - **`Mainguard.Server.Tests/AuditRetentionLeaseTests.cs`** (F64b) — retention over a real
+    SQLite-backed `ChainedAuditLog` with an injected clock: with no lease everything expired expires;
+    an open `InMemoryMergeLeaseStore` lease holds back the records naming its agent or lease id while
+    unrelated ones still expire; the held record expires on the sweep after the lease confirms;
+    redaction events are never themselves redacted and the chain still verifies; plus the pure
+    `LeaseReferences` / `IsHeldByOpenLease` predicates (repo hash deliberately NOT a hold key).
+  - **`Mainguard.Server.Tests/AuditReadBoundTests.cs`** (F64a) — `ReadAudit` over a stub chain of fat
+    records: the page stops at the byte budget and fits under gRPC's 4 MB default, is a contiguous
+    prefix so the walk resumes, still returns a single oversized record, and leaves small pages alone.
   - `SpawnImagePreflightTests` asserts the `Spawn` step sequence + the image-missing failure.
   - **`Mainguard.Tests/Headless/DaemonLogsRenderHarness.cs`** — the Daemon logs window in all five
     themes × populated/spawn/loading/empty → `artifacts_headless/daemon_logs_<Theme>_<state>.png`.
@@ -439,7 +458,13 @@
   `SshKeyServiceTests` (T-14 ArgumentList argv construction + a REAL local ssh-keygen round trip —
   generate → files exist → `ListKeys` finds it → passphrase round-trips through the keyring,
   `RequiresGitCli`), `SecureKeyringTests` (T-14 round-trip + null-on-corrupt via the path override +
-  encrypted-at-rest), `CredentialResolverTests` (T-14 SSH-vs-token credential selection),
+  encrypted-at-rest), `SecureKeyringProtectionTests` (**F53**: the `Absent`/`Present`/`Unreadable`
+  tri-state, the audit master key failing closed on a tampered entry while a host token still degrades
+  to null, the `MAINGUARD_KEYRING_PASSPHRASE` protector round-tripping and leaving
+  `mainguardPassphraseEncryptedKey` in the key XML, a missing/wrong passphrase reading as `Unreadable`
+  rather than absent, and the unprotected-write refusal matrix — end-to-end only where a protector can
+  actually be absent, i.e. not Windows/macOS, via `RequiresUnprotectedPlatformFact`),
+  `CredentialResolverTests` (T-14 SSH-vs-token credential selection),
   `AccountsViewModelTests` (T-14 known-host catalog + PAT store/remove + add-custom-host),
   `SignatureStatusParserTests` (T-15 pure: the `%G?` code table + batched-log parse incl.
   separator-in-signer/CRLF/empty), `GitServiceSigningTests` (T-15 integration, `RequiresGpg`: signed

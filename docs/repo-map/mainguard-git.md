@@ -253,8 +253,26 @@ The all-editions base. Git logic goes here.
     (`UnsupportedCommitContextProvider` base + GitLab/Bitbucket/Azure DevOps stubs that throw a typed
     "not yet supported for <host>" and report `IsImplemented=false`).
 - **`Security/`** — `SecureKeyring.cs` (OS keyring / DataProtection secret storage; T-14 added a
-  storage-directory-override constructor for testability, `Retrieve` returns null on a corrupt/foreign
-  payload; the key ring is DPAPI-wrapped on Windows and Keychain-wrapped on macOS),
+  storage-directory-override constructor for testability; the key ring is DPAPI-wrapped on Windows and
+  Keychain-wrapped on macOS). **F53 fixed two defects here.** (1) *Linux/WSL had no protector at all*
+  — the DataProtection master key sat in plain XML beside the ciphertext, so the audit master key was
+  effectively stored in the clear. There is now a **passphrase protector**: set
+  `MAINGUARD_KEYRING_PASSPHRASE` and the key XML is AES-256-GCM-encrypted under a PBKDF2-HMAC-SHA256
+  (600k, per-key random salt recorded in the element) key — `PassphraseXmlEncryptor` /
+  `PassphraseXmlDecryptor` / `PassphraseKeyDerivation`, all in `SecureKeyring.cs`. Chosen over
+  libsecret (session D-Bus + a native dependency a systemd daemon does not have), the kernel keyring
+  (does not survive a reboot, so the audit key would go with it) and systemd-creds (needs root, absent
+  on WSL); zero new packages, works headless. With no protector available the ring reports
+  `Protection == KeyringProtection.None` / `IsUnprotected`, and **`SaveSecret` REFUSES the keys in
+  `FailClosedKeys` (currently `audit-payload-key`)** with a typed `UnprotectedKeyringException` unless
+  `MAINGUARD_ALLOW_UNPROTECTED_KEYRING=1`; ordinary secrets still store, because "no `token_<host>`"
+  is a normal degraded state and the audit master key is not. (2) *`RetrieveSecret` swallowed every
+  exception as "no secret"*, so a tampered ring was indistinguishable from a fresh install — and the
+  audit key's caller answers "no secret" by minting a new one, silently orphaning every stored
+  payload. `TryRetrieveSecret(key, out secret)` now returns a `KeyringEntryState`
+  (`Absent`/`Present`/`Unreadable`), and `RetrieveSecret` **fails closed** with
+  `KeyringUnreadableException` on a present-but-unreadable `FailClosedKeys` entry while still
+  returning null for the rest. `.keyring` files are written owner-only (`0600` pre-created on Unix).
   `MacKeychainKeyProtection.cs` (the macOS DPAPI analogue: the DataProtection key XML is
   AES-256-GCM-encrypted with a master key living ONLY in the login Keychain, accessed through
   `/usr/bin/security` so the item's ACL names the Apple-signed CLI and ad-hoc-rebuilt dev
