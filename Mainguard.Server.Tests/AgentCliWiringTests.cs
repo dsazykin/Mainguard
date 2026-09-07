@@ -366,14 +366,12 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         Assert.False(Directory.Exists(dir));
     }
 
-    [LinuxOnlyFact]
+    // The python3 half of the gate used to be an inline `if (!IsOnPath("python3")) return;`, which
+    // xunit reports as Passed — a bare CI box got a green result for a leg that ran nothing. Same
+    // condition, now expressed as a skip.
+    [LinuxOnlyRequiresPython3Fact("the real mainguard-agent shim is a python script")]
     public async Task MainguardAgentShim_RealScript_SpawnsWorkerOverTheSocket()
     {
-        if (!IsOnPath("python3"))
-        {
-            return; // the pre-baked jail toolchain has python3; a bare CI box without it skips the leg
-        }
-
         using var rig = WiringRig.Create(_daemon);
         var agents = new AgentService.AgentServiceClient(rig.Channel);
         var coordinator = await agents.SpawnAgentAsync(new SpawnAgentRequest
@@ -623,11 +621,6 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         using var reader = new StreamReader(stream, Encoding.UTF8);
         return (await reader.ReadLineAsync())!;
     }
-
-    private static bool IsOnPath(string binary) =>
-        (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
-            .Split(Path.PathSeparator)
-            .Any(dir => dir.Length > 0 && File.Exists(Path.Combine(dir, binary)));
 
     private static async Task<string> ReadUntilAsync(
         AsyncDuplexStreamingCall<TerminalInput, TerminalOutput> call,
