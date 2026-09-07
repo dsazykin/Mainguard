@@ -48,6 +48,28 @@ public sealed class AuditAnchorService : BackgroundService
             ? new Rfc3161TimestampClient(uri)
             : null;
 
+        // F64c — the off-by-default posture is a DECISION, not an oversight, so it is stated once at
+        // boot rather than being inferable only from a null client. Anchoring is the one part of the
+        // audit chain that leaves the machine: it POSTs a hash of the chain head to a third-party
+        // timestamp authority. Turning that on by default would make every install phone a TSA
+        // (chosen by us, not by the operator) without being asked, and it would leak the fact and
+        // cadence of a user's activity to that party. So the daemon queues heads unconditionally —
+        // no backlog is lost — and sends nothing until an operator names an endpoint. An install
+        // WITHOUT a TSA still has a tamper-evident chain and the file-mirror witness; what it lacks
+        // is proof of the time a head existed, which is exactly the claim only a third party can make.
+        if (client is null)
+        {
+            _log.LogInformation(
+                "audit anchor: RFC 3161 timestamping is OFF (no {Variable}) — by design, so no install "
+                + "contacts a third-party TSA unasked. Heads still queue by policy; set {Variable} to an "
+                + "RFC 3161 endpoint and the backlog anchors on the next hourly sweep.",
+                TsaUrlVariable, TsaUrlVariable);
+        }
+        else
+        {
+            _log.LogInformation("audit anchor: RFC 3161 timestamping ON via {Variable}", TsaUrlVariable);
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
