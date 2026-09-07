@@ -66,6 +66,16 @@ public sealed class GatewayConfinementDockerTests
     private const string ApiKeyVar = "ANTHROPIC_API_KEY";
     private const string UpstreamHost = "api.anthropic.com";
 
+    // F46 — the second adapter this world knows about, and the one whose confinement was silently
+    // broken: a different base-URL variable, a different key variable, a different upstream, and above
+    // all a DIFFERENT HEADER. Every assertion in this file used Anthropic's shape, which is exactly why
+    // "CONFINABLE, verified" in the adapter table was not true of gemini-cli.
+    private const string GeminiAdapterId = "gemini-cli";
+    private const string GeminiBaseUrlVar = "GOOGLE_GEMINI_BASE_URL";
+    private const string GeminiApiKeyVar = "GEMINI_API_KEY";
+    private const string GeminiUpstreamHost = "generativelanguage.googleapis.com";
+    private const string GeminiRealKey = "AIza-REAL-PROVIDER-KEY-DO-NOT-LEAK";
+
     /// <summary>41 tokens — the usage the fake provider reports, so the ledger assertion is exact.</summary>
     private const string ProviderBody =
         "{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":25,\"output_tokens\":16},\"content\":\"pong\"}";
@@ -109,6 +119,50 @@ public sealed class GatewayConfinementDockerTests
         // --- and the ledger was charged for it -----------------------------------------------------
         var ledger = world.Daemon.Services.GetRequiredService<BudgetLedger>();
         Assert.Equal(41, ledger.GetTotals(jail.AgentId).Tokens);
+    }
+
+    /// <summary>
+    /// <b>F46 — the same journey, in Google's header shape.</b> This file's other confinement tests all
+    /// send <c>x-api-key</c>, so they proved the path worked for exactly one of the two adapters the
+    /// table calls confinable. gemini-cli sends <c>x-goog-api-key</c>; the gateway read neither that
+    /// header on the way in nor wrote it on the way out, so a confined Gemini jail 404'd on every model
+    /// call while the daemon reported it as confined.
+    ///
+    /// <para>Same world, same shipped launcher, same egress proxy — only the adapter and the header
+    /// change, which is the point: nothing about the confinement machinery was Anthropic-specific
+    /// except the two header names nobody had generalised.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task ConfinedGeminiJail_IsIdentifiedByItsGoogleHeader_AndGetsTheRealKeyInTheSameShape()
+    {
+        await using var world = await ConfinementWorld.StartAsync(new BudgetCaps(0, 0, 0, 0));
+        var jail = await world.LaunchAsync(
+            "byok-gemini-1", modelApiKey: GeminiRealKey, agentKind: GeminiAdapterId);
+
+        // The jail was confined under the adapter's OWN declared variables.
+        var env = await world.ReadSecretsFileAsync(jail);
+        Assert.Contains(GeminiBaseUrlVar + "=" + world.GatewayBaseUrl, env, StringComparison.Ordinal);
+        var token = ValueOf(env, GeminiApiKeyVar);
+        Assert.StartsWith("mg_sess_", token, StringComparison.Ordinal);
+        Assert.DoesNotContain(GeminiRealKey, env, StringComparison.Ordinal);
+
+        // The request, in the shape gemini-cli actually sends it.
+        var call = await world.CurlFromJailAsync(
+            jail,
+            "curl -sS -o /tmp/out -w '%{http_code}' -X POST "
+            + "\"$" + GeminiBaseUrlVar + "/v1beta/models/gemini-2.5-pro:generateContent\" "
+            + "-H \"x-goog-api-key: $" + GeminiApiKeyVar + "\" -H 'content-type: application/json' "
+            + "-d '{\"contents\":[]}'; echo; head -c 300 /tmp/out");
+
+        Assert.StartsWith("200", call, StringComparison.Ordinal);
+
+        var sent = Assert.Single(world.Upstream.Requests);
+        Assert.Equal(GeminiUpstreamHost, sent.Host);
+        Assert.Equal("https", sent.Scheme);
+        // The daemon's key went out in GOOGLE's header — a Bearer would not authenticate this API…
+        Assert.Equal(GeminiRealKey, sent.GoogleApiKeyHeader);
+        // …and the jail's token did not travel at all.
+        Assert.DoesNotContain(token, sent.AllHeaderValues, StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -466,13 +520,14 @@ public sealed class GatewayConfinementDockerTests
         /// <summary>Spawns a jail through the daemon's own launcher — the shipped spawn chain.</summary>
         public async Task<Jail> LaunchAsync(
             string agentId, string? modelApiKey,
-            IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
+            IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
+            string agentKind = AdapterId)
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(4));
             var launcher = Daemon.Services.GetRequiredService<SandboxAgentLauncher>();
 
             var launch = await launcher.TryLaunchAsync(
-                RepoHash, agentId, agentKind: AdapterId, modelApiKey: modelApiKey,
+                RepoHash, agentId, agentKind: agentKind, modelApiKey: modelApiKey,
                 ipcDirPath: null, ct: cts.Token, extraEnv: null, cliCredentials: cliCredentials);
 
             Assert.NotNull(launch);
@@ -621,6 +676,20 @@ public sealed class GatewayConfinementDockerTests
 
             File.WriteAllText(
                 Path.Combine(registryDir, AdapterId + ".json"), InstalledAdapterMarker.Serialize(marker));
+
+            // F46: the same registry also knows gemini-cli, so a jail of that kind can be launched
+            // through the shipped chain rather than through a hand-built spec.
+            var gemini = new InstalledAdapterMarker(
+                GeminiAdapterId, "0.52.0", new[] { "/opt/mainguard/adapters/bin/gemini" },
+                ApiKeyEnvVar: GeminiApiKeyVar,
+                EgressHosts: new[] { GeminiUpstreamHost },
+                CredentialPaths: new[] { ".gemini/oauth_creds.json", ".gemini/settings.json" },
+                BaseUrlEnvVar: GeminiBaseUrlVar,
+                ModelHost: GeminiUpstreamHost);
+
+            File.WriteAllText(
+                Path.Combine(registryDir, GeminiAdapterId + ".json"),
+                InstalledAdapterMarker.Serialize(gemini));
         }
 
         internal static void SeedRepoAt(string path)
@@ -744,6 +813,7 @@ public sealed class GatewayConfinementDockerTests
                     request.RequestUri!.Host,
                     request.RequestUri.Scheme,
                     request.Headers.TryGetValues("x-api-key", out var key) ? key.FirstOrDefault() : null,
+                    request.Headers.TryGetValues("x-goog-api-key", out var goog) ? goog.FirstOrDefault() : null,
                     headers));
             }
         }
@@ -778,5 +848,6 @@ public sealed class GatewayConfinementDockerTests
     }
 
     private sealed record UpstreamRequest(
-        string Host, string Scheme, string? ApiKeyHeader, IReadOnlyList<string> AllHeaderValues);
+        string Host, string Scheme, string? ApiKeyHeader, string? GoogleApiKeyHeader,
+        IReadOnlyList<string> AllHeaderValues);
 }
