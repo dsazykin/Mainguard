@@ -70,8 +70,10 @@ public sealed class BoundTerminalSession : IDisposable
     private readonly List<string> _pendingClipboard = new();
     private readonly VtermSession? _vterm;
     private readonly Func<bool>? _isInputLocked;
+    private readonly SemaphoreSlim _writeGate = new(1, 1);
     private int _replayBytes;
     private bool _completed;
+    private bool _inputClaimed;
     private int _disposed;
 
     /// <param name="isInputLocked">
@@ -200,8 +202,79 @@ public sealed class BoundTerminalSession : IDisposable
     /// <summary>Writes keystrokes/paste toward the CLI.</summary>
     public async Task WriteInputAsync(ReadOnlyMemory<byte> data, CancellationToken ct)
     {
-        await _session.IO.WriteAsync(data, ct).ConfigureAwait(false);
-        await _session.IO.FlushAsync(ct).ConfigureAwait(false);
+        // F64: write+flush is one indivisible act. `_session.IO` is a single Stream over the PTY master
+        // and Stream is not thread-safe; two attaches typing at once interleaved at the BYTE level, so a
+        // multi-byte escape sequence or a UTF-8 codepoint from one writer could be split by the other's
+        // keystroke. The gate below costs an uncontended semaphore per keystroke.
+        await _writeGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _session.IO.WriteAsync(data, ct).ConfigureAwait(false);
+            await _session.IO.FlushAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// F64: claims the exclusive right to TYPE into this session, or returns null when another attach
+    /// already holds it. Dispose the returned handle to release (the attach's <c>finally</c>).
+    ///
+    /// <para>Attaches fan out freely — any number of clients may watch — but exactly one may write. Two
+    /// concurrent writable attaches to one CLI is not a shared terminal, it is two people's keystrokes
+    /// arriving as one stream with no way to tell whose is whose; and on a coordinator-driven worker it
+    /// meant an operator could type into a session the coordinator was mid-turn on. The claim is per
+    /// attach and released on detach, so the terminal is handed over rather than locked forever.</para>
+    ///
+    /// <para>The daemon's own prompt delivery (<see cref="WriteInputAndAwaitOutputAsync"/>) does not take
+    /// this claim: it is the session's owner acting, not a viewer competing, and it must not be blocked
+    /// by whoever happens to have a terminal open. Its writes are still serialized by the gate above.</para>
+    /// </summary>
+    public IDisposable? TryClaimInput()
+    {
+        lock (_gate)
+        {
+            if (_inputClaimed)
+            {
+                return null;
+            }
+
+            _inputClaimed = true;
+        }
+
+        return new InputClaim(this);
+    }
+
+    /// <summary>Whether some attach currently holds the exclusive write claim.</summary>
+    public bool IsInputClaimed
+    {
+        get { lock (_gate) { return _inputClaimed; } }
+    }
+
+    private void ReleaseInputClaim()
+    {
+        lock (_gate)
+        {
+            _inputClaimed = false;
+        }
+    }
+
+    private sealed class InputClaim : IDisposable
+    {
+        private readonly BoundTerminalSession _owner;
+        private int _released;
+
+        public InputClaim(BoundTerminalSession owner) => _owner = owner;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) == 0)
+            {
+                _owner.ReleaseInputClaim();
+            }
+        }
     }
 
     /// <summary>
@@ -613,6 +686,7 @@ public sealed class BoundTerminalSession : IDisposable
         _session.Dispose();
         _streamer.Dispose();
         _pumpCts.Dispose();
+        _writeGate.Dispose();
         lock (_gate)
         {
             _vterm?.Dispose();
