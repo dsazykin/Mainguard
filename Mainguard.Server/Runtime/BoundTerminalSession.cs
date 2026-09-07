@@ -558,6 +558,26 @@ public sealed class BoundTerminalSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// F59: releases the daemon-side half of this session — the pump, the streamer, the vterm and every
+    /// subscriber — <b>without killing the CLI</b>.
+    ///
+    /// <para>Used on daemon shutdown. The jail and the agent's worktree survive a restart by design; the
+    /// PTY this daemon opened does not, and cannot be reattached (the Docker API has no re-attach for a
+    /// running exec). But "the terminal is gone" and "SIGKILL the agent mid-task" are different acts, and
+    /// only the first is a consequence of the daemon stopping. <see cref="Dispose"/> — the explicit
+    /// StopAgent / teardown path — still kills, because there the kill is the request.</para>
+    /// </summary>
+    public void Detach()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        TearDownDaemonSide();
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -574,6 +594,12 @@ public sealed class BoundTerminalSession : IDisposable
             // Best-effort reap.
         }
 
+        TearDownDaemonSide();
+    }
+
+    /// <summary>The half of teardown that is the daemon's own state, shared by Dispose and Detach.</summary>
+    private void TearDownDaemonSide()
+    {
         _pumpCts.Cancel();
         try
         {

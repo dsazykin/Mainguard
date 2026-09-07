@@ -46,7 +46,10 @@ public sealed class SessionTransportCertificates : IDisposable
     private const string ClientAuthOid = "1.3.6.1.5.5.7.3.2";
 
     private readonly byte[] _pinnedClientFingerprint;
+    private readonly byte[] _serverCertificateDer;
+    private readonly byte[] _clientPkcs12;
     private bool _disposed;
+    private bool _persisted;
 
     /// <summary>The certificate Kestrel presents on the control-plane listener (has its private key).</summary>
     public X509Certificate2 ServerCertificate { get; }
@@ -61,38 +64,71 @@ public sealed class SessionTransportCertificates : IDisposable
     public string ClientCertificatePath => DaemonTransportFiles.ClientCertificatePath(Directory);
 
     private SessionTransportCertificates(
-        X509Certificate2 serverCertificate, byte[] pinnedClientFingerprint, string directory)
+        X509Certificate2 serverCertificate,
+        byte[] pinnedClientFingerprint,
+        string directory,
+        byte[] serverCertificateDer,
+        byte[] clientPkcs12)
     {
         ServerCertificate = serverCertificate;
         _pinnedClientFingerprint = pinnedClientFingerprint;
         Directory = directory;
+        _serverCertificateDer = serverCertificateDer;
+        _clientPkcs12 = clientPkcs12;
     }
 
     /// <summary>
-    /// Mints a fresh session pair and writes the client material beside <paramref name="tokenPath"/>
-    /// (or beside the OS-default token path when null).
+    /// Mints a fresh session pair <b>in memory only</b> — nothing is written to disk until
+    /// <see cref="Persist"/> is called.
+    ///
+    /// <para><b>F55.</b> Same reasoning as <see cref="SessionTokenFile.Mint"/>: the losing daemon of a
+    /// port race used to rotate <c>daemon-server.cer</c> / <c>daemon-client.pfx</c> during
+    /// <c>ConfigureServices</c> and only afterwards fail to bind, so every live client then presented a
+    /// client certificate the surviving daemon does not pin and every handshake failed. Minting is free
+    /// and reversible; writing is not, so the write waits for the bind.</para>
     /// </summary>
-    public static SessionTransportCertificates Create(string? tokenPath = null)
+    public static SessionTransportCertificates MintSession(string? tokenPath = null)
     {
         tokenPath ??= SessionTokenFile.DefaultPath();
         var directory = Path.GetDirectoryName(Path.GetFullPath(tokenPath))!;
-        System.IO.Directory.CreateDirectory(directory);
 
         var serverCertificate = Mint("CN=Mainguard Daemon", ServerAuthOid, loopbackSubjectNames: true);
         using var clientCertificate = Mint("CN=Mainguard Daemon Client", ClientAuthOid, loopbackSubjectNames: false);
 
-        WriteRestricted(
-            DaemonTransportFiles.ServerCertificatePath(directory),
-            serverCertificate.Export(X509ContentType.Cert));
-        WriteRestricted(
-            DaemonTransportFiles.ClientCertificatePath(directory),
-            clientCertificate.Export(X509ContentType.Pkcs12));
-
         return new SessionTransportCertificates(
             RoundTripForTls(serverCertificate),
             DaemonTransportCredentials.Fingerprint(clientCertificate),
-            directory);
+            directory,
+            serverCertificate.Export(X509ContentType.Cert),
+            clientCertificate.Export(X509ContentType.Pkcs12));
     }
+
+    /// <summary>
+    /// Mints a fresh session pair and writes the client material beside <paramref name="tokenPath"/>
+    /// (or beside the OS-default token path when null). Equivalent to <see cref="MintSession"/> +
+    /// <see cref="Persist"/>; kept for callers that are not behind a port race (tests, tooling).
+    /// </summary>
+    public static SessionTransportCertificates Create(string? tokenPath = null)
+    {
+        var certificates = MintSession(tokenPath);
+        certificates.Persist();
+        return certificates;
+    }
+
+    /// <summary>
+    /// Writes this session's material user-only-readable into <see cref="Directory"/>. Idempotent —
+    /// a second call rewrites the same bytes, so a retried startup is not a rotation.
+    /// </summary>
+    public void Persist()
+    {
+        System.IO.Directory.CreateDirectory(Directory);
+        WriteRestricted(DaemonTransportFiles.ServerCertificatePath(Directory), _serverCertificateDer);
+        WriteRestricted(DaemonTransportFiles.ClientCertificatePath(Directory), _clientPkcs12);
+        _persisted = true;
+    }
+
+    /// <summary>Whether this session's material has been written to disk yet (F55 test surface).</summary>
+    public bool IsPersisted => _persisted;
 
     /// <summary>
     /// The server-side pinning predicate Kestrel consults for every presented client certificate:
@@ -157,29 +193,30 @@ public sealed class SessionTransportCertificates : IDisposable
     /// <summary>
     /// Writes <paramref name="content"/> user-only-readable, mirroring <see cref="SessionTokenFile"/>:
     /// on Unix the file is pre-created at <c>0600</c> so the bytes never land under a permissive mode and
-    /// the mode is re-asserted after the write (umask can widen it); on Windows the file is created inside
-    /// the user-scoped data root and its DACL is reduced to a single full-control ACE for this user.
+    /// the mode is re-asserted after the write (umask can widen it); on Windows the DACL is reduced to a
+    /// single full-control ACE for this user <b>before</b> the bytes are written (F64), not after — the
+    /// old order left the client private key on disk under the inherited ACL for the write's duration.
     /// </summary>
     private static void WriteRestricted(string path, byte[] content)
     {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
-            {
-                File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-            }
-        }
-
-        File.WriteAllBytes(path, content);
-
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
+            using (new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+            }
+
             RestrictWindows(path);
+            File.WriteAllBytes(path, content);
+            return;
         }
-        else
+
+        using (new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
         {
             File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
         }
+
+        File.WriteAllBytes(path, content);
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
 
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
@@ -207,6 +244,9 @@ public sealed class SessionTransportCertificates : IDisposable
         }
 
         _disposed = true;
+        // The in-memory PKCS#12 holds the client private key; it lives for the process's life so a
+        // restart-in-place can re-persist it, so wipe it deliberately on the way out.
+        CryptographicOperations.ZeroMemory(_clientPkcs12);
         ServerCertificate.Dispose();
     }
 }

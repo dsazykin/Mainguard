@@ -35,39 +35,69 @@ public sealed class SessionTokenFile
     public static string DefaultPath() => Mainguard.Agents.Daemon.DaemonPaths.TokenFilePath();
 
     /// <summary>
-    /// Generates a fresh 256-bit token, writes it user-only-readable to
-    /// <paramref name="path"/> (or the OS default), and returns the handle.
+    /// Generates a fresh 256-bit token <b>in memory only</b> — nothing is written to disk.
+    ///
+    /// <para><b>F55.</b> Minting and persisting are separate acts because a daemon that loses the port
+    /// race must not have touched the surviving daemon's files. The old <see cref="Create"/> wrote the
+    /// token during <c>ConfigureServices</c>, which runs long before Kestrel binds: a second instance
+    /// started against the same data root rotated <c>daemon.token</c> (and the mTLS material beside it)
+    /// and only then discovered the port was taken, leaving every live client authenticating with a
+    /// token the running daemon had never heard of. <see cref="Persist"/> is now called from the host's
+    /// <c>ApplicationStarted</c> hook, i.e. only after the port has actually been won.</para>
+    /// </summary>
+    public static SessionTokenFile Mint(string? path = null)
+    {
+        path ??= DefaultPath();
+        var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+        return new SessionTokenFile(System.IO.Path.GetFullPath(path), token);
+    }
+
+    /// <summary>
+    /// Generates a fresh token and writes it user-only-readable to <paramref name="path"/> (or the OS
+    /// default). Equivalent to <see cref="Mint"/> + <see cref="Persist"/>; kept for callers that are
+    /// not behind a port race (tests, tooling).
     /// </summary>
     public static SessionTokenFile Create(string? path = null)
     {
-        path ??= DefaultPath();
-        var dir = System.IO.Path.GetDirectoryName(path)!;
+        var file = Mint(path);
+        file.Persist();
+        return file;
+    }
+
+    /// <summary>
+    /// Writes this token to <see cref="Path"/>, readable only by the current user. Idempotent.
+    ///
+    /// <para>On Unix the file is pre-created at <c>0600</c> so the bytes never land under a permissive
+    /// mode, and the mode is re-asserted after the write (umask can widen it). On Windows the DACL is
+    /// tightened <b>before</b> the token is written (F64): the previous order created the file under the
+    /// inherited ACL, wrote the secret into it, and only then reduced the ACL — so the token existed on
+    /// disk, readable by whoever the inherited ACEs named, for the duration of the write.</para>
+    /// </summary>
+    public void Persist()
+    {
+        var dir = System.IO.Path.GetDirectoryName(Path)!;
         Directory.CreateDirectory(dir);
-
-        var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
-
-        // On Unix, pre-create the file at 0600 so the token never lands under a
-        // permissive mode. On Windows the file is created inside the user-scoped
-        // %LocalAppData% and the DACL is tightened by path immediately after.
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
-            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        }
-
-        File.WriteAllText(path, token);
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            RestrictWindows(path);
-        }
-        else
-        {
-            // Re-assert 0600 (WriteAllText above may have widened it via umask).
-            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            // Create empty, tighten, then write. The DACL is in place before the secret is.
+            using (new FileStream(Path, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+            }
+
+            RestrictWindows(Path);
+            File.WriteAllText(Path, Token);
+            return;
         }
 
-        return new SessionTokenFile(path, token);
+        using (new FileStream(Path, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            File.SetUnixFileMode(Path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+
+        File.WriteAllText(Path, Token);
+        // Re-assert 0600 (WriteAllText above may have widened it via umask).
+        File.SetUnixFileMode(Path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
 
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
