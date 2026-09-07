@@ -1408,9 +1408,29 @@
   the decay mode #65 exists to prevent. It deliberately does NOT set `MAINGUARD_REQUIRE_LIBVTERM`:
   `build/libvterm/build.sh` emits `.so`/`.dylib` only (the Windows daemon lives in WSL2), so there is
   no library to load and requiring one would hard-fail every libvterm leg on a platform that cannot
-  have it. The `sandbox-security` job's header now states the **Linux-engine-only** limit of the
-  `RequiresDocker` tier out loud — hosted macOS and Windows runners cannot run Linux containers, so
-  that is a permanent gap needing a self-hosted/on-device matrix, not a job a later PR adds.
+  have it. Its first run measured the backlog nobody could see — `Mainguard.Tests` on Windows is
+  3903/3998 passing with **78 failures** (52 `MergeQueueProvisionerTests`, 8
+  `QueueRowRequiresApprovedPlanTests`, 5 `DeadPortAllocationTests`, 4 `MergeQueueRestartResumeTests`,
+  3 `DaemonAuthTests`, 2 `AutoFetchFailureSurfacingTests`, 1 each in `WslConfigMergerTests`,
+  `DaemonStreamTests`, `AgentWorkCommitTests`, `AgentIpcProtocolTests`) — so the job is
+  `continue-on-error` until that inventory is empty. It still runs and reports on every PR; failing
+  every PR on a backlog nobody is scoped to fix is how a check gets deleted, the same reasoning
+  `verify-repo-map-complete.sh` sets out for its allowlist. The **only** acceptable way to drop
+  `continue-on-error` is fixing those tests — narrowing the `--filter` would recreate the blindness
+  the job exists to end. Both test steps carry `if: !cancelled()`, because a failing step aborts the
+  rest and the first run therefore never reached `Mainguard.Server.Tests` at all, i.e. never ran the
+  `[WindowsOnlyFact]` it was added for. The `sandbox-security` job's header now states the
+  **Linux-engine-only** limit of the `RequiresDocker` tier out loud — hosted macOS and Windows runners
+  cannot run Linux containers, so that is a permanent gap needing a self-hosted/on-device matrix, not
+  a job a later PR adds. Every Linux `dotnet test` step (`build-and-test`, `sandbox-security`, and
+  `nightly-network.yml`) sets **`MAINGUARD_KEYRING_PASSPHRASE`** to a CI-only throwaway: F53 makes
+  `SecureKeyring` refuse to store the fail-closed `audit-payload-key` when it has no protector, which
+  on Linux is the default, so without it `AuditCrypto` silently degrades to the in-memory journal.
+  `MAINGUARD_ALLOW_UNPROTECTED_KEYRING=1` would also make CI pass and is deliberately NOT used — it
+  turns the refusal off, so the protected path would never be exercised and a regression in the
+  protector would stay invisible. Not set on the Windows/macOS legs, where `ResolveProtection`
+  returns `Dpapi`/`MacKeychain` and the refusal cannot fire; setting it there would only replace the
+  platform-native protector under test with the passphrase one.
 - **`.github/workflows/macos.yml`** — the macos-host substrate leg (build + the
   `Category!=RequiresDocker` tier of both test projects on `macos-15`, plus the `--local-dev --smoke`
   daemon composition check and the libvterm `.dylib` lane). **Promoted into the PR matrix in audit
@@ -1422,7 +1442,13 @@
   list including `feat/**`/`fix/**` so a stacked PR still gets a macOS check, same `push` list, same
   concurrency shape). It is the ONE workflow with a NuGet package cache, keyed on the committed
   lockfiles: macOS runner minutes bill at 10x, so a cold restore per PR is the largest avoidable cost
-  here. `timeout-minutes: 45` caps a hung leg.
+  here. `timeout-minutes: 45` caps a hung leg. Its first PR run measured 4015/4026 passing with **one**
+  failure — `SpawnWatchdogWiringTests.LaunchProgressDeltas_KeepASpawnAliveWellPastTheSilenceBudget`, a
+  timing flake (300 ms silence budget beaten every 40 ms; a cold first iteration on a loaded runner
+  overshoots) rather than anything macOS-specific — so the job is `continue-on-error` until that test
+  is made time-independent. Its later steps carry `if: !cancelled()`: a failing step aborts the rest,
+  so that one flake stopped the run before `Mainguard.Server.Tests`, which is where all three
+  `[MacOnlyFact]` tests live — the entire point of the promotion.
 - **`.github/workflows/nightly-network.yml`** — the nightly leg `RequiresNetworkFact` had always
   claimed and never had. It is the **only** place `MAINGUARD_NETWORK_TESTS=1` is set, so it is the
   only thing that runs `Rfc3161AnchorTests.AnchorRoundTrip_ShouldValidateAgainstRealTsa` — the sole

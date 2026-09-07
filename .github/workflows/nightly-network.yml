@@ -99,6 +99,11 @@ jobs:
       - name: The RFC 3161 anchoring round trip, against a live TSA
         env:
           MAINGUARD_NETWORK_TESTS: "1"
+          # F53 — CI-only throwaway; see the long note on ci.yml's `build-and-test` Test step. This
+          # is a Linux `dotnet test` and the test under it writes to the audit log, so without a
+          # protector SecureKeyring refuses the fail-closed `audit-payload-key`. Deliberately NOT
+          # MAINGUARD_ALLOW_UNPROTECTED_KEYRING, which would bypass the protector rather than run it.
+          MAINGUARD_KEYRING_PASSPHRASE: "ci-throwaway-not-a-secret"
           # Set the repository variable MAINGUARD_TSA_URL to point at an internal TSA. The `||`
           # fallback is load-bearing: an UNSET repo variable expands to the empty string, and the
           # test reads `GetEnvironmentVariable(...) ?? default` — an empty string is not null, so
