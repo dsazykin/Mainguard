@@ -98,7 +98,11 @@ public sealed class CompositionRootResolutionTests
                 // the flag-gated QueueSeedingService, which a shipped daemon never maps, so the gate
                 // lives at the RPC surface rather than in a conditional wiring this exact-set
                 // assertion could not tell from an oversight.
-                "agentStates", "audit", "checkAgentBranch", "locateAgentWorktree", "log",
+                // W1-A: `locateAgentRepo` is the daemon's own answer to which repository backs an agent's
+                // worktree. Unwired, the keep-alive cycle falls back to deriving it from the worktree's
+                // agent-writable `.git` pointer and round-trip-checking the result — weaker, and silently
+                // so, which is exactly the degradation this set exists to catch.
+                "agentStates", "audit", "checkAgentBranch", "locateAgentRepo", "locateAgentWorktree", "log",
                 // Without `promptAgent`, the "let the agent resolve" control on a conflicted entry
                 // refuses — correctly and loudly, rather than unpausing a jail and telling it nothing —
                 // which would leave the card exactly where it started: naming a human action the product
