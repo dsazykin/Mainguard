@@ -156,9 +156,9 @@ public sealed class CliSettingsBoundaryTests
     [Fact]
     public void TheAttendancePolicy_AdmitsManualAndCoordinatorSessions_AndRefusesManagedOnes()
     {
-        Assert.True(CliSettingsHarvestPolicy.MayHarvest(string.Empty));
-        Assert.True(CliSettingsHarvestPolicy.MayHarvest(AgentRoles.Coordinator));
-        Assert.False(CliSettingsHarvestPolicy.MayHarvest(AgentRoles.Managed));
+        Assert.True(CliHarvestPolicy.MayHarvest(string.Empty));
+        Assert.True(CliHarvestPolicy.MayHarvest(AgentRoles.Coordinator));
+        Assert.False(CliHarvestPolicy.MayHarvest(AgentRoles.Managed));
     }
 
     // ---- gate 3: ROLE — one role's tool grant never reaches another role's jail (D5b) ----------

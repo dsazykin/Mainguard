@@ -28,27 +28,43 @@ public sealed record AgentStopResult(
     string RepoHandle = "");
 
 /// <summary>
-/// May the settings a jail holds — the CLI's approved-command list — flow back OUT to the host store
-/// that seeds every later agent in this repository?
+/// May what a jail holds — the CLI's approved-command list, and its login-state files — flow back OUT
+/// to the host stores that seed every later agent in this repository?
 ///
 /// <para>This is the escalation direction and it is deliberately narrower than the restore direction.
-/// The settings file is agent-writable by construction (the CLI must be able to record a new
-/// approval), so Mainguard cannot tell "the human answered yes" from "the agent wrote the file". What
-/// it CAN tell is whether a human was in a position to answer at all:</para>
+/// The files are agent-writable by construction (the CLI must be able to record a new approval, and to
+/// write the tokens its own login produced), so Mainguard cannot tell "the human did this" from "the
+/// agent wrote the file". What it CAN tell is whether a human was in a position to act at all:</para>
 /// <list type="bullet">
 ///   <item>a <see cref="AgentRoles.Managed"/> worker's terminal is daemon-locked read-only (P2-14), so
-///   nobody typed an approval into it — anything found there was written by the agent, and the
-///   external-PR intake's untrusted worker is Managed by construction;</item>
+///   nobody typed an approval or a login into it — anything found there was written by the agent, and
+///   the external-PR intake's untrusted worker is Managed by construction;</item>
 ///   <item>every other session (manual, coordinator) is a terminal the user drives, which is exactly
-///   where the owner's approvals are made and therefore the only place worth harvesting.</item>
+///   where the owner's approvals and logins are made and therefore the only place worth harvesting.</item>
 /// </list>
-/// <para>Restore stays wider on purpose: a Managed worker SHOULD inherit the repo's approvals so it
-/// does not stall on prompts nobody can answer. Grants flow in from a human-managed source and never
-/// back out of an unattended one.</para>
+/// <para>Restore stays wider on purpose: a Managed worker SHOULD inherit the repo's approvals and its
+/// login so it does not stall on prompts nobody can answer. Grants and credentials flow in from a
+/// human-managed source and never back out of an unattended one.</para>
+///
+/// <para><b>F2 — why this now gates credentials as well as settings.</b> It was written for settings
+/// alone, and the credential harvest beside it had no trust gate at all. That was not a theoretical
+/// gap: a coordinator's shim spawns its workers as <see cref="AgentRoles.Managed"/> running real
+/// adapter kinds, so every one of them WAS harvested — the daemon read the CLI login files back out of
+/// an unattended jail, on the word of the only party in it, and filed them in the host's durable
+/// credential store. The asymmetry made no sense in either direction it was argued: a file naming
+/// approved commands was judged untrustworthy from an unattended jail, while a file carrying an OAuth
+/// refresh token from the same jail was taken at face value. The refresh token is the more dangerous
+/// of the two — it mints access tokens for the user's whole provider account — so it gets the same
+/// gate, evaluated in the same place.</para>
+///
+/// <para>What a refused harvest costs: nothing durable. The jail keeps the files it wrote for as long
+/// as it lives; they simply never reach the host store, so the next Managed worker starts from the
+/// login the HUMAN performed rather than from one an unattended agent produced.</para>
 /// </summary>
-public static class CliSettingsHarvestPolicy
+public static class CliHarvestPolicy
 {
-    /// <summary>True when a session of this role is human-attended, so its settings may be persisted.</summary>
+    /// <summary>True when a session of this role is human-attended, so its settings and its CLI login
+    /// state may be persisted to the host.</summary>
     public static bool MayHarvest(string? role) =>
         !string.Equals(role, AgentRoles.Managed, StringComparison.Ordinal);
 }
@@ -603,8 +619,7 @@ public sealed class AgentSpawnService
                 session?.RepoHash ?? string.Empty);
         }
 
-        var credentials = await _launcher.HarvestCliCredentialsAsync(
-            containerId, session.Kind, ct).ConfigureAwait(false);
+        var credentials = await HarvestCredentialsIfAttendedAsync(session, containerId, ct).ConfigureAwait(false);
         var settings = await HarvestSettingsIfAttendedAsync(session, containerId, ct).ConfigureAwait(false);
         if (settings.Count > 0)
         {
@@ -628,8 +643,29 @@ public sealed class AgentSpawnService
     }
 
     /// <summary>
+    /// Harvests a session's CLI LOGIN STATE — or refuses to, and says why. Same gate, same reasoning
+    /// and the same call sites as <see cref="HarvestSettingsIfAttendedAsync"/>: see
+    /// <see cref="CliHarvestPolicy"/> for why an unattended jail's credential files are no more
+    /// trustworthy than its approved-command list, and for what a refusal does and does not cost.
+    /// </summary>
+    private async Task<IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>>
+        HarvestCredentialsIfAttendedAsync(AgentSession session, string containerId, CancellationToken ct)
+    {
+        if (!CliHarvestPolicy.MayHarvest(session.Role))
+        {
+            _spawnLog.LogInformation(
+                "cli credential harvest skipped: agent={Agent} role={Role} — an unattended jail's login "
+                + "files are agent-authored and never flow back to the host credential store.",
+                session.Id, session.Role);
+            return Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>();
+        }
+
+        return await _launcher.HarvestCliCredentialsAsync(containerId, session.Kind, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Harvests a session's CLI settings — or refuses to, and says why. The gate is
-    /// <see cref="CliSettingsHarvestPolicy"/>: only a human-attended session's approvals may flow back
+    /// <see cref="CliHarvestPolicy"/>: only a human-attended session's approvals may flow back
     /// out to the store that seeds every later agent in the repository. A Managed worker (the
     /// external-PR intake's untrusted jail included) has a daemon-locked read-only terminal, so nothing
     /// in its settings file was approved by a person — persisting it would let an agent write its own
@@ -638,7 +674,7 @@ public sealed class AgentSpawnService
     private async Task<IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>>
         HarvestSettingsIfAttendedAsync(AgentSession session, string containerId, CancellationToken ct)
     {
-        if (!CliSettingsHarvestPolicy.MayHarvest(session.Role))
+        if (!CliHarvestPolicy.MayHarvest(session.Role))
         {
             _spawnLog.LogInformation(
                 "cli settings harvest skipped: agent={Agent} role={Role} — an unattended jail's "
@@ -713,8 +749,10 @@ public sealed class AgentSpawnService
             Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>();
         if (stopped && session?.ContainerId is { Length: > 0 } containerId)
         {
-            credentials = await _launcher.HarvestCliCredentialsAsync(
-                containerId, session.Kind, ct).ConfigureAwait(false);
+            // The login the user performed in this jail, on its way to the host keychain — but only
+            // from a session a human could actually have logged in from (see the policy type). A
+            // coordinator's workers are Managed, so this is the path that used to harvest them.
+            credentials = await HarvestCredentialsIfAttendedAsync(session, containerId, ct).ConfigureAwait(false);
             // The approvals the user gave in this jail, on their way to the per-repo host store — but
             // only from a session a human could actually approve in (see the policy type).
             settings = await HarvestSettingsIfAttendedAsync(session, containerId, ct).ConfigureAwait(false);

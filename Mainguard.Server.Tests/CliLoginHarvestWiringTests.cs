@@ -54,6 +54,12 @@ public sealed class CliLoginHarvestWiringTests
     /// <summary>The declared <c>credentialPaths</c> entry — the only file the daemon may harvest.</summary>
     private const string LoginPath = ".probe/login.json";
 
+    /// <summary>The repo the rig provisions — the vault key is scoped by it (F2).</summary>
+    private const string RigRepoHandle = "harvest-rig-repo";
+
+    /// <summary>This repo + kind's keyring entry. Never null here: both scopes are constants.</summary>
+    private static string VaultKey => CliLoginVault.KeystoreKeyFor(AgentKind, RigRepoHandle)!;
+
     /// <summary>A per-run nonce standing in for the token an interactive login writes. Random so a
     /// stale vault entry from an earlier run could never satisfy the assertion.</summary>
     private static string NewLogin() => "{\"token\":\"" + Guid.NewGuid().ToString("N") + "\"}";
@@ -75,7 +81,7 @@ public sealed class CliLoginHarvestWiringTests
 
         adapter.Start();
 
-        var stored = await WaitForVaultAsync(vault, CliLoginVault.KeystoreKeyFor(AgentKind));
+        var stored = await WaitForVaultAsync(vault, VaultKey);
         Assert.NotNull(stored);
 
         var file = Assert.Single(CliLoginVault.Parse(stored));
@@ -89,7 +95,7 @@ public sealed class CliLoginHarvestWiringTests
         var login = NewLogin();
         using var rig = HarvestRig.Create(login);
         var vault = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
-        var key = CliLoginVault.KeystoreKeyFor(AgentKind);
+        var key = VaultKey;
 
         using var client = rig.NewClient();
         // A sweep interval no test run can reach, so anything that lands in the vault below came from
@@ -135,7 +141,7 @@ public sealed class CliLoginHarvestWiringTests
     /// </summary>
     private sealed class HarvestRig : IDisposable
     {
-        private const string RepoHandle = "harvest-rig-repo";
+        private const string RepoHandle = RigRepoHandle;
 
         private readonly string _root;
 

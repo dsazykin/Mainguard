@@ -845,6 +845,13 @@ public sealed class SandboxAgentLauncher
     /// the home-relative shape gate. The client names paths on the wire, so without this filter a
     /// compromised client could write arbitrary agent-home files at spawn; with it the surface is
     /// exactly the vendor-declared login files. No marker / no declared paths ⇒ nothing is restored.
+    ///
+    /// <para><b>F2 — the cap and the scrub apply on the way IN too.</b> Same argument the settings leg
+    /// makes in <see cref="FilterCliSettings"/>: scrubbing only the harvest would fix nothing already
+    /// on the owner's disk, because a poisoned entry keeps being restored until some later attended
+    /// stop overwrites it. Scrubbing the restore neutralises every stored file immediately, with no
+    /// migration. The size ceiling is re-applied here for the same reason it exists at all — the store
+    /// this reads from was written by a jail.</para>
     /// </summary>
     internal static IReadOnlyList<SandboxCredentialFile>? FilterCliCredentials(
         IReadOnlyList<SandboxCredentialFile>? supplied, InstalledAdapterMarker? adapter)
@@ -857,7 +864,16 @@ public sealed class SandboxAgentLauncher
         var allowed = new HashSet<string>(
             declared.Where(AdapterManifest.IsHomeRelativeFilePath), StringComparer.Ordinal);
         var kept = supplied
-            .Where(f => f.Content is { Length: > 0 } && allowed.Contains(f.HomeRelativePath))
+            .Where(f => f.Content is { Length: > 0 }
+                        && allowed.Contains(f.HomeRelativePath)
+                        && f.Content.Length <= AdapterCredentialPolicy.MaxBytesFor(f.HomeRelativePath))
+            .Select(f => !AdapterCredentialPolicy.IsSettingsShaped(f.HomeRelativePath)
+                ? f
+                : CliSettingsGrantScrub.Scrub(f.Content) is { Length: > 0 } clean
+                    ? f with { Content = clean }
+                    : null)
+            .Where(f => f is not null)
+            .Select(f => f!)
             .ToArray();
         return kept.Length > 0 ? kept : null;
     }
@@ -1284,6 +1300,19 @@ public sealed class SandboxAgentLauncher
     /// would otherwise evaporate. Files come out base64 over the exec pipe (binary-safe through the
     /// string plumbing); a missing file is skipped, and any exec failure yields an empty result —
     /// harvesting must never block a stop.
+    ///
+    /// <para><b>WHETHER this may run at all is the caller's decision, not this method's</b> — see
+    /// <c>CliHarvestPolicy</c>. These files are agent-writable, so what comes back is "whatever is in
+    /// the jail", not "what a human logged in as".</para>
+    ///
+    /// <para><b>F2 — the two protections the settings leg had and this one did not.</b> A file over
+    /// <see cref="AdapterCredentialPolicy.MaxFileBytes"/> is REFUSED rather than truncated, and the
+    /// check happens in the shell so an oversized file is never read into the daemon's memory at all —
+    /// exactly as <see cref="HarvestCliSettingsAsync"/> does it. And a declared credential path that is
+    /// really a settings file (gemini-cli's and qwen-code's <c>settings.json</c>, which sit in this
+    /// field for migration reasons the manifest explains) is put through
+    /// <see cref="CliSettingsGrantScrub"/> and held to the settings cap where it sits, so those two
+    /// files stop being the hole in the middle of both.</para>
     /// </summary>
     public async Task<IReadOnlyList<SandboxCredentialFile>> HarvestCliCredentialsAsync(
         string containerId, string agentKind, CancellationToken ct = default)
@@ -1303,15 +1332,34 @@ public sealed class SandboxAgentLauncher
         var harvested = new List<SandboxCredentialFile>();
         foreach (var relative in declared.Where(AdapterManifest.IsHomeRelativeFilePath))
         {
+            var maxBytes = AdapterCredentialPolicy.MaxBytesFor(relative);
             try
             {
                 // Runs as the container's default user — the agent uid — so its own 0600 files read
-                // fine. Path is positional ("$1"), never interpolated into script text.
+                // fine. Path is positional ("$1"), never interpolated into script text. The size check
+                // happens in the shell so an oversized file is never read into the daemon's memory at
+                // all — the same three-line script the settings harvest uses, for the same reason.
                 var result = await _environment.Sandboxes.ExecAsync(containerId, new[]
                 {
-                    "sh", "-c", "[ -f \"$1\" ] && base64 \"$1\"", "sh",
+                    "sh", "-c",
+                    "[ -f \"$1\" ] || exit 1\n"
+                    + "[ \"$(wc -c < \"$1\" | tr -d ' ')\" -le \"$2\" ] || exit 2\n"
+                    + "base64 \"$1\"\n",
+                    "sh",
                     ContainerSpecBuilder.AgentHome + "/" + relative,
+                    maxBytes.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 }, ct).ConfigureAwait(false);
+
+                if (result.ExitCode == 2)
+                {
+                    // Refused, not truncated: half a credential file is a corrupt one, and it would
+                    // REPLACE the good copy in the vault (a harvested path always wins). Keeping the
+                    // last known-good login is the better failure.
+                    _log.LogWarning(
+                        "cli credential harvest refused (over {Max} bytes): kind={Kind} path={Path}",
+                        maxBytes, agentKind, relative);
+                    continue;
+                }
 
                 if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(result.Stdout))
                 {
@@ -1320,7 +1368,34 @@ public sealed class SandboxAgentLauncher
 
                 var content = Convert.FromBase64String(
                     string.Concat(result.Stdout.Where(c => !char.IsWhiteSpace(c))));
-                if (content.Length > 0)
+
+                // D5b, applied where the file actually sits. A settings file declared under
+                // credentialPaths is still a settings file: it can carry a rule naming the daemon-owned
+                // IPC mount, and it is restored into every later jail of this repo just like the real
+                // ones. An unparseable one that names the mount does not travel at all.
+                if (AdapterCredentialPolicy.IsSettingsShaped(relative))
+                {
+                    var scrubbed = CliSettingsGrantScrub.Scrub(content);
+                    if (scrubbed is null)
+                    {
+                        _log.LogWarning(
+                            "cli credential harvest refused (settings-shaped, names {Mount} and could not "
+                            + "be scrubbed): kind={Kind} path={Path}",
+                            CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind, relative);
+                        continue;
+                    }
+
+                    if (scrubbed.Length != content.Length)
+                    {
+                        _log.LogInformation(
+                            "cli credential harvest scrubbed a role-scoped grant for {Mount}: kind={Kind} path={Path}",
+                            CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind, relative);
+                    }
+
+                    content = scrubbed;
+                }
+
+                if (content.Length is > 0 && content.Length <= maxBytes)
                 {
                     harvested.Add(new SandboxCredentialFile(relative, content));
                 }

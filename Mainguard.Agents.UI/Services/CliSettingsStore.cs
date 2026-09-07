@@ -198,8 +198,14 @@ public sealed class CliSettingsStore
     /// safe is replaced by a hash of the original rather than sanitised in place — two different
     /// scopes must never be able to collapse onto one directory, which is how a per-repo store quietly
     /// becomes a shared one.
+    ///
+    /// <para><b>Public because <see cref="CliLoginVault"/> now scopes its keyring entries by repo too
+    /// (F2), and a second copy of this rule is exactly how the two stores drift into disagreeing about
+    /// which repo a scope names.</b> The vault hashes unconditionally rather than reusing the
+    /// safe-passthrough branch — see <c>CliLoginVault.RepoScope</c> for why a keyring key needs a
+    /// fixed-width suffix — but the collapse rule below is the same one, defined once.</para>
     /// </summary>
-    private static string ScopeSegment(string value)
+    public static string ScopeSegment(string value)
     {
         var safe = value.Length is > 0 and <= 64
                    && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.')

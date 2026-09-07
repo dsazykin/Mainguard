@@ -86,8 +86,51 @@ public sealed class CliLoginVaultTests
     }
 
     [Fact]
-    public void KeystoreKey_IsPerAdapterKind()
+    public void KeystoreKey_IsPerAdapterKind_AndPerRepo()
     {
-        Assert.Equal("cli_login_claude-code", CliLoginVault.KeystoreKeyFor("claude-code"));
+        var key = CliLoginVault.KeystoreKeyFor("claude-code", "repo-a");
+
+        Assert.NotNull(key);
+        Assert.StartsWith("cli_login_claude-code_", key);
+        // A fixed-width hex suffix, so no (kind, repo) pair can be re-parsed as another one.
+        Assert.Equal("cli_login_claude-code_".Length + 32, key!.Length);
+    }
+
+    /// <summary>F2: the whole point of the key change. Two repositories must not resolve to one
+    /// entry — that shared entry is what carried a login out of the repo it was made in.</summary>
+    [Fact]
+    public void KeystoreKey_DiffersPerRepo_ForTheSameKind()
+    {
+        Assert.NotEqual(
+            CliLoginVault.KeystoreKeyFor("claude-code", "repo-a"),
+            CliLoginVault.KeystoreKeyFor("claude-code", "repo-b"));
+    }
+
+    /// <summary>A separator that both scopes may contain must not let one pair spell another's key.</summary>
+    [Fact]
+    public void KeystoreKey_CannotCollideAcrossTheSeparator()
+    {
+        Assert.NotEqual(
+            CliLoginVault.KeystoreKeyFor("a_b", "c"),
+            CliLoginVault.KeystoreKeyFor("a", "b_c"));
+    }
+
+    [Fact]
+    public void KeystoreKey_IsNull_WhenEitherScopeIsBlank()
+    {
+        Assert.Null(CliLoginVault.KeystoreKeyFor("claude-code", " "));
+        Assert.Null(CliLoginVault.KeystoreKeyFor("claude-code", null));
+        Assert.Null(CliLoginVault.KeystoreKeyFor("", "repo-a"));
+    }
+
+    /// <summary>The pre-F2 shape, pinned only so the migration note has something to point at. Nothing
+    /// reads this entry's value any more; a read fallback to it would be the defect restored.</summary>
+    [Fact]
+    public void LegacyKeystoreKey_IsTheUnscopedName_AndIsNeverProducedByTheScopedOne()
+    {
+        Assert.Equal("cli_login_claude-code", CliLoginVault.LegacyKeystoreKeyFor("claude-code"));
+        Assert.NotEqual(
+            CliLoginVault.LegacyKeystoreKeyFor("claude-code"),
+            CliLoginVault.KeystoreKeyFor("claude-code", "repo-a"));
     }
 }
