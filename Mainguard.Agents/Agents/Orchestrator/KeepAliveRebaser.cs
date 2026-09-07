@@ -9,7 +9,19 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// <param name="WorktreePath">The agent's worktree (the mutation target).</param>
 /// <param name="BarePath">The daemon-owned bare mirror the worktree is linked to.</param>
 /// <param name="MainBranch">The mirror branch to rebase onto (the current, already-fetched main).</param>
-public sealed record AgentWorktreeLocation(string WorktreePath, string BarePath, string MainBranch);
+/// <param name="AgentRepoPath">
+/// W1-A — the daemon-computed per-agent repository (<see cref="AgentRepoLayout.AgentRepoPath"/>) the
+/// worktree is linked off, when the caller knows it.
+///
+/// <para>Optional, and the difference it makes is between a <i>check</i> and a <i>pin</i>. Without it the
+/// cycle still refuses a worktree whose <c>gitdir:</c> pointer has been aimed at the shared mirror, and
+/// still ignores <c>commondir</c> — but it derives the repository from the pointer's own shape, so an
+/// agent that redirects to some third repository is only caught by the round-trip registration check.
+/// With it, the pointer can no longer decide <i>whose</i> repository the daemon operates on at all: a
+/// mismatch is a typed refusal. Supply it wherever the agent id and repo hash are in hand.</para>
+/// </param>
+public sealed record AgentWorktreeLocation(
+    string WorktreePath, string BarePath, string MainBranch, string? AgentRepoPath = null);
 
 /// <summary>The T-04 handoff payload: the conflicted worktree the resolver runs against.</summary>
 public sealed record ConflictHandoff(string AgentId, string WorktreePath, string MainBranch);
@@ -156,6 +168,24 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
         }
 
         var loc = _locate(agentId);
+
+        // W1-A — resolve the git layout from daemon-computed roots BEFORE the yield, so a worktree whose
+        // `.git` pointer has been aimed somewhere else costs nothing but a skipped cycle. Every git below
+        // then runs with GIT_DIR/GIT_COMMON_DIR/GIT_WORK_TREE pinned to what this resolved, which outranks
+        // the pointer file and `commondir` — neither of which the daemon reads again. Null is the
+        // substrate-less shape (a main working tree, or a test double): nothing to redirect, run as before.
+        TrustedWorktreeLayout? layout;
+        try
+        {
+            layout = TrustedWorktreeLayout.TryResolve(loc.WorktreePath, loc.AgentRepoPath, loc.BarePath);
+        }
+        catch (RepoProvisioningException ex)
+        {
+            // A refused layout is the same terminus as a guard refusal: mutate nothing, resume nothing
+            // (no token has been taken), and let the reason reach the caller verbatim.
+            return new RebaseCycleResult(RebaseCycleKind.Skipped, ex.Message, WipCommitCreated: false);
+        }
+
         _setState(agentId, AgentRunState.Yielding);
 
         var token = await _yield.RequestYieldAsync(agentId, _yieldTimeout, ct).ConfigureAwait(false);
@@ -184,7 +214,7 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
             // of main" — about a main from before the human's merge. Every state transition looked
             // healthy, the queue re-verified on the strength of it, and the merge refused. A cycle that
             // cannot establish what main IS must not claim the branch is on top of it.
-            if (!TryRefreshMainFromMirror(loc, out var refreshFailure))
+            if (!TryRefreshMainFromMirror(loc, layout, out var refreshFailure))
             {
                 _setState(agentId, AgentRunState.Working);
                 return new RebaseCycleResult(RebaseCycleKind.Skipped, refreshFailure, WipCommitCreated: false);
@@ -204,26 +234,26 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
             string headBefore;
             try
             {
-                if (IsDirty(loc.WorktreePath))
+                if (IsDirty(loc.WorktreePath, layout))
                 {
                     GitMutationGuard.RunGuarded(
                         token,
                         () => GitMutationGuard.IsIndexLockHeld(loc.WorktreePath),
                         () =>
                         {
-                            AgentGitCommand.Run(loc.WorktreePath, "add", "-A");
-                            AgentGitCommand.Run(loc.WorktreePath, Args("commit", "-m", "wip: sync"));
+                            RunIn(loc.WorktreePath, layout, "add", "-A");
+                            RunIn(loc.WorktreePath, layout, Args("commit", "-m", "wip: sync"));
                             return 0;
                         },
                         recheck: recheck);
                     wip = true;
                 }
 
-                headBefore = HeadSha(loc.WorktreePath);
+                headBefore = HeadSha(loc.WorktreePath, layout);
                 rebaseExit = GitMutationGuard.RunGuarded(
                     token,
                     () => GitMutationGuard.IsIndexLockHeld(loc.WorktreePath),
-                    () => AgentGitCommand.TryRun(loc.WorktreePath, out _, Args("rebase", loc.MainBranch)),
+                    () => TryRunIn(loc.WorktreePath, layout, out _, Args("rebase", loc.MainBranch)),
                     recheck: recheck);
             }
             catch (GitMutationStateChangedException ex)
@@ -262,7 +292,7 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
             }
 
             _setState(agentId, AgentRunState.Working);
-            var moved = wip || !string.Equals(headBefore, HeadSha(loc.WorktreePath), StringComparison.Ordinal);
+            var moved = wip || !string.Equals(headBefore, HeadSha(loc.WorktreePath, layout), StringComparison.Ordinal);
             return new RebaseCycleResult(
                 moved ? RebaseCycleKind.Rebased : RebaseCycleKind.CleanNoop,
                 moved ? "Committed/reparented onto main." : "Clean; already on top of main.",
@@ -296,8 +326,19 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
         }
     }
 
-    private static bool IsDirty(string worktreePath) =>
-        AgentGitCommand.Run(worktreePath, "status", "--porcelain").Trim().Length > 0;
+    private static bool IsDirty(string worktreePath, TrustedWorktreeLayout? layout) =>
+        RunIn(worktreePath, layout, "status", "--porcelain").Trim().Length > 0;
+
+    /// <summary>W1-A — every git in this cycle, with the resolved layout pinned into the child process.
+    /// A null layout means "there is no linked-worktree indirection here", and the call is exactly the
+    /// one this file made before.</summary>
+    private static string RunIn(string worktreePath, TrustedWorktreeLayout? layout, params string[] args)
+        => AgentGitCommand.RunWithEnv(layout?.WorkTree ?? worktreePath, layout?.Env, args);
+
+    /// <inheritdoc cref="RunIn"/>
+    private static int TryRunIn(
+        string worktreePath, TrustedWorktreeLayout? layout, out string output, params string[] args)
+        => AgentGitCommand.TryRunWithEnv(layout?.WorkTree ?? worktreePath, layout?.Env, out output, args);
 
     /// <summary>
     /// MG-3 — fast-forwards the agent repository's copy of the main branch from the shared mirror, so
@@ -319,7 +360,8 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
     /// failure: there is nothing to carry across, which is the pre-MG-3 shape, and the rebase below is
     /// then against whatever ref the caller named.</para>
     /// </summary>
-    private static bool TryRefreshMainFromMirror(AgentWorktreeLocation loc, out string? failure)
+    private static bool TryRefreshMainFromMirror(
+        AgentWorktreeLocation loc, TrustedWorktreeLayout? layout, out string? failure)
     {
         failure = null;
         if (string.IsNullOrEmpty(loc.BarePath) || string.IsNullOrEmpty(loc.MainBranch))
@@ -327,8 +369,8 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
             return true;
         }
 
-        var exit = AgentGitCommand.TryRun(
-            loc.WorktreePath, out _, "fetch", "--no-tags", loc.BarePath,
+        var exit = TryRunIn(
+            loc.WorktreePath, layout, out _, "fetch", "--no-tags", loc.BarePath,
             $"+refs/heads/{loc.MainBranch}:refs/heads/{loc.MainBranch}");
         if (exit == 0)
         {
@@ -341,9 +383,9 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
         return false;
     }
 
-    private static string HeadSha(string worktreePath)
+    private static string HeadSha(string worktreePath, TrustedWorktreeLayout? layout)
     {
-        AgentGitCommand.TryRun(worktreePath, out var output, "rev-parse", "HEAD");
+        TryRunIn(worktreePath, layout, out var output, "rev-parse", "HEAD");
         return output.Trim();
     }
 
