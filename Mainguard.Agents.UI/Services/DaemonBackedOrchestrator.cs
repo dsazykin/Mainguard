@@ -1023,7 +1023,9 @@ public sealed class DaemonBackedOrchestrator :
         RaiseIsolated(() => Changed?.Invoke());
     }
 
-    private void ApplyPlanUpdate(Proto.PlanUpdate update)
+    /// <remarks>Internal, like every other applier here, so a test can drive one push directly — the
+    /// property being pinned is that a throwing subscriber never escapes back into the pump.</remarks>
+    internal void ApplyPlanUpdate(Proto.PlanUpdate update)
     {
         lock (_gate)
         {
@@ -1076,7 +1078,8 @@ public sealed class DaemonBackedOrchestrator :
         RaiseIsolated(() => Changed?.Invoke());
     }
 
-    private void ApplyConversationUpdate(Proto.ConversationUpdate update)
+    /// <remarks>Internal for the same reason as <see cref="ApplyPlanUpdate"/>.</remarks>
+    internal void ApplyConversationUpdate(Proto.ConversationUpdate update)
     {
         lock (_gate)
         {
@@ -1094,7 +1097,8 @@ public sealed class DaemonBackedOrchestrator :
         RaiseIsolated(() => Changed?.Invoke());
     }
 
-    private void ApplySpendSample(Proto.SpendSample sample)
+    /// <remarks>Internal for the same reason as <see cref="ApplyPlanUpdate"/>.</remarks>
+    internal void ApplySpendSample(Proto.SpendSample sample)
     {
         lock (_gate)
         {
@@ -1119,7 +1123,7 @@ public sealed class DaemonBackedOrchestrator :
     /// purpose: an agent that has gone away must lose its numbers rather than keep showing its last ones
     /// forever, which would be a stale reading presented as a live one.
     /// </summary>
-    private void ApplyResourceSnapshot(Proto.AgentResourcesSnapshot snapshot)
+    internal void ApplyResourceSnapshot(Proto.AgentResourcesSnapshot snapshot)
     {
         lock (_gate)
         {
