@@ -239,6 +239,18 @@ public static class ContainerSpecBuilder
     /// <summary>The container mount point of the agent worktree.</summary>
     public const string WorkspaceTarget = "/workspace";
 
+    /// <summary>W1-A — where the worktree's <c>gitdir:</c> pointer file lands in the jail. Read-only,
+    /// nested inside the read-write <see cref="WorkspaceTarget"/>: see the mount's own comment for why a
+    /// file git writes exactly once at <c>worktree add</c> has no business being agent-writable.</summary>
+    public const string WorkspaceGitPointerTarget = WorkspaceTarget + "/.git";
+
+    /// <summary>The VM-side path of a worktree's <c>.git</c> pointer file. Hand-joined with a forward
+    /// slash rather than <see cref="System.IO.Path"/>, which yields backslashes when the daemon build
+    /// runs on Windows and would silently stop naming a path the Linux engine can resolve — the same
+    /// reason <see cref="CredTmpfsSpec.DirectoryOf"/> is hand-rolled.</summary>
+    public static string WorktreeGitPointer(string worktreePath)
+        => worktreePath.TrimEnd('/') + "/.git";
+
     /// <summary>
     /// MG-3 — whether the shared mirror's bind mount denies writes from inside the jail.
     ///
@@ -337,6 +349,33 @@ public static class ContainerSpecBuilder
                 // MG-3: the ONE git directory the agent may write. Exactly one jail mounts it, so a
                 // write here cannot reach another agent, and the shared mirror is not writable at all.
                 ReadOnly = false,
+            });
+
+            // W1-A — the worktree's `.git` POINTER FILE, re-mounted read-only on top of the read-write
+            // workspace.
+            //
+            // It is one line (`gitdir: <abs VM path>`), it is written once by `git worktree add`, and
+            // nothing ever writes it again — not the agent's git, not the daemon's. But it sits inside
+            // /workspace, so until now the agent could rewrite it, and it is the first thing any git run
+            // with the worktree as its working directory reads. Pointing it at the shared mirror was the
+            // audit's "plausible second vector": the mirror is read-only to jails precisely so no agent
+            // can reach it, and a daemon that follows this pointer reaches it on the agent's behalf, with
+            // the daemon's own credentials, outside the jail. A file that is never legitimately written
+            // does not need to be writable, so it is not.
+            //
+            // Nested under the /workspace mount on purpose: Docker orders bind mounts by target depth, so
+            // this one lands after the workspace and wins for exactly this path. The rest of the worktree
+            // stays read-write — this removes nothing the agent does.
+            //
+            // Gated on AgentRepoPath because that is what makes `.git` a FILE: in the MG-3 layout the
+            // worktree is linked off the per-agent repository, and `git worktree add` writes a pointer.
+            // Without it there is no per-agent repo and no pointer file to protect.
+            mounts.Add(new Mount
+            {
+                Type = "bind",
+                Source = WorktreeGitPointer(request.WorktreePath),
+                Target = WorkspaceGitPointerTarget,
+                ReadOnly = true,
             });
         }
 
