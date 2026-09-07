@@ -148,8 +148,25 @@ jobs:
           fi
           echo "$ALLOWLIST did not grow vs origin/phase2."
 
+  # ------------------------------------------------------------------------------------------------
+  # KNOWN COVERAGE GAP — the 127 RequiresDocker tests run on the LINUX ENGINE ONLY.
+  # ------------------------------------------------------------------------------------------------
+  # This job is the only place the `Category=RequiresDocker` tier executes, and it is `ubuntu-latest`.
+  # The macOS leg (macos.yml) and the Windows leg (windows-tests, below) both filter it out.
+  #
+  # That is NOT a gap a later PR closes by adding a job. GitHub's hosted macOS runners ship no
+  # container engine and cannot run Linux containers (no nested virtualisation, no Docker Desktop),
+  # and a hosted Windows runner cannot run Linux containers either — while the product's Windows
+  # engine is WSL2, which no hosted runner reproduces. A job that tried would fail on its first
+  # `docker build`, and a failing job teaches nothing that this comment does not.
+  #
+  # So, stated plainly rather than left to be inferred from a `--filter`: container hardening,
+  # default-deny egress, the A6 git proxy, G2 key custody and the merge-queue end-to-end suite are
+  # proven against the LINUX engine and no other. The macOS engine's evidence is the on-device run in
+  # docs/phase-2/Mainguard_Substrate_MacHost.md; the Windows/WSL2 engine's is the B2 doc's own run.
+  # Closing this in CI needs a self-hosted macOS runner or an on-device matrix.
   sandbox-security:
-    name: Sandbox security suite (RequiresDocker, Linux)
+    name: Sandbox security suite (RequiresDocker, Linux ENGINE ONLY — see note above)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -533,6 +550,67 @@ jobs:
             exit 1
           fi
           echo "No conflict markers under site/."
+
+  # ------------------------------------------------------------------------------------------------
+  # The Windows test leg — three [WindowsOnlyFact] tests that ran NOWHERE.
+  # ------------------------------------------------------------------------------------------------
+  # `daemon-smoke` below has been the only Windows job, and it BUILDS `Mainguard.Server` and runs one
+  # smoke — it has never executed a single `dotnet test`. So the ConPTY side of the terminal stack
+  # (`Mainguard.Server.Tests/TerminalPtyAttachTests`, `Mainguard.Tests/PtySessionTests`,
+  # `Mainguard.Tests/WindowsIntegrationTests`) was gated behind `[WindowsOnlyFact]`, skipped on every
+  # Linux run, and executed by no job at all. A test that only ever skips reports green forever.
+  #
+  # WHY THE WHOLE NON-DOCKER TIER, NOT A FILTER NAMING THOSE THREE CLASSES
+  # ----------------------------------------------------------------------
+  # A `--filter` naming the known Windows-only classes would run today's three and silently miss the
+  # fourth — the next `[WindowsOnlyFact]` someone adds in a class this list does not mention. That is
+  # exactly the decay mode ticket #65 exists to prevent, and it is cheaper to avoid it than to add
+  # another guard script: run everything that is not Docker-gated, and no Windows-only test can be
+  # added out from under the job.
+  #
+  # WHAT IT CANNOT COVER
+  # --------------------
+  #   * `Category=RequiresDocker` (127 tests) is filtered out. A hosted Windows runner cannot run
+  #     LINUX containers, and the product's Windows engine is WSL2, which no hosted runner
+  #     reproduces. The Docker-backed sandbox/security evidence is therefore Linux-engine-only —
+  #     see the same note in macos.yml. This is a real coverage gap, recorded rather than papered
+  #     over; closing it needs a self-hosted or on-device matrix.
+  #   * libvterm. `build/libvterm/build.sh` emits `.so`/`.dylib` and is daemon-side only (the daemon
+  #     on Windows lives in WSL2), so there is no Windows lane for it. MAINGUARD_REQUIRE_LIBVTERM is
+  #     deliberately NOT set here — setting it would turn every libvterm leg into a hard failure on a
+  #     platform that has no library to load. Those legs skip with their reason; the P2-04/P2-18
+  #     engine gate stays the Linux `build-and-test` job, which does set it.
+  windows-tests:
+    name: Non-Docker tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # MG-35: the Windows leg locks too — a lockfile that only binds on Linux would let a
+      # Windows-only transitive (a runtime.win asset, a native shim) drift unobserved.
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Test — Mainguard.Tests (non-Docker)
+        run: >
+          dotnet test Mainguard.Tests/Mainguard.Tests.csproj
+          --no-build --configuration Release --verbosity normal
+          --filter "Category!=RequiresDocker"
+
+      - name: Test — Mainguard.Server.Tests (non-Docker, incl. every [WindowsOnlyFact])
+        run: >
+          dotnet test Mainguard.Server.Tests/Mainguard.Server.Tests.csproj
+          --no-build --configuration Release --verbosity normal
+          --filter "Category!=RequiresDocker"
 
   daemon-smoke:
     name: Daemon --local-dev smoke (Windows)

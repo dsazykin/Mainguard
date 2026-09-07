@@ -885,7 +885,14 @@
     `MacOnlyFact` skip-with-reason attributes. `UnixOnlyFact` (Linux + macOS) is for any-Unix
     behavior — forkpty, unix file modes — now that the macos-host substrate means "not Windows"
     no longer implies Linux; `LinuxOnlyFact` stays for genuinely Linux-bound dependencies
-    (cgroups, /proc, the in-VM daemon).
+    (cgroups, /proc, the in-VM daemon). Also `RequiresNetworkFact` (P2-15 — skips unless
+    `MAINGUARD_NETWORK_TESTS=1`, which **only** `.github/workflows/nightly-network.yml` sets) and
+    `RequiresPython3Fact` + its cached `Python3Availability` probe. The python gate exists because
+    `AgentIpcProtocolTests.BothShims_AreValidPython` opened with a silent `return;` when python3 was
+    absent, and an early return is reported by xunit as **Passed** — a box without an interpreter got
+    a green result for a check that compiled nothing. Same condition, expressed as a skip, so the
+    absence is visible in the run. The probe LAUNCHES `python3 --version` rather than scanning
+    `PATH`: a name that exists but is not executable would pass a scan and then fail the test.
   - `TestTools/SelfInvocation.cs` — the quoted command prefix tests hand to
     `GitService.SelfInvocationOverride` to spawn the COPIED Mainguard.Client.App head. On macOS it
     always takes the `dotnet <dll>` form: current macOS pins an executable name to the location it
@@ -1392,7 +1399,48 @@
   the one distributed — scans the publish dir **recursively**, and its positive control requires **all
   six** tokens to match, not one (a mistyped token used to stop detecting anything forever while the
   control still reported PASS on its neighbours). The RID restore rewrites `packages.lock.json`, so the
-  script snapshots and puts them back.
+  script snapshots and puts them back. Its **`windows-tests`** job (audit batch 7) is the first
+  Windows `dotnet test` in this repo: `daemon-smoke` only ever BUILT `Mainguard.Server` and ran one
+  smoke, so the three `[WindowsOnlyFact]` ConPTY tests (`TerminalPtyAttachTests`, `PtySessionTests`,
+  `WindowsIntegrationTests`) were skipped on every Linux run and executed by no job at all. It runs
+  the whole `Category!=RequiresDocker` tier of BOTH test projects rather than a filter naming those
+  three classes — a name list would silently miss the next Windows-only test someone adds, which is
+  the decay mode #65 exists to prevent. It deliberately does NOT set `MAINGUARD_REQUIRE_LIBVTERM`:
+  `build/libvterm/build.sh` emits `.so`/`.dylib` only (the Windows daemon lives in WSL2), so there is
+  no library to load and requiring one would hard-fail every libvterm leg on a platform that cannot
+  have it. The `sandbox-security` job's header now states the **Linux-engine-only** limit of the
+  `RequiresDocker` tier out loud — hosted macOS and Windows runners cannot run Linux containers, so
+  that is a permanent gap needing a self-hosted/on-device matrix, not a job a later PR adds.
+- **`.github/workflows/macos.yml`** — the macos-host substrate leg (build + the
+  `Category!=RequiresDocker` tier of both test projects on `macos-15`, plus the `--local-dev --smoke`
+  daemon composition check and the libvterm `.dylib` lane). **Promoted into the PR matrix in audit
+  batch 7**: it used to trigger on `workflow_dispatch` + pushes to `port/macos` only, under a header
+  saying "promote it into the PR matrix when the port merges". The port merged, the promotion did
+  not, and the file last ran 2026-08-25 — so the three `[MacOnlyFact]` tests
+  (`AgentEnvironmentFactoryTests.MacHost_*`, `SubstrateConformanceTests.GitObjectsRoundTrip_*`) ran
+  nowhere and were permanently green. Triggers now mirror `ci.yml` exactly (same `pull_request` base
+  list including `feat/**`/`fix/**` so a stacked PR still gets a macOS check, same `push` list, same
+  concurrency shape). It is the ONE workflow with a NuGet package cache, keyed on the committed
+  lockfiles: macOS runner minutes bill at 10x, so a cold restore per PR is the largest avoidable cost
+  here. `timeout-minutes: 45` caps a hung leg.
+- **`.github/workflows/nightly-network.yml`** — the nightly leg `RequiresNetworkFact` had always
+  claimed and never had. It is the **only** place `MAINGUARD_NETWORK_TESTS=1` is set, so it is the
+  only thing that runs `Rfc3161AnchorTests.AnchorRoundTrip_ShouldValidateAgainstRealTsa` — the sole
+  proof that a real RFC 3161 token from a live TSA round-trips and validates against the audit log's
+  head hash (every other anchoring test drives a scripted client returning deliberately-invalid
+  bytes). Nightly at 05:30 UTC (half an hour after `e2e-verification.yml`, so the two do not compete
+  for capacity), plus `workflow_dispatch`. **Non-blocking for PRs, two ways**: a `paths:` filter so
+  only changes to the anchoring code / its test / the gate attribute / this file trigger it, and
+  `continue-on-error` scoped to `github.event_name == 'pull_request'` so even then it annotates
+  rather than blocks — a third-party TSA's uptime is not a property of this repo and must never turn
+  a PR red. The `paths:` filter is the deliberate exception to this repo's no-path-filter rule, sound
+  here for the reason it was unsound in `e2e-verification.yml`: that job's blast radius is the whole
+  repository, this one's is enumerable — and the filter names the workflow file itself, so the PR
+  that changes the wiring is the PR that proves it runs. Like `e2e-verification.yml` it asserts from
+  the `.trx` that **1 test actually executed**, because a run in which the test skipped exits 0,
+  which is exactly how a network gate could be "added" while measuring nothing. `schedule` and
+  `workflow_dispatch` stay INERT until this reaches `main` (GitHub honours them only for workflows on
+  the default branch) — the same caveat `e2e-verification.yml` records for itself.
 - **`.github/workflows/e2e-verification.yml`** — the **`Full in-jail verification (slow, opt-in)`** job:
   the only place `MAINGUARD_VERIFY_E2E=1` is set, so it is the only thing that runs the two
   `[RequiresDockerAndOptInFact]` legs (`VerifyInJailDockerTests` + `PythonToolchainDockerTests`). It
@@ -2711,9 +2759,16 @@
   output only when it FAILS, so an instrument meant to report on GREEN runs would report on nothing —
   extracted from `ToolchainProvisioningDockerTests`, which now shares it), `Fixtures/RequiresDockerFact.cs`
   (`[RequiresDockerFact]` skips unless Docker is reachable AND the CI-built agent-base image is
-  present; the sibling `[RequiresDockerDaemonFact]` gates on Docker-daemon presence only — for P2-08's
-  reconciler test that stands up its own trivial image; class-level
-  `[Trait("Category","RequiresDocker")]` carries the CI filter),
+  present; the sibling `[RequiresDockerDaemonFact]` gates on Docker-daemon presence only; and
+  `[RequiresDockerBusyboxFact]` gates on daemon presence AND `busybox:latest` being present or
+  pullable — the two suites that stand up their own trivial containers
+  (`SwarmReconcilerDockerTests`, `ResourceSamplingDockerTests`) used to express that condition as an
+  inline `if (!await EnsureTrivialImageAsync(...)) return;`, and an early return is reported by xunit
+  as **Passed**, so a registry-less runner produced a green result for a test that asserted nothing.
+  The condition is unchanged, it just lives in the attribute now, where the outcome reads as
+  **Skipped** with a reason. All three probes are cached in `DockerAvailability`; class-level
+  `[Trait("Category","RequiresDocker")]` carries the CI filter, and `FixtureAcceptanceTests`
+  cross-checks the trait against any `RequiresDocker*` attribute by name, so the new one counts),
   `Fixtures/RequiresAccessDeniedFact.cs` (`[RequiresAccessDeniedFact]` — skips unless this process can
   actually be DENIED access to a directory it owns, which root, Windows and any metadata-less mount
   quietly are not; the probe performs the real deny-then-read rather than trusting `chmod`, because a
@@ -2987,7 +3042,13 @@
   `PlatformFacts.cs` supplies the `LinuxOnlyFact`/`WindowsOnlyFact` skip-with-reason attributes for
   the platform-split PTY probes (plus `UnixOnlyFact`/`MacOnlyFact`, and P2-15's
   `RequiresNetworkFact` — network-gated tests skip unless `MAINGUARD_NETWORK_TESTS=1`, the nightly
-  leg; a TSA outage can never fail a PR build). `ResizeClampTests.cs` (MG-22 — resize dimensions are clamped to
+  leg in `.github/workflows/nightly-network.yml`; a TSA outage can never fail a PR build). It also
+  holds `LinuxOnlyRequiresPython3Fact` + the cached `Python3Availability` probe — a COMPOSITE gate in
+  the same shape as `RequiresDockerAndOptInFact`, because xunit honours exactly one `FactAttribute`
+  per method and `AgentCliWiringTests.MainguardAgentShim_RealScript_SpawnsWorkerOverTheSocket` needs
+  both halves (Linux, and a launchable python3 for the real shim). Its python half used to be an
+  inline `if (!IsOnPath("python3")) return;`, which xunit reports as **Passed**: a bare CI box got a
+  green result for a leg that ran nothing. `ResizeClampTests.cs` (MG-22 — resize dimensions are clamped to
   `VtermSession.MaxDimension` BEFORE the native call: the proto carries `uint32` and only `<=0` was
   rejected, so anything in `[1, 2^31-1]` reached `vterm_set_size`, whose upstream `alloc_buffer`
   multiplies `rows*cols` with no overflow or upper-bound check; clamping is applied in

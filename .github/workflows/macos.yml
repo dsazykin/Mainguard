@@ -1,50 +1,122 @@
+# =================================================================================================
 # The macos-host substrate leg: build + the non-Docker test tier on an Apple Silicon runner.
-# Deliberately NOT part of ci.yml's per-PR matrix — macOS runner minutes bill at 10× — so it runs
-# on demand and on pushes to the macOS port branch; promote it into the PR matrix when the port
-# merges and the spend is a deliberate decision. Docker-gated tests skip on these runners (no
-# engine); the full RequiresDocker tier's mac evidence is the on-device run recorded in
-# docs/phase-2/Mainguard_Substrate_MacHost.md.
+# =================================================================================================
+# PROMOTED INTO THE PR MATRIX. This file used to trigger on `workflow_dispatch` and pushes to
+# `port/macos` only, with a header saying "promote it into the PR matrix when the port merges". The
+# port merged; the promotion never happened. Its last run was 2026-08-25, which meant that for
+# months there was no macOS signal on any pull request at all — and, specifically, that the three
+# `[MacOnlyFact]` tests (`AgentEnvironmentFactoryTests.MacHost_*`,
+# `SubstrateConformanceTests.GitObjectsRoundTrip_ShouldBeByteIdentical`) ran NOWHERE. A test that
+# only ever skips is reported green forever, which is the shape this repo keeps being bitten by.
+#
+# The triggers below now mirror `ci.yml` exactly — same `pull_request` base-branch list (including
+# `feat/**` / `fix/**`, so a STACKED pr still gets a macOS check rather than reporting zero), same
+# `push` list, same concurrency group shape.
+#
+# ON THE SPEND, WHICH IS THE REASON IT WAS DEFERRED
+# -------------------------------------------------
+# GitHub bills macOS runner minutes at 10x Linux, so this is a deliberate cost decision, not an
+# oversight being corrected for free. Two things keep it bounded:
+#   * the leg runs the NON-DOCKER tier only (see below) — it is not a second full CI;
+#   * the NuGet package cache below is why this file diverges from `ci.yml`, which has none: at 10x
+#     billing a cold ~1.7 GB restore on every PR is the single largest avoidable cost here.
+# `timeout-minutes: 45` is the ceiling; a hung leg cannot quietly burn six hours of 10x minutes.
+#
+# WHAT THIS LEG DOES NOT COVER — THE 127 RequiresDocker TESTS
+# -----------------------------------------------------------
+# The whole `Category=RequiresDocker` tier (127 tests: container hardening, default-deny egress, the
+# A6 git proxy, G2 key custody, the merge-queue end-to-end suite) runs ONLY on `ubuntu-latest`, in
+# `ci.yml`'s `sandbox-security` job. It is filtered out here, and that is not a temporary gap that a
+# later PR closes: GitHub's hosted macOS runners ship no container engine and cannot run Linux
+# containers (no nested virtualisation, no Docker Desktop), so there is no version of this job that
+# could run them. The same is true of a hosted Windows runner for LINUX containers.
+#
+# So the honest statement of coverage is: the Docker-backed sandbox/security evidence is
+# LINUX-ENGINE-ONLY. The macOS engine's evidence is the on-device run recorded in
+# docs/phase-2/Mainguard_Substrate_MacHost.md, and the Windows engine's is WSL2, which no hosted
+# runner reproduces either. Closing that for real needs a self-hosted macOS runner or an on-device
+# matrix — not a job here that would fail on its first line.
+# =================================================================================================
 name: macOS
 
 on:
-  workflow_dispatch:
+  # Mirrors ci.yml. 'feat/**' / 'fix/**' so a STACKED pr — one whose base is another feature branch
+  # rather than a long-lived one — still gets a macOS check instead of reporting zero checks.
+  # For pull_request, the branches filter matches the BASE branch.
+  pull_request:
+    branches: [main, phase2, 'feat/**', 'fix/**']
   push:
-    branches: [ "port/macos" ]
+    branches: [main, phase2]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch/PR. At 10x billing this matters more here than anywhere.
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   mac-build-and-test:
+    name: Build & non-Docker tests (macOS)
     runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-dotnet@v4
+      # MG-35: global.json pins the SDK to an EXACT build, so this runner uses the same compiler,
+      # analyzers and runtime packs as the Linux leg. Identical to ci.yml's step.
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
 
-      - name: Restore (locked mode — the committed lockfiles must bind on osx-arm64)
-        run: dotnet restore Mainguard.slnx --locked-mode
+      # NOT in ci.yml, deliberately: see the spend note in the header. Keyed on the committed
+      # lockfiles, which are exactly what --locked-mode restores from, so a stale cache is
+      # impossible — a lockfile edit changes the key.
+      - name: Cache the NuGet package closure (macOS minutes bill at 10x)
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-macos-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: nuget-macos-
 
-      - name: Build (Release)
-        run: dotnet build Mainguard.slnx -c Release --no-restore
+      # MG-35: --locked-mode restores ONLY what the committed packages.lock.json already names, so a
+      # transitive that drifted between review and merge fails here (NU1004/NU1403) instead of
+      # entering the product. The osx-arm64 RID section is committed for these projects precisely so
+      # this binds on a Mac (see CLAUDE.md § lockfiles).
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
 
-      - name: Build the pinned libvterm (.dylib lane)
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      # P2-18: the pinned libvterm, .dylib lane (same script, same pinned source + sha256 as the
+      # Linux leg). MAINGUARD_REQUIRE_LIBVTERM turns a missing library into a hard test failure, so
+      # the libvterm legs can never silently skip on macOS either.
+      - name: Build pinned libvterm (P2-18 engine, .dylib lane)
         run: bash build/libvterm/build.sh
 
+      # --filter "Category!=RequiresDocker" is what makes this a bounded leg rather than a second
+      # full CI. Everything else runs, which is what gets the three [MacOnlyFact] tests executed.
       - name: Test — Mainguard.Tests (non-Docker)
         env:
           MAINGUARD_LIBVTERM: ${{ github.workspace }}/build/libvterm/out/libvterm.dylib
           MAINGUARD_REQUIRE_LIBVTERM: "1"
         run: >
-          dotnet test Mainguard.Tests/Mainguard.Tests.csproj -c Release --no-build
+          dotnet test Mainguard.Tests/Mainguard.Tests.csproj
+          --no-build --configuration Release --verbosity normal
           --filter "Category!=RequiresDocker"
 
-      - name: Test — Mainguard.Server.Tests (non-Docker)
+      # The [MacOnlyFact] tests live here (Agents/AgentEnvironmentFactoryTests.cs,
+      # Agents/SubstrateConformanceTests.cs). SubstrateConformanceTests is deliberately split in two
+      # classes so the round-trip row keeps its own class WITHOUT the RequiresDocker trait — if it
+      # ever gains that trait the filter above would exclude it and the mac row would go quiet again.
+      - name: Test — Mainguard.Server.Tests (non-Docker, incl. every [MacOnlyFact])
         env:
           MAINGUARD_LIBVTERM: ${{ github.workspace }}/build/libvterm/out/libvterm.dylib
           MAINGUARD_REQUIRE_LIBVTERM: "1"
         run: >
-          dotnet test Mainguard.Server.Tests/Mainguard.Server.Tests.csproj -c Release --no-build
+          dotnet test Mainguard.Server.Tests/Mainguard.Server.Tests.csproj
+          --no-build --configuration Release --verbosity normal
           --filter "Category!=RequiresDocker"
 
       - name: Daemon --local-dev smoke (macos-host substrate composition)
