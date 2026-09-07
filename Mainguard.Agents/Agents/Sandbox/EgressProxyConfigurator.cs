@@ -47,6 +47,15 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// <summary>The tinyproxy CONNECT listener port.</summary>
     public const int ProxyPort = 8888;
 
+    /// <summary>
+    /// F25 — the name a container uses for the daemon's own host, mapped to <c>host-gateway</c> on the
+    /// proxy container (see <see cref="ProxyHostConfig"/>). It mirrors
+    /// <c>GatewayBindPolicy.ProxyReachableHostAlias</c>, which is the daemon-side half of the same
+    /// contract; the two live in different assemblies, so the constant is stated in both and pinned by
+    /// a test rather than shared through a dependency the layering does not allow.
+    /// </summary>
+    public const string GatewayHostAlias = "host.docker.internal";
+
     /// <summary>The docker label both mainguard networks carry, keyed to their role.</summary>
     public const string NetworkRoleLabel = "mainguard.role";
 
@@ -528,6 +537,19 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     internal static HostConfig ProxyHostConfig() => new()
     {
         NetworkMode = AgentNetworkName,
+
+        // F25 — the ONE name that reaches the daemon from inside this container. The model gateway's
+        // default bind is now the narrowest address the daemon can offer (loopback on Docker Desktop,
+        // the Docker bridge on Linux) instead of whatever private IPv4 the host's NICs happened to
+        // carry, which on a Mac was the Wi-Fi address, i.e. a plaintext HTTP gateway on the operator's
+        // LAN. A loopback bind is only usable because of this mapping: `host-gateway` is the host side
+        // of this container's bridge, and on Docker Desktop that route reaches the host's loopback
+        // stack. Without the mapping the name does not resolve, `CanProxyReachAsync` returns false, and
+        // the spawn simply declines to confine — a skipped confinement, never a broken agent.
+        //
+        // It is only set on the PROXY, which is the sole container that dials the daemon. The jails sit
+        // on Internal networks with no route anywhere and receive no such host entry.
+        ExtraHosts = new List<string> { GatewayHostAlias + ":host-gateway" },
 
         // NET_ADMIN: the iptables backstop. NET_BIND_SERVICE: dnsmasq's port 53. SETGID/SETUID:
         // dnsmasq's own privilege drop. KILL: restarting those daemons on a policy reload, once they

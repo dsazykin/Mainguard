@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Security.Cryptography;
 
 namespace Mainguard.Server.Gateway;
@@ -31,10 +33,69 @@ public sealed class AgentGatewayCredentials
     /// reaching the jail is distinguishable from the token that is supposed to be there.</summary>
     public const string TokenPrefix = "mg_sess_";
 
+    /// <summary>
+    /// F25 — how long a token may serve before it is replaced. Not a guess at "how long is safe": the
+    /// token is agent-readable by design, so a prompt-injected worker can commit it, and the only thing
+    /// that bounds the value of a leaked copy is how soon it stops working. A leaked token is useful for
+    /// at most this long plus <see cref="DefaultOverlap"/>.
+    /// </summary>
+    public static readonly TimeSpan DefaultRotationInterval = TimeSpan.FromHours(1);
+
+    /// <summary>
+    /// How long a SUPERSEDED token keeps resolving after its replacement was delivered. This is the
+    /// "must not break a live agent mid-request" half of the contract: a request that was already in
+    /// flight (or that the CLI had already started with the old value) completes on the old token, and
+    /// only then does it stop being an identity.
+    /// </summary>
+    public static readonly TimeSpan DefaultOverlap = TimeSpan.FromMinutes(5);
+
     private readonly ConcurrentDictionary<string, string> _agentByToken = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, string> _tokenByAgent = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, string> _providerKeyByAgent = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, string> _upstreamHostByAgent = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _issuedAtByAgent = new(StringComparer.Ordinal);
+
+    /// <summary>Superseded tokens still inside their overlap window: token → (agentId, expiry).</summary>
+    private readonly ConcurrentDictionary<string, (string AgentId, DateTimeOffset Until)> _retiring =
+        new(StringComparer.Ordinal);
+
+    private readonly Func<DateTimeOffset> _clock;
+    private readonly TimeSpan _rotationInterval;
+    private readonly TimeSpan _overlap;
+    private readonly object _rotationGate = new();
+
+    /// <param name="clock">The sole time source, injected so rotation is testable on a virtual clock.</param>
+    /// <param name="rotationInterval">Token lifetime before rotation; <c>null</c> uses
+    /// <see cref="DefaultRotationInterval"/>.</param>
+    /// <param name="overlap">How long a superseded token stays valid; <c>null</c> uses
+    /// <see cref="DefaultOverlap"/>.</param>
+    public AgentGatewayCredentials(
+        Func<DateTimeOffset>? clock = null,
+        TimeSpan? rotationInterval = null,
+        TimeSpan? overlap = null)
+    {
+        _clock = clock ?? (() => DateTimeOffset.UtcNow);
+        _rotationInterval = rotationInterval ?? DefaultRotationInterval;
+        _overlap = overlap ?? DefaultOverlap;
+    }
+
+    /// <summary>
+    /// F25 — how a rotated token reaches the jail that has to present it. Returns true when the new
+    /// token was delivered; a false (or an unset hook) means the agent still only holds the old one.
+    ///
+    /// <para><b>Rotation is gated on this returning true, and that gating is the whole safety
+    /// argument.</b> The token lives in the jail's <c>/run/secrets/agent/agent.env</c>, which the launch
+    /// wrapper sources; nothing in the daemon rewrites that file today. Retiring a token we could not
+    /// redeliver would break the agent at the end of the overlap window, so instead the old token is
+    /// KEPT and rotation is retried on the next evaluation. With no hook wired the behaviour is exactly
+    /// what it was before this change — one token per spawn, revoked on stop — and wiring the hook is
+    /// the single step that turns scheduled rotation on. See the PR body for the spawn-path edit.</para>
+    /// </summary>
+    public Func<string, string, bool>? TokenDelivery { get; set; }
+
+    /// <summary>Raised after a token was rotated and delivered — (agentId, newToken). Observation only;
+    /// <see cref="TokenDelivery"/> is the thing rotation is gated on.</summary>
+    public event Action<string, string>? TokenRotated;
 
     /// <summary>
     /// Issues (or re-issues) this agent's gateway token and takes custody of its real provider key.
@@ -65,9 +126,10 @@ public sealed class AgentGatewayCredentials
             _agentByToken.TryRemove(previous, out _);
         }
 
-        var token = TokenPrefix + Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+        var token = NewToken();
         _tokenByAgent[agentId] = token;
         _agentByToken[token] = agentId;
+        _issuedAtByAgent[agentId] = _clock();
 
         if (!string.IsNullOrWhiteSpace(providerApiKey))
         {
@@ -94,9 +156,152 @@ public sealed class AgentGatewayCredentials
     /// <summary>
     /// The authenticated agent behind a presented gateway token, or null when the token is unknown.
     /// This is the ONLY trustworthy identity source at the gateway — never a client-supplied header.
+    ///
+    /// <para>F25: a token that has been superseded but is still inside its overlap window resolves too,
+    /// so rotation can never fail a request that was already under way. An overlap that has elapsed
+    /// resolves to null — that is the point of rotating.</para>
+    ///
+    /// <para>Rotation is evaluated here rather than on a timer. This is the one method every model
+    /// request goes through, the check is a timestamp comparison, and an idle agent whose token nobody
+    /// is presenting has nothing to rotate. A timer would add a daemon lifecycle for no reachable
+    /// difference in exposure.</para>
     /// </summary>
-    public string? ResolveAgent(string? token) =>
-        !string.IsNullOrEmpty(token) && _agentByToken.TryGetValue(token, out var agentId) ? agentId : null;
+    public string? ResolveAgent(string? token)
+    {
+        if (string.IsNullOrEmpty(token))
+        {
+            return null;
+        }
+
+        RotateStale();
+
+        if (_agentByToken.TryGetValue(token, out var agentId))
+        {
+            return agentId;
+        }
+
+        if (_retiring.TryGetValue(token, out var retiring))
+        {
+            if (retiring.Until > _clock())
+            {
+                return retiring.AgentId;
+            }
+
+            _retiring.TryRemove(token, out _);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// F25 — replaces every token older than the rotation interval, provided the replacement can be
+    /// delivered to the jail (<see cref="TokenDelivery"/>). Returns how many agents were rotated.
+    ///
+    /// <para>Safe to call from anywhere and as often as you like: it is a timestamp scan under one lock,
+    /// it is idempotent within an interval, and it never touches an agent whose token is still young.
+    /// Called opportunistically by <see cref="ResolveAgent"/>; also public so a daemon that wants a
+    /// fixed cadence can drive it.</para>
+    /// </summary>
+    public int RotateStale()
+    {
+        var deliver = TokenDelivery;
+        if (deliver is null || _rotationInterval <= TimeSpan.Zero)
+        {
+            // No way to hand the jail its new token — see TokenDelivery for why rotating anyway would
+            // break the agent instead of protecting it.
+            return 0;
+        }
+
+        var now = _clock();
+        List<(string AgentId, string Token)> rotated;
+
+        lock (_rotationGate)
+        {
+            var due = _issuedAtByAgent
+                .Where(kv => now - kv.Value >= _rotationInterval)
+                .Select(kv => kv.Key)
+                .ToList();
+
+            if (due.Count == 0)
+            {
+                DropExpiredRetirees(now);
+                return 0;
+            }
+
+            rotated = new List<(string, string)>(due.Count);
+            foreach (var agentId in due)
+            {
+                if (!_tokenByAgent.TryGetValue(agentId, out var previous))
+                {
+                    _issuedAtByAgent.TryRemove(agentId, out _);
+                    continue;
+                }
+
+                var replacement = NewToken();
+
+                // Deliver FIRST. A delivery that fails leaves the agent holding a token that still
+                // works and this method retrying on the next call, which is strictly better than an
+                // agent that authenticates with nothing.
+                if (!TryDeliver(deliver, agentId, replacement))
+                {
+                    continue;
+                }
+
+                _tokenByAgent[agentId] = replacement;
+                _agentByToken[replacement] = agentId;
+                _issuedAtByAgent[agentId] = now;
+
+                // The old token stops being a live identity but stays resolvable for the overlap, so an
+                // in-flight request finishes on it.
+                _agentByToken.TryRemove(previous, out _);
+                _retiring[previous] = (agentId, now + _overlap);
+
+                rotated.Add((agentId, replacement));
+            }
+
+            DropExpiredRetirees(now);
+        }
+
+        foreach (var (agentId, replacement) in rotated)
+        {
+            TokenRotated?.Invoke(agentId, replacement);
+        }
+
+        return rotated.Count;
+    }
+
+    /// <summary>When the agent's current token was minted, or null when it holds none. Test seam for the
+    /// rotation clock, and the honest answer to "how old is this credential?".</summary>
+    public DateTimeOffset? IssuedAtFor(string? agentId) =>
+        !string.IsNullOrEmpty(agentId) && _issuedAtByAgent.TryGetValue(agentId, out var at) ? at : null;
+
+    private static string NewToken() =>
+        TokenPrefix + Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+
+    /// <summary>A delivery hook is host-supplied code on a request path; a throw from it must not take
+    /// the gateway down, and it means the same thing as "not delivered".</summary>
+    private static bool TryDeliver(Func<string, string, bool> deliver, string agentId, string token)
+    {
+        try
+        {
+            return deliver(agentId, token);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private void DropExpiredRetirees(DateTimeOffset now)
+    {
+        foreach (var kv in _retiring)
+        {
+            if (kv.Value.Until <= now)
+            {
+                _retiring.TryRemove(kv.Key, out _);
+            }
+        }
+    }
 
     /// <summary>The real provider key held for an agent, or null when none is in custody.</summary>
     public string? ProviderKeyFor(string? agentId) =>
@@ -120,6 +325,17 @@ public sealed class AgentGatewayCredentials
             _agentByToken.TryRemove(token, out _);
         }
 
+        // A stopped agent gets no overlap: the whole point of revoking is that nothing it held can be
+        // replayed, and there is no in-flight request to protect once the jail is gone.
+        foreach (var kv in _retiring)
+        {
+            if (string.Equals(kv.Value.AgentId, agentId, StringComparison.Ordinal))
+            {
+                _retiring.TryRemove(kv.Key, out _);
+            }
+        }
+
+        _issuedAtByAgent.TryRemove(agentId, out _);
         _providerKeyByAgent.TryRemove(agentId, out _);
         _upstreamHostByAgent.TryRemove(agentId, out _);
     }
