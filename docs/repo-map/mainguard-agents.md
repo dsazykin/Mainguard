@@ -531,9 +531,33 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the shared mirror is now read-only to every jail, so its `config`/`hooks` are no longer an attack
       surface at all, and what remains to defend is the per-agent repo + worktree, which the daemon also
       runs git against). All git routes through `GitService.RunGit`; the only process spawn here is the
-      injectable pnpm runner. `RunWithEnv` is the one env-accepting overload — extra env merged UNDER
-      the hardening pins (re-applied last, so a caller cannot un-pin them) — added for the queue
-      seeder's scratch `GIT_INDEX_FILE` plumbing.
+      injectable pnpm runner. `RunWithEnv`/`TryRunWithEnv` are the env-accepting overloads — extra env
+      merged UNDER the hardening pins (re-applied last, so a caller cannot un-pin them) — added for the
+      queue seeder's scratch `GIT_INDEX_FILE` plumbing and reused by the W1-A pinned-layout callers.
+      **W1-A closed the `filter.*` concession**: MG-1's fixed `-c` list cannot express a wildcard family,
+      so `filter.<d>.clean|smudge|process`, `diff.<d>.command|textconv`, `merge.<d>.driver` and friends
+      used to be written off as "confined to the per-agent repo" — confined in location, not execution,
+      since the keep-alive rebaser and the PR head fetcher run git there as the daemon user on the host.
+      Every invocation now ENUMERATES the target repository's effective config
+      (`git config --list --name-only -z`, which executes nothing) and emits `-c <key>=` for every key in
+      a command-executing family (empty is git's own "no driver"); a key whose name cannot be expressed
+      on the command line — a subsection containing `=`/whitespace — is a typed refusal, never a silently
+      misapplied override. The static pin list also gained `safe.directory=` (the protected-scope reset
+      that makes git's ownership check provably strict on agent-owned paths), `core.pager`/`askPass`/
+      `gitProxy`/`alternateRefsCommand`/`attributesFile`, `diff.external`, `uploadpack.packObjectsHook`,
+      and `GIT_EDITOR`/`GIT_SEQUENCE_EDITOR=:` in the env.
+    - `GitConfigExecutionSurface` (same file) — the **pure** classifier for "config keys git will spawn a
+      command from", unit-pinned family by family so the list is a tested artifact. Deliberately excludes
+      `alias.*` (a git alias cannot shadow a built-in and the daemon invokes nothing else).
+    - `TrustedWorktreeLayout` (same file) — W1-A layer 2. Resolves an agent worktree's git layout from
+      DAEMON-computed roots and validates it, instead of letting git discover it from the agent-writable
+      `.git` pointer file and `commondir`: the common dir is derived from the gitdir's own
+      `…/worktrees/<name>` shape (never read from `commondir`), asserted equal to the daemon's
+      `AgentRepoLayout.AgentRepoPath` when the caller knows it, refused when it is the shared mirror
+      (the audit's "second vector"), round-trip-checked against the repository's own `worktrees/<n>/gitdir`
+      registration, and then pinned into the child through `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE`,
+      which outrank every on-disk pointer. Returns null (= run unpinned, exactly as before) for a main
+      working tree or a substrate-less test double, which have no indirection to subvert.
   - **`Agents/Bootstrap/`** (P2-05 MainguardOS bootstrapper — client-side; gets a WSL2-enabled
     Windows machine to a health-checked `mainguardd`).
     - `WslConfigMerger.cs` (the **pure**, IO-free INI merge for `%UserProfile%\.wslconfig`: adds only

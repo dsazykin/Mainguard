@@ -2992,6 +2992,15 @@
   rejected, so anything in `[1, 2^31-1]` reached `vterm_set_size`, whose upstream `alloc_buffer`
   multiplies `rows*cols` with no overflow or upper-bound check; clamping is applied in
   `BoundTerminalSession.Resize` too so the PTY and the grid are never driven to different sizes).
+  **W1-A daemon-git hardening (`Agents/AgentGitCommandHardeningTests.cs`, real git, no Docker):** plants
+  the audit's exact payload — a repo-local `filter.*`/`diff.*.textconv` driver plus the `.gitattributes`
+  line that assigns it — and measures whether the driver's command runs. Each execution test proves
+  itself non-vacuous first (an unhardened `git` runs the payload and the marker appears; the same repo
+  driven through `AgentGitCommand` leaves it absent) so it cannot pass by the attribute never matching.
+  The payload command is `git config` rather than a shell utility, so the proof does not depend on
+  `sh`/`touch` existing. Also pins `GitConfigExecutionSurface` family by family in both directions —
+  every command-executing key classified as such, every key the product itself writes left alone — and
+  the typed refusal for a key name (`filter."a=b".clean`) that `git -c` cannot express.
   **P2-09 lifecycle suite (`Agents/`, real git over `DualRepoFixture`):** `KeepAliveRebaserTests`
   (clean rebase onto advanced main + wip commit + resume; agent mid-its-own-rebase → guard skip then
   next-cycle success; induced conflict → status `Conflict` routed to the T-04 resolver with the rebase
