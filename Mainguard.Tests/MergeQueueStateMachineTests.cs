@@ -1045,7 +1045,7 @@ public class MergeQueueStateMachineTests
         Assert.False(h.Queue.CanMerge("a", out var reason));
         Assert.Contains("test command changed", reason);
 
-        h.ChangedGate.Acknowledge("a");
+        h.ChangedGate.Acknowledge("a", ChangedTestCommandGate.TestCommandItem, null);
         Assert.True(h.Queue.CanMerge("a", out _));
     }
 

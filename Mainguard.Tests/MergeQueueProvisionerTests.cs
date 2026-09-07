@@ -62,7 +62,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.False(ctx.Queue.CanMerge(AgentId, out var reason));
         Assert.Contains("test command changed", reason);
 
-        ctx.ChangedTestCommand.Acknowledge(AgentId);
+        ctx.ChangedTestCommand.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, null);
         Assert.True(ctx.Queue.CanMerge(AgentId, out _));
     }
 
@@ -86,7 +86,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         var ctx = provisioner.EnsureQueue(repoHash)!;
         await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
 
-        Assert.True(ctx.ChangedTestCommand!.Acknowledge(AgentId, "owner@example"));
+        Assert.True(ctx.ChangedTestCommand!.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example"));
 
         var waiver = Assert.Single(
             provisioner.AuditLog.Read(),
@@ -563,7 +563,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
         Assert.False(ctx.Queue.CanMerge(AgentId, out _));
 
-        ctx.ChangedTestCommand!.Acknowledge(AgentId);
+        ctx.ChangedTestCommand!.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, null);
         Assert.True(ctx.Queue.CanMerge(AgentId, out _));
     }
 

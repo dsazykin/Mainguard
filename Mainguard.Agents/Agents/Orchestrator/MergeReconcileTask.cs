@@ -197,22 +197,29 @@ public sealed class MergeReconcileTask : IBootTask
             return ReconcileVerdict.Undecidable;
         }
 
-        // (4) Ask git. The branch is looked for locally first and then through any remote-tracking form,
-        // because the user's checkout may only ever have seen agent/<id> over the sync remote.
-        var branchRef = ResolveAgentRef(repoPath, lease.AgentId);
-        if (branchRef is not null)
+        // (4) Ask git — about the tip this lease AUTHORIZED, not about whatever the name points at now.
+        //
+        // The lease records that tip (K3), and using it is what makes this an identity check. Resolving
+        // `agent/<id>` by name and asking containment of its current value answers a different question:
+        // a worker that pushed after BeginMerge moves the ref, and a hand merge of THAT later, unverified
+        // tip then satisfies the containment test and is recorded as this lease's merge — a terminal
+        // Merged, and a cascade, for bytes the queue never verified. The name is only fallen back on when
+        // the lease carries no sha (a substrate-less double, or a row from before the field existed),
+        // where every check below still has to prove the merge independently.
+        var authorizedTip = ResolveAuthorizedTip(repoPath, lease);
+        if (authorizedTip is not null)
         {
             // A branch that was already CONTAINED in the main this lease authorized landed nothing: a
             // fast-forward of it is "Already up to date". So "main now contains it" is true of every
             // forward move main could make and proves nothing about this lease — the zero-commit form
             // of the same coincidence. Undecidable, not Merged: main moved, and not because of this.
             if (!string.IsNullOrEmpty(lease.ExpectedMainSha)
-                && IsAncestor(repoPath, branchRef, lease.ExpectedMainSha))
+                && IsAncestor(repoPath, authorizedTip, lease.ExpectedMainSha))
             {
                 return ReconcileVerdict.Undecidable;
             }
 
-            return IsAncestor(repoPath, branchRef, currentMain)
+            return IsAncestor(repoPath, authorizedTip, currentMain)
                 ? ReconcileVerdict.Merged
                 : ReconcileVerdict.Undecidable;
         }
@@ -277,6 +284,28 @@ public sealed class MergeReconcileTask : IBootTask
 
         return Mainguard.Agents.Services.ExternalPrMergeService.PrNumberFor(agentId) is int number
             && description.Contains($"pull request #{number}", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The commit this lease authorized, as something git can be asked about here: the lease's own
+    /// <c>ExpectedBranchSha</c> when this repository has that object, else the <c>agent/&lt;id&gt;</c> ref
+    /// by name, else null.
+    ///
+    /// <para><b>The sha wins over the name whenever both exist</b>, which is the whole point: the name is
+    /// a moving target (the worker may have pushed since the lease was taken, and a rebase or force-push
+    /// replaces it outright) while the sha is the thing a human was shown a green rail about. A sha this
+    /// checkout does not carry is not a mismatch, only a question git cannot be asked here — the name is
+    /// then the best remaining witness, and every containment test above still has to pass on it.</para>
+    /// </summary>
+    private static string? ResolveAuthorizedTip(string repoPath, Mainguard.Git.Models.MergeLeaseRow lease)
+    {
+        if (!string.IsNullOrEmpty(lease.ExpectedBranchSha)
+            && RevParse(repoPath, lease.ExpectedBranchSha + "^{commit}").Length > 0)
+        {
+            return lease.ExpectedBranchSha;
+        }
+
+        return ResolveAgentRef(repoPath, lease.AgentId);
     }
 
     /// <summary>

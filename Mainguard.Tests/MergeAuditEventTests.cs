@@ -187,7 +187,7 @@ public class MergeAuditEventTests
             new ChangedTestCommandGate.CommandDrift(".mainguard/verify", "npm test", "exit 0"));
         h.FlaggedGate.StoreFor(AgentId).SetFlagged(Array.Empty<FlaggedChange>());
         await queue.RunVerificationAsync(AgentId, CancellationToken.None);
-        h.ChangedGate.Acknowledge(AgentId, "owner@example");
+        h.ChangedGate.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example");
 
         Assert.True(queue.TryConfirmHumanMerge(AgentId, "main-sha-1", MainSha, out _));
 

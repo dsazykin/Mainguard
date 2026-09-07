@@ -101,7 +101,7 @@ public class ForegroundMergeServiceTests : IDisposable
         out InMemoryMergeLeaseStore leases,
         out OperationJournal journal,
         List<(string Agent, string Sha)>? merged = null,
-        Func<string, IReadOnlyList<string>, int>? installRunner = null,
+        Func<string, string, IReadOnlyList<string>, int>? installRunner = null,
         MergeGateCheck? canMerge = null,
         Action<string, string>? onStaleOverride = null)
     {
@@ -222,7 +222,7 @@ public class ForegroundMergeServiceTests : IDisposable
         var calls = 0;
         // A fake npm: it runs the poisoned postinstall (writes POISON) ONLY when --ignore-scripts is
         // absent. It also throws one EBUSY to exercise the NTFS retry wrapper.
-        Func<string, IReadOnlyList<string>, int> fakeInstall = (dir, args) =>
+        Func<string, string, IReadOnlyList<string>, int> fakeInstall = (dir, manager, args) =>
         {
             calls++;
             if (calls == 1)

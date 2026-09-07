@@ -280,8 +280,13 @@ public sealed class ChangedTestCommandGate : IMergeGate
     /// <summary>
     /// The per-repo verification <b>toolchain</b> declaration (<c>.mainguard/toolchain</c>). It rides
     /// this same gate rather than a parallel one because it is the same class of claim — "the branch
-    /// changed how it is checked" — and because a second, separately-acknowledged gate would let a
-    /// human clear one and merge while the other item was still unread.
+    /// changed how it is checked".
+    ///
+    /// <para><b>Same gate, separate waivers.</b> One gate is not one checkbox: each armed item is
+    /// acknowledged on its own (<see cref="Acknowledge"/>), and the gate stays shut while any armed item
+    /// is unwaived. It used to be one — a single ack cleared every item at once — which meant a human
+    /// clicking "I have read the new test command" also waived, unseen, a change to the toolchain that
+    /// runs it, in direct contradiction of the acknowledge RPC's own "per item, never all" contract.</para>
     /// </summary>
     public const string ToolchainItem = "verification toolchain";
 
@@ -302,7 +307,10 @@ public sealed class ChangedTestCommandGate : IMergeGate
 
     private readonly object _gate = new();
     private readonly Dictionary<string, SortedSet<string>> _flagged = new(StringComparer.Ordinal);
-    private readonly HashSet<string> _acknowledged = new(StringComparer.Ordinal);
+
+    // Keyed by (agent, ITEM), not by agent. A per-agent set was what made one click waive everything:
+    // the toolchain item and the test-command item shared a single "this branch is acknowledged" bit.
+    private readonly HashSet<(string Agent, string Item)> _acknowledged = new();
     private readonly Dictionary<(string Agent, string Item), CommandDrift> _drift = new();
     private readonly IAuditLog _audit;
 
@@ -340,7 +348,9 @@ public sealed class ChangedTestCommandGate : IMergeGate
             {
                 if (items.Add(item))
                 {
-                    _acknowledged.Remove(agentId); // a fresh change re-arms the gate.
+                    // A fresh change re-arms THIS item — and only this one. Dropping the whole agent's
+                    // acknowledgments here would silently un-waive an item the human really did read.
+                    _acknowledged.Remove((agentId, item));
                 }
 
                 // Always overwritten while the item is armed: a re-verification against a NEW branch tip
@@ -354,9 +364,9 @@ public sealed class ChangedTestCommandGate : IMergeGate
             else
             {
                 _drift.Remove((agentId, item));
-                if (items.Remove(item) && items.Count == 0)
+                if (items.Remove(item))
                 {
-                    _acknowledged.Remove(agentId);
+                    _acknowledged.Remove((agentId, item));
                 }
             }
 
@@ -368,54 +378,59 @@ public sealed class ChangedTestCommandGate : IMergeGate
     }
 
     /// <summary>
-    /// Acknowledges the changed-test-command items for an agent (P2-11 per-item ack) and <b>appends one
-    /// <c>acknowledged_flagged_change</c> audit event per item waived</b>.
+    /// Acknowledges <b>one</b> armed item for an agent (P2-11 per-item ack) and appends its
+    /// <c>acknowledged_flagged_change</c> audit event.
     ///
-    /// <para>One event per item rather than one per click: the click clears every armed item at once (by
-    /// design — see <see cref="ToolchainItem"/>), but what was waived is the items, and a single event
-    /// would make "the command changed" and "the toolchain changed" indistinguishable in the chain.</para>
+    /// <para><b>One item, never all.</b> This used to take only an agent and waive every armed item on it,
+    /// which is the shape the acknowledge RPC's own contract calls a rejection trigger: the human who read
+    /// the branch's new test command also waived, with the same click and with no record of having seen
+    /// it, a change to the <see cref="ToolchainItem"/> that runs it. The gate now stays shut until each
+    /// armed item has its own waiver, and each waiver is its own event naming what was waived.</para>
     ///
-    /// <para>Idempotent: a second call on an already-acknowledged agent appends nothing. Re-appending
-    /// would let a UI that refreshes twice inflate the record of how often a human waived something.</para>
+    /// <para>Idempotent per item: a second call for an already-acknowledged item appends nothing.
+    /// Re-appending would let a UI that refreshes twice inflate the record of how often a human waived
+    /// something. An item that is not armed is never "acknowledged" — the call is a no-op that audits
+    /// nothing, because a record here would put a waiver in the chain for a change that never happened.</para>
     /// </summary>
     /// <param name="agentId">The branch being waived.</param>
+    /// <param name="item">The armed item (<see cref="TestCommandItem"/> / <see cref="ToolchainItem"/>).</param>
     /// <param name="acknowledgedBy">Daemon-derived actor (SA-1/F2 — never client-supplied).</param>
-    /// <returns>True iff this call newly acknowledged the agent's armed items.</returns>
-    public bool Acknowledge(string agentId, string? acknowledgedBy = null)
+    /// <returns>True iff this call newly acknowledged that item.</returns>
+    public bool Acknowledge(string agentId, string item, string? acknowledgedBy)
     {
-        List<(string Item, CommandDrift? Drift)> waived;
+        ArgumentException.ThrowIfNullOrWhiteSpace(item);
+
+        CommandDrift? drift;
         lock (_gate)
         {
-            if (!_flagged.TryGetValue(agentId, out var items) || !_acknowledged.Add(agentId))
+            if (!_flagged.TryGetValue(agentId, out var items)
+                || !items.Contains(item)
+                || !_acknowledged.Add((agentId, item)))
             {
                 return false;
             }
 
-            waived = items
-                .Select(i => (Item: i, Drift: _drift.TryGetValue((agentId, i), out var d) ? d : null))
-                .ToList();
+            drift = _drift.TryGetValue((agentId, item), out var d) ? d : null;
         }
 
         var by = string.IsNullOrWhiteSpace(acknowledgedBy) ? "unknown" : acknowledgedBy!;
-        foreach (var (item, drift) in waived)
+
+        // Deliberately the SAME event type FlaggedChangeGate's acks use: a reader asking "what did a
+        // human wave through on this branch" must get one answer, not two lists to remember to union.
+        // The `kind` field is what separates them, exactly as it does across FlaggedKind.
+        _audit.Append(new AuditEvent("acknowledged_flagged_change", new Dictionary<string, string>
         {
-            // Deliberately the SAME event type FlaggedChangeGate's acks use: a reader asking "what did a
-            // human wave through on this branch" must get one answer, not two lists to remember to union.
-            // The `kind` field is what separates them, exactly as it does across FlaggedKind.
-            _audit.Append(new AuditEvent("acknowledged_flagged_change", new Dictionary<string, string>
-            {
-                ["agent"] = agentId ?? string.Empty,
-                ["item"] = item,
-                ["path"] = drift?.ConfigPath ?? "(not recorded)",
-                ["category"] = RiskCategory.ExecutableConfig.ToString(),
-                ["kind"] = FlaggedKind.ChangedTestCommand.ToString(),
-                ["by"] = by,
-                ["from"] = Excerpt(drift?.FromMain, drift is null),
-                ["to"] = Excerpt(drift?.ToBranch, drift is null),
-                ["from_hash"] = ContentHash(drift?.FromMain, drift is null),
-                ["to_hash"] = ContentHash(drift?.ToBranch, drift is null),
-            }));
-        }
+            ["agent"] = agentId ?? string.Empty,
+            ["item"] = item,
+            ["path"] = drift?.ConfigPath ?? "(not recorded)",
+            ["category"] = RiskCategory.ExecutableConfig.ToString(),
+            ["kind"] = FlaggedKind.ChangedTestCommand.ToString(),
+            ["by"] = by,
+            ["from"] = Excerpt(drift?.FromMain, drift is null),
+            ["to"] = Excerpt(drift?.ToBranch, drift is null),
+            ["from_hash"] = ContentHash(drift?.FromMain, drift is null),
+            ["to_hash"] = ContentHash(drift?.ToBranch, drift is null),
+        }));
 
         return true;
     }
@@ -456,13 +471,35 @@ public sealed class ChangedTestCommandGate : IMergeGate
         return normalized.Length == 0 ? "(absent)" : VerificationCommandResolver.Sha256(normalized);
     }
 
-    /// <summary>True iff the agent currently has an unacknowledged changed-test-command flag.</summary>
+    /// <summary>True iff the agent currently has ANY unacknowledged changed-test-command flag.</summary>
     public bool IsUnacknowledged(string agentId)
     {
         lock (_gate)
         {
-            return _flagged.ContainsKey(agentId) && !_acknowledged.Contains(agentId);
+            return UnacknowledgedItemsLocked(agentId).Count > 0;
         }
+    }
+
+    /// <summary>True iff <paramref name="item"/> is armed for this agent and not yet waived.</summary>
+    public bool IsUnacknowledged(string agentId, string item)
+    {
+        lock (_gate)
+        {
+            return _flagged.TryGetValue(agentId, out var items)
+                && items.Contains(item)
+                && !_acknowledged.Contains((agentId, item));
+        }
+    }
+
+    // The armed items still awaiting their own waiver, in the gate's stable (sorted) order.
+    private List<string> UnacknowledgedItemsLocked(string agentId)
+    {
+        if (!_flagged.TryGetValue(agentId, out var items))
+        {
+            return new List<string>();
+        }
+
+        return items.Where(i => !_acknowledged.Contains((agentId, i))).ToList();
     }
 
     /// <summary>The drift items currently flagged for an agent (empty when none) — what the reviewer
@@ -479,12 +516,16 @@ public sealed class ChangedTestCommandGate : IMergeGate
     {
         lock (_gate)
         {
-            if (_flagged.TryGetValue(agentId, out var items) && items.Count > 0 && !_acknowledged.Contains(agentId))
+            // The UNACKNOWLEDGED items, not every armed one: with per-item waivers a branch can sit with
+            // one item cleared and one outstanding, and naming the cleared one in the refusal would send
+            // the human back to a checkbox they have already ticked.
+            var pending = UnacknowledgedItemsLocked(agentId);
+            if (pending.Count > 0)
             {
                 // Kept word-for-word for the single-item test-command case: this string is read by the
                 // merge-confirm gate and its tests, and a gate that changes its reason when a NEW,
                 // unrelated item is added would be a silent behaviour change in the old path.
-                reason = $"the {string.Join(" and the ", items)} changed vs main — acknowledge to merge";
+                reason = $"the {string.Join(" and the ", pending)} changed vs main — acknowledge to merge";
                 return false;
             }
         }
@@ -510,8 +551,11 @@ public sealed class ChangedTestCommandGate : IMergeGate
                 return "changed-test-command: no drift vs main";
             }
 
-            var state = _acknowledged.Contains(agentId) ? "acknowledged" : "UNACKNOWLEDGED";
-            return $"changed-test-command: {string.Join(" + ", items)} changed vs main — {state}";
+            // Per item, because the waivers are per item: "acknowledged" about a branch with one cleared
+            // and one outstanding item would be the same sentence for two different merge decisions.
+            var described = items.Select(i =>
+                $"{i} ({(_acknowledged.Contains((agentId, i)) ? "acknowledged" : "UNACKNOWLEDGED")})");
+            return $"changed-test-command: {string.Join(" + ", described)} changed vs main";
         }
     }
 }

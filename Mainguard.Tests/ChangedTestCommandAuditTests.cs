@@ -36,7 +36,7 @@ public class ChangedTestCommandAuditTests
         var gate = new ChangedTestCommandGate(audit);
         gate.SetFlagged(AgentId, ChangedTestCommandGate.TestCommandItem, changed: true, SelfGreen);
 
-        Assert.True(gate.Acknowledge(AgentId, "owner@example"));
+        Assert.True(gate.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example"));
 
         var ack = Assert.Single(audit.Read(), e => e.Type == "acknowledged_flagged_change");
         Assert.Equal(AgentId, ack.Fields["agent"]);
@@ -67,7 +67,7 @@ public class ChangedTestCommandAuditTests
         store.SetFlagged(new[] { item });
 
         gate.SetFlagged(AgentId, ChangedTestCommandGate.TestCommandItem, changed: true, SelfGreen);
-        gate.Acknowledge(AgentId, "owner@example");
+        gate.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example");
         store.Acknowledge(item.Id);
 
         var acks = audit.Read().Where(e => e.Type == "acknowledged_flagged_change").ToList();
@@ -78,13 +78,17 @@ public class ChangedTestCommandAuditTests
     }
 
     /// <summary>
-    /// One event per ITEM waived, not one per click. The click clears every armed item at once (by
-    /// design — a second, separately-acknowledged gate would let a human clear one and merge while the
-    /// other went unread), but what was waived is the items, and a single event would make "the command
-    /// changed" and "the toolchain changed" indistinguishable in the chain.
+    /// One waiver per ITEM, and the gate stays shut until every armed item has one.
+    ///
+    /// <para>This test used to assert the opposite — one call, two records — because the ack took only an
+    /// agent id and cleared everything armed on it. That is the F42 defect: a human reading "the branch
+    /// changed its test command" also waived, with the same click and with nothing on screen about it, a
+    /// change to the toolchain that runs that command. It contradicted the acknowledge RPC's own "per
+    /// item, never all" contract, which the neighbouring <c>AcknowledgmentStore</c> honours by having no
+    /// ack-all method at all.</para>
     /// </summary>
     [Fact]
-    public void TwoArmedItems_ProduceTwoRecords()
+    public void AcknowledgingOneItem_LeavesTheOtherArmed()
     {
         var audit = new InMemoryAuditLog();
         var gate = new ChangedTestCommandGate(audit);
@@ -93,11 +97,24 @@ public class ChangedTestCommandAuditTests
             AgentId, ChangedTestCommandGate.ToolchainItem, changed: true,
             new ChangedTestCommandGate.CommandDrift(".mainguard/toolchain", "dotnet:10", "node:20"));
 
-        gate.Acknowledge(AgentId, "owner@example");
+        Assert.True(gate.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example"));
+
+        // The toolchain change is still unread, so the gate is still shut and says so by name.
+        Assert.False(gate.IsUnacknowledged(AgentId, ChangedTestCommandGate.TestCommandItem));
+        Assert.True(gate.IsUnacknowledged(AgentId, ChangedTestCommandGate.ToolchainItem));
+        Assert.False(gate.Allows(AgentId, out var reason));
+        Assert.Contains(ChangedTestCommandGate.ToolchainItem, reason, StringComparison.Ordinal);
+        Assert.DoesNotContain(ChangedTestCommandGate.TestCommandItem, reason, StringComparison.Ordinal);
+
+        // ...and exactly ONE record so far: the item the human actually decided about.
+        var first = Assert.Single(audit.Read(), e => e.Type == "acknowledged_flagged_change");
+        Assert.Equal(ChangedTestCommandGate.TestCommandItem, first.Fields["item"]);
+
+        Assert.True(gate.Acknowledge(AgentId, ChangedTestCommandGate.ToolchainItem, "owner@example"));
+        Assert.True(gate.Allows(AgentId, out _));
 
         var acks = audit.Read().Where(e => e.Type == "acknowledged_flagged_change").ToList();
         Assert.Equal(2, acks.Count);
-        Assert.Contains(acks, a => a.Fields["item"] == ChangedTestCommandGate.TestCommandItem);
         Assert.Contains(acks, a => a.Fields["item"] == ChangedTestCommandGate.ToolchainItem
                                    && a.Fields["to"] == "node:20");
     }
@@ -113,8 +130,8 @@ public class ChangedTestCommandAuditTests
         var gate = new ChangedTestCommandGate(audit);
         gate.SetFlagged(AgentId, ChangedTestCommandGate.TestCommandItem, changed: true, SelfGreen);
 
-        Assert.True(gate.Acknowledge(AgentId, "owner@example"));
-        Assert.False(gate.Acknowledge(AgentId, "owner@example"));
+        Assert.True(gate.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example"));
+        Assert.False(gate.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example"));
 
         Assert.Single(audit.Read(), e => e.Type == "acknowledged_flagged_change");
     }
@@ -130,7 +147,7 @@ public class ChangedTestCommandAuditTests
         var audit = new InMemoryAuditLog();
         var gate = new ChangedTestCommandGate(audit);
 
-        Assert.False(gate.Acknowledge("never-flagged", "owner@example"));
+        Assert.False(gate.Acknowledge("never-flagged", ChangedTestCommandGate.TestCommandItem, "owner@example"));
         Assert.Empty(audit.Read());
     }
 
@@ -145,7 +162,7 @@ public class ChangedTestCommandAuditTests
         var audit = new InMemoryAuditLog();
         var gate = new ChangedTestCommandGate(audit);
         gate.SetFlagged(AgentId, ChangedTestCommandGate.TestCommandItem, changed: true, SelfGreen);
-        gate.Acknowledge(AgentId, "owner@example");
+        gate.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example");
 
         // The branch re-verifies against a new tip whose command drifted differently.
         gate.SetFlagged(AgentId, ChangedTestCommandGate.TestCommandItem, changed: false);
@@ -154,7 +171,7 @@ public class ChangedTestCommandAuditTests
             new ChangedTestCommandGate.CommandDrift(VerifyPath, "dotnet test", "true"));
 
         Assert.True(gate.IsUnacknowledged(AgentId));
-        Assert.True(gate.Acknowledge(AgentId, "owner@example"));
+        Assert.True(gate.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example"));
 
         var acks = audit.Read().Where(e => e.Type == "acknowledged_flagged_change").ToList();
         Assert.Equal(2, acks.Count);
@@ -183,7 +200,7 @@ public class ChangedTestCommandAuditTests
             AgentId, ChangedTestCommandGate.TestCommandItem, changed: true,
             new ChangedTestCommandGate.CommandDrift(VerifyPath, "dotnet test\n", "true\n"));
 
-        gate.Acknowledge(AgentId, "owner@example");
+        gate.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example");
 
         var ack = Assert.Single(audit.Read(), e => e.Type == "acknowledged_flagged_change");
         Assert.Equal("true", ack.Fields["to"]);
@@ -206,8 +223,8 @@ public class ChangedTestCommandAuditTests
             "absent-on-main", ChangedTestCommandGate.TestCommandItem, changed: true,
             new ChangedTestCommandGate.CommandDrift(VerifyPath, FromMain: null, ToBranch: "exit 0"));
 
-        gate.Acknowledge("no-detail", "owner@example");
-        gate.Acknowledge("absent-on-main", "owner@example");
+        gate.Acknowledge("no-detail", ChangedTestCommandGate.TestCommandItem, "owner@example");
+        gate.Acknowledge("absent-on-main", ChangedTestCommandGate.TestCommandItem, "owner@example");
 
         var acks = audit.Read().Where(e => e.Type == "acknowledged_flagged_change").ToList();
         var undetailed = Assert.Single(acks, a => a.Fields["agent"] == "no-detail");
@@ -233,7 +250,7 @@ public class ChangedTestCommandAuditTests
             AgentId, ChangedTestCommandGate.TestCommandItem, changed: true,
             new ChangedTestCommandGate.CommandDrift(VerifyPath, "dotnet test", huge));
 
-        gate.Acknowledge(AgentId, "owner@example");
+        gate.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example");
 
         var ack = Assert.Single(audit.Read(), e => e.Type == "acknowledged_flagged_change");
         Assert.EndsWith("…(truncated)", ack.Fields["to"], StringComparison.Ordinal);
@@ -253,7 +270,7 @@ public class ChangedTestCommandAuditTests
         var gate = new ChangedTestCommandGate(audit);
         gate.SetFlagged(AgentId, ChangedTestCommandGate.TestCommandItem, changed: true, SelfGreen);
 
-        gate.Acknowledge(AgentId);
+        gate.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, null);
 
         var ack = Assert.Single(audit.Read(), e => e.Type == "acknowledged_flagged_change");
         Assert.Equal("unknown", ack.Fields["by"]);

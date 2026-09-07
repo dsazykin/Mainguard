@@ -43,6 +43,22 @@ public sealed class FlaggedChangeGate : IMergeGate
     public AcknowledgmentStore? PeekStore(string agentId) =>
         _stores.TryGetValue(agentId ?? string.Empty, out var store) ? store : null;
 
+    /// <summary>
+    /// Drops the agent's acknowledgment store, returning the gate to its MG-40 default-DENY for that
+    /// branch. Returns true iff a store was actually dropped.
+    ///
+    /// <para><b>What this is for.</b> A review that FAILS to run — the diff threw, the mirror was
+    /// unreadable, a <c>packed-refs.lock</c> was held for a moment — must not leave the previous run's
+    /// verdict standing. The arming path used to log and return in that case, so v2 of a branch (say, one
+    /// that has since added a CI workflow) was gated by v1's flagged set and v1's acknowledgments: the
+    /// human's earlier ticks kept a gate open over bytes nobody had classified. Forgetting the store is
+    /// the fail-closed answer — <see cref="Allows"/> then says, truthfully, that the review has not run
+    /// for this branch — and it is deliberately not "install an empty set", because an empty set is
+    /// <see cref="AcknowledgmentStore.AllAcknowledged"/>, i.e. indistinguishable from "reviewed and
+    /// clean".</para>
+    /// </summary>
+    public bool ForgetStore(string agentId) => _stores.TryRemove(agentId ?? string.Empty, out _);
+
     public bool Allows(string agentId, out string reason)
     {
         // Default-DENY on an agent this gate has never seen. The old code treated "no ack store" as

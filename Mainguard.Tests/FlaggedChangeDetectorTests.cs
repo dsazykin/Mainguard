@@ -135,7 +135,7 @@ public class FlaggedChangeDetectorTests
         Assert.False(queue.CanMerge("loom-1", out var reason));
         Assert.Contains("test command changed", reason);
 
-        changedGate.Acknowledge("loom-1");
+        changedGate.Acknowledge("loom-1", ChangedTestCommandGate.TestCommandItem, null);
         Assert.True(queue.CanMerge("loom-1", out _));
     }
 

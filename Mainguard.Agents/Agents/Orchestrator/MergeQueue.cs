@@ -1590,12 +1590,28 @@ public sealed class MergeQueue : IMergeQueue
     /// Cancels and forgets an entry (P2-12 closed-PR cleanup): the entry is <b>gone</b>, not a terminal
     /// state. The caller prunes the worktree + branch; this drops all in-memory tracking and the
     /// persisted row. Safe to call for an unknown agent (no-op).
+    ///
+    /// <para><b>A row that already reached a terminal state is kept.</b> The only caller is the intake's
+    /// closed-upstream sweep, which fires for every pull request that is no longer OPEN — and a pull
+    /// request Mainguard itself merged is not open. So the entry that had just been recorded
+    /// <see cref="WorkerMergeState.Merged"/> was deleted at the very next poll, and the queue's own answer
+    /// to "did this merge?" became "there is no such entry", indistinguishable from a PR somebody closed
+    /// unmerged. <see cref="WorkerMergeState.Rejected"/> is kept for the same reason: it is a human's
+    /// recorded verdict, not bookkeeping. Discarded rows are deliberately NOT in this set — a discard is
+    /// already "forget this", and <see cref="Hydrate"/> keeps it as a tombstone through its own path.</para>
     /// </summary>
     public void Cancel(string agentId)
     {
         bool removed;
         lock (_gate)
         {
+            if (_states.TryGetValue(agentId, out var state) && IsTerminalRecord(state))
+            {
+                // Nothing is dropped, in memory or in the store: the whole value of the row is that it
+                // still says what happened to this branch after the PR left the open list.
+                return;
+            }
+
             removed = _states.Remove(agentId);
             _origins.Remove(agentId);
             _discards.Remove(agentId);
@@ -1615,6 +1631,14 @@ public sealed class MergeQueue : IMergeQueue
             Changed?.Invoke();
         }
     }
+
+    /// <summary>
+    /// States whose row is a RECORD of something that happened rather than live queue bookkeeping, and so
+    /// survives <see cref="Cancel"/>. Deliberately not <see cref="WorkerMergeState.Discarded"/>: that one
+    /// already means "take this off the queue".
+    /// </summary>
+    private static bool IsTerminalRecord(WorkerMergeState state)
+        => state is WorkerMergeState.Merged or WorkerMergeState.Rejected;
 
     // ---- Override path (loud, separate, journaled+audited; CanMerge stays false) ----
 
@@ -2403,7 +2427,15 @@ public sealed class MergeQueue : IMergeQueue
                     FromState: null);
             }
 
-            var record = _verifications.Latest(_repoHash, row.AgentId);
+            // The row's OWN pointer first. `LastVerificationId` was written on every save and read by
+            // nothing, while this rehydrate reached for "the newest record this agent has" — a different
+            // question, and a different answer whenever a verification landed after the row was last
+            // written. The state and the evidence beside it then came from two different runs. The
+            // pointer is what binds them, so it is used, and when it names a row this repo no longer has
+            // the record is left absent rather than substituted with a neighbour's.
+            var record = row.LastVerificationId is long id
+                ? _verifications.ById(_repoHash, id)
+                : _verifications.Latest(_repoHash, row.AgentId); // pre-pointer rows only.
             if (record is not null)
             {
                 _lastVerification[row.AgentId] = record;
