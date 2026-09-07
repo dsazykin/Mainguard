@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using Mainguard.Agents.UI.Services;
@@ -7,7 +8,8 @@ namespace Mainguard.Tests;
 
 /// <summary>
 /// The host-side half of the CLI login round-trip: the keyring vault format
-/// (<c>cli_login_&lt;kind&gt;</c> → JSON path→base64) must survive a store/parse cycle, fold a
+/// (<c>cli_login_&lt;kind&gt;_&lt;repoScope&gt;</c> → JSON path→base64) must survive a store/parse cycle,
+/// key itself per REPOSITORY as well as per adapter kind (F2), fold a
 /// harvest into an existing vault without erasing logins the harvest didn't return, and treat any
 /// corrupt value as "no saved login" (a fresh interactive login) — never a crash.
 /// </summary>
@@ -121,6 +123,29 @@ public sealed class CliLoginVaultTests
         Assert.Null(CliLoginVault.KeystoreKeyFor("claude-code", " "));
         Assert.Null(CliLoginVault.KeystoreKeyFor("claude-code", null));
         Assert.Null(CliLoginVault.KeystoreKeyFor("", "repo-a"));
+    }
+
+    /// <summary>
+    /// F2, end to end over the storage shape the client actually uses: a login saved while working in
+    /// one repository cannot be read back under another. Written against a plain dictionary because
+    /// that is exactly what the keystore is to this type — a name → value map — so the assertion is
+    /// about the only thing the vault controls, which is the name.
+    /// </summary>
+    [Fact]
+    public void ALoginSavedInOneRepo_IsNotReadableFromAnother()
+    {
+        var keystore = new Dictionary<string, string>(StringComparer.Ordinal);
+        var fromRepoA = new[] { new CliLoginFile(".claude/.credentials.json", "rt-a"u8.ToArray()) };
+
+        keystore[CliLoginVault.KeystoreKeyFor("claude-code", "repo-a")!] =
+            CliLoginVault.MergeAndSerialize(null, fromRepoA)!;
+
+        var inRepoB = keystore.TryGetValue(CliLoginVault.KeystoreKeyFor("claude-code", "repo-b")!, out var v) ? v : null;
+        Assert.Empty(CliLoginVault.Parse(inRepoB));
+
+        // ...and the repo it WAS made in still reads it, so the scoping did not just break the feature.
+        var inRepoA = keystore[CliLoginVault.KeystoreKeyFor("claude-code", "repo-a")!];
+        Assert.Single(CliLoginVault.Parse(inRepoA));
     }
 
     /// <summary>The pre-F2 shape, pinned only so the migration note has something to point at. Nothing
