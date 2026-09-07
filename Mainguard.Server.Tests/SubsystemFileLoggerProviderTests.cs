@@ -110,6 +110,57 @@ public sealed class SubsystemFileLoggerProviderTests : IDisposable
         Assert.Contains("an info line", spawn);
     }
 
+    /// <summary>
+    /// F56 — <c>rpc.log</c> was created under the process umask (0022 by default), i.e.
+    /// world-readable, in a directory that was equally open. Every log file and the directory that
+    /// holds them are now owner-only from the moment they exist.
+    /// </summary>
+    [UnixOnlyFact("log-file permissions are a POSIX mode; Windows uses a single-ACE DACL instead")]
+    public void LogFilesAndDirectory_AreCreatedOwnerOnly()
+    {
+        using var provider = new SubsystemFileLoggerProvider(_dir);
+        provider.CreateLogger(DaemonLogCategories.Rpc).LogInformation("rpc-begin method=/x peer=y");
+
+        var dirMode = File.GetUnixFileMode(_dir);
+        Assert.False(dirMode.HasFlag(UnixFileMode.GroupRead), "the logs directory must not be group-readable");
+        Assert.False(dirMode.HasFlag(UnixFileMode.OtherRead), "the logs directory must not be world-readable");
+        Assert.False(dirMode.HasFlag(UnixFileMode.OtherExecute), "the logs directory must not be world-traversable");
+
+        var fileMode = File.GetUnixFileMode(Path.Combine(_dir, "rpc.log"));
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, fileMode);
+    }
+
+    /// <summary>The mode has to be right on the FIRST line, not fixed up afterwards: a log file that
+    /// spends even one write world-readable has already published that write.</summary>
+    [UnixOnlyFact("log-file permissions are a POSIX mode")]
+    public void FirstLine_LandsInAnAlreadyRestrictedFile()
+    {
+        using var provider = new SubsystemFileLoggerProvider(_dir);
+        var logger = provider.CreateLogger(DaemonLogCategories.Spawn);
+        logger.LogInformation("the very first line");
+
+        var path = Path.Combine(_dir, "spawn.log");
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(path));
+        Assert.Contains("the very first line", File.ReadAllText(path));
+    }
+
+    /// <summary>A rolled file must not become the readable copy of what the live file protects.</summary>
+    [UnixOnlyFact("log-file permissions are a POSIX mode")]
+    public void RolledFiles_StayOwnerOnly()
+    {
+        using var provider = new SubsystemFileLoggerProvider(_dir, maxBytes: 256, maxRoll: 2);
+        var logger = provider.CreateLogger(DaemonLogCategories.Spawn);
+        for (var i = 0; i < 20; i++)
+            logger.LogInformation("line {Index} padded to force a roll over the tiny cap", i);
+
+        var rolled = Path.Combine(_dir, "spawn.1.log");
+        Assert.True(File.Exists(rolled));
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(rolled));
+        Assert.Equal(
+            UnixFileMode.UserRead | UnixFileMode.UserWrite,
+            File.GetUnixFileMode(Path.Combine(_dir, "spawn.log")));
+    }
+
     [Fact]
     public void DirectoryCreateFailure_IsSwallowed()
     {

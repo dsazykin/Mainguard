@@ -205,7 +205,7 @@ public class SecureKeyring : ISecureKeyring, ISecureKeyStore
 
     public void SaveSecret(string key, string secret)
     {
-        if (IsUnprotected && IsFailClosedKey(key) && !AllowUnprotected())
+        if (RefusesUnprotectedWrite(Protection, key))
         {
             throw new UnprotectedKeyringException(key);
         }
@@ -291,6 +291,15 @@ public class SecureKeyring : ISecureKeyring, ISecureKeyStore
         names.Sort(StringComparer.Ordinal);
         return names;
     }
+
+    /// <summary>
+    /// The write refusal, as a pure decision: an unprotected key ring, a key that must not sit in
+    /// one, and no operator opt-in. Internal so the matrix is testable on every platform — the
+    /// end-to-end refusal itself only ever fires on Linux/WSL, which is precisely why it went
+    /// unnoticed.
+    /// </summary>
+    internal static bool RefusesUnprotectedWrite(KeyringProtection protection, string key)
+        => protection == KeyringProtection.None && IsFailClosedKey(key) && !AllowUnprotected();
 
     private static bool IsFailClosedKey(string key)
     {
