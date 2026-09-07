@@ -69,15 +69,24 @@ internal static class AgentGitCommand
     ///   a repository whose directory is not owned by the daemon user is refused rather than operated
     ///   on. This is the "belt on the agent side" the audit found missing — it was previously only
     ///   true by the accident of the daemon having no global config.</item>
-    /// <item><c>core.pager=</c>, <c>core.askPass=</c>, <c>core.gitProxy=</c>,
-    ///   <c>core.alternateRefsCommand=</c>, <c>core.attributesFile=</c>, <c>diff.external=</c>,
-    ///   <c>uploadpack.packObjectsHook=</c> — the fixed-name command-executing knobs. Every one of
-    ///   them is disabled by an empty value in git's own reader (<c>if (cmd &amp;&amp; *cmd)</c>), and
-    ///   the product sets none of them, so pinning them empty is behaviour-preserving.</item>
     /// </list>
-    /// The wildcard families (<c>filter.*</c>, <c>diff.*.command</c>/<c>textconv</c>,
+    ///
+    /// <para><b>The list deliberately stops there, and one measurement is why.</b> The obvious next step
+    /// is to pin the other fixed-name command knobs (<c>core.pager</c>, <c>core.askPass</c>,
+    /// <c>diff.external</c>, <c>uploadpack.packObjectsHook</c>, …) empty as well. It was tried, and
+    /// <c>-c diff.external=</c> broke every clean repository: git does <b>not</b> read an empty
+    /// <c>diff.external</c> as "no external diff" — it reads it as a command to run, and every
+    /// <c>git diff</c> the daemon issued died with <c>error: cannot run :</c>. (Measured; the merge
+    /// queue's flagged-change gate went dark and <c>CanMerge</c> silently went false.) An always-on pin
+    /// has to be correct for repositories that declare nothing, and "empty means disabled" is a
+    /// per-key fact rather than a rule, so it is not assumed here for any key that has not been
+    /// measured. Everything else is left to <see cref="NeutralizingArgs"/>, which emits an override
+    /// only when the repository actually declares the key — where the worst case is a loud failure on
+    /// a repository that had planted an executable value, never a regression on one that had not.</para>
+    ///
+    /// <para>The wildcard families (<c>filter.*</c>, <c>diff.*.command</c>/<c>textconv</c>,
     /// <c>merge.*.driver</c>, …) cannot be expressed here at all; they are handled by
-    /// <see cref="NeutralizingArgs"/>.
+    /// <see cref="NeutralizingArgs"/> too.</para>
     /// </summary>
     private static readonly string[] HardeningArgs =
     {
@@ -85,13 +94,6 @@ internal static class AgentGitCommand
         "-c", "core.fsmonitor=",
         "-c", "protocol.ext.allow=never",
         "-c", "safe.directory=",
-        "-c", "core.pager=",
-        "-c", "core.askPass=",
-        "-c", "core.gitProxy=",
-        "-c", "core.alternateRefsCommand=",
-        "-c", "core.attributesFile=",
-        "-c", "diff.external=",
-        "-c", "uploadpack.packObjectsHook=",
     };
 
     /// <summary>
@@ -201,8 +203,19 @@ internal static class AgentGitCommand
     /// first (<c>git config --list --name-only</c> executes nothing and, under
     /// <see cref="HardeningEnv"/>, sees only the repo-local, worktree and included scopes), and each
     /// declared key is overridden empty on the command line, which is the highest-precedence scope.
-    /// Empty is git's own "absent": <c>apply_filter</c>, the textconv/external-diff readers and the
-    /// merge-driver lookup all gate on <c>cmd &amp;&amp; *cmd</c>.</para>
+    /// For the <c>filter.*</c> family — the one the audit measured — empty IS git's own "absent":
+    /// <c>apply_filter</c> gates on <c>cmd &amp;&amp; *cmd</c>, so a neutralized clean/smudge/process
+    /// driver simply does not run and <c>add</c>/<c>commit</c>/<c>checkout</c> behave normally.</para>
+    ///
+    /// <para><b>The <c>diff.*</c> family behaves differently, and the difference is a deliberate
+    /// trade.</b> git reads an empty <c>diff.external</c> / <c>diff.&lt;d&gt;.command</c> /
+    /// <c>diff.&lt;d&gt;.textconv</c> as a command to RUN, not as "none" — measured: it reports
+    /// <c>error: cannot run :</c> and fails the diff. So neutralizing one of those does not restore the
+    /// ordinary diff; it turns the daemon's diff into a loud failure for that repository. That is the
+    /// correct side of the trade — the agent's command still never runs, and the alternative is
+    /// executing it — and it is contained: only a repository that planted an executable diff driver is
+    /// affected, and the product plants none. It is also exactly why <see cref="HardeningArgs"/> does
+    /// not pin these unconditionally.</para>
     ///
     /// <para><b>Behaviour-preserving.</b> The daemon writes exactly six repo-local keys
     /// (<c>core.sharedRepository</c>, <c>core.untrackedCache</c>, <c>gc.auto</c>,
@@ -353,8 +366,11 @@ internal static class GitConfigExecutionSurface
             "merge" => hasSubsection && variable is "driver",
             "diff" => variable is "command" or "textconv" or "external",
             "difftool" or "mergetool" or "guitool" => variable is "cmd" or "path",
+            // core.attributesFile is deliberately absent: it names a file, not a command. It can ASSIGN a
+            // driver, but every driver it could assign is itself neutralized above, and pinning it empty
+            // would be another unmeasured "empty means disabled" assumption.
             "core" => variable is "hookspath" or "fsmonitor" or "pager" or "editor" or "sshcommand"
-                or "askpass" or "gitproxy" or "alternaterefscommand" or "attributesfile",
+                or "askpass" or "gitproxy" or "alternaterefscommand",
             "sequence" => variable is "editor",
             "credential" => variable is "helper",
             "remote" => hasSubsection && variable is "uploadpack" or "receivepack" or "proxy",
@@ -474,7 +490,13 @@ internal sealed class TrustedWorktreeLayout
             return null;
         }
 
-        var workTree = Path.GetFullPath(worktreePath);
+        // RealPath, not GetFullPath: git writes the SYMLINK-RESOLVED path into the pointer file and into
+        // its own worktrees/<n>/gitdir registration, while the daemon's computed paths are whatever the
+        // substrate handed it. On macOS — where the daemon runs on the host — /tmp and /var are symlinks
+        // into /private, so every comparison below would have been between two spellings of the same
+        // directory and every legitimate worktree would have been refused as "a repository the agent
+        // chose". Measured by TrustedWorktreeLayoutTests, which failed on exactly that before this line.
+        var workTree = RealPath(worktreePath);
         var dotGit = Path.Combine(workTree, ".git");
 
         // A real .git directory is the main working tree: there is no pointer to subvert, and pinning
@@ -510,7 +532,7 @@ internal sealed class TrustedWorktreeLayout
             return null;
         }
 
-        var gitDir = Path.GetFullPath(Path.IsPathRooted(target) ? target : Path.Combine(workTree, target));
+        var gitDir = RealPath(Path.IsPathRooted(target) ? target : Path.Combine(workTree, target));
         var worktreesDir = Path.GetDirectoryName(gitDir);
         var commonDir = worktreesDir is null ? null : Path.GetDirectoryName(worktreesDir);
 
@@ -524,17 +546,10 @@ internal sealed class TrustedWorktreeLayout
                 + "worktree directory of any repository. Refusing to run daemon-side git against it.");
         }
 
-        if (agentRepoPath is { Length: > 0 } &&
-            !PathsEqual(commonDir, Path.GetFullPath(agentRepoPath)))
-        {
-            throw new RepoProvisioningException(
-                $"W1-A: the worktree at '{workTree}' claims to belong to '{commonDir}', but the daemon "
-                + $"provisioned it under '{Path.GetFullPath(agentRepoPath)}'. Refusing to run daemon-side "
-                + "git against a repository the agent chose.");
-        }
-
-        if (forbiddenCommonDir is { Length: > 0 } &&
-            PathsEqual(commonDir, Path.GetFullPath(forbiddenCommonDir)))
+        // The mirror is checked FIRST, ahead of the identity check that would also catch it: it is the
+        // named vector, and "you aimed this at the shared mirror" is the diagnostic an operator can act
+        // on, where "this is not the repository we provisioned" is merely true.
+        if (forbiddenCommonDir is { Length: > 0 } && PathsEqual(commonDir, RealPath(forbiddenCommonDir)))
         {
             throw new RepoProvisioningException(
                 $"W1-A: the worktree at '{workTree}' points its git directory at the shared mirror "
@@ -542,12 +557,20 @@ internal sealed class TrustedWorktreeLayout
                 + "it; refusing to reach it on the agent's behalf.");
         }
 
+        if (agentRepoPath is { Length: > 0 } && !PathsEqual(commonDir, RealPath(agentRepoPath)))
+        {
+            throw new RepoProvisioningException(
+                $"W1-A: the worktree at '{workTree}' claims to belong to '{commonDir}', but the daemon "
+                + $"provisioned it under '{RealPath(agentRepoPath)}'. Refusing to run daemon-side "
+                + "git against a repository the agent chose.");
+        }
+
         // Round-trip: the repository must itself have this worktree registered, and register it back at
         // the path we were given. A pointer at a directory that does not name us back is not our layout.
         var registration = Path.Combine(gitDir, "gitdir");
         try
         {
-            if (!File.Exists(registration) || !PathsEqual(File.ReadAllText(registration).Trim(), dotGit))
+            if (!File.Exists(registration) || !PathsEqual(RealPath(File.ReadAllText(registration).Trim()), dotGit))
             {
                 return null;
             }
@@ -571,19 +594,73 @@ internal sealed class TrustedWorktreeLayout
             return false;
         }
 
-        static string Normalize(string p) =>
-            Path.TrimEndingDirectorySeparator(Path.GetFullPath(p));
-
         var comparison = OperatingSystem.IsWindows()
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
+        return string.Equals(a, b, comparison);
+    }
+
+    /// <summary>
+    /// The absolute, <b>symlink-resolved</b>, separator-trimmed form of a path — the only spelling in
+    /// which two of these may be compared.
+    ///
+    /// <para>.NET has no <c>realpath</c>: <see cref="Path.GetFullPath(string)"/> normalizes <c>..</c> and
+    /// makes a path absolute but resolves no links, and <c>ResolveLinkTarget</c> resolves only the FINAL
+    /// component. An intermediate link is the common case on the substrate this actually runs on — macOS
+    /// puts the daemon on the host, where <c>/tmp</c> and <c>/var</c> are links into <c>/private</c> —
+    /// so the walk is component-by-component from the root. A component that does not exist, or that
+    /// cannot be inspected, is kept verbatim; this is a canonicalizer, never a validator.</para>
+    /// </summary>
+    private static string RealPath(string path)
+    {
+        string full;
         try
         {
-            return string.Equals(Normalize(a), Normalize(b), comparison);
+            full = Path.GetFullPath(path);
         }
         catch (ArgumentException)
         {
-            return false;
+            return path;
         }
+        catch (NotSupportedException)
+        {
+            return path;
+        }
+
+        var root = Path.GetPathRoot(full);
+        if (string.IsNullOrEmpty(root))
+        {
+            return Path.TrimEndingDirectorySeparator(full);
+        }
+
+        var current = root;
+        foreach (var segment in full[root.Length..]
+                     .Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, segment);
+            try
+            {
+                var link = Directory.Exists(current)
+                    ? new DirectoryInfo(current).ResolveLinkTarget(returnFinalTarget: true)?.FullName
+                    : File.Exists(current)
+                        ? new FileInfo(current).ResolveLinkTarget(returnFinalTarget: true)?.FullName
+                        : null;
+                if (!string.IsNullOrEmpty(link))
+                {
+                    current = Path.IsPathRooted(link)
+                        ? link
+                        : Path.GetFullPath(Path.Combine(Path.GetDirectoryName(current) ?? root, link));
+                }
+            }
+            catch (IOException)
+            {
+                // An unreadable component is kept as written — the comparison then simply fails closed.
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+
+        return Path.TrimEndingDirectorySeparator(current);
     }
 }

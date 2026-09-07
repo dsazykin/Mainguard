@@ -76,6 +76,11 @@ public sealed class AgentGitCommandHardeningTests : IDisposable
 
         ClearMarkers(repo);
 
+        // The daemon path neutralizes it. Note the deliberate trade documented on NeutralizingArgs: for
+        // the diff.* family git reads an empty value as a command to RUN rather than as "none", so the
+        // diff FAILS instead of coming back plain. The agent's command still never runs — which is the
+        // property that matters — and only a repository that planted an executable diff driver is
+        // affected. `CleanRepository_StillProducesARealDiff_ThroughTheDaemonPath` is the other half.
         AgentGitCommand.TryRun(repo, out _, "diff");
         Assert.Null(Marker(repo, "textconv"));
     }
@@ -176,6 +181,33 @@ public sealed class AgentGitCommandHardeningTests : IDisposable
         Assert.Equal(string.Empty, AgentGitCommand.Run(repo, "status", "--porcelain").Trim());
         Assert.Equal(0, AgentGitCommand.TryRun(repo, out var sha, "rev-parse", "HEAD"));
         Assert.Equal(40, sha.Trim().Length);
+    }
+
+    /// <summary>
+    /// The regression this suite's first draft shipped and <c>MergeQueueProvisionerTests</c> caught.
+    ///
+    /// <para>The belt originally pinned the fixed-name command knobs empty unconditionally, on the
+    /// assumption that empty means "disabled" — which holds for <c>filter.*</c> and does NOT hold for
+    /// <c>diff.external</c>: git reads an empty value there as a command to run, so every daemon-side
+    /// <c>git diff</c> on a perfectly ordinary repository died with <c>error: cannot run :</c>. The
+    /// merge queue's flagged-change gate consumes that diff, so its failure surfaced as
+    /// <c>CanMerge</c> quietly going false. An always-on pin must be correct for a repository that
+    /// declares nothing; this test is what says so.</para>
+    /// </summary>
+    [Fact]
+    public void CleanRepository_StillProducesARealDiff_ThroughTheDaemonPath()
+    {
+        var repo = NewRepo("diffable");
+        File.WriteAllText(Path.Combine(repo, "a.txt"), "one\n");
+        AgentGitCommand.Run(repo, "add", "-A");
+        AgentGitCommand.Run(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "seed");
+        File.WriteAllText(Path.Combine(repo, "a.txt"), "two\n");
+
+        var patch = AgentGitCommand.Run(repo, "diff");
+
+        Assert.Contains("diff --git a/a.txt b/a.txt", patch, StringComparison.Ordinal);
+        Assert.Contains("+two", patch, StringComparison.Ordinal);
+        Assert.DoesNotContain("cannot run", patch, StringComparison.Ordinal);
     }
 
     // ---- fixture -------------------------------------------------------------

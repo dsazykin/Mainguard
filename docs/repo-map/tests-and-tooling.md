@@ -3001,6 +3001,24 @@
   `sh`/`touch` existing. Also pins `GitConfigExecutionSurface` family by family in both directions —
   every command-executing key classified as such, every key the product itself writes left alone — and
   the typed refusal for a key name (`filter."a=b".clean`) that `git -c` cannot express.
+  **W1-A trusted git layout (`Agents/TrustedWorktreeLayoutTests.cs`, real git worktrees, no Docker):**
+  builds the production MG-3 shape (source → shared mirror → per-agent repo → linked worktree) and then
+  rewrites the worktree's `.git` pointer the way a jailed agent can. Pins: a real worktree resolves to the
+  daemon-computed repository; a pointer aimed at the shared mirror is refused by name; a pointer aimed at
+  any other repository is refused when the daemon knows the real one; a pointer with no
+  `…/worktrees/<name>` shape is refused rather than guessed at; a main working tree resolves to null
+  (= run unpinned, exactly as before); and end-to-end, a redirected worktree ends the keep-alive cycle as
+  `Skipped` **before the yield** — the yield protocol in that test throws if it is reached, which is the
+  assertion. These tests are also what caught the macOS symlink bug (`/var` → `/private/var`) that made
+  every legitimate worktree look like "a repository the agent chose".
+  **F40 intake ordering (`Mainguard.Tests/ExternalPrIntakeHeadPeekTests.cs`):** ten polls of an unchanged
+  PR must make ZERO destructive fetches and ten peeks; a moved head still fetches and still invalidates;
+  a peek that cannot answer falls through to the authoritative fetch; and a fetcher with no peek
+  capability keeps the pre-F40 behaviour exactly.
+  **W1-A `.git` pointer mount (`Mainguard.Tests/ContainerSpecGitPointerMountTests.cs`):** the pointer file
+  is bind-mounted read-only at `/workspace/.git` while `/workspace` itself stays read-write, the mount is
+  absent when there is no per-agent repo (where `.git` is a directory and a file mount would fail the
+  create), and MG-3's two decisions — mirror read-only, per-agent repo read-write — are unchanged.
   **P2-09 lifecycle suite (`Agents/`, real git over `DualRepoFixture`):** `KeepAliveRebaserTests`
   (clean rebase onto advanced main + wip commit + resume; agent mid-its-own-rebase → guard skip then
   next-cycle success; induced conflict → status `Conflict` routed to the T-04 resolver with the rebase
