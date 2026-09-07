@@ -860,6 +860,14 @@ public static class DaemonHost
             throw new DaemonStartupException(options.Port,
                 $"Mainguard daemon could not bind loopback port {options.Port} (already in use?).", ex);
         }
+        catch (Exception)
+        {
+            // F55 added a second way for startup to fail (the instance lock refusing a second daemon),
+            // and a host that failed to start must be disposed on EVERY path — a leaked one holds the
+            // container, its hosted services and, on a partial start, a listener.
+            await app.DisposeAsync();
+            throw;
+        }
 
         return app;
     }

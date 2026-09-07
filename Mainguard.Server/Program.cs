@@ -30,6 +30,25 @@ try
 {
     app.Run();
 }
+catch (Mainguard.Server.Runtime.DaemonAlreadyRunningException already)
+{
+    // F55: a second daemon against the same data root. Not an error the operator needs a stack trace
+    // for — it is the guard working — so it exits with a named code and one line on stderr. Nothing has
+    // been written: the credential files and the migration lock belong to the daemon that is up.
+    try
+    {
+        app.Services.GetService<ILoggerFactory>()?
+            .CreateLogger(DaemonLogCategories.Lifecycle)
+            .LogWarning("refusing to start: {Message}", already.Message);
+    }
+    catch (Exception)
+    {
+        // Diagnostics must never mask the refusal they diagnose.
+    }
+
+    Console.Error.WriteLine(already.Message);
+    return 3;
+}
 catch (IOException ex)
 {
     // Loopback port already bound → typed failure naming the port (edge row 3). Record it under the

@@ -95,12 +95,15 @@ public sealed class SessionTransportCertificates : IDisposable
         var serverCertificate = Mint("CN=Mainguard Daemon", ServerAuthOid, loopbackSubjectNames: true);
         using var clientCertificate = Mint("CN=Mainguard Daemon Client", ClientAuthOid, loopbackSubjectNames: false);
 
+        // Export BEFORE the round-trip: RoundTripForTls disposes the certificate it is given, and C#
+        // evaluates arguments left to right — so exporting inline in the constructor call would read a
+        // disposed handle.
+        var serverDer = serverCertificate.Export(X509ContentType.Cert);
+        var clientPkcs12 = clientCertificate.Export(X509ContentType.Pkcs12);
+        var fingerprint = DaemonTransportCredentials.Fingerprint(clientCertificate);
+
         return new SessionTransportCertificates(
-            RoundTripForTls(serverCertificate),
-            DaemonTransportCredentials.Fingerprint(clientCertificate),
-            directory,
-            serverCertificate.Export(X509ContentType.Cert),
-            clientCertificate.Export(X509ContentType.Pkcs12));
+            RoundTripForTls(serverCertificate), fingerprint, directory, serverDer, clientPkcs12);
     }
 
     /// <summary>
