@@ -158,9 +158,19 @@ internal static class GatewayBindPolicy
     }
 
     /// <summary>
-    /// The IPv4 the Docker bridge holds on this host — <c>docker0</c> first, then any <c>br-*</c>
-    /// (a user-defined network's bridge). Null when Docker has created no bridge here, in which case
-    /// there are no jails either and a gateway would have nothing to front.
+    /// The IPv4 <c>docker0</c> holds on this host. Null when Docker has created no default bridge here,
+    /// in which case there are no jails either and a gateway would have nothing to front.
+    ///
+    /// <para><b>Only <c>docker0</c>, and that is a containment decision, not laziness.</b> The
+    /// user-defined <c>br-*</c> bridges include the per-agent segments themselves, and a container on an
+    /// internal segment CAN reach its own bridge's address — measured on this engine:
+    /// <c>ping 192.168.97.1</c> from inside an internal-network container answers in 0.05 ms, while
+    /// <c>ping 172.17.0.1</c> from the same container is "Network is unreachable" (an internal segment
+    /// has no default route, so only its own subnet is on-link). Binding the gateway to a segment's own
+    /// bridge would therefore let a jail dial the gateway DIRECTLY, bypassing tinyproxy — and with it
+    /// the F26 port bound and every other egress control. <c>docker0</c> is off every jail's subnet, so
+    /// the only route to it is the one through the proxy. It is also the stable choice: its address
+    /// survives network create/remove cycles, which the memoization contract needs.</para>
     /// </summary>
     private static string? TryResolveDockerBridgeAddress()
     {
@@ -170,8 +180,7 @@ internal static class GatewayBindPolicy
                 .Where(n => n.OperationalStatus == System.Net.NetworkInformation.OperationalStatus.Up)
                 .ToArray();
 
-            return AddressOn(nics, n => string.Equals(n.Name, "docker0", StringComparison.Ordinal))
-                ?? AddressOn(nics, n => n.Name.StartsWith("br-", StringComparison.Ordinal));
+            return AddressOn(nics, n => string.Equals(n.Name, "docker0", StringComparison.Ordinal));
         }
         catch (System.Net.NetworkInformation.NetworkInformationException)
         {

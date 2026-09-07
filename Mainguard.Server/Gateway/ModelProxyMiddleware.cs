@@ -160,6 +160,7 @@ public sealed class GatewayForwarder
                     await PumpAsync(response, sink, sniffer, ct).ConfigureAwait(false);
                 }
 
+                sniffer.Complete();
                 var (tokens, model) = sniffer.Result;
                 _gateway.Settle(lease, tokens ?? estimate, model);
                 settled = true;
@@ -207,7 +208,6 @@ public sealed class GatewayForwarder
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
-            sniffer.Complete();
         }
     }
 
