@@ -115,6 +115,4 @@ public class SwarmReconcilerDockerTests
             }
         }
     }
-
-    /// <summary>Ensures the trivial image is present (inspect, else pull). False if it can't be obtained.</summary>
 }
