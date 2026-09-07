@@ -197,3 +197,62 @@ public static class PayloadSignature
         }
     }
 }
+
+/// <summary>
+/// <b>When a privileged call site must refuse, given a verdict.</b> One shared decision so the elevation
+/// launcher and the elevated helper cannot drift apart on the question that matters most.
+///
+/// <para><b>What went wrong (audit F57).</b> Every call site refused on
+/// <see cref="SignatureVerdictKind.Rejected"/> and proceeded on
+/// <see cref="SignatureVerdictKind.NotAvailable"/>. On a build with no signing identity that is honest —
+/// there is nothing to check and refusing would refuse every install. But <c>NotAvailable</c> is ALSO
+/// what a signing-enabled build answers when the check could not be RUN: a missing or unusable
+/// <c>wintrust.dll</c>, or a host where Authenticode cannot be evaluated at all
+/// (<see cref="AuthenticodeStatus.Unsupported"/>). On such a build, "I could not check" and "I checked
+/// and it failed" were spelled differently and treated identically to "carry on" — so disabling the
+/// trust provider was a cheaper bypass than forging a signature. That is the same reasoning
+/// <c>NpmProvenanceGate</c> already applies on the npm path ("unverifiable is not verified"), applied
+/// here.</para>
+///
+/// <para><b>The rule.</b> Refuse on <c>Rejected</c>, always. Refuse ALSO on <c>NotAvailable</c> when the
+/// artifact is a kind the pin can speak for (<see cref="SigningPolicy.Covers"/>) AND this build claims
+/// to be able to check — i.e. it configured signing pins, or it is stamped as an attested release
+/// (<see cref="BuildProvenanceStamp.IsAttestedRelease"/>) and therefore MUST have shipped pins. Proceed
+/// on <c>NotAvailable</c> only for an unsigned, unattested build — <c>dotnet run</c> from a checkout —
+/// and for kinds Authenticode structurally cannot cover (the Linux daemon payload, npm tarballs), whose
+/// provenance is established elsewhere and whose reason text names the gap.</para>
+/// </summary>
+public static class PayloadSignatureGate
+{
+    /// <summary>Whether <paramref name="verdict"/> must abort the operation. <paramref name="policy"/>
+    /// and <paramref name="attestedRelease"/> are injected so both answers are unit-testable without two
+    /// differently-built assemblies; production passes neither and gets this build's own facts.</summary>
+    public static bool MustRefuse(
+        SignatureVerdict verdict,
+        SignedArtifactKind kind,
+        SigningPolicy? policy = null,
+        bool? attestedRelease = null)
+    {
+        ArgumentNullException.ThrowIfNull(verdict);
+
+        if (verdict.MustRefuse)
+            return true;
+
+        if (verdict.Kind != SignatureVerdictKind.NotAvailable)
+            return false;
+
+        if (!SigningPolicy.Covers(kind))
+            return false;
+
+        var signingEnabled = (policy ?? SigningPolicy.Current).SigningEnabled;
+        var attested = attestedRelease ?? BuildProvenanceStamp.IsAttestedRelease;
+        return signingEnabled || attested;
+    }
+
+    /// <summary>The sentence a caller adds to a <c>NotAvailable</c> refusal, so the log says why an
+    /// answer that reads like "nothing to check" was nevertheless fatal.</summary>
+    public static string WhyNotAvailableIsFatal(SignedArtifactKind kind) =>
+        $"this build is configured to verify signatures (or is stamped as a release), so a {kind} whose "
+        + "signature could NOT be checked is refused: on a build that can check, 'could not check' is "
+        + "indistinguishable from 'the check failed'.";
+}

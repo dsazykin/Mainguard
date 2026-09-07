@@ -59,6 +59,35 @@
     <AssemblyMetadata Include="MainguardAttestedRelease" Value="true" />
   </ItemGroup>
 
+  <!--
+    ============== Audit F57: a RELEASE build must carry pins, and the build proves it ==============
+    The finding was not that pinning is missing — the mechanism above is complete — but that NOTHING
+    connected "this is a release" to "this build set the pins". $(MainguardPinnedThumbprints) defaults
+    empty, so an unsigned verifier whose verdict is never Rejected shipped by omission, and no test
+    asserted otherwise. A release that forgets the property is indistinguishable from a developer build
+    at runtime, which is precisely the state an attacker wants and nobody would notice.
+
+    So the two facts are welded together HERE, at the only moment both are known: a build stamped as an
+    attesting release ($(MainguardAttestedRelease)=true, what the release workflow sets) that carries no
+    usable pin FAILS. It cannot be shipped and then discovered; it never compiles.
+
+    MainguardPinsRequired lets a signed-but-not-attested pipeline opt into the same guard
+    (-p:MainguardPinsRequired=true), so the check is available before the attestation workflow is.
+
+    The runtime half of this invariant — "if the loaded assembly says attested release, SigningPolicy
+    must have usable pins" — is asserted by ReleaseBuildCarriesPinsTests, and that test also reads THIS
+    target back out of the csproj, so deleting the guard fails CI rather than silently disarming it.
+  -->
+  <PropertyGroup>
+    <MainguardPinsRequired Condition="'$(MainguardPinsRequired)' == '' AND '$(MainguardAttestedRelease)' == 'true'">true</MainguardPinsRequired>
+    <MainguardPinsRequired Condition="'$(MainguardPinsRequired)' == ''">false</MainguardPinsRequired>
+  </PropertyGroup>
+  <Target Name="MainguardRequirePinsOnReleaseBuild" BeforeTargets="CoreCompile">
+    <Error Condition="'$(MainguardPinsRequired)' == 'true' AND '$(MainguardPinnedThumbprints)' == ''"
+           Code="MG0057"
+           Text="This build is marked as a Mainguard RELEASE (MainguardAttestedRelease/MainguardPinsRequired) but $(MainguardPinnedThumbprints) is empty. A release with no pins ships UnsignedBuildSignatureVerifier, whose verdict is never Rejected, so every privileged promote proceeds unverified (audit F57). Pass -p:MainguardPinnedThumbprints=&lt;thumbprint&gt; (build/velopack/pack.ps1 derives it from the signing certificate; build/signing/README.md is the recipe)." />
+  </Target>
+
   <!-- Step 2a (ADR-0001): the pure git engine + persistence now lives in Mainguard.Git; Mainguard.Agents
        keeps the agent platform (orchestration, bootstrap, adapters, daemon, sandbox, terminal) and references
        the git-engine leaf. Docker.DotNet + Porta.Pty stay here (agents/daemon only); LibGit2Sharp / EF /

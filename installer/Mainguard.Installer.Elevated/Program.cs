@@ -51,6 +51,23 @@ internal static class Program
             return (int)ElevatedHelperExitCode.BadArguments;
         }
 
+        // Audit F58: --resume-target was validated and --result was NOT, although both arrive on the
+        // same argv across the same UAC boundary and the second one is OPENED FOR WRITING while
+        // elevated. That made "can get the user through a UAC prompt" into "can create or overwrite any
+        // file on the machine as administrator, with partially caller-controlled content" — the JSON
+        // below echoes the caller's own --resume-target string back into its error field. Validated
+        // FIRST, before the refusal path can itself use the path it is refusing: note that every
+        // WriteResult below (including the resume-target refusal) writes to this value, so validating
+        // it after that check would leave the write primitive intact on the failure path.
+        if (!TrustedResultPath.TryValidate(resultPath, dataRoot: null, out var validatedResultPath, out var resultRefusal))
+        {
+            // Nothing is written anywhere: the only path we were given is the one we just refused.
+            Console.Error.WriteLine($"refusing --result '{resultPath}': {resultRefusal}.");
+            return (int)ElevatedHelperExitCode.BadArguments;
+        }
+
+        resultPath = validatedResultPath;
+
         var protection = ProtectedLocationPolicy.ForHost();
 
         // The root a legitimate --resume-target must live under. DERIVED, never received: when this
@@ -96,16 +113,27 @@ internal static class Program
         // checking then lives in an administrator-owned directory, so its verdict holds even against
         // malware running as the user. On a build with no signing identity this answers NotAvailable
         // and we proceed with the gap named; on a signed build an unsigned resume target is a refusal.
+        //
+        // Audit F57: this used to refuse only on Rejected and proceed on NotAvailable. A signing-enabled
+        // build answers NotAvailable when the check could not be RUN (no usable wintrust.dll, a host
+        // that cannot evaluate Authenticode), so "could not check" was treated as "carry on" on exactly
+        // the builds that claim to enforce. PayloadSignatureGate makes that fatal on a build with pins
+        // or a release stamp, while leaving a plain `dotnet run` checkout working.
         var resumeSignature = PayloadSignature.VerifyFile(SignedArtifactKind.ResumeTarget, resumeTarget);
         Console.Error.WriteLine($"resume target signature: {resumeSignature.Kind} — {resumeSignature.Reason}");
-        if (resumeSignature.MustRefuse)
+        if (PayloadSignatureGate.MustRefuse(resumeSignature, SignedArtifactKind.ResumeTarget))
         {
+            var why = resumeSignature.MustRefuse
+                ? resumeSignature.Reason
+                : $"{resumeSignature.Reason} "
+                  + PayloadSignatureGate.WhyNotAvailableIsFatal(SignedArtifactKind.ResumeTarget);
+            Console.Error.WriteLine($"refusing to register the resume task: {why}");
             WriteResult(resultPath, new ElevatedHelperResult
             {
                 FeaturesEnabled = false,
                 RebootRequired = false,
                 ResumeTaskRegistered = false,
-                Error = $"refusing to register the resume task: {resumeSignature.Reason}",
+                Error = $"refusing to register the resume task: {why}",
             });
             return (int)ElevatedHelperExitCode.BadArguments;
         }
