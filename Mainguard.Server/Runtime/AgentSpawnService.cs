@@ -769,6 +769,28 @@ public sealed class AgentSpawnService
             await _launcher.TeardownAsync(session.RepoHash, agentId, containerId, ct).ConfigureAwait(false);
         }
 
+        // F50: the daemon's custody of this repo + kind ends when its last session does. Evaluated
+        // AFTER the harvest above, because that harvest is the thing that legitimately refreshes the
+        // cache — dropping first would throw away the login the user just performed, then re-add it.
+        //
+        // Two scopes, because the cache has two: the per-(repo, kind) entries go when no session of that
+        // kind survives in the repo, and the repo-level custom env entries go when the repo is empty.
+        // Both are read from the store AFTER the Stop above removed this one, so "no sessions left"
+        // means exactly that.
+        if (session?.RepoHash is { Length: > 0 } stoppedRepo)
+        {
+            var live = _store.List().Where(s => string.Equals(s.RepoHash, stoppedRepo, StringComparison.Ordinal)).ToArray();
+            if (!live.Any(s => string.Equals(s.Kind, session.Kind, StringComparison.Ordinal)))
+            {
+                _keys.Forget(stoppedRepo, session.Kind);
+            }
+
+            if (live.Length == 0)
+            {
+                _keys.ForgetRepo(stoppedRepo);
+            }
+        }
+
         // MG-10 corollary: a stopped session's jail is gone, but nothing about that touches MergeQueue
         // state (Stop isn't a queue transition), so the queue's own `Changed` event — the only thing
         // that makes StreamQueue re-push — never fires here. An already-open rail keeps rendering this

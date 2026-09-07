@@ -295,6 +295,54 @@ public sealed class CliSettingsBoundaryTests
     private static IReadOnlyList<(string Relative, byte[] Content)> OneLogin(string content) =>
         new[] { (DeclaredCredentialPath, Encoding.UTF8.GetBytes(content)) };
 
+    // ---- F50: the daemon's custody ends with the last session ------------------------------------
+
+    /// <summary>
+    /// Nothing ever evicted this cache, so a provider key and a set of harvested OAuth files stayed in
+    /// the daemon's memory for its whole lifetime — and the daemon is a long-lived background process.
+    /// Stopping every agent is the gesture a person makes when they want the machine holding nothing.
+    /// </summary>
+    [Fact]
+    public async Task StoppingTheLastSessionOfAKind_DropsTheDaemonsCachedCredentials()
+    {
+        using var rig = SettingsRig.Create(inJailCredentials: OneLogin(InJailLogin));
+        var keys = rig.Host.Services.GetRequiredService<SessionKeyCache>();
+
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: "sk-provider-key",
+            role: AgentRoles.Coordinator, CancellationToken.None);
+        Assert.True(keys.HasAnythingFor(RepoHandle, AgentKind), "the spawn should have cached the key");
+
+        await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        Assert.False(keys.HasAnythingFor(RepoHandle, AgentKind));
+        Assert.Null(keys.TryGet(RepoHandle, AgentKind));
+        Assert.Null(keys.TryGetCliCredentials(RepoHandle, AgentKind));
+        Assert.Null(keys.TryGetExtraEnv(RepoHandle));
+    }
+
+    /// <summary>The paired non-eviction: while ANY session of that kind is still running in the repo,
+    /// the cache is what a coordinator-spawned worker inherits, so stopping a sibling must not empty
+    /// it. Eviction is "the last one left", not "one of them stopped".</summary>
+    [Fact]
+    public async Task StoppingOneOfTwoSessions_KeepsTheCacheForTheSurvivor()
+    {
+        using var rig = SettingsRig.Create(inJailCredentials: OneLogin(InJailLogin));
+        var keys = rig.Host.Services.GetRequiredService<SessionKeyCache>();
+
+        var first = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: "sk-provider-key",
+            role: AgentRoles.Coordinator, CancellationToken.None);
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: "sk-provider-key",
+            role: AgentRoles.Managed, CancellationToken.None);
+
+        await rig.Spawns.StopAsync(first, CancellationToken.None);
+
+        Assert.True(keys.HasAnythingFor(RepoHandle, AgentKind));
+        Assert.Equal("sk-provider-key", keys.TryGet(RepoHandle, AgentKind));
+    }
+
     // ---- gate 3: ROLE — one role's tool grant never reaches another role's jail (D5b) ----------
 
     /// <summary>
