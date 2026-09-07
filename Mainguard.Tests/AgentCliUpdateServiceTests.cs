@@ -118,7 +118,9 @@ public class AgentCliUpdateServiceTests
         public readonly AgentCliUpdateService Updater;
         public readonly List<string> Log = new();
 
-        public Fixture()
+        /// <param name="autoAdoptRegistryLatest">Audit F48: the shipped default is FALSE (install the
+        /// pin, offer the newer release). Tests that exercise the opt-in adoption path pass true.</param>
+        public Fixture(bool autoAdoptRegistryLatest = false)
         {
             Source.PayloadToServe = PayloadOld;
             // The channel gets the SAME fake gate as the updater (audit F47): EnsureAsync now runs the
@@ -126,7 +128,8 @@ public class AgentCliUpdateServiceTests
             // would fall back to the real registry-backed one and reach the network.
             Channel = new AdapterChannel(Source, Host, new AdapterChannelTests.FakeCache(ManifestJson()),
                 delay: (_, _) => Task.CompletedTask, pins: Pins, provenance: Provenance);
-            Updater = new AgentCliUpdateService(Channel, Pins, Npm, Log.Add, Provenance);
+            Updater = new AgentCliUpdateService(
+                Channel, Pins, Npm, Log.Add, Provenance, autoAdoptRegistryLatest);
         }
     }
 
@@ -161,17 +164,39 @@ public class AgentCliUpdateServiceTests
     }
 
     [Fact]
-    public async Task EnsureLatest_InstallsTheRegistrysCurrentRelease_NotTheBundledPin()
+    public async Task EnsureLatest_OptedIn_InstallsTheRegistrysCurrentRelease_NotTheBundledPin()
     {
-        // "There is no fixed default install version": a fresh install resolves npm's current
-        // release, pins its exact bytes, and installs that — the bundled 1.2.3 is only a fallback.
-        var f = new Fixture();
+        // The opt-in path: a fresh install resolves npm's current release, pins its exact bytes, and
+        // installs that. Only reachable with autoAdoptRegistryLatest — see the next test for why the
+        // shipped default is now the other way (audit F48).
+        var f = new Fixture(autoAdoptRegistryLatest: true);
         f.Source.PayloadToServe = PayloadNew;
 
         await f.Updater.EnsureLatestAsync("tool");
 
         Assert.Equal("2.0.0", f.Host.InstalledVersion);
         Assert.Equal(ShaOf(PayloadNew), f.Pins.TryGet("tool")!.Sha256);
+    }
+
+    [Fact]
+    public async Task EnsureLatest_ByDefault_InstallsTheShippedPin_AndOnlyOffersTheNewerRelease()
+    {
+        // Audit F48. Every check this service runs is a check on the BYTES (npm signed them, we hold
+        // them) and none is a check on the CHOICE OF VERSION, so a legitimately signed release from a
+        // taken-over publisher account clears the whole ladder. The default therefore does not adopt
+        // it: the shipped, human-reviewed pin installs, and the newer version is recorded as an offer.
+        var f = new Fixture();
+        f.Source.PayloadToServe = PayloadOld;
+
+        await f.Updater.EnsureLatestAsync("tool");
+
+        Assert.Equal("1.2.3", f.Host.InstalledVersion);   // the reviewed pin, not upstream's newest
+        Assert.Null(f.Pins.TryGet("tool"));               // and the pin was not moved
+        Assert.Contains(f.Updater.RefusedUpdates, r => r.Contains("not adopted automatically"));
+
+        // The upgrade is still discoverable — declining to auto-install is not declining to tell.
+        var offered = Assert.Single(await f.Updater.CheckForUpdatesAsync());
+        Assert.Equal("2.0.0", offered.LatestVersion);
     }
 
     [Fact]
