@@ -41,6 +41,63 @@ public sealed record AdapterPinOverride(
     };
 }
 
+/// <summary>
+/// <b>Where a pin override is allowed to point (audit F47).</b>
+///
+/// <para>The override file's validation used to be shape-only: HTTPS, 64 hex, a concrete version. Any
+/// HTTPS host passed. Since the same file also supplies the sha256 that "verifies" what it fetches, a
+/// single line in a user-writable JSON file could redirect an install to an attacker's server AND
+/// declare the hash it should match — both sides of the check chosen by the same party. HTTPS bought
+/// nothing there: the attacker's own server has a perfectly valid certificate.</para>
+///
+/// <para>So an override may only point at the hosts the shipped channel itself uses. Every adapter in
+/// <c>adapters.starter.json</c> is served from <c>registry.npmjs.org</c>, and every override is written
+/// by <see cref="AgentCliUpdateService"/>, which already refuses a tarball URL from anywhere else — so
+/// this narrows nothing legitimate. What it removes is the redirect primitive, and it does so on BOTH
+/// sides of the file (write refuses, read drops), because "we validated it when we wrote it" is not a
+/// property of a file anyone can edit.</para>
+///
+/// <para>This is deliberately not the whole fix. Restricting the HOST still leaves an attacker free to
+/// name a different, legitimately-signed <i>version</i> from npm. That is what the provenance gate on
+/// <see cref="AdapterChannel.EnsureAsync(string,System.Threading.CancellationToken)"/> now covers; the
+/// two together are what close F47.</para>
+/// </summary>
+public static class AdapterPinHosts
+{
+    /// <summary>The hosts a pin override's <c>payloadUrl</c> may name. Adding one is a reviewed commit,
+    /// never a runtime or config decision — the point of the list is that the file being validated
+    /// cannot extend it.</summary>
+    public static readonly IReadOnlyList<string> Allowed = new[] { "registry.npmjs.org" };
+
+    /// <summary>True when <paramref name="payloadUrl"/> is an absolute HTTPS URL on an allowed host.</summary>
+    public static bool IsAllowed(string? payloadUrl)
+    {
+        if (!Uri.TryCreate(payloadUrl, UriKind.Absolute, out var url))
+            return false;
+        if (url.Scheme != Uri.UriSchemeHttps)
+            return false;
+
+        foreach (var host in Allowed)
+        {
+            if (string.Equals(url.Host, host, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>The sentence a refusal carries — it names the host so a hand-edit shows up as itself
+    /// rather than as a generic "invalid override".</summary>
+    public static string Refusal(string? payloadUrl)
+    {
+        var host = Uri.TryCreate(payloadUrl, UriKind.Absolute, out var url) ? url.Host : "<unparseable>";
+        return $"Override payloadUrl host '{host}' is not an allowed adapter payload host "
+            + $"({string.Join(", ", Allowed)}). A pin override supplies both the URL and the hash that "
+            + "checks it, so an arbitrary host would let one file edit redirect an install to bytes it "
+            + "also vouches for.";
+    }
+}
+
 /// <summary>Persistence for the per-adapter pin overrides. File-backed in production; injectable
 /// for tests (the update/revert flows are exercised with an in-memory fake).</summary>
 public interface IAdapterPinOverrideStore
@@ -113,6 +170,8 @@ public sealed class FileAdapterPinOverrideStore : IAdapterPinOverrideStore
             return "Override sha256 must be 64 hex chars.";
         if (pin.PayloadUrl is null || !pin.PayloadUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
             return "Override payloadUrl must be HTTPS.";
+        if (!AdapterPinHosts.IsAllowed(pin.PayloadUrl))
+            return AdapterPinHosts.Refusal(pin.PayloadUrl);
         return null;
     }
 

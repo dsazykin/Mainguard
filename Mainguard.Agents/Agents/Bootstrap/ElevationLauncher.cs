@@ -131,13 +131,21 @@ public sealed class RunAsElevationLauncher : IElevationLauncher
         // worth. Once the helper is promoted (MG-15), the copy of this check that runs INSIDE it is
         // administrator-owned; the copy running here, in the per-user app, is not, and defends against a
         // corrupted or hostile download rather than against same-user malware.
+        //
+        // Audit F57: NotAvailable is fatal too on a build that CAN check (pins configured, or a release
+        // stamp). Only an unsigned, unattested developer build proceeds on it — see PayloadSignatureGate.
         var signature = PayloadSignature.VerifyFile(SignedArtifactKind.ElevatedHelper, helperExe);
         Log($"signature check: {signature.Kind} — {signature.Reason}");
-        if (signature.MustRefuse)
+        if (PayloadSignatureGate.MustRefuse(signature, SignedArtifactKind.ElevatedHelper))
         {
+            var why = signature.MustRefuse
+                ? signature.Reason
+                : $"{signature.Reason} "
+                  + PayloadSignatureGate.WhyNotAvailableIsFatal(SignedArtifactKind.ElevatedHelper);
+            Log($"REFUSED elevated helper '{helperExe}': {why}");
             throw new BootstrapException("EnableFeatures",
                 $"Mainguard's elevated setup helper failed its signature check and was not run: "
-                + $"{signature.Reason} Reinstall Mainguard from a trusted source.");
+                + $"{why} Reinstall Mainguard from a trusted source.");
         }
 
         // UseShellExecute + Verb=runas is what raises the single UAC prompt. Arguments can't be an

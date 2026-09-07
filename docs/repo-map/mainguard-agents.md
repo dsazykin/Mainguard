@@ -767,7 +767,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       digest would prove nothing; an untrusted chain is EXPECTED for a self-signed key, a bad digest never
       is) and `PinnedThumbprintSignatureVerifier` (on a signing-enabled build an unsigned covered artifact
       is `Rejected`, never `NotAvailable`). `PayloadSignature` now selects its default from the build's
-      own configuration, so no entry point opts in. Packaging: the Pro head's
+      own configuration, so no entry point opts in. **Audit F57** adds two things on top:
+      `PayloadSignatureGate` in `PayloadSignature.cs` — the one shared "must this refuse?" decision, which
+      makes `NotAvailable` FATAL for a pin-covered kind once the build can actually check (pins
+      configured, or stamped `MainguardAttestedRelease`), so a missing/unusable `wintrust.dll` is no
+      longer a cheaper bypass than forging a signature; and the `MainguardRequirePinsOnReleaseBuild`
+      MSBuild target in `Mainguard.Agents.csproj` (error `MG0057`), which FAILS a build stamped as a
+      release that set no pins — the property defaults empty, so before this a release shipping the
+      never-Rejecting unsigned verifier was indistinguishable at runtime from a dev build.
+      `Mainguard.Tests/ReleaseBuildCarriesPinsTests.cs` pins both halves (the runtime implication
+      attested ⇒ usable pins, and the csproj guard's own existence). Packaging: the Pro head's
       `StageElevatedComponentsToPublish` target self-contained-publishes the helper into `elevated-stage/`
       at PUBLISH (never on a dev build) — an EMPTY stage is now an `<Error>`, not a `<Warning>` buried in
       the publish log, since it means the packaged app silently falls back to the per-user helper, i.e.
@@ -787,6 +796,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       path outside the install root, compared segment-wise so `Mainguard-evil\` fails against
       `Mainguard\`; applied in the schtasks **builder** rather than at the call sites so no caller can
       forget it. Syntactic and platform-independent on purpose — the Windows cases run on Linux CI.)
+      `TrustedResultPath.cs` (**audit F58** — the WRITE-side twin: the elevated helper validated
+      `--resume-target` and not `--result`, although both arrive on the same argv and the second is
+      opened for writing AS ADMINISTRATOR with content that echoes the caller's own string back. Reuses
+      `TrustedExecutablePath`'s normalisation (absolute, canonical, no traversal/UNC/device/ADS/quoting
+      metacharacters) and adds two rules: the file must be named `elevated-result.json` — the one name
+      both production callers pass — and its directory must be a Mainguard data root, either this
+      process's own or a directory named `Mainguard`/`.mainguard` so over-the-shoulder elevation by a
+      second account still works. Pure and injectable; `Mainguard.Tests/TrustedResultPathTests.cs`.)
   - **`Agents/Sandbox/`** (P2-07 sandbox hardening + default-deny egress — daemon-side, no UI; the
     launch-tier prompt-injection exfiltration control). Adds `Docker.DotNet` to `Mainguard.Agents`
     (never referenced from `Mainguard.App.Shell` — G-18). **Pure, unit-tested heart:**
@@ -900,8 +917,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `/workspace` workdir, and a fixed argv-safe `sh -c` wrapper that sources
       `CredTmpfsSpec.DefaultCredentialPath` — `/run/secrets/agent/agent.env`, spelled through the constant
       because the wrapper's `[ -r … ]` guard makes a stale copy of the path fail SILENTLY — and puts the
-      IPC mount on PATH before `exec "$@"`). **Engine-agnostic seams (no Docker.DotNet in the
-      signature):**
+      IPC mount on PATH before `exec "$@"`). The same file now carries `TrustedDockerBinary` (**audit
+      F54**): every daemon-side docker invocation used the bare name `"docker"`, resolved against the
+      daemon's INHERITED `PATH` — so whoever controlled the environment the daemon was started with chose
+      the program that creates every jail. It resolves to an absolute path from a fixed list of
+      system-owned directories (deliberately excluding the same-user-writable `~/.docker/bin`), with no
+      environment override, and `TrustedChildPath` is the matching fixed `PATH` handed to the child
+      instead of ours (`AgentCliBinder.BuildPtyLaunch`). Nothing found ⇒ the first candidate, so the
+      answer is always absolute and the spawn fails with a plain ENOENT — the degrade `TryBind` already
+      audits. **Engine-agnostic seams (no Docker.DotNet in the signature):**
     - `ISandboxEngine.cs` (`SpawnAsync`/`ExecAsync`/`PauseAsync`/`UnpauseAsync` (P2-09 yield-timeout
       `docker pause`/`unpause`)/`StopAsync`/`RemoveAsync`/`ImageExistsAsync` (the v1 spawn-preflight image
       probe; defaults true — an engine/fake with no separate image store has nothing to preflight, the
@@ -2106,14 +2130,21 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       see [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md)).
     - `AdapterChannel.cs` (`AdapterChannel.EnsureAsync(id)` — idempotent: green probe at the pinned
       version → no-op; else fetch payload → verify SHA-256 against the pin (typed `HashMismatch` refusal)
-      → run `installCmd` INSIDE the VM at the pinned version → write config shims → **place the platform
+      → **run the npm provenance gate whenever an OVERRIDE governs the install (audit F47)** → run
+      `installCmd` INSIDE the VM at the pinned version → write config shims → **place the platform
       executable** when the spec declares one → probe (exit 0 AND the
       pinned version substring); pin survival is structural — the install cmd + probe both carry the pin,
       so a breaking upstream never changes what's installed (the simulation test). Seams:
       `IAdapterChannelSource` (+ real `HttpsAdapterChannelSource`, HTTPS-only), `IAdapterInstallHost` (+
       real `WslAdapterInstallHost` over `IWslRunner` `wsl -d MainguardEnv --`, and
       `ContainerAdapterInstallHost.cs` — the macos-host implementation: every command runs in a
-      DISPOSABLE agent-base container with the daemon-owned adapters + toolchains roots mounted
+      DISPOSABLE **hardened** agent-base container (audit F49 — `HardeningArgs` mirrors
+      `ContainerSpecBuilder`'s jail posture: `--cap-drop ALL` + the minimal add-backs,
+      `no-new-privileges`, the shared default-deny `SeccompProfile` written out as a file for the docker
+      CLI, `--read-only` rootfs with two named tmpfs for npm's cache/temp, `SandboxLimits.Default`
+      memory/pids/CPU + nofile/nproc rlimits, and an explicit `--user 1000` pin; the default bridge is
+      kept and stated, because reaching the registry IS the job) with the daemon-owned adapters +
+      toolchains roots mounted
       read-write AT THEIR VM PATHS, so the channels' command shapes, markers and the spawn path's
       VmRoot→SandboxMount rewrite work verbatim while the bytes land in the host trees the jails
       later mount read-only; `AdapterPaths.DaemonSideRoot()`/`ToolchainPaths.DaemonSideRoot()` are
@@ -2184,14 +2215,27 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the effective pin — version/payloadUrl/sha256/probe-substring together via
       `AdapterPinOverride.Apply` — with the replaced pin kept as one-step revert history;
       `AdapterChannel.EffectiveSpec` applies it inside `EnsureAsync`, `Set` validates like the manifest
-      parser so a hand-edited entry can never weaken an install).
+      parser so a hand-edited entry can never weaken an install). **Audit F47** adds `AdapterPinHosts` —
+      an override's `payloadUrl` must name a host the shipped channel itself uses
+      (`registry.npmjs.org`), enforced on BOTH sides of the file (write throws, read drops the entry),
+      because the same file supplies the URL *and* the sha256 that "verifies" it, so any-HTTPS-host was
+      a redirect primitive whose hash check passed by construction. The host rule alone is not the whole
+      fix — see the provenance gate in `AdapterChannel.EnsureAsync`. Covered by
+      `Mainguard.Tests/AdapterPinOverrideHostTests.cs`.
     - `AgentCliUpdateService.cs` (the Mainguard-managed CLI updater — the in-CLI self-updaters are
       disabled in every jail via `DISABLE_AUTOUPDATER=1`: `CheckForUpdatesAsync` sweeps npm for newer
       releases of npm-sourced CLIs (per-CLI failures silent — harmless at launch), `ApplyUpdateAsync`
-      downloads the exact new tarball, sha256-pins it as an override and installs through the channel's
-      verify path (a failure rolls the override back), `RevertAsync` restores the previous pin, and
-      `EnsureLatestAsync` is the INSTALL policy: resolve the registry's current release and pin THAT —
-      there is no fixed default install version; the bundled pins are the offline fallback.
+      downloads the exact new tarball, runs the provenance gate, INSTALLS it, and only then writes the
+      sha256 pin as an override (**audit F54** — writing the pin first left a crash window in which a
+      new pin was active over the old binary and the next `Ensure` installed it unprompted;
+      `AdapterChannel.VerifiedPin` carries the already-gated pin down so the user-writable file is
+      untouched until the install succeeds), `RevertAsync` restores the previous pin, and
+      `EnsureLatestAsync` is the INSTALL policy. **Audit F48 flipped that policy's default**: it now
+      installs the SHIPPED PIN and merely records a newer registry release as an offer, because every
+      check in this file is a check on the BYTES and none is a check on the CHOICE OF VERSION — a
+      legitimately signed release from a taken-over publisher account clears the whole ladder. The old
+      behaviour is the opt-in `autoAdoptRegistryLatest: true` ctor flag. The bundled pins remain the
+      offline fallback and are now also the default floor.
       `AgentCliInstaller` composes it in `CreateDefault`; the Pro launch sequence
       (`ProDesktopHost.KickAgentCliUpdateCheck`) toasts when an installed CLI has a newer release, and the
       Agent CLIs settings rows carry Update/Revert).
@@ -2244,9 +2288,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the self-derived hash), and the `INpmProvenanceGate`/`NpmProvenanceGate` +
       `INpmProvenanceSource`/`HttpNpmProvenanceSource` seams (the gate is the whole fetch+decide unit so
       the pinned key stays unreachable from outside it; an unreachable registry is a REFUSAL, not a pass).
-      Wired at the one point that MOVES a pin (`ApplyUpdateAsync` → typed
-      `AdapterChannelError.ProvenanceRejected`); `EnsureLatestAsync` refuses the registry's bytes and
-      falls back to the REVIEWED bundled pin, loudly. **Measured 2026-07-26:** only `@openai/codex`
+      **Audit F48 downgraded the top rung's LABEL rather than pretending to verify it**: the outcome is
+      now `BuildProvenanceAttestationPresent`, not `BuildProvenanceVerified`, and every passing verdict
+      carries `NpmProvenancePolicy.BuildProvenanceLimitation` — the attestation's own DSSE signature,
+      its Fulcio certificate chain and its Rekor inclusion proof are NOT checked, so the attestation
+      document is unauthenticated and its presence+digest binding is a change-detector, not an origin
+      proof. Real verification needs a pinned Sigstore trust root, which this build does not carry; the
+      caveat string is pinned by `NpmProvenanceTests` so it cannot be tidied back out.
+      Wired at the point that MOVES a pin (`ApplyUpdateAsync` → typed
+      `AdapterChannelError.ProvenanceRejected`) **and, since audit F47, at every install an override
+      governs (`AdapterChannel.EnsureAsync`)** — the rung always comes from the MANIFEST spec, never from
+      the user-writable override, so the file cannot lower its own requirement; a composition that passes
+      no gate gets the real registry-backed one lazily rather than silently skipping the check.
+      `EnsureLatestAsync` refuses the registry's bytes and falls back to the REVIEWED bundled pin, loudly. **Measured 2026-07-26:** only `@openai/codex`
       publishes npm build provenance; claude-code / gemini-cli / qwen-code / opencode-ai 404 on the
       attestations endpoint, so they sit at `npm-registry-signature` — a statement about upstream, not a
       Mainguard gap. **Residual, stated in the manifest too:** the pin-override file is user-writable

@@ -17,7 +17,13 @@ The three installer projects. `Mainguard.Installer.Elevated` is the ONLY elevate
 - **`installer/Mainguard.Installer.Elevated`** (P2-21) — the tiny elevated helper (the only elevated
   component): does EXACTLY the two enumerated privileged actions (enable the two Windows features via
   the surfaced PowerShell; register the elevated resume Scheduled Task), then reports via exit code +
-  `ElevatedHelperResult` JSON. No other privileged work ever moves here (plan §7). **P2-48:** `WinExe`
+  `ElevatedHelperResult` JSON. No other privileged work ever moves here (plan §7). **Audit F58:** BOTH
+  argv paths are now validated before anything privileged happens — `--resume-target` through
+  `TrustedExecutablePath` as before, and `--result` through the new `TrustedResultPath`, FIRST of all
+  (every `WriteResult` on the refusal paths writes to that value, so validating it later would leave the
+  administrator-level arbitrary-write primitive intact on exactly the failure path). **Audit F57:** the
+  resume target's signature check now goes through `PayloadSignatureGate`, so a `NotAvailable` verdict is
+  fatal on a build that can actually check rather than a shrug. **P2-48:** `WinExe`
   + windowless child processes (no console flash); an `app.manifest` (`requireAdministrator`) +
   branded version resource (`AssemblyTitle`="Mainguard Setup") make the UAC consent dialog show a
   trustworthy product name, and the `SignMainguardExecutables`/pack signing hooks upgrade it to a
