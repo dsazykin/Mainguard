@@ -248,6 +248,50 @@ public sealed class GatewayConfinementDockerTests
     // ---------------------------------------------------------------------------------------------
 
     /// <summary>
+    /// <b>F24 — a resumed jail must come back with secrets that work.</b>
+    ///
+    /// <para>The reuse branch restored the CLI's login and settings into a jail it had just
+    /// <c>docker start</c>ed, and wrote neither the env file nor the supervisor key. Both live on tmpfs,
+    /// which Docker recreates EMPTY on start — and the launcher mints a fresh gateway token on every
+    /// launch while <c>Issue</c> retires the previous one. So a resumed jail came up either with no
+    /// token at all or with one the daemon had already replaced: every model call 401s, and the
+    /// out-of-band supervisor has no key.</para>
+    ///
+    /// <para>Asserted by relaunching the SAME agent id, which is what a resume does, and then reading
+    /// the jail's own env file back and comparing it to the token the daemon currently holds — not to
+    /// the one the first launch produced.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task ResumedJail_ComesBackWithTheTokenTheDaemonNowHolds_AndAnOobKey()
+    {
+        await using var world = await ConfinementWorld.StartAsync(new BudgetCaps(0, 0, 0, 0));
+        var first = await world.LaunchAsync("byok-resume-1", modelApiKey: RealKey);
+        var firstToken = ValueOf(await world.ReadSecretsFileAsync(first), ApiKeyVar);
+
+        // The resume: same repo, same agent id, so the launcher finds and reuses the container.
+        var resumed = await world.LaunchAsync("byok-resume-1", modelApiKey: RealKey);
+        Assert.Equal(first.ContainerId, resumed.ContainerId);
+
+        var env = await world.ReadSecretsFileAsync(resumed);
+        var liveToken = world.Daemon.Services
+            .GetRequiredService<Mainguard.Server.Gateway.AgentGatewayCredentials>()
+            .TokenFor(resumed.AgentId);
+
+        Assert.StartsWith("mg_sess_", ValueOf(env, ApiKeyVar), StringComparison.Ordinal);
+        // The file holds the CURRENT token — the one the gateway will accept — not the retired one.
+        Assert.Equal(liveToken, ValueOf(env, ApiKeyVar));
+        Assert.NotEqual(firstToken, ValueOf(env, ApiKeyVar));
+        Assert.Contains(BaseUrlVar + "=" + world.GatewayBaseUrl, env, StringComparison.Ordinal);
+
+        // The supervisor's key was rewritten too — the other tmpfs file the reuse branch never touched.
+        // Read as root, because the point of that file's ownership is that the agent uid cannot.
+        var oob = await world.ExecAsync(
+            resumed, "wc -c < " + CredTmpfsSpec.DefaultOobKeyPath + " 2>/dev/null || echo missing",
+            asUid: 0);
+        Assert.Equal("32", oob.Trim());
+    }
+
+    /// <summary>
     /// <b>The highest-value test here.</b> An agent that authenticates interactively holds no API key, so
     /// it cannot be gateway-confined and must keep the exact behaviour it has today: no base-URL
     /// override, no gateway token, its login files restored from the keychain, and its provider host
