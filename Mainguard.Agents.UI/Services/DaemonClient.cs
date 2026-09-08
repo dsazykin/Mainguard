@@ -110,7 +110,27 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         // Deliberately NOT disposed here: the client certificate it owns must stay alive for as long as
         // the handler that presents it. The channel disposes the handler, and the certificate goes with it.
         var credentials = DaemonTransportCredentials.Load(sessionDirectory);
-        var handler = new SocketsHttpHandler { SslOptions = credentials.BuildSslOptions() };
+
+        // F60: without keepalive pings a half-open TCP connection looks alive until the OS timeout, which
+        // is minutes. Attach, StreamQueue and StreamAgentEvents are long-lived and mostly SILENT, so a
+        // sleep/wake or a dropped link leaves the client rendering stale state and the reconnect loop
+        // idle, because nothing has faulted yet for it to react to.
+        //
+        // KeepAlivePingPolicy is the load-bearing line. The default, WithActiveRequests, does not ping a
+        // connection whose streams are open but quiet — which is EXACTLY an idle Attach, i.e. precisely
+        // the case this exists to catch. Always pings regardless, so a dead link faults within ~40s and
+        // the existing reconnect loop handles it with no structural change.
+        var handler = new SocketsHttpHandler
+        {
+            SslOptions = credentials.BuildSslOptions(),
+            KeepAlivePingDelay = TimeSpan.FromSeconds(20),
+            KeepAlivePingTimeout = TimeSpan.FromSeconds(20),
+            KeepAlivePingPolicy = HttpKeepAlivePingPolicy.Always,
+            // A long-lived stream must not be torn down for being idle; the ping above is what proves
+            // liveness, not traffic.
+            PooledConnectionIdleTimeout = Timeout.InfiniteTimeSpan,
+            EnableMultipleHttp2Connections = true,
+        };
         return GrpcChannel.ForAddress(
             $"https://127.0.0.1:{port}",
             new GrpcChannelOptions { HttpHandler = handler, DisposeHttpClient = true });
