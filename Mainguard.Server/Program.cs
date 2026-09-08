@@ -25,16 +25,27 @@ if (options.Smoke)
 // Normal daemon run. Build via the shared host configuration so the in-proc test
 // tier (WebApplicationFactory<Program>) exercises the same pipeline. app.Run() is
 // reached so the test harness can intercept host startup.
-var app = DaemonHost.Build(options);
+// F55: the single-instance guard fires during Build (the Kestrel options callback takes the lock before
+// a listener is configured), so the refusal is caught around Build as well as around Run. It is the guard
+// working, not a crash — one line on stderr and a named exit code, no stack trace. Nothing has been
+// written: the credential files and the migration lock still belong to the daemon that is up.
+Microsoft.AspNetCore.Builder.WebApplication app;
+try
+{
+    app = DaemonHost.Build(options);
+}
+catch (Mainguard.Server.Runtime.DaemonAlreadyRunningException already)
+{
+    Console.Error.WriteLine(already.Message);
+    return DaemonExitCodes.AlreadyRunning;
+}
+
 try
 {
     app.Run();
 }
 catch (Mainguard.Server.Runtime.DaemonAlreadyRunningException already)
 {
-    // F55: a second daemon against the same data root. Not an error the operator needs a stack trace
-    // for — it is the guard working — so it exits with a named code and one line on stderr. Nothing has
-    // been written: the credential files and the migration lock belong to the daemon that is up.
     try
     {
         app.Services.GetService<ILoggerFactory>()?
@@ -47,7 +58,7 @@ catch (Mainguard.Server.Runtime.DaemonAlreadyRunningException already)
     }
 
     Console.Error.WriteLine(already.Message);
-    return 3;
+    return DaemonExitCodes.AlreadyRunning;
 }
 catch (IOException ex)
 {
@@ -70,6 +81,18 @@ catch (IOException ex)
 }
 
 return 0;
+
+/// <summary>
+/// The daemon's process exit codes. Named because launchd reads them: the LaunchAgent's
+/// <c>KeepAlive</c> is <c>{ SuccessfulExit: false }</c>, so a non-zero exit is what asks launchd to try
+/// again — and <see cref="AlreadyRunning"/> deliberately IS non-zero, because a second instance losing to
+/// a first is a condition that resolves itself when the first one stops.
+/// </summary>
+public static class DaemonExitCodes
+{
+    /// <summary>F55: another daemon holds this data root. Not a crash — the guard working.</summary>
+    public const int AlreadyRunning = 3;
+}
 
 // Exposed so WebApplicationFactory<Program> can host the daemon in-proc (TI-P2-00).
 public partial class Program { }

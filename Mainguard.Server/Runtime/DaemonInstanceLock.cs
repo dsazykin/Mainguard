@@ -95,8 +95,24 @@ public sealed class DaemonInstanceLock : IDisposable
                 Environment.ProcessId.ToString(CultureInfo.InvariantCulture) + "\n");
             stream.Write(stamp);
             stream.Flush(flushToDisk: true);
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+
+            // ...and the same pid in an UNLOCKED sibling, purely so the refusal message can name the
+            // holder. The lock file itself cannot be read while it is held: .NET takes a real `flock` for
+            // every FileStream on Unix, so any attempt to read it conflicts with the holder's exclusive
+            // lock — which is the correct behaviour for a lock and useless for a diagnostic.
+            //
+            // This is NOT a pidfile in the sense the daemon deliberately does not have one: nothing reads
+            // it to decide anything. A stale value here changes no behaviour at all; the kernel's answer
+            // to "is the lock held" is the decision, and this is a string in an error message.
+            File.WriteAllText(
+                HolderPathIn(System.IO.Path.GetDirectoryName(path)!),
+                Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // The stamp is diagnostics. Failing to write it must never fail an acquired lock.
         }
@@ -104,16 +120,20 @@ public sealed class DaemonInstanceLock : IDisposable
         return new DaemonInstanceLock(path, stream);
     }
 
+    /// <summary>The unlocked sibling that records the holder's pid for diagnosis only.</summary>
+    private static string HolderPathIn(string directory) =>
+        System.IO.Path.Combine(directory, FileName + ".holder");
+
     /// <summary>
-    /// Best-effort "who holds it" for the refusal message. Reads the pid the holder stamped and, when
-    /// that process still exists, names it. Never throws and never decides anything — a stale pid in a
-    /// file the OS says is locked simply means the stamp lost a race with a restart.
+    /// Best-effort "who holds it" for the refusal message. Reads the pid the holder recorded and, when
+    /// that process still exists, names it. Never throws and never decides anything — a stale pid beside
+    /// a file the OS says is locked simply means the record lost a race with a restart.
     /// </summary>
     private static string DescribeHolder(string path)
     {
         try
         {
-            var text = File.ReadAllText(path).Trim();
+            var text = File.ReadAllText(HolderPathIn(System.IO.Path.GetDirectoryName(path)!)).Trim();
             if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var pid))
             {
                 try
@@ -123,14 +143,13 @@ public sealed class DaemonInstanceLock : IDisposable
                 }
                 catch (ArgumentException)
                 {
-                    return $"pid {pid} (no longer running — the lock is held by a process that did not stamp it)";
+                    return $"a process that did not record its pid (the recorded pid {pid} is gone)";
                 }
             }
         }
         catch (Exception)
         {
-            // A locked file we cannot read is the normal Windows shape of this. Say nothing rather than
-            // guess.
+            // No record, or one we cannot read. Say nothing rather than guess.
         }
 
         return "another process";
