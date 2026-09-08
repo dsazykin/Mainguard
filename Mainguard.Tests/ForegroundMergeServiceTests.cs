@@ -60,8 +60,10 @@ public class ForegroundMergeServiceTests : IDisposable
     }
 
     /// <summary>Builds a repo on branch main with an agent/&lt;id&gt; branch one commit ahead of main.</summary>
+    /// <param name="lockfileName">Which lockfile the seeded repo carries when <paramref name="withLockfile"/>
+    /// is set — the file the post-merge refresh reads to decide WHICH package manager to run.</param>
     private (string RepoPath, string RepoHash, string MainSha, string SyncName, string SyncUrl) BuildRepo(
-        string agentId = "x", bool withLockfile = false)
+        string agentId = "x", bool withLockfile = false, string lockfileName = "package-lock.json")
     {
         var repo = NewDir("mainguard-fmerge-");
         Git(repo, "-c", "init.defaultBranch=main", "init");
@@ -74,7 +76,7 @@ public class ForegroundMergeServiceTests : IDisposable
         {
             File.WriteAllText(Path.Combine(repo, "package.json"),
                 "{\"name\":\"x\",\"scripts\":{\"postinstall\":\"node -e \\\"require('fs').writeFileSync('POISON','x')\\\"\"}}");
-            File.WriteAllText(Path.Combine(repo, "package-lock.json"), "{}\n");
+            File.WriteAllText(Path.Combine(repo, lockfileName), "{}\n");
         }
 
         Git(repo, "add", "-A");
@@ -137,6 +139,101 @@ public class ForegroundMergeServiceTests : IDisposable
         var entry = journal.GetHistory(repo.RepoPath).First(e => e.Kind == JournalKinds.Merge);
         journal.Undo(repo.RepoPath, entry.Id);
         Assert.Equal(repo.MainSha, Rev(repo.RepoPath, "main"));
+    }
+
+    // ---- F39: the merge must not damage the user's checkout --------------
+
+    /// <summary>
+    /// A repository stopped in the middle of a rebase is refused.
+    ///
+    /// <para><c>status --porcelain</c> is EMPTY during a rebase that stopped without conflicts — an
+    /// <c>edit</c>/<c>break</c> step, or a failed <c>--exec</c> — so the clean-tree precondition said yes
+    /// and everything after it proceeded: the checkout switched branches out from under the in-flight
+    /// sequence and the fast-forward landed on main. The user came back to a repository whose rebase
+    /// state described a branch it was no longer on.</para>
+    /// </summary>
+    [Fact]
+    public void ForegroundMerge_MidRebase_IsRefused_AndMainNeverMoves()
+    {
+        var repo = BuildRepo();
+
+        // A second commit on main, then an interactive rebase that STOPS at it without conflicting.
+        File.WriteAllText(Path.Combine(repo.RepoPath, "later.txt"), "later\n");
+        Git(repo.RepoPath, "add", "-A");
+        Git(repo.RepoPath, "commit", "-m", "later work");
+        var mainBeforeRebase = Rev(repo.RepoPath, "main");
+
+        // `--exec false` fails at the first step, which parks the rebase with a perfectly clean tree.
+        GitService.RunGit(
+            repo.RepoPath, "-c", "sequence.editor=true", "rebase", "--exec", "false", "HEAD~1");
+        var (statusCode, dirt, _) = GitService.RunGit(
+            repo.RepoPath, "status", "--porcelain", "--untracked-files=no");
+        Assert.Equal(0, statusCode);
+        Assert.Equal(string.Empty, dirt.Trim()); // the precondition that used to wave this through
+
+        var service = NewService(repo.SyncName, repo.SyncUrl, out _, out _);
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", mainBeforeRebase, "main"));
+
+        Assert.False(result.Merged);
+        Assert.Contains("in the middle of a rebase", result.Reason);
+        Assert.Equal(mainBeforeRebase, Rev(repo.RepoPath, "main"));
+
+        Git(repo.RepoPath, "rebase", "--abort");
+    }
+
+    /// <summary>
+    /// The post-merge dependency refresh runs the package manager the repository's own lockfile names.
+    ///
+    /// <para>The manager was detected and then discarded: the runner hardcoded <c>npm</c>. So a merge in a
+    /// pnpm or yarn repo ran <c>npm install</c> in the user's checkout — writing a
+    /// <c>package-lock.json</c> the project does not use and a differently-resolved <c>node_modules</c> —
+    /// immediately after a precondition that had refused to proceed on an unclean tree.</para>
+    /// </summary>
+    [Fact]
+    public void PostMergeRefresh_UsesTheManagerTheLockfileNames_NotNpm()
+    {
+        // A pnpm repository: pnpm-lock.yaml and no package-lock.json.
+        var repo = BuildRepo(withLockfile: true, lockfileName: "pnpm-lock.yaml");
+        var mainSha = repo.MainSha;
+
+        var invocations = new List<(string Manager, string Args)>();
+        Func<string, string, IReadOnlyList<string>, int> recorder = (_, manager, args) =>
+        {
+            invocations.Add((manager, string.Join(' ', args)));
+            return 0;
+        };
+
+        var service = NewService(repo.SyncName, repo.SyncUrl, out _, out _, installRunner: recorder);
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", mainSha, "main"));
+
+        Assert.True(result.Merged);
+        var run = Assert.Single(invocations);
+        Assert.Equal("pnpm", run.Manager);
+        Assert.Contains("--ignore-scripts", run.Args, StringComparison.Ordinal);
+        Assert.False(File.Exists(Path.Combine(repo.RepoPath, "package-lock.json")));
+    }
+
+    /// <summary>
+    /// The checkout is borrowed, not taken: a merge started from a feature branch leaves the user where
+    /// they were. It used to park them on main, so their next edit and commit landed on the wrong branch
+    /// with nothing having said so.
+    /// </summary>
+    [Fact]
+    public void ForegroundMerge_StartedFromAnotherBranch_RestoresTheUsersCheckout()
+    {
+        var repo = BuildRepo();
+        Git(repo.RepoPath, "checkout", "-b", "my-work");
+
+        var service = NewService(repo.SyncName, repo.SyncUrl, out _, out _);
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+
+        Assert.True(result.Merged);
+        var (_, head, _) = GitService.RunGit(repo.RepoPath, "rev-parse", "--abbrev-ref", "HEAD");
+        Assert.Equal("my-work", head.Trim());
+        Assert.NotEqual(repo.MainSha, Rev(repo.RepoPath, "main")); // ...and the merge still landed
     }
 
     // ---- A5 ref-level CAS: main moved → no merge ------------------------
