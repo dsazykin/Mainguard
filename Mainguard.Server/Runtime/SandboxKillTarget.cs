@@ -84,6 +84,20 @@ public sealed class SandboxKillTarget : IKillTarget
         TerminalLockRegistry locks,
         IPauseArbiter arbiter,
         ILoggerFactory loggerFactory)
+        : this(store, sandboxes, leader, locks, arbiter, loggerFactory, null)
+    {
+    }
+
+    /// <param name="persist">The restart store the causation ledger is written through to, or null for
+    /// the process-wide one. The test seam.</param>
+    internal SandboxKillTarget(
+        AgentSessionStore store,
+        ISandboxEngine sandboxes,
+        SessionLeader leader,
+        TerminalLockRegistry locks,
+        IPauseArbiter arbiter,
+        ILoggerFactory loggerFactory,
+        IAgentRestartLedger? persist)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _sandboxes = sandboxes ?? throw new ArgumentNullException(nameof(sandboxes));
@@ -92,7 +106,37 @@ public sealed class SandboxKillTarget : IKillTarget
         _arbiter = arbiter ?? throw new ArgumentNullException(nameof(arbiter));
         _log = (loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory)))
             .CreateLogger(DaemonLogCategories.KillSwitch);
+        _persist = persist ?? AgentRestartLedger.Process;
+
+        // Rehydrate the causation ledger. Without it a daemon restart after an emergency stop left every
+        // jail `docker pause`d with nothing in the app entitled to wake them: Resume released "exactly the
+        // containment this target applied", and this dictionary — the record of what that was — was gone
+        // (audit F3). The containers are the load-bearing half; the two flags are recorded too so a worker
+        // locked at spawn still keeps its lock across the restart.
+        foreach (var record in _persist.LoadAll())
+        {
+            if (record.KillContained)
+            {
+                _contained[record.AgentId] = new KillContainment(
+                    record.KillPausedContainers.ToList(),
+                    record.KillTookTerminalLock,
+                    record.KillClosedInputGate);
+            }
+        }
     }
+
+    private readonly IAgentRestartLedger _persist;
+
+    /// <summary>Writes one agent's causation line through to the restart ledger (null = released).</summary>
+    private void Persist(string agentId, KillContainment? contained) =>
+        _persist.Update(agentId, record => record with
+        {
+            KillContained = contained is not null,
+            KillPausedContainers = contained?.PausedContainers.ToList()
+                                   ?? (IReadOnlyList<string>)Array.Empty<string>(),
+            KillTookTerminalLock = contained?.TookTerminalLock ?? false,
+            KillClosedInputGate = contained?.ClosedInputGate ?? false,
+        });
 
     /// <summary>One agent's line in the causation ledger: which jails this kill switch actually froze, and
     /// whether it was the party that took the terminal lock / closed the leader's input gate.</summary>
@@ -139,13 +183,13 @@ public sealed class SandboxKillTarget : IKillTarget
         // froze and its `tookLock` reads false, so overwriting here would erase the record of what the
         // first one owned and Resume would then release nothing at all — the original bug, restored by
         // a double click.
-        void Record() => _contained.AddOrUpdate(
+        void Record() => Persist(agentId, _contained.AddOrUpdate(
             agentId,
             _ => new KillContainment(pausedByThisKill, tookLock, closedGate),
             (_, existing) => new KillContainment(
                 existing.PausedContainers.Union(pausedByThisKill, StringComparer.Ordinal).ToList(),
                 existing.TookTerminalLock || tookLock,
-                existing.ClosedInputGate || closedGate));
+                existing.ClosedInputGate || closedGate)));
 
         // EVERY session behind this id, across repos. An agent id is unique only within a repository (the
         // external-PR intake names its sessions `pr-<n>` after the pull request number), so resolving one
@@ -173,7 +217,12 @@ public sealed class SandboxKillTarget : IKillTarget
                 // The input sever is the whole of the available containment; reporting PauseFailed here
                 // would cry wolf on every degraded spawn and bury the failures that DO mean an agent is
                 // still running.
-                _store.MarkState(session.Key, "Paused", "Kill switch engaged — no jail bound; terminal input severed.");
+                _store.MarkState(session.Key, "Paused", NoJailReason);
+                // Audit F22: the word without the axis. Every frozen-jail guard reads the axis first
+                // (AgentSessionStore._frozen exists BECAUSE the merge queue rewrites the word on every
+                // transition), so a record marked Paused here read as thawed the moment anything else
+                // touched its state — while the kill switch believed it had contained it.
+                _store.MarkFrozen(session.Key, NoJailReason);
                 _log.LogWarning("kill: agent={Agent} repo={Repo} has no container — terminal input severed only",
                     agentId, session.RepoHash);
                 continue;
@@ -197,10 +246,33 @@ public sealed class SandboxKillTarget : IKillTarget
                 // This call is what transitioned the jail, so this kill switch owns the pause and Resume
                 // may reverse it.
                 pausedByThisKill.Add(containerId);
-                _store.MarkState(session.Key, "Paused",
-                    "Kill switch engaged — jail paused, terminal input severed. Resume to recover.");
+                _store.MarkState(session.Key, "Paused", PausedByKillReason);
+                // Audit F16: the kill switch wrote the WORD and never the axis, so the one paired writer
+                // of the pause axis on this path was its own release below — which cleared a mark it had
+                // never set, while the mark the reconciler's drift pass HAD set stayed put. Written here,
+                // cleared in MarkResumed: one owner, both directions.
+                _store.MarkFrozen(session.Key, PausedByKillReason);
                 _log.LogWarning("kill: agent={Agent} repo={Repo} container={Container} paused; terminal input severed",
                     agentId, session.RepoHash, containerId);
+                continue;
+            }
+
+            if (ct.IsCancellationRequested)
+            {
+                // Audit F22. The confirmation probe below runs on the SAME token the pause ran on, and
+                // that token carries the RT-D4 fan-out deadline. Once it has lapsed the probe cannot make
+                // a round trip at all, and its catch-all answered `false` — which is the same answer as
+                // "Docker says the jail is running", so the report claimed a pause had FAILED for a jail
+                // the engine may have frozen a millisecond later. Cancellation is not evidence; the honest
+                // word is that containment is unconfirmed, and it must not be spelled the same way as a
+                // measured failure.
+                _store.MarkState(session.Key, "Unresponsive", DeadlineLapsedReason);
+                _store.MarkFrozen(session.Key, DeadlineLapsedReason);
+                _log.LogError(pauseError,
+                    "kill: agent={Agent} repo={Repo} container={Container} — the fan-out deadline lapsed "
+                    + "before the jail's state could be read; containment UNCONFIRMED",
+                    agentId, session.RepoHash, containerId);
+                failure ??= System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(pauseError);
                 continue;
             }
 
@@ -253,6 +325,11 @@ public sealed class SandboxKillTarget : IKillTarget
             _log.LogInformation("resume: agent={Agent} was not contained by the kill switch — nothing to release", agentId);
             return;
         }
+
+        // Off the durable ledger as soon as it is off the in-memory one. A release that succeeded and then
+        // lost the daemon would otherwise rehydrate the entry and re-release an already-running jail on
+        // the next Resume — harmless, but it would report containment that no longer exists.
+        Persist(agentId, null);
 
         // A human pause is sticky through a kill-switch cycle. It outranks the ledger because the two can
         // race: if a human pause landed while the kill's own pause call was in flight, the kill switch may
@@ -342,17 +419,38 @@ public sealed class SandboxKillTarget : IKillTarget
         if (failure is not null)
         {
             // Put the entry back so pressing Resume again retries this agent rather than reporting
-            // "nothing to release" for a jail that is demonstrably still frozen.
-            _contained[agentId] = contained with { TookTerminalLock = false, ClosedInputGate = false };
+            // "nothing to release" for a jail that is demonstrably still frozen — durably, so the retry
+            // survives the restart an operator may well reach for next.
+            var retained = contained with { TookTerminalLock = false, ClosedInputGate = false };
+            _contained[agentId] = retained;
+            Persist(agentId, retained);
             failure.Throw();
         }
     }
+
+    /// <summary>The axis reason for a session-only record the kill switch could only sever input for.</summary>
+    internal const string NoJailReason =
+        "Kill switch engaged — no jail bound; terminal input severed.";
+
+    /// <summary>The axis reason for a jail whose containment could not be CONFIRMED because the RT-D4
+    /// fan-out deadline lapsed first. Deliberately distinct from the measured-failure wording.</summary>
+    internal const string DeadlineLapsedReason =
+        "Kill switch engaged — the emergency stop's deadline lapsed before this jail's state could be "
+        + "read, so containment is UNCONFIRMED; it may be paused or it may still be running.";
+
+    /// <summary>The axis reason for a jail this kill switch froze.</summary>
+    internal const string PausedByKillReason =
+        "Kill switch engaged — jail paused, terminal input severed. Resume to recover.";
 
     private void MarkResumed(AgentSession? session)
     {
         if (session is not null)
         {
             _store.MarkState(session.Key, "Working", "Resumed — the kill switch released this jail.");
+            // The other half of the pair. A released jail that keeps a freeze mark refuses prompts and
+            // verification forever, and defers the readiness trigger forever with it — the axis has no
+            // timer and no second writer, so nothing else would ever clear it (audit F16).
+            _store.MarkFrozen(session.Key, null);
         }
     }
 

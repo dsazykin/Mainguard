@@ -18,8 +18,20 @@ public sealed record LeaderReconcileReport(
 ///
 /// <para><b>Input pause is the leader's job:</b> <see cref="PauseInput"/>/<see cref="ResumeInput"/> gate
 /// keystrokes toward the CLI. They are what the real <c>IAgentSupervisor</c> drives for the P2-08 429 /
-/// budget pause and the P2-09 yield window; the terminal input path consults <see cref="IsPaused"/>
-/// before forwarding bytes.</para>
+/// budget pause and the P2-09 yield window, and <c>BoundTerminalSession.WriteInputAsync</c> consults
+/// <see cref="IsPaused"/> before forwarding bytes — dropping them, not buffering them, while the gate is
+/// closed.</para>
+///
+/// <para><b>That consultation is new (audit F7), and the finding is worth keeping.</b> These three methods
+/// shipped with no enforcing reader at all: the only non-test caller of <see cref="IsPaused"/> was
+/// <c>SandboxKillTarget</c> computing whether IT had been the party to close the gate, for its own release
+/// ledger. So the flag was written by the gateway's back-off, written by the kill switch, read for
+/// bookkeeping, and never once checked before a keystroke reached a CLI — a pause that paused nothing,
+/// which is the MG-12 shape (two copies of a rule, one decorative) with the enforcing copy missing
+/// entirely. The alternative was to delete them and let <c>TerminalLockRegistry</c> be the only gate; that
+/// was rejected because the lock is a ROLE property (a managed worker is locked for its whole life) and
+/// these are a temporary state, and collapsing the two would mean a 429 back-off could never be lifted
+/// without also unlocking a worker's terminal for good.</para>
 ///
 /// <para><b>Boot reconcile</b> (<see cref="Reattach"/>) runs after the container reconciler and resolves
 /// every mismatch toward Docker truth: a registry session whose container is not live is reaped.</para>

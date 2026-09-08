@@ -525,9 +525,13 @@ public static class GatewayServiceRegistration
             // decide which copy wins.
             queues: sp.GetRequiredService<IMergeQueueRegistry>(),
             // An adopted jail still has its IPC directory mounted (the server no longer deletes it on
-            // shutdown); this re-binds the listener at that same path so the adopted agent's shim works.
+            // shutdown); this re-binds the listener at that same path so the adopted agent's shim works —
+            // AND starts a fresh CLI in the surviving jail under a new daemon-side PTY, which is the half
+            // that did not exist (audit F6): the old CLI was a `docker exec` child of the dead daemon's
+            // PTY, so an adopted agent had a re-bound endpoint and no process behind it.
             // Resolved lazily, at call time, because AgentSpawnService sits above this in the graph.
-            onAdopted: session => sp.GetRequiredService<Runtime.AgentSpawnService>().TryReattachEndpoint(session)));
+            onAdopted: session =>
+                sp.GetRequiredService<Runtime.AgentSpawnService>().TryReattachAdoptedAgent(session)));
         services.AddHostedService<Runtime.AgentSessionReconcilerService>();
     }
 

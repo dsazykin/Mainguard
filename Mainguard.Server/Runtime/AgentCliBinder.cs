@@ -189,7 +189,13 @@ public sealed class AgentCliBinder
         var locks = _locks;
         var agentId = spec.AgentId;
         Func<bool>? isInputLocked = locks is null ? null : () => locks.IsLocked(agentId);
-        var bound = new BoundTerminalSession(spec.AgentId, session, _engine, DefaultCols, DefaultRows, isInputLocked);
+        // Audit F7: the leader's input gate, made real. It is registered below (Register comes after the
+        // bind), so the predicate has to be evaluated live rather than read once — which is also what a
+        // gate opened and closed repeatedly over a session's life requires.
+        var leader = _leader;
+        Func<bool> isInputPaused = () => leader.IsPaused(agentId);
+        var bound = new BoundTerminalSession(
+            spec.AgentId, session, _engine, DefaultCols, DefaultRows, isInputLocked, isInputPaused);
         // (repo, agent id), never the id alone: an intake-named `pr-<n>` is unique only inside a repo, and
         // Bind DISPOSES whatever it replaces — id-only keying let this bind kill another repository's
         // still-running worker CLI.
@@ -232,6 +238,11 @@ public sealed class AgentCliBinder
     /// out because the leader has no repo in its key, so the caller must only reach it once NO session
     /// anywhere on the daemon still answers to the id.</summary>
     public void ReleaseLeader(string agentId) => _leader.Kill(agentId);
+
+    /// <summary>Whether a live CLI is currently bound for this session. The adoption path's guard: a
+    /// re-bind must never start a second <c>docker exec</c> into a jail that already has one, which would
+    /// leave two CLIs racing for one workspace and one branch.</summary>
+    public bool IsBound(AgentSessionKey key) => _terminals.TryGetBound(key) is not null;
 
     /// <summary>Marks that a CLI bind is expected for this session (spawn in-flight) so an
     /// early attach waits for it instead of falling into echo — the attach-before-bind race. Cleared by a
@@ -332,6 +343,120 @@ public sealed class AgentCliBinder
     /// the cause ("the input device is not a TTY", "Not logged in …", a stack-trace head).</summary>
     internal const int ExitTailChars = 400;
 
+    /// <summary>
+    /// Makes a jail's dying terminal output safe to put in an audit event and a session state string.
+    ///
+    /// <para><b>Why it needs doing at all.</b> The tail is raw PTY bytes from inside the jail — i.e. text
+    /// the untrusted occupant chooses. It went verbatim into the <c>cli_exited</c> audit event and into the
+    /// state word's reason, which are read by a log file, a JSON audit reader and a terminal-rendered
+    /// client. Raw output carries ANSI CSI/OSC sequences (an OSC 8 hyperlink, or an OSC 52 clipboard write
+    /// the daemon strips everywhere else), C0 control bytes, and newlines that break a line-oriented sink
+    /// into records it did not write. None of that is diagnosis; the diagnosis is the words.</para>
+    ///
+    /// <para>So: escape sequences dropped, every control character and line break folded to a space, runs
+    /// of whitespace collapsed, and the result capped. Ordinary text — which is the whole point of keeping
+    /// a tail — survives unchanged.</para>
+    /// </summary>
+    internal static string SanitizeExitTail(string? tail)
+    {
+        if (string.IsNullOrEmpty(tail))
+        {
+            return string.Empty;
+        }
+
+        var sb = new System.Text.StringBuilder(Math.Min(tail.Length, ExitTailChars));
+        var lastWasSpace = true; // leading whitespace is dropped
+        for (var i = 0; i < tail.Length && sb.Length < ExitTailChars; i++)
+        {
+            var c = tail[i];
+
+            if (c == '')
+            {
+                i = SkipEscape(tail, i);
+                continue;
+            }
+
+            // C0/C1 controls, DEL, and every line/paragraph separator become one space. Unicode
+            // "format" characters (bidi overrides, zero-width joiners) go too: they reorder or hide
+            // what a human reads without changing what a matcher sees.
+            if (char.IsControl(c) || char.IsSeparator(c) || char.GetUnicodeCategory(c)
+                    is System.Globalization.UnicodeCategory.Format
+                    or System.Globalization.UnicodeCategory.LineSeparator
+                    or System.Globalization.UnicodeCategory.ParagraphSeparator
+                || char.IsWhiteSpace(c))
+            {
+                if (!lastWasSpace)
+                {
+                    sb.Append(' ');
+                    lastWasSpace = true;
+                }
+
+                continue;
+            }
+
+            sb.Append(c);
+            lastWasSpace = false;
+        }
+
+        // A trailing separator says nothing and makes two tails that differ only in whitespace look
+        // like two different diagnoses.
+        while (sb.Length > 0 && sb[^1] == ' ')
+        {
+            sb.Length--;
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>Index of the LAST character of the escape sequence starting at <paramref name="start"/>
+    /// (an ESC). Handles CSI (<c>ESC [ … final</c>), OSC (<c>ESC ] … BEL</c> or <c>ESC \</c>) and the
+    /// two-character forms; an unterminated sequence swallows the rest of the tail, which is the safe
+    /// direction — an unterminated CSI is not text either.</summary>
+    private static int SkipEscape(string s, int start)
+    {
+        var i = start + 1;
+        if (i >= s.Length)
+        {
+            return s.Length;
+        }
+
+        var kind = s[i];
+        if (kind == '[')
+        {
+            // CSI: parameter/intermediate bytes then one final byte in @..~
+            for (i++; i < s.Length; i++)
+            {
+                if (s[i] >= '@' && s[i] <= '~')
+                {
+                    return i;
+                }
+            }
+
+            return s.Length;
+        }
+
+        if (kind is ']' or 'P' or 'X' or '^' or '_')
+        {
+            // OSC / DCS / SOS / PM / APC: run to BEL or the ST (ESC \).
+            for (i++; i < s.Length; i++)
+            {
+                if (s[i] == '\a')
+                {
+                    return i;
+                }
+
+                if (s[i] == '' && i + 1 < s.Length && s[i + 1] == '\\')
+                {
+                    return i + 1;
+                }
+            }
+
+            return s.Length;
+        }
+
+        return i; // a two-character escape (ESC c, ESC =, …)
+    }
+
     private async Task WatchExitAsync(AgentSessionKey key, BoundTerminalSession bound)
     {
         var agentId = key.AgentId;
@@ -354,7 +479,12 @@ public sealed class AgentCliBinder
             // told the field NOTHING when the coordinator died at launch. They go to the audit
             // log durably; the bound session stays registered, so attaching to the dead agent's
             // terminal still replays the same output in full.
-            var tail = bound.TailText(ExitTailChars);
+            // Sanitized, not raw: this string is jail-authored and its two destinations are an audit
+            // event and a state reason that reaches a terminal-rendered client. Read a generous slice so
+            // the cap is applied AFTER the escape sequences are removed — otherwise a CLI that ends its
+            // life repainting the screen spends the whole budget on control bytes and the diagnosis is
+            // trimmed off.
+            var tail = SanitizeExitTail(bound.TailText(ExitTailChars * 4));
             _log.LogInformation("cli exited agent={Agent} exitCode={ExitCode}", agentId, exitCode);
             _audit.Append(new AuditEvent("cli_exited", new Dictionary<string, string>
             {
