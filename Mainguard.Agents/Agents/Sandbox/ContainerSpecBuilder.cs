@@ -572,19 +572,116 @@ public static class ContainerSpecBuilder
         return tmpfs;
     }
 
-    /// <summary>True when <paramref name="path"/> equals a root or sits inside one (textual, in the
-    /// daemon's own namespace — mount sources are daemon-produced paths, never user input).</summary>
+    /// <summary>
+    /// True when <paramref name="path"/> equals a root or sits inside one — compared on the REAL paths,
+    /// not the spelled ones.
+    ///
+    /// <para><b>Audit F33.</b> This used to be pure textual prefix matching, and the docker daemon does
+    /// not bind what a path spells — it binds what the path RESOLVES to. So a symlink anywhere under a
+    /// daemon-owned root pointed anywhere else passed a containment check the bind then ignored, and
+    /// this is exactly the shape ESC-I1 exists to make structural. The specific reachable case on the
+    /// shipping substrate is macOS's own <c>/var → /private/var</c> (and <c>/tmp</c>), which every
+    /// fixture that crosses the boundary already has to canonicalize by hand.</para>
+    ///
+    /// <para>Both sides are resolved, because a root spelled through a symlink is just as wrong as a
+    /// source spelled through one: resolving only the source would start REFUSING every legitimate mount
+    /// on a machine whose data root happens to sit under <c>/var</c>. Resolution is best-effort on a path
+    /// that does not exist yet — a not-yet-created cache directory is a legitimate source, so an
+    /// unresolvable path falls back to its normalized form and is compared as before rather than being
+    /// refused for not existing.</para>
+    /// </summary>
     private static bool IsUnderAnyRoot(string path, IReadOnlyList<string> roots)
     {
-        var full = Path.GetFullPath(path);
+        var full = RealPath(path);
         foreach (var root in roots)
         {
-            var fullRoot = Path.GetFullPath(root);
+            var fullRoot = RealPath(root);
             if (string.Equals(full, fullRoot, Mainguard.Git.Services.FileSystemPaths.Comparison)) return true;
             var prefix = fullRoot.EndsWith(Path.DirectorySeparatorChar) ? fullRoot : fullRoot + Path.DirectorySeparatorChar;
             if (full.StartsWith(prefix, Mainguard.Git.Services.FileSystemPaths.Comparison)) return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// <paramref name="path"/> with every symlink on it resolved, normalized. Falls back to
+    /// <see cref="Path.GetFullPath(string)"/> for a path that does not exist or cannot be resolved —
+    /// see <see cref="IsUnderAnyRoot"/> for why that fallback is the safe direction here.
+    ///
+    /// <para>Resolved COMPONENT BY COMPONENT, from the root down, which is the part that matters: the
+    /// escape shape is an intermediate link (<c>/var</c> → <c>/private/var</c>), and asking only whether
+    /// the leaf is a link would miss every one of them. A component that does not exist yet is simply
+    /// appended — a not-yet-created cache directory under a resolved parent is still contained by that
+    /// parent. <c>ResolveLinkTarget(returnFinalTarget: true)</c> is the framework's own "follow the whole
+    /// chain", and answers null for a path that is not a link, which is the ordinary case.</para>
+    /// </summary>
+    internal static string RealPath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        try
+        {
+            var current = full;
+            // Each pass substitutes the FIRST link it meets and starts again, because a link's target
+            // may itself be spelled through links (macOS: /tmp → /private/tmp, and /var → /private/var
+            // under it). Bounded so a link cycle terminates instead of spinning; a path that has not
+            // settled in this many substitutions is one we decline to have an opinion about.
+            for (var hops = 0; hops < 64; hops++)
+            {
+                var next = SubstituteFirstLink(current);
+                if (next is null)
+                {
+                    return Path.GetFullPath(current);
+                }
+
+                current = next;
+            }
+
+            return full;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return full;
+        }
+    }
+
+    /// <summary>The path with its first symlinked component replaced by that link's target (and the rest
+    /// of the path re-appended), or null when it contains no link left to substitute.</summary>
+    private static string? SubstituteFirstLink(string full)
+    {
+        var root = Path.GetPathRoot(full);
+        if (string.IsNullOrEmpty(root))
+        {
+            return null;
+        }
+
+        var segments = full[root.Length..]
+            .Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                StringSplitOptions.RemoveEmptyEntries);
+
+        var walked = root;
+        for (var i = 0; i < segments.Length; i++)
+        {
+            walked = Path.Combine(walked, segments[i]);
+
+            // A component that does not exist cannot be a link, and a not-yet-created leaf under a
+            // resolved parent is a legitimate mount source — so absence is simply walked past.
+            var target = Directory.Exists(walked)
+                ? new DirectoryInfo(walked).ResolveLinkTarget(returnFinalTarget: false)?.FullName
+                : File.Exists(walked)
+                    ? new FileInfo(walked).ResolveLinkTarget(returnFinalTarget: false)?.FullName
+                    : null;
+            if (string.IsNullOrEmpty(target))
+            {
+                continue;
+            }
+
+            var tail = segments.Skip(i + 1).ToArray();
+            return tail.Length == 0
+                ? target
+                : Path.GetFullPath(Path.Combine(new[] { target }.Concat(tail).ToArray()));
+        }
+
+        return null;
     }
 
     /// <summary>Builds the hardened create request; throws typed on any invariant violation.</summary>
@@ -877,15 +974,23 @@ public static class ContainerSpecBuilder
     private static List<string> BuildProxyEnv(string proxyUrl)
     {
         // Only proxy routing — NEVER a secret (G-13). Both upper- and lower-case forms so every
-        // toolchain honours the proxy; NO_PROXY carries loopback + the internal git proxy host.
+        // toolchain honours the proxy; NO_PROXY carries loopback and nothing else.
+        //
+        // AUDIT F33: `git.mainguard.internal` used to be in this list. Nothing anywhere resolves that
+        // name — no DNS record on any segment, no `url.insteadOf` rewriting to it, and the A6
+        // DaemonGitProxy it was reserved for has only test callers — so the entry described a route that
+        // does not exist. That is worse than useless in a default-deny design: it is a standing
+        // pre-authorisation to BYPASS the proxy for a hostname, sitting in every jail's environment,
+        // waiting for the day something makes the name resolve. Re-add it in the same commit that gives
+        // the name an address, not before.
         return new List<string>
         {
             $"HTTP_PROXY={proxyUrl}",
             $"HTTPS_PROXY={proxyUrl}",
             $"http_proxy={proxyUrl}",
             $"https_proxy={proxyUrl}",
-            "NO_PROXY=localhost,127.0.0.1,::1,git.mainguard.internal",
-            "no_proxy=localhost,127.0.0.1,::1,git.mainguard.internal",
+            "NO_PROXY=localhost,127.0.0.1,::1",
+            "no_proxy=localhost,127.0.0.1,::1",
             // CLIs must not self-update: versions are pinned by the adapter channel (sha256-verified
             // installs into a mount the jail sees READ-ONLY), so an in-CLI updater can only fail —
             // claude-code's footer showed a permanent "Auto-update failed" until this was set.
@@ -1239,19 +1344,54 @@ public static class ContainerSpecBuilder
             throw new SandboxSpecException("kernel.yama.ptrace_scope is VM-wide (P2-05); it must not be set on the container create request.");
     }
 
+    /// <summary>
+    /// G-13 — the create request's environment carries proxy routing and toolchain PATH only; a
+    /// credential reaches a jail through the 0400 tmpfs and nowhere else.
+    ///
+    /// <para><b>Audit F33: this was name-shaped only.</b> An anonymously-named variable holding a real
+    /// token — <c>ANTHROPIC_AUTH=sk-ant-…</c>, <c>GH=ghp_…</c> — passed a check built entirely out of
+    /// KEY/TOKEN/SECRET substrings, which is precisely the shape a mistake takes: nobody writes
+    /// <c>MY_SECRET_TOKEN=</c> by accident. So the VALUE is now checked too, against the same rule
+    /// catalog the pre-commit scanner uses (<see cref="Mainguard.Git.Safety.SecretPatterns"/>) — the
+    /// single place in this codebase where "does this text look like a credential" is written down, and
+    /// one whose public surface is a bool by construction, so a refusal here can never echo the value it
+    /// refused.</para>
+    ///
+    /// <para>The name rule is kept alongside it, not replaced: a variable NAMED like a secret is worth
+    /// refusing even when its value is a placeholder, because the next edit fills it in.</para>
+    /// </summary>
+    /// <summary>The G-13 guard, reachable by the suite so a planted credential can be driven through it
+    /// on a request the builder has already accepted — <see cref="Build"/> runs it on the way out, so
+    /// there is otherwise no way to add an env entry and then ask.</summary>
+    internal static void AssertNoSecretsInEnvForTests(CreateContainerParameters create) =>
+        AssertNoSecretsInEnv(create);
+
     private static void AssertNoSecretsInEnv(CreateContainerParameters create)
     {
-        // G-13: the environment carries proxy routing ONLY. Any KEY/TOKEN/SECRET/PASSWORD-shaped var
-        // is a leak — the credential path is the 0400 tmpfs, never Env.
         foreach (var entry in create.Env ?? new List<string>())
         {
-            var name = entry.Split('=', 2)[0];
+            var split = entry.Split('=', 2);
+            var name = split[0];
+            var value = split.Length > 1 ? split[1] : string.Empty;
             var upper = name.ToUpperInvariant();
-            var isProxy = upper is "HTTP_PROXY" or "HTTPS_PROXY" or "NO_PROXY";
-            if (isProxy) continue;
+
+            // The proxy variables carry a URL that is allowed to look like anything; nothing else is
+            // exempt from either half of the check.
+            if (upper is "HTTP_PROXY" or "HTTPS_PROXY" or "NO_PROXY") continue;
+
             if (upper.Contains("KEY") || upper.Contains("TOKEN") || upper.Contains("SECRET")
                 || upper.Contains("PASSWORD") || upper.Contains("CREDENTIAL"))
                 throw new SandboxSpecException($"G-13: environment variable '{name}' looks like a secret; secrets go on the 0400 tmpfs, never Env.");
+
+            foreach (var rule in Mainguard.Git.Safety.SecretPatterns.All)
+            {
+                // The rule NAME and the variable NAME; never the value. The catalog's own invariant is
+                // that a match cannot hand back what it matched, and this message keeps that true.
+                if (rule.IsMatch(value))
+                    throw new SandboxSpecException(
+                        $"G-13: environment variable '{name}' carries a value matching the "
+                        + $"'{rule.DisplayName}' rule; secrets go on the 0400 tmpfs, never Env.");
+            }
         }
     }
 }

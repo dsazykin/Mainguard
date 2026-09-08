@@ -581,7 +581,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 // A small tolerance, because the container's clock is the engine's and the directory's is
                 // the host's; the resume shape is separated by seconds to minutes, a fresh spawn by the
                 // other sign.
-                if (born > created.AddSeconds(2))
+                if (BirthTimeIsUsable(born) && born > created.AddSeconds(2))
                 {
                     return false;
                 }
@@ -602,6 +602,33 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// <b>Audit F33 — whether the host really told us when this directory was born.</b>
+    ///
+    /// <para>A birth time is not a portable fact. <c>statx</c> answers it on ext4, APFS and btrfs; on a
+    /// filesystem or kernel without it .NET has no birth time to report and hands back a sentinel near
+    /// the epoch instead. Compared naively, that sentinel is always OLDER than the container, so the
+    /// heuristic silently answers "not recreated" for every directory on such a substrate — the check
+    /// looks applied and measures nothing, which is exactly the defect class this file keeps closing. A
+    /// future timestamp is the other unusable shape (a clock skew between host and engine), and it fails
+    /// in the expensive direction: it would recreate a perfectly good jail.</para>
+    ///
+    /// <para>So an unusable birth time is treated as "cannot tell" and the decision falls through to the
+    /// jail's own <c>cd /workspace</c> probe, which needs no timestamps at all. <b>Not closed by this:</b>
+    /// on a birth-time-less filesystem the resume shape — a bind pinned to a deleted inode that still
+    /// resolves inside the container — remains invisible to both checks. Closing it properly wants an
+    /// identity written INTO the worktree at creation and read back from inside the jail, which belongs
+    /// beside worktree creation rather than here.</para>
+    /// </summary>
+    internal static bool BirthTimeIsUsable(DateTime born)
+    {
+        var utc = born.Kind == DateTimeKind.Utc ? born : born.ToUniversalTime();
+        // 1980 is comfortably after every "no birth time" sentinel (the Unix epoch, and Windows'
+        // 1601 file-time zero) and comfortably before any real directory on a machine running this.
+        return utc > new DateTime(1980, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+            && utc < DateTime.UtcNow.AddDays(1);
     }
 
     /// <summary>

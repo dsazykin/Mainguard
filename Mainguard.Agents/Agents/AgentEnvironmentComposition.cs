@@ -34,8 +34,22 @@ internal static class AgentEnvironmentComposition
         string? gatewayEndpoint,
         Func<string, string> syncRemoteUrlResolver,
         // ESC-I1: pass the substrate's daemon-owned roots to enforce them on every bind-mount
-        // source at spec construction; null keeps the builder's per-source rejections alone
-        // (WSL2 today — its adapter/toolchain roots are per-user VM paths not yet formalized).
+        // source at spec construction; null keeps the builder's per-source rejections alone.
+        //
+        // AUDIT F33 — this is still null on WSL2, i.e. the allow-list is a macOS-only control, and that
+        // is a deliberate refusal rather than an oversight. The roots WSL2 would need are now derivable
+        // and there are four of them: `root`, MainguardPaths.DataRoot() (the IPC socket dir),
+        // AdapterPaths.DaemonSideRoot() and ToolchainPaths.DaemonSideRoot(). Inside the VM the last two
+        // resolve UNDER `root` for the default vmRoot — /home/mainguard/mainguard/{adapters,toolchains}
+        // — so the list would very likely be a no-op, and "very likely" is the problem: switching it on
+        // converts a documented no-op into a HARD spawn refusal for any bind source that falls outside,
+        // and the failure mode is "no agent can start", on the one substrate this branch cannot
+        // exercise. What it needs is a live WSL2 spawn confirming every bind source resolves inside
+        // those four, and then this argument, not a guess made from the type signature.
+        //
+        // The other half of the finding — that the containment test itself was textual — IS fixed:
+        // ContainerSpecBuilder.IsUnderAnyRoot now compares resolved real paths, so a symlink out of a
+        // daemon-owned root no longer passes a check the bind then ignores.
         Func<string, IReadOnlyList<string>>? allowedMountRoots = null)
     {
         // The root, resolved HERE rather than left to each collaborator's own default, because the
