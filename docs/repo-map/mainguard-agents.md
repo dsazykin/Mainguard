@@ -1027,7 +1027,25 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       on (MG-7's resolver pin, MG-18's posture check) — a gate that compared against the literal
       `mainguard-agents` would have silently switched itself off the moment a second network appeared.
       `ProxyAddressesOf` collects the proxy's address on EVERY segment so the MG-18 backstop admits each
-      (a single-address render would DROP agents 2..N). **MG-27:** the proxy's image ref is resolved to
+      (a single-address render would DROP agents 2..N).
+    - `SandboxSegmentReaper.cs` (**audit F27 — the segments teardown never got to.** The segment is
+      created BEFORE `SpawnAsync`, and a failed spawn's rollback removes the container and the worktree
+      but not the segment; only a clean teardown calls `RemoveAgentSegmentAsync`. A few dozen failed
+      spawns exhaust Docker's default address pool, after which EVERY spawn fails at network creation on
+      a machine with no running agents. `SandboxSegmentReapPolicy` is the pure decision — `JailNameFor`
+      inverts `AgentSegmentName` back to the container name, which is what lets the sweep ask Docker
+      directly whether the jail this segment exists for is still present — and five independent
+      conditions each save a network on their own: not a segment name (`mainguard-agents` itself is one
+      character off the prefix and can never match), missing Mainguard's own `mainguard.role=agent-net`
+      stamp, anything attached other than the egress proxy (which is on every segment by construction),
+      a container with the segment's jail name existing **running or stopped**, and an age inside the
+      ten-minute grace, since a spawn creates the segment before the jail. `SandboxSegmentReaper.SweepAsync`
+      gathers the facts — networks, then ALL containers, then a per-candidate inspect because the network
+      LIST does not populate `Containers` — fails closed if either list is unavailable, and swallows
+      per-network failures so one bad network never stops the sweep. **Not yet wired:** the daemon-side
+      caller belongs in `Mainguard.Server/Runtime/JailReaperHostedService` (one `SweepAsync` per sweep,
+      or once at boot); refusals are pinned in `Mainguard.Tests/SandboxResidueReapingTests.cs`.
+      **MG-27:** the proxy's image ref is resolved to
       its content digest and both compared and created against that).
     - `EgressBlockDetector.cs` (pure: a CLI's failure output → the egress host the default-deny proxy
       refused, skipping already-allowlisted + git hosts — the "what was blocked" core behind the Fix-2
@@ -1188,6 +1206,23 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       builds), which is also why the layer is chosen at spawn — a live jail's image cannot be swapped
       underneath it. **Failure:** typed `ToolchainProvisioningException`/`UnknownToolchainException`
       (`Mainguard.Git/Exceptions/`), never a degrade;
+    - `ToolchainImageGc.cs` (**audit F32 — the layers nothing removed.** Every base-image refresh and
+      every recipe edit changes the content-addressed tag, so each one strands a 1–3 GB image forever.
+      `ToolchainImageCandidate` is one layer as the engine reports it (id, `RepoTags`, created, and the
+      count of containers referencing it, counted from the container list because the image list leaves
+      its own `Containers` field at `-1`); `ToolchainImageGcPolicy.Judge` is the pure decision, and its
+      whole value is the five independent conditions that each save a layer ON THEIR OWN, evaluated
+      most-certain-first so the reported reason is the strongest one: a tag outside
+      `mainguard-agent-toolchain` (`KeptForeign`), any referencing container **running or stopped** —
+      a stopped jail is a reusable jail (`KeptInUse`), a ref the caller still wants (`KeptWanted`),
+      younger than the six-hour grace, because a layer is built BEFORE the jail that uses it
+      (`KeptTooYoung`), and the newest N of whatever is left (`KeptRetained`, default 3, so a revert
+      does not rebuild). `DockerToolchainImageBuilder.CollectGarbageAsync` gathers the facts, lists ONLY
+      the toolchain repository, and deletes **non-forced** — the engine's own refusal to remove a
+      referenced image is a second safety net independent of the policy. Collection runs from
+      `ToolchainProvisioner` right after a successful BUILD (the one thing that creates the sprawl,
+      already minutes long) and never throws; refusals are pinned in
+      `Mainguard.Tests/SandboxResidueReapingTests.cs`);
     - `MergeQueueProvisioner` additionally runs each recipe's catalogued probe **inside the worker's own
       jail** before every verification, so "our records say provisioned, the container says otherwise"
       surfaces as a provisioning failure instead of an exit-127 that reads like the agent's code being

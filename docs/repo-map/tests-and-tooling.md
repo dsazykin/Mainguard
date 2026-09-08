@@ -1953,6 +1953,35 @@
   `AllowedMountRoots` on the spec, a bind source outside every declared substrate root (a user
   repo, a prefix-sibling like `<root>-evil`) is a typed refusal at construction; with no roots
   declared (WSL2 today) behavior is pinned unchanged.
+  **`SandboxResidueReapingTests.cs`** — audit F27/F32/F28, and every test in it is about a REFUSAL,
+  because a collector that takes too little wastes disk while one that takes too much destroys a live
+  agent's network or the image its jail is running on. Pins `SandboxSegmentReapPolicy` (the shared
+  `mainguard-agents` network is never a candidate; an unstamped network, an occupied one, one whose
+  jail still exists **stopped**, and one inside the grace are each kept), `ToolchainImageGcPolicy`
+  (an image any container references is never removed — asserted while old, unwanted and past
+  retention, so "in use" wins alone; plus wanted-by-tag-or-id, too-young, foreign-tagged, and that
+  retention spends its slots only on layers that would otherwise go), and
+  `ContainerSpecBuilder.InspectPosture` (a jail the builder just made shows no drift; a raised ceiling
+  is a RETIGHTEN not a recreate, so an operator moving a slider does not kill live sessions; a
+  pre-MG-26 jail with no CPU cap is caught; every hardening control missing is a recreate; an
+  unreadable `HostConfig` reports no drift).
+  **`SandboxDefenceInDepthTests.cs`** — audit F33, the controls that had drifted into decoration. A
+  bind source that symlinks OUT of a daemon-owned root is refused (docker binds what a path resolves
+  to, not what it spells) while a source under a symlinked ROOT is still contained (the macOS
+  `/var` → `/private/var` shape, which resolving only one side would start refusing);
+  `ContainerSpecBuilder.RealPath` resolves through symlinked parents to a leaf that does not exist
+  yet. An innocuously-named env var carrying a real credential is refused by VALUE via the shared
+  `Mainguard.Git.Safety.SecretPatterns` catalog, and the refusal names the variable and the rule and
+  **never** the value. `NO_PROXY` exempts loopback only — the unroutable `git.mainguard.internal` is
+  gone. `DockerSandboxEngine.BirthTimeIsUsable` rejects the sentinels a filesystem without `statx`
+  produces. The world-writable package-cache leaf carries the sticky bit; the group-shared rung is not
+  world-writable and must not acquire one.
+  **`HandBackPermitTests.cs`** — audit F44 residual, the store half: a conflict hand-back permits the
+  rewrite while fresh, right up to `RebaseConflictParkingStore.HandBackLifetime`, and stops permitting
+  it after; expiry is not a latch (deciding again re-arms); consuming disarms; the key is the
+  (repo, agent) PAIR, so one repository's `pr-7` authorisation never excuses another's. The mediator
+  half — that the permit is spent by the next publish that MOVES the ref, fast-forward or not — is in
+  `Mainguard.Server.Tests/Agents/AgentRefMediationTests.cs` against real git.
   **`SandboxSecretWriteTimeoutTests.cs`** — the spawn path's secret delivery is TIME-BOUNDED: it
   drives the real `DockerSandboxEngine.WriteSecretFileAsync` against a fake `IDockerClient` whose exec
   create never completes and never observes its cancellation token (the shape of a Docker endpoint
