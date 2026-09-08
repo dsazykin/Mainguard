@@ -82,7 +82,8 @@ public sealed class CliLoginHarvestWiringTests
         adapter.Start();
 
         var stored = await WaitForVaultAsync(vault, VaultKey);
-        Assert.NotNull(stored);
+        Assert.True(stored is not null,
+            $"expected key '{VaultKey}'; vault holds: {string.Join(", ", vault.Keys)}");
 
         var file = Assert.Single(CliLoginVault.Parse(stored));
         Assert.Equal(LoginPath, file.Path);
@@ -308,10 +309,27 @@ public sealed class CliLoginHarvestWiringTests
             public Task<SandboxExecResult> ExecAsync(
                 string containerId, IReadOnlyList<string> command, CancellationToken ct = default)
             {
-                var path = command.LastOrDefault();
-                return Task.FromResult(string.Equals(path, DeclaredJailPath, StringComparison.Ordinal)
-                    ? new SandboxExecResult(0, Convert.ToBase64String(Encoding.UTF8.GetBytes(_login)), string.Empty)
-                    : new SandboxExecResult(1, string.Empty, string.Empty));
+                // The harvest exec is `sh -c <script> sh <path> <maxBytes>` — the path IDENTIFIES which
+                // declared file is being read and the ceiling rides last. Matched by containment rather
+                // than by position: this fake used to read `command.Last()` as the path, which silently
+                // stopped matching the day the credential leg grew its in-shell size check (F2) and made
+                // every harvest here look like "file absent".
+                if (!command.Contains(DeclaredJailPath, StringComparer.Ordinal))
+                {
+                    return Task.FromResult(new SandboxExecResult(1, string.Empty, string.Empty));
+                }
+
+                var content = Encoding.UTF8.GetBytes(_login);
+                if (int.TryParse(
+                        command[^1], System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture, out var max)
+                    && content.Length > max)
+                {
+                    return Task.FromResult(new SandboxExecResult(2, string.Empty, string.Empty));
+                }
+
+                return Task.FromResult(
+                    new SandboxExecResult(0, Convert.ToBase64String(content), string.Empty));
             }
 
             public Task PauseAsync(string containerId, CancellationToken ct = default) => Task.CompletedTask;
