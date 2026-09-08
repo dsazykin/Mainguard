@@ -62,7 +62,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.False(ctx.Queue.CanMerge(AgentId, out var reason));
         Assert.Contains("test command changed", reason);
 
-        ctx.ChangedTestCommand.Acknowledge(AgentId);
+        ctx.ChangedTestCommand.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, null);
         Assert.True(ctx.Queue.CanMerge(AgentId, out _));
     }
 
@@ -86,7 +86,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         var ctx = provisioner.EnsureQueue(repoHash)!;
         await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
 
-        Assert.True(ctx.ChangedTestCommand!.Acknowledge(AgentId, "owner@example"));
+        Assert.True(ctx.ChangedTestCommand!.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, "owner@example"));
 
         var waiver = Assert.Single(
             provisioner.AuditLog.Read(),
@@ -563,7 +563,9 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
         Assert.False(ctx.Queue.CanMerge(AgentId, out _));
 
-        ctx.ChangedTestCommand!.Acknowledge(AgentId);
+        // The TOOLCHAIN is what drifted here, so the toolchain is what gets waived. Acknowledging the
+        // test-command item would leave this gate shut — which is the point of the per-item waiver.
+        ctx.ChangedTestCommand!.Acknowledge(AgentId, ChangedTestCommandGate.ToolchainItem, null);
         Assert.True(ctx.Queue.CanMerge(AgentId, out _));
     }
 
@@ -882,8 +884,9 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>
-    /// A repo declaring nothing keeps behaving exactly as it did before this feature existed: no
-    /// probes, no extra execs, straight to the verification command.
+    /// A repo declaring nothing runs no toolchain PROBES: the only execs in its jail are the daemon's two
+    /// pre-run evidence questions (is the worktree clean, is HEAD the commit being verified) and then the
+    /// verification command itself.
     /// </summary>
     [Fact]
     public async Task ARepoWithNoToolchainDeclaration_RunsNoProbes()
@@ -894,7 +897,14 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         var ctx = NewProvisioner(exitCode: 0, out var engine).EnsureQueue(repoHash)!;
         await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
 
-        Assert.Equal(new[] { "npm test" }, engine.Commands.Select(c => string.Join(' ', c)));
+        Assert.Equal(
+            new[]
+            {
+                "git status --porcelain --untracked-files=no",
+                "git rev-parse HEAD",
+                "npm test",
+            },
+            engine.Commands.Select(c => string.Join(' ', c)));
     }
 
     [Fact]
@@ -2014,6 +2024,140 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             checkAgentBranch: (repoHash, agentId) => new WorktreeManager(_vmRoot).CheckAgentBranch(repoHash, agentId));
     }
 
+    // ---- F34/F35: the verified bytes ARE the recorded bytes ---------------
+
+    /// <summary>
+    /// F34 (a) — a pre-verification publish the mediator REFUSED fails the run.
+    ///
+    /// <para>The publish carries the agent's tip into the mirror, and its answer says whether the mirror
+    /// ends up holding it. That answer was thrown away: on a refusal (a non-fast-forward after an amend,
+    /// say) the mirror kept the OLD tip, <c>branchSha</c> resolved to it, and the test command ran in the
+    /// jail against the new worktree. The record then paired a pass with a commit that was never tested —
+    /// the sha <c>BeginMerge</c> pins into the lease and <c>--ff-only</c> lands.</para>
+    /// </summary>
+    [Fact]
+    public async Task ARefusedPreVerificationPublish_FailsTheRun_AndRecordsNothing()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        // The mediator refuses: the mirror does not end up carrying the agent's tip.
+        var provisioner = NewProvisioner(
+            exitCode: 0, out var engine, new MergeQueueRegistry(), exitFor: null,
+            resolveApprovedWork: null, mergeDiff: null,
+            publishAgentRef: (_, _) => false);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None));
+
+        Assert.Contains("does not carry", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Verification was NOT run", ex.Message, StringComparison.Ordinal);
+
+        // Nothing executed in the jail, and nothing was written down.
+        Assert.Empty(engine.Commands);
+        Assert.Null(ctx.Queue.LastVerification(AgentId));
+        Assert.NotEqual(WorkerMergeState.Verified, ctx.Queue.GetState(AgentId));
+    }
+
+    /// <summary>
+    /// F34 (b) — a jail whose working tree has uncommitted changes is not recorded as verified.
+    ///
+    /// <para>Every sha on the verify path is read from the mirror; the command runs in the worktree.
+    /// Nothing joined the two, so an agent mid-edit had its uncommitted bytes tested and the pass recorded
+    /// against the last commit — which does not contain them. That is the merge a human is shown a green
+    /// rail about.</para>
+    /// </summary>
+    [Fact]
+    public async Task ADirtyJailWorktree_IsRefused_AndNothingIsRecordedVerified()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var provisioner = NewProvisioner(exitCode: 0, out var engine);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+
+        // git, inside the jail, ANSWERS that a tracked file is modified.
+        engine.GitProbeResult = new SandboxExecResult(0, " M feature.cs\n", "");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None));
+
+        Assert.Contains("uncommitted changes", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("feature.cs", ex.Message, StringComparison.Ordinal);
+
+        // The refusal happens BEFORE the command: the only exec is the probe that produced it.
+        Assert.Equal(
+            new[] { "git status --porcelain --untracked-files=no" },
+            engine.Commands.Select(c => string.Join(' ', c)));
+        Assert.Null(ctx.Queue.LastVerification(AgentId));
+        Assert.NotEqual(WorkerMergeState.Verified, ctx.Queue.GetState(AgentId));
+    }
+
+    /// <summary>
+    /// F35 — an arm that THROWS leaves the flagged-change gate closed, and takes the previous run's
+    /// acknowledgments with it.
+    ///
+    /// <para>The old code logged and returned, leaving the previous <c>AcknowledgmentStore</c> in place.
+    /// So v2 of a branch was gated by v1's flagged set and v1's ticks: a branch that had since added a CI
+    /// workflow verified green with acknowledgments granted for a diff that no longer existed, and
+    /// <c>CanMerge</c> said yes. A transient <c>packed-refs.lock</c> is enough to reach it. Failing to arm
+    /// must never leave a permissive state.</para>
+    /// </summary>
+    [Fact]
+    public async Task AnArmThatThrows_LeavesTheGateClosed_AndDropsTheEarlierAcknowledgments()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var diff = new SwitchableMergeDiff(new MergeBranchDiffService(
+            new RepoProvisioner(_vmRoot),
+            (r, a) => new WorktreeManager(_vmRoot).PublishAgentBranch(r, a)));
+
+        var provisioner = NewProvisioner(
+            exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
+            resolveApprovedWork: null, mergeDiff: diff);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+
+        // Run 1: the review runs for real, and the human clears everything it found.
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+        var store = ctx.FlaggedChanges!.PeekStore(AgentId);
+        Assert.NotNull(store);
+        foreach (var item in store!.Items)
+        {
+            Assert.True(store.Acknowledge(item.Id));
+        }
+
+        Assert.True(ctx.Queue.CanMerge(AgentId, out _));
+
+        // Run 2: the branch pushed again — which is what re-arms this gate — and the classification
+        // cannot be computed this time.
+        ctx.Queue.NotifyNewCommits(AgentId);
+        diff.Fail = true;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        // Fail CLOSED: no store at all, so the gate's MG-40 default-DENY answers — never the old verdict.
+        Assert.Null(ctx.FlaggedChanges.PeekStore(AgentId));
+        Assert.False(ctx.Queue.CanMerge(AgentId, out var reason));
+        Assert.Contains("flagged-change review has not run", reason, StringComparison.Ordinal);
+    }
+
+    /// <summary>A diff service that can be told to start failing, so a SECOND arm throws where the first
+    /// succeeded — the "the branch pushed and the mirror was momentarily unreadable" shape.</summary>
+    private sealed class SwitchableMergeDiff : IMergeBranchDiffService
+    {
+        private readonly IMergeBranchDiffService _inner;
+
+        public SwitchableMergeDiff(IMergeBranchDiffService inner) => _inner = inner;
+
+        public bool Fail { get; set; }
+
+        public MergeBranchDiff Compute(string repoHash, string agentId)
+            => Fail
+                ? throw new RepoProvisioningException("cannot lock ref 'refs/heads/agent/x': packed-refs.lock exists")
+                : _inner.Compute(repoHash, agentId);
+    }
+
     // ---- harness ---------------------------------------------------------
 
     /// <summary>
@@ -2284,7 +2428,10 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     private MergeQueueProvisioner NewProvisioner(
         int exitCode, out FakeSandboxEngine engine, MergeQueueRegistry registry,
         Func<IReadOnlyList<string>, int>? exitFor, Func<string, ApprovedWork?>? resolveApprovedWork,
-        IMergeBranchDiffService? mergeDiff = null)
+        IMergeBranchDiffService? mergeDiff = null,
+        // Overridden only by the test that is ABOUT a refused publish; every other test gets the real
+        // mediator, whose answer this class relies on being true.
+        Func<string, string, bool>? publishAgentRef = null)
     {
         engine = new FakeSandboxEngine(exitCode, exitFor);
         return new MergeQueueProvisioner(
@@ -2306,7 +2453,8 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             // daemon-side publish the RT-D2 provenance would be read off the mirror's stale copy of
             // agent/<id> — the branch's rewritten test command would be invisible and the drift gate
             // would silently stop firing while every assertion below still looked plausible.
-            publishAgentRef: (repoHash, agentId) => new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId),
+            publishAgentRef: publishAgentRef
+                ?? ((repoHash, agentId) => new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId)),
             // ...and the production drift check alongside it. Wired for EVERY test in this class on
             // purpose: the interesting risk is not that it fires when it should, it is that it fires when
             // it should not. Every other test here commits on agent/<id> and must stay green.
@@ -2429,11 +2577,27 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         /// so a test that only ever saw the LAST one could not tell which toolchain was probed.</summary>
         public List<IReadOnlyList<string>> Commands { get; } = new();
 
+        /// <summary>
+        /// What the daemon's own pre-run git probes answer inside the fake jail. Defaults to a clean
+        /// worktree (exit 0, no output), which is what every test here means by "the agent's branch is
+        /// its committed work". A test that wants the dirty-tree refusal sets this.
+        /// </summary>
+        public SandboxExecResult GitProbeResult { get; set; } = new(0, "", "");
+
         public Task<SandboxExecResult> ExecAsync(string containerId, IReadOnlyList<string> command, CancellationToken ct = default)
         {
             LastContainerId = containerId;
             LastCommand = command;
             Commands.Add(command);
+
+            // The verify path asks git two questions in the jail before it runs anything (is the tree
+            // clean, is HEAD the commit being verified). Answering them with the blanket "output" this
+            // double gives every other command would read as a permanently dirty worktree.
+            if (command.Count > 0 && string.Equals(command[0], "git", StringComparison.Ordinal))
+            {
+                return Task.FromResult(GitProbeResult);
+            }
+
             return Task.FromResult(new SandboxExecResult(_exitFor?.Invoke(command) ?? _exitCode, "output", ""));
         }
 

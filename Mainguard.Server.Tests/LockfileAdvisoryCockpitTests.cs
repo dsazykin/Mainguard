@@ -409,7 +409,12 @@ public sealed class LockfileAdvisoryCockpitTests : IDisposable
     private sealed class PassingSandboxEngine : ISandboxEngine
     {
         public Task<SandboxExecResult> ExecAsync(string containerId, IReadOnlyList<string> command, CancellationToken ct = default)
-            => Task.FromResult(new SandboxExecResult(0, "output", ""));
+            // The daemon's pre-run evidence probes (clean worktree, HEAD == the commit being verified)
+            // answer as a clean tree; the blanket "output" below would read as permanent local edits and
+            // refuse every run before the lockfile review these tests are about could be reached.
+            => Task.FromResult(command.Count > 0 && string.Equals(command[0], "git", StringComparison.Ordinal)
+                ? new SandboxExecResult(0, "", "")
+                : new SandboxExecResult(0, "output", ""));
 
         public Task<SandboxHandle> SpawnAsync(SandboxSpawnRequest request, CancellationToken ct = default) => throw new NotSupportedException();
         public Task PauseAsync(string containerId, CancellationToken ct = default) => Task.CompletedTask;

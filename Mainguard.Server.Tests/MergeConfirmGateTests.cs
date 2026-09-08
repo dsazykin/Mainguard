@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Grpc.Core;
@@ -341,14 +342,23 @@ public sealed class MergeConfirmGateTests : IDisposable
     }
 
     /// <summary>
-    /// The late confirm. The worker pushed between BeginMerge and ConfirmMerge, so the invalidator walked
-    /// the row off Verified and the gate refuses on state — but the client merged the VERIFIED tip (the
-    /// K2 identity guarantees that), and the reported main is exactly that tip. The reviewed bytes landed
-    /// on the user's main; the daemon records that, late and under its own source, instead of leaving the
-    /// repository and the queue permanently disagreeing.
+    /// F36 — the late-confirm path is a GATE, not a formality.
+    ///
+    /// <para>The worker pushed between BeginMerge and ConfirmMerge, so the invalidator walked the row off
+    /// Verified and the gate refuses on state. The caller reports the tip the lease authorized, which is
+    /// exactly what a real fast-forward leaves behind — and which is also exactly what a client that
+    /// merged nothing would report, since the daemon put that value on the lease and handed it over at
+    /// BeginMerge.</para>
+    ///
+    /// <para><b>The claim used to be the proof.</b> The identity check at (1.5) already refuses every
+    /// Local confirm whose reported sha is NOT the authorized tip, so the condition guarding this branch
+    /// was true by construction the moment it was reached: every gate refusal became a terminal
+    /// <c>Merged</c> plus a fired stale cascade, and <c>confirm_rpc_late</c> was the source recorded for
+    /// all of them. Here the daemon has no mirror it can read main from, so it cannot observe the merge —
+    /// and an unobservable merge is refused, with the lease kept for the reconcile.</para>
     /// </summary>
     [Fact]
-    public async Task ConfirmMerge_WhenTheGateRefusesButTheReportedMainIsTheAuthorizedTip_RecordsTheMergeLate()
+    public async Task ConfirmMerge_WhenTheGateRefusesAndTheMergeCannotBeObserved_IsRefused()
     {
         using var host = new DaemonFixture();
         var (client, headers) = Client(host);
@@ -363,19 +373,148 @@ public sealed class MergeConfirmGateTests : IDisposable
         Assert.True(queue.NotifyBranchAdvanced(AgentId, CoTenantMergedSha));
         Assert.Equal(WorkerMergeState.Working, queue.GetState(AgentId));
 
+        var ex = await Assert.ThrowsAsync<RpcException>(() => client.ConfirmMergeAsync(new ConfirmMergeRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = AgentId,
+            LeaseId = begun.LeaseId,
+            NewMainSha = VerifiedBranchSha, // the claim, and nothing but the claim
+        }, headers).ResponseAsync);
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        // The refusal says BOTH halves: the gate's own reason, and that the daemon looked and could not
+        // find the merge. A reader who sees only the first would go on believing the claim was checked.
+        Assert.Contains("could not observe this merge on the checkout", ex.Status.Detail);
+        Assert.NotEqual(WorkerMergeState.Merged, queue.GetState(AgentId));
+        Assert.Equal(MainSha, queue.CurrentMainSha);
+
+        // The lease is HELD, which is what the queue-creation and on-demand reconciles act on.
+        Assert.NotNull(_leases!.GetOutstanding(_repoHandle));
+    }
+
+    /// <summary>
+    /// The other side of F36: when the merge really did land, the daemon can SEE it and records it late
+    /// under <see cref="MergeAuthorization.ConfirmRpcLateSource"/>.
+    ///
+    /// <para>Nothing here is asserted from the caller's message. A real checkout is built with main
+    /// fast-forwarded onto the branch tip, a real mirror of it sits where the provisioner looks, and the
+    /// daemon fetches main from that checkout and asks git the two questions: is main the sha this
+    /// confirm reports, and does it contain the tip the lease authorized.</para>
+    /// </summary>
+    [Fact]
+    public async Task ConfirmMerge_WhenTheGateRefusesAndTheMergeIsObservedOnTheCheckout_RecordsItAsConfirmRpcLate()
+    {
+        using var host = new DaemonFixture();
+        var world = LandedMergeWorld.Build(host, _repoHandle);
+        var (client, headers) = Client(host);
+        var queue = await SeedVerifiedQueueAsync(
+            host, branchSha: world.BranchSha, mainSha: world.PreMergeMainSha);
+
+        var begun = await client.BeginMergeAsync(
+            new BeginMergeRequest { RepoHandle = _repoHandle, AgentId = AgentId }, headers);
+        Assert.True(begun.Granted);
+        Assert.Equal(world.BranchSha, begun.ExpectedBranchSha);
+
+        // The worker pushes while the human is merging: the gate will refuse on state.
+        Assert.True(queue.NotifyBranchAdvanced(AgentId, CoTenantMergedSha));
+        Assert.Equal(WorkerMergeState.Working, queue.GetState(AgentId));
+
         var confirmed = await client.ConfirmMergeAsync(new ConfirmMergeRequest
         {
             RepoHandle = _repoHandle,
             AgentId = AgentId,
             LeaseId = begun.LeaseId,
-            NewMainSha = VerifiedBranchSha,
+            NewMainSha = world.BranchSha,
         }, headers);
 
         Assert.True(confirmed.Confirmed);
         Assert.Contains("recorded after the fact", confirmed.Note);
         Assert.Equal(WorkerMergeState.Merged, queue.GetState(AgentId));
-        Assert.Equal(VerifiedBranchSha, queue.CurrentMainSha);
+        Assert.Equal(world.BranchSha, queue.CurrentMainSha);
         Assert.Null(_leases!.GetOutstanding(_repoHandle));
+
+        // The record names the source, so a reader can tell a late reconciliation from an ordinary
+        // confirm without inferring it from timestamps.
+        // Scoped to THIS test's repo handle: in-proc daemon fixtures can share one audit chain, and the
+        // agent id is a constant across the class.
+        var merged = Assert.Single(
+            host.Services.GetRequiredService<Mainguard.Git.Audit.IAuditLog>().Read(),
+            e => e.Type == MergeQueue.MergedEvent
+                 && e.Fields.GetValueOrDefault("agent") == AgentId
+                 && e.Fields.GetValueOrDefault("repo") == _repoHandle);
+        Assert.Equal(MergeAuthorization.ConfirmRpcLateSource, merged.Fields["source"]);
+    }
+
+    /// <summary>
+    /// F37 — a branch main ALREADY contains can reach <c>Merged</c>.
+    ///
+    /// <para><c>merge --ff-only</c> of a contained branch exits 0 and moves nothing, so the client
+    /// honestly reports the pre-merge sha — which <c>ConfirmMerge</c> refused as "nothing moved, so
+    /// nothing was recorded as merged". Reachable after an Undecidable boot reconcile or a hand pull, and
+    /// once there the row could reach no terminal but Discard: the only way to close a branch that HAD
+    /// landed was to record that it had not. The daemon now asks git whether main contains the authorized
+    /// tip, and records the truth.</para>
+    /// </summary>
+    [Fact]
+    public async Task ConfirmMerge_WhenMainAlreadyContainsTheAuthorizedTip_RecordsItAsMerged()
+    {
+        using var host = new DaemonFixture();
+        var world = LandedMergeWorld.Build(host, _repoHandle);
+        var (client, headers) = Client(host);
+
+        // The queue's main is ALREADY the post-merge sha — the branch is contained — so the client's
+        // ff-only did nothing and it reports that same sha back.
+        var queue = await SeedVerifiedQueueAsync(
+            host, branchSha: world.BranchSha, mainSha: world.BranchSha);
+
+        var begun = await client.BeginMergeAsync(
+            new BeginMergeRequest { RepoHandle = _repoHandle, AgentId = AgentId }, headers);
+        Assert.True(begun.Granted);
+
+        var confirmed = await client.ConfirmMergeAsync(new ConfirmMergeRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = AgentId,
+            LeaseId = begun.LeaseId,
+            NewMainSha = world.BranchSha, // == ExpectedMainSha: nothing moved
+        }, headers);
+
+        Assert.True(confirmed.Confirmed);
+        Assert.Contains("already contained", confirmed.Note);
+        Assert.Equal(WorkerMergeState.Merged, queue.GetState(AgentId));
+        Assert.Null(_leases!.GetOutstanding(_repoHandle));
+    }
+
+    /// <summary>
+    /// ...and the control that keeps the test above from being "confirm accepts anything when nothing
+    /// moved": a branch the checkout's main does NOT contain is still refused.
+    /// </summary>
+    [Fact]
+    public async Task ConfirmMerge_WhenNothingMovedAndMainDoesNotContainTheBranch_IsStillRefused()
+    {
+        using var host = new DaemonFixture();
+        var world = LandedMergeWorld.Build(host, _repoHandle);
+        var (client, headers) = Client(host);
+
+        // The lease's branch tip is a commit this checkout has never heard of, so `--is-ancestor` says no.
+        var queue = await SeedVerifiedQueueAsync(
+            host, branchSha: VerifiedBranchSha, mainSha: world.BranchSha);
+
+        var begun = await client.BeginMergeAsync(
+            new BeginMergeRequest { RepoHandle = _repoHandle, AgentId = AgentId }, headers);
+        Assert.True(begun.Granted);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => client.ConfirmMergeAsync(new ConfirmMergeRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = AgentId,
+            LeaseId = begun.LeaseId,
+            NewMainSha = world.BranchSha,
+        }, headers).ResponseAsync);
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("nothing moved", ex.Status.Detail);
+        Assert.NotEqual(WorkerMergeState.Merged, queue.GetState(AgentId));
     }
 
     /// <summary>
@@ -426,7 +565,7 @@ public sealed class MergeConfirmGateTests : IDisposable
     /// daemon's own lease-store singleton so the lease checks under test are the real ones.
     /// </summary>
     private async Task<MergeQueue> SeedVerifiedQueueAsync(
-        DaemonFixture host, string branchSha = "", params string[] extraAgents)
+        DaemonFixture host, string branchSha = "", string mainSha = MainSha, params string[] extraAgents)
     {
         var registry = host.Services.GetRequiredService<MergeQueueRegistry>();
         var leases = host.Services.GetRequiredService<IMergeLeaseStore>();
@@ -436,7 +575,7 @@ public sealed class MergeConfirmGateTests : IDisposable
         MergeQueue queue = null!;
         queue = new MergeQueue(
             repoHash: _repoHandle,
-            currentMainSha: MainSha,
+            currentMainSha: mainSha,
             store: new InMemoryMergeQueueStore(),
             verifications: new InMemoryVerificationStore(),
             // BranchSha defaults to "" — the pre-K3 shape, which every identity compare reads as "not
@@ -446,7 +585,10 @@ public sealed class MergeConfirmGateTests : IDisposable
                 ConfigHash: "cfg", When: DateTimeOffset.UtcNow, BranchSha: branchSha)),
             // No re-verify on the cascade: the tests want the intermediate stale window to stay observable.
             requeue: (_, _) => Task.CompletedTask,
-            gates: new IMergeGate[] { changed });
+            gates: new IMergeGate[] { changed },
+            // The DAEMON's audit chain, so a test can read back what the queue recorded about a merge —
+            // in particular which authorization source it landed under.
+            audit: host.Services.GetRequiredService<Mainguard.Git.Audit.IAuditLog>());
 
         registry.Register(_repoHandle, new MergeQueueContext(queue, leases) { ChangedTestCommand = changed });
 
@@ -458,5 +600,95 @@ public sealed class MergeConfirmGateTests : IDisposable
 
         Assert.True(queue.CanMerge(AgentId, out _));
         return queue;
+    }
+
+    /// <summary>
+    /// A REAL repository the daemon can look at: a checkout whose <c>main</c> has been fast-forwarded onto
+    /// the agent's tip, plus a bare mirror of it sitting exactly where the daemon's provisioner looks, with
+    /// <c>origin</c> pointing back at the checkout.
+    ///
+    /// <para>This exists because F36's fix is "stop believing the caller and go and look". A fixture made
+    /// of literal sha constants can only ever exercise the refusal half; the confirm half has to be
+    /// measured against git, in the place the daemon actually reads main from.</para>
+    /// </summary>
+    private sealed record LandedMergeWorld(string PreMergeMainSha, string BranchSha)
+    {
+        public static LandedMergeWorld Build(DaemonFixture host, string repoHandle)
+        {
+            var barePath = host.Services
+                .GetRequiredService<Mainguard.Agents.Agents.IAgentEnvironment>()
+                .Repos.BareRepoPathFor(repoHandle);
+
+            var checkout = Path.Combine(
+                Path.GetTempPath(), "mainguard-confirm-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(checkout);
+
+            Git(checkout, "-c", "init.defaultBranch=main", "init");
+            Git(checkout, "config", "user.name", "T");
+            Git(checkout, "config", "user.email", "t@mainguard.local");
+            Git(checkout, "config", "commit.gpgsign", "false");
+
+            File.WriteAllText(Path.Combine(checkout, "README.md"), "seed\n");
+            Git(checkout, "add", "-A");
+            Git(checkout, "commit", "-m", "seed");
+            var preMerge = Rev(checkout, "main");
+
+            // The agent's commit, fast-forwarded onto main exactly as `merge --ff-only` leaves it.
+            File.WriteAllText(Path.Combine(checkout, "feature.txt"), "agent work\n");
+            Git(checkout, "add", "-A");
+            Git(checkout, "commit", "-m", "agent commit");
+            var branchSha = Rev(checkout, "main");
+
+            // The mirror, where MergeQueueProvisioner.BareRepoPathFor says it is. Cloned from the checkout
+            // so `origin` is the checkout — which is the whole mechanism the observation relies on.
+            Directory.CreateDirectory(Path.GetDirectoryName(barePath)!);
+            if (Directory.Exists(barePath))
+            {
+                Directory.Delete(barePath, recursive: true);
+            }
+
+            Git(Path.GetDirectoryName(barePath)!, "clone", "--bare", checkout, barePath);
+
+            return new LandedMergeWorld(preMerge, branchSha);
+        }
+
+        // Plain process invocation rather than GitService.RunGit: that helper is internal to Mainguard.Git
+        // and this assembly is not one of its friends. These are fixture repositories, not a git surface
+        // under test.
+        private static void Git(string cwd, params string[] args)
+        {
+            var (code, _, err) = Run(cwd, args);
+            if (code != 0)
+            {
+                throw new InvalidOperationException($"git {string.Join(' ', args)} failed ({code}): {err}");
+            }
+        }
+
+        private static string Rev(string repo, string reference)
+            => Run(repo, new[] { "rev-parse", "--verify", reference }).Out.Trim();
+
+        private static (int Code, string Out, string Err) Run(string cwd, string[] args)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "git",
+                WorkingDirectory = cwd,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            foreach (var a in args)
+            {
+                psi.ArgumentList.Add(a);
+            }
+
+            using var process = System.Diagnostics.Process.Start(psi)
+                ?? throw new InvalidOperationException("could not start git");
+            var stdout = process.StandardOutput.ReadToEnd();
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            return (process.ExitCode, stdout, stderr);
+        }
     }
 }

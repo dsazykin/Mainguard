@@ -24,6 +24,23 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     /// <c>FlaggedChange</c> row — the gate owns it), so client and daemon address it by the same name.</summary>
     internal const string ChangedTestCommandItemId = "changed-test-command";
 
+    /// <summary>
+    /// The wire id for the gate's OTHER item, the verification toolchain declaration. It needs its own id
+    /// for the same reason it needs its own waiver: one id meant one ack, and one ack cleared both.
+    /// </summary>
+    internal const string ChangedToolchainItemId = "changed-toolchain";
+
+    /// <summary>
+    /// Which <see cref="ChangedTestCommandGate"/> item a wire item id addresses, or null when the id is
+    /// not one of the gate's (every other id is a <c>FlaggedChange</c> row on the acknowledgment store).
+    /// </summary>
+    private static string? GateItemFor(string? itemId) => itemId switch
+    {
+        ChangedTestCommandItemId => ChangedTestCommandGate.TestCommandItem,
+        ChangedToolchainItemId => ChangedTestCommandGate.ToolchainItem,
+        _ => null,
+    };
+
     private readonly IMergeQueueRegistry _registry;
     private readonly KillSwitchGate _killGate;
     private readonly IMergeBranchDiffService _mergeDiff;
@@ -39,15 +56,27 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     private readonly Mainguard.Git.Audit.IAuditLog _audit;
     private readonly ILogger _log;
 
+    /// <summary>
+    /// P2-14 role resolution, for the two RPCs on this service that SPEND a co-tenant's jail or read its
+    /// code. Optional so the unit fixtures can build the service without the daemon's auth spine; when
+    /// they are absent the check is not performed and the <c>RoleInterceptor</c> remains the only gate.
+    /// </summary>
+    private readonly Mainguard.Server.Auth.ConnectionRoleRegistry? _roles;
+    private readonly Mainguard.Server.Auth.SessionTokenFile? _tokenFile;
+
     public MergeQueueGrpcService(
         IMergeQueueRegistry registry, KillSwitchGate killGate, IMergeBranchDiffService mergeDiff,
         Mainguard.Server.Auth.IApproverIdentityResolver identity,
         Mainguard.Server.Runtime.AgentSessionStore sessions,
         Mainguard.Git.Audit.IAuditLog audit,
         ILoggerFactory loggerFactory,
-        Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner? queues = null)
+        Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner? queues = null,
+        Mainguard.Server.Auth.ConnectionRoleRegistry? roles = null,
+        Mainguard.Server.Auth.SessionTokenFile? tokenFile = null)
     {
         _queues = queues;
+        _roles = roles;
+        _tokenFile = tokenFile;
         _audit = audit ?? throw new ArgumentNullException(nameof(audit));
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _killGate = killGate ?? throw new ArgumentNullException(nameof(killGate));
@@ -103,6 +132,7 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     /// </summary>
     public override async Task<RunVerificationResponse> RunVerification(RunVerificationRequest request, ServerCallContext context)
     {
+        DenyCoordinator(context, "RunVerification");
         var ctx = Resolve(request.RepoHandle);
 
         // Asked BEFORE the run, because it is the one condition under which starting a verification is
@@ -501,6 +531,36 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
 
         if (string.Equals(request.NewMainSha, lease.ExpectedMainSha, StringComparison.Ordinal))
         {
+            // "Nothing moved" has TWO causes, and only one of them is a non-merge. `merge --ff-only` of a
+            // branch main already contains exits 0 and leaves main exactly where it was ("Already up to
+            // date"), so an entry whose work reached main another way — a hand pull, or a merge the boot
+            // reconcile could only call Undecidable — reports the pre-merge sha honestly and was refused
+            // here forever. The row could then reach no terminal but Discard, i.e. the queue's only way
+            // to close a branch that HAD landed was to record that it had not.
+            //
+            // The distinction is a git fact, and the daemon can read it: the mirror's origin is the
+            // user's checkout. Asked only when the daemon can answer (a provisioner and a branch tip on
+            // the lease); otherwise the old refusal stands unchanged.
+            if (_queues is not null
+                && ctx.Queue.GetOrigin(request.AgentId) != Mainguard.Agents.Agents.MergeEntryOrigin.External
+                && _queues.TryObserveMergeLanded(
+                    request.RepoHandle, request.NewMainSha, lease.ExpectedBranchSha, out _))
+            {
+                ctx.Queue.ConfirmHumanMerge(
+                    request.AgentId, request.NewMainSha, MergeAuthorization.ConfirmRpcLate(actor, lease.LeaseId));
+                ctx.Leases.Confirm(request.RepoHandle, request.LeaseId, request.NewMainSha);
+                _log.LogInformation(
+                    "ConfirmMerge recorded repo={Repo} agent={Agent}: main did not move because it already "
+                    + "contained the authorized branch tip {Branch}",
+                    request.RepoHandle, request.AgentId, lease.ExpectedBranchSha);
+                return Task.FromResult(new ConfirmMergeResponse
+                {
+                    Confirmed = true,
+                    Note = "main did not move: it already contained this branch's verified tip, so the "
+                         + "fast-forward had nothing left to do. Recorded as merged, because it is.",
+                });
+            }
+
             const string didNotMove =
                 "This confirm reports the same main the merge was authorized against — nothing moved, so "
                 + "nothing was recorded as merged.";
@@ -544,15 +604,34 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         {
             // By the time this RPC is reached the client's git operation has ALREADY RUN (§21.2), so a
             // refusal here does not prevent a merge — it decides whether the daemon reflects one. When the
-            // reported sha IS the branch tip the lease authorized (Local entries fast-forward main exactly
-            // there), the reviewed bytes demonstrably landed: record it, late, under its own source. The
-            // shape this closes: the worker pushed between BeginMerge and ConfirmMerge, the invalidator
-            // walked the row to Working, the gate refused on state — and the user's main had moved while
-            // the queue said "not merged", with nothing anywhere that would ever reconcile the two.
-            var landedTheAuthorizedTip =
+            // reviewed bytes DEMONSTRABLY landed, record it, late, under its own source. The shape this
+            // closes: the worker pushed between BeginMerge and ConfirmMerge, the invalidator walked the row
+            // to Working, the gate refused on state — and the user's main had moved while the queue said
+            // "not merged", with nothing anywhere that would ever reconcile the two.
+            //
+            // "DEMONSTRABLY" is the whole of this branch, and it used to be nothing at all. The test was
+            // `NewMainSha == lease.ExpectedBranchSha` — but the identity check at (1.5) above has already
+            // REFUSED every Local confirm for which that is false, so by the time control reaches here the
+            // condition was true by construction: every gate refusal on a Local entry became a terminal
+            // Merged plus a fired cascade, on nothing but the caller's own claim about a ref on its own
+            // machine. A client that reported the expected sha without merging anything got the merge
+            // recorded for it. So the daemon LOOKS instead: the mirror's origin is the user's checkout,
+            // and TryObserveMergeLanded fetches main from it and asks git two questions — is main the sha
+            // this confirm reports, and does it contain the tip the lease authorized. No provisioner (the
+            // slimmest fixtures) means no observation, which is a refusal, not a pass.
+            var claimsTheAuthorizedTip =
                 ctx.Queue.GetOrigin(request.AgentId) != Mainguard.Agents.Agents.MergeEntryOrigin.External
                 && !string.IsNullOrEmpty(lease.ExpectedBranchSha)
                 && string.Equals(request.NewMainSha, lease.ExpectedBranchSha, StringComparison.OrdinalIgnoreCase);
+
+            var landedTheAuthorizedTip = false;
+            var notLanded = "the daemon has no mirror for this repository, so it could not observe what landed";
+            if (claimsTheAuthorizedTip && _queues is not null)
+            {
+                landedTheAuthorizedTip = _queues.TryObserveMergeLanded(
+                    request.RepoHandle, request.NewMainSha, lease.ExpectedBranchSha, out notLanded);
+            }
+
             if (landedTheAuthorizedTip)
             {
                 ctx.Queue.ConfirmHumanMerge(
@@ -582,11 +661,18 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             // reconcile never resolved a repo, and a released lease is never reconciled at all. Held, the
             // lease is exactly what the queue-creation and on-demand reconciles act on; the repo is not
             // stranded, because BeginMerge reconciles a landed merge before refusing on a held lease.
+            //
+            // A confirm that CLAIMED the authorized tip and could not be observed to have landed is a
+            // different sentence from a plain gate refusal, and it is the one worth reading: the caller
+            // says the merge happened, the daemon looked, and the checkout does not agree.
+            var refusal = claimsTheAuthorizedTip
+                ? reason + " The daemon also could not observe this merge on the checkout: " + notLanded + "."
+                : reason;
             _log.LogWarning("ConfirmMerge refused repo={Repo} agent={Agent}: {Reason} (lease kept outstanding for the reconcile)",
-                request.RepoHandle, request.AgentId, reason);
-            AuditConfirmRefused(request, actor, "gate", lease.ExpectedMainSha, reason);
+                request.RepoHandle, request.AgentId, refusal);
+            AuditConfirmRefused(request, actor, "gate", lease.ExpectedMainSha, refusal);
             throw new RpcException(new Status(StatusCode.FailedPrecondition,
-                reason + " The merge lease stays outstanding until the daemon can establish what landed."));
+                refusal + " The merge lease stays outstanding until the daemon can establish what landed."));
         }
 
         // Only now is the idempotency record written: a confirmed lease is the daemon's statement that this
@@ -696,17 +782,21 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         var ctx = Resolve(request.RepoHandle);
         var acknowledged = false;
 
-        if (string.Equals(request.ItemId, ChangedTestCommandItemId, StringComparison.Ordinal)
-            && ctx.ChangedTestCommand is { } changed)
+        if (GateItemFor(request.ItemId) is { } gateItem && ctx.ChangedTestCommand is { } changed)
         {
             // SA-1/F2: the waiver's actor comes from the connection, never from the message. This is the
             // one acknowledgment in the product that lets a branch self-green, so an unattributed one
             // would be the least useful record in the chain.
-            changed.Acknowledge(request.AgentId, _identity.Resolve(context));
+            //
+            // ONE item. This used to hand the gate only an agent id, and the gate waived every armed item
+            // on it — so a human clearing "the test command changed" also waived, unseen and unprompted,
+            // a change to the toolchain that runs it, in contradiction of this RPC's own summary. The two
+            // items now have two ids on the wire and two waivers in the chain.
+            changed.Acknowledge(request.AgentId, gateItem, _identity.Resolve(context));
 
-            // Acknowledge is a no-op for an agent that is not flagged, so the "was it really cleared?"
+            // Acknowledge is a no-op for an item that is not armed, so the "was it really cleared?"
             // answer is read back off the gate rather than assumed from the call having been made.
-            acknowledged = !changed.IsUnacknowledged(request.AgentId);
+            acknowledged = !changed.IsUnacknowledged(request.AgentId, gateItem);
         }
         else if (ctx.FlaggedChanges is { } flagged)
         {
@@ -982,6 +1072,7 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
 
     public override Task<GetMergeDiffResponse> GetMergeDiff(GetMergeDiffRequest request, ServerCallContext context)
     {
+        DenyCoordinator(context, "GetMergeDiff");
         if (string.IsNullOrWhiteSpace(request.RepoHandle) || string.IsNullOrWhiteSpace(request.AgentId))
         {
             throw new RpcException(new Status(StatusCode.InvalidArgument, "repo_handle and agent_id are required."));
@@ -1001,6 +1092,40 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         {
             // No provisioned mirror / no such branch — a typed NOT_FOUND rather than an opaque Internal.
             throw new RpcException(new Status(StatusCode.NotFound, ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// Refuses a coordinator credential.
+    ///
+    /// <para><b>Why this is here as well as in the interceptor.</b> <c>RunVerification</c> and
+    /// <c>GetMergeDiff</c> are not reads of the caller's own state: the first EXECUTES a repository's test
+    /// suite inside another agent's jail, on demand and with no cooldown of any kind (the coordinator's
+    /// own <c>request_verification</c> op has a readiness cooldown; this door has none), and the second
+    /// returns a co-tenant branch's full diff — the same "a transcript of work it competes with" read the
+    /// interceptor already denies for <c>GetScrollback</c> and <c>StreamPlans</c>. Neither was on the
+    /// coordinator deny-list. The list is the durable fix and it lives in <c>RoleInterceptor</c>; this is
+    /// the same boundary asserted at the handler, so the check does not depend on one file's list staying
+    /// in step with this service's method set.</para>
+    /// </summary>
+    private void DenyCoordinator(ServerCallContext context, string operation)
+    {
+        if (_roles is null || _tokenFile is null)
+        {
+            return;
+        }
+
+        var header = context.RequestHeaders.GetValue("authorization");
+        var token = header is not null && header.StartsWith("bearer ", StringComparison.OrdinalIgnoreCase)
+            ? header["bearer ".Length..]
+            : null;
+
+        if (_roles.Resolve(token, _tokenFile.Token) == Mainguard.Server.Auth.ConnectionRole.Coordinator)
+        {
+            _log.LogWarning("{Operation} refused: coordinator credential", operation);
+            throw new RpcException(new Status(StatusCode.PermissionDenied,
+                $"The coordinator role cannot invoke {operation} — it spends another agent's jail or reads "
+                + "its code, which is merge power by another name."));
         }
     }
 
@@ -1183,21 +1308,26 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     {
         if (ctx.ChangedTestCommand is { } changed)
         {
-            var drifted = changed.FlaggedItems(agentId);
-            if (drifted.Count > 0)
+            // ONE ROW PER DRIFT ITEM, each addressed by the id the daemon's own AcknowledgeFlaggedChange
+            // accepts for it. This used to be a single row naming both facts in one sentence, cleared by a
+            // single ack — which meant the human who read "the test command changed" also waived the
+            // toolchain that runs it, and the surface had no way to show one as read and the other as not.
+            foreach (var item in changed.FlaggedItems(agentId))
             {
-                // One row, addressed by the id the daemon's own AcknowledgeFlaggedChange accepts. The gate
-                // acknowledges its drift items together (a human clearing one while another went unread is
-                // the failure it was shaped to prevent), so it presents as one item naming everything that
-                // drifted.
+                var wireId = item == ChangedTestCommandGate.ToolchainItem
+                    ? ChangedToolchainItemId
+                    : ChangedTestCommandItemId;
+
                 yield return new FlaggedItem
                 {
-                    Id = ChangedTestCommandItemId,
-                    Path = "(verification command)",
+                    Id = wireId,
+                    Path = item == ChangedTestCommandGate.ToolchainItem
+                        ? "(verification toolchain)"
+                        : "(verification command)",
                     Category = "ExecutableConfig",
-                    Fact = $"the {string.Join(" and the ", drifted)} changed on this branch vs main "
+                    Fact = $"the {item} changed on this branch vs main "
                         + "— a branch cannot be allowed to self-green",
-                    Acknowledged = !changed.IsUnacknowledged(agentId),
+                    Acknowledged = !changed.IsUnacknowledged(agentId, item),
                 };
             }
         }

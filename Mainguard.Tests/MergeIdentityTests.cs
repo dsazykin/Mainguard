@@ -130,6 +130,71 @@ public class MergeIdentityTests : IDisposable
         return new Reconciled(merged, interrupted);
     }
 
+    // ---- F38: the reconcile asks about the tip the LEASE authorized ----------------------------
+
+    /// <summary>
+    /// F38 — a hand merge of a LATER, unverified tip is not this lease's merge.
+    ///
+    /// <para><c>Classify</c> resolved <c>agent/&lt;id&gt;</c> by NAME and asked whether main contained
+    /// whatever that name pointed at now. A worker that pushed after <c>BeginMerge</c> moves that name, so
+    /// a human who then merged the new tip by hand had the daemon record it as the lease's merge — a
+    /// terminal <c>Merged</c>, and the whole stale cascade, for bytes the queue never verified. The lease
+    /// carries the tip it authorized (K3); that is what gets asked about.</para>
+    /// </summary>
+    [Fact]
+    public void ART_D1_Reconcile_IsUndecidable_WhenTheMergedTipIsNotTheOneTheLeaseAuthorized()
+    {
+        var (repo, seed) = BuildTwoAgentRepo();
+        var journal = NewJournal();
+        var leases = new InMemoryMergeLeaseStore();
+
+        // The tip the queue verified and the lease authorized.
+        var authorizedTip = Rev(repo, "agent/x");
+
+        // The worker pushes again AFTER the lease was granted: agent/x now names something else.
+        Git(repo, "checkout", "agent/x");
+        Commit(repo, "x2.txt", "unverified work\n", "x second commit");
+        Git(repo, "checkout", "main");
+        Assert.NotEqual(authorizedTip, Rev(repo, "agent/x"));
+
+        var lease = leases.TryBegin("repohash", "lease-x", "x", seed, "main", authorizedTip)!;
+        Assert.NotNull(lease);
+
+        // A human merges the branch by hand — landing the LATER tip, which contains the authorized one.
+        JournaledFfMerge(journal, repo, "agent/x");
+
+        var outcome = RunReconcile(repo, leases, journal, lease);
+
+        // Main contains the authorized tip, so a name-based containment test would say "merged". It is
+        // not: what landed is a superset nobody verified.
+        Assert.Empty(outcome.Merged);
+        var (_, reason) = Assert.Single(outcome.Interrupted);
+        Assert.Contains("was NOT recorded", reason, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The control: when the tip that landed IS the tip the lease authorized, the reconcile still records
+    /// the merge. Without this the test above would be satisfied by a reconcile that had simply stopped
+    /// deciding anything.
+    /// </summary>
+    [Fact]
+    public void ART_D1_Reconcile_RecordsTheMerge_WhenTheAuthorizedTipIsWhatLanded()
+    {
+        var (repo, seed) = BuildTwoAgentRepo();
+        var journal = NewJournal();
+        var leases = new InMemoryMergeLeaseStore();
+        var authorizedTip = Rev(repo, "agent/x");
+        var lease = leases.TryBegin("repohash", "lease-x", "x", seed, "main", authorizedTip)!;
+
+        JournaledFfMerge(journal, repo, "agent/x");
+
+        var outcome = RunReconcile(repo, leases, journal, lease);
+
+        var (_, agent, sha) = Assert.Single(outcome.Merged);
+        Assert.Equal("x", agent);
+        Assert.Equal(authorizedTip, sha);
+    }
+
     // ---- K1: the boot reconcile may not synthesize a merge from a coincidence -------------------
 
     /// <summary>
