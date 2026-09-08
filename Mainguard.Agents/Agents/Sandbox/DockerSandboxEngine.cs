@@ -180,13 +180,19 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // so the host's arithmetic and the jail itself are asked instead.
             var staleWorkspace =
                 !await WorkspaceMountAliveAsync(existing, request, ct).ConfigureAwait(false);
+            // F28: the two questions this reuse path never asked — the hardening set, and the ceiling.
+            // Every check above is "was this container created by a build that knows about X?"; these two
+            // are "does it still match what we would create TODAY?", which is what an operator lowering
+            // the per-jail ceiling, and a Mainguard upgrade tightening the jail, both change. A jail
+            // created before MG-26 was otherwise reused forever with no CPU cap at all.
+            var posture = await InspectPostureAsync(existing.ID, request.Limits, ct).ConfigureAwait(false);
             // MG-27: the ref is now a content digest, and Docker's container LIST reports a short image
             // id — compare through the matcher, never with `!=`, or every reuse would look like an
             // upgrade and recreate a perfectly good jail on every spawn.
             if (staleSecretLayout || staleWorkspace
                 || !SandboxImageDigest.SameImage(existing.Image, request.ImageRef)
                 || missingBareMount || missingAgentRepoMount || writableMirror || stalePin || wrongNetwork
-                || missingCacheMount)
+                || missingCacheMount || posture.MustRecreate)
             {
                 await _docker.Containers.RemoveContainerAsync(existing.ID,
                     new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
@@ -195,6 +201,13 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             {
                 try
                 {
+                    // F28: re-apply the ceiling BEFORE the jail is started. Memory, CPU and pids are all
+                    // writable on a live cgroup, so an operator who lowered the per-jail ceiling reaches
+                    // this jail without it being destroyed and its session lost — which is why this is an
+                    // update rather than another entry in the recreate set above.
+                    if (posture.MustRetighten)
+                        await RetightenCeilingAsync(existing.ID, request.Limits, ct).ConfigureAwait(false);
+
                     if (!string.Equals(existing.State, "running", StringComparison.OrdinalIgnoreCase))
                         await _docker.Containers.StartContainerAsync(existing.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
                     // A restarted jail's tmpfs $HOME came back empty — restore the CLI's saved login
@@ -435,6 +448,64 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         catch (DockerContainerNotFoundException)
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// F28 — the reuse-time posture check: how the existing jail differs from what
+    /// <see cref="ContainerSpecBuilder"/> would create for <paramref name="expected"/> today.
+    ///
+    /// <para>Read from the container's own <c>HostConfig</c>, which is what it was CREATED with. A
+    /// container that vanished under us, or an inspect that fails, reports no drift — same convention as
+    /// every sibling probe here: an unanswerable question is not a reason to destroy a jail, and the
+    /// recreate path the caller already has will deal with a container that is really gone.</para>
+    /// </summary>
+    private async Task<ContainerSpecBuilder.JailPostureVerdict> InspectPostureAsync(
+        string containerId, SandboxLimits expected, CancellationToken ct)
+    {
+        try
+        {
+            var inspect = await RunBoundedAsync(
+                token => _docker.Containers.InspectContainerAsync(containerId, token),
+                ControlPlaneTimeout, "inspect (posture)", containerId, ct).ConfigureAwait(false);
+            return ContainerSpecBuilder.InspectPosture(inspect.HostConfig, expected);
+        }
+        catch (DockerContainerNotFoundException)
+        {
+            return ContainerSpecBuilder.JailPostureVerdict.Clean;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return ContainerSpecBuilder.JailPostureVerdict.Clean;
+        }
+    }
+
+    /// <summary>
+    /// F28 — writes the current ceiling onto a jail that already exists, through Docker's container
+    /// update endpoint (cgroup <c>memory.max</c> / <c>cpu.max</c> / <c>pids.max</c>).
+    ///
+    /// <para>Best effort by contract. The failure mode this guards against is an engine that refuses the
+    /// update — an old API, or a memory ceiling below the jail's current working set, which the engine
+    /// rejects rather than OOM-killing on the spot. Failing the spawn there would mean an operator's
+    /// slider could make every reuse fail; the jail keeps the ceiling it has, and the next recreate (an
+    /// image upgrade, a mount change, a teardown) picks up the new one anyway.</para>
+    /// </summary>
+    private async Task RetightenCeilingAsync(string containerId, SandboxLimits expected, CancellationToken ct)
+    {
+        try
+        {
+            await RunBoundedAsync(
+                token => _docker.Containers.UpdateContainerAsync(containerId, new ContainerUpdateParameters
+                {
+                    Memory = expected.MemoryBytes,
+                    NanoCPUs = ContainerSpecBuilder.NanoCpus(expected.Cpus),
+                    PidsLimit = expected.Pids,
+                }, token),
+                ControlPlaneTimeout, "update (ceiling)", containerId, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Swallowed on purpose — see the summary. The jail keeps the ceiling it already had.
         }
     }
 

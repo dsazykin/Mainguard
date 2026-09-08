@@ -936,7 +936,120 @@ public static class ContainerSpecBuilder
     }
 
     /// <summary>Whole cores → Docker's <c>NanoCPUs</c> (1e9 nanoCPU = 1 core).</summary>
-    private static long NanoCpus(double cpus) => (long)Math.Round(cpus * 1_000_000_000d, MidpointRounding.AwayFromZero);
+    internal static long NanoCpus(double cpus) => (long)Math.Round(cpus * 1_000_000_000d, MidpointRounding.AwayFromZero);
+
+    /// <summary>
+    /// What a jail we are about to REUSE is missing, relative to the posture this builder would create
+    /// it with today (audit F28).
+    /// </summary>
+    /// <param name="Recreate">Reasons that can only be fixed by creating a new container: every G2/G-15
+    /// hardening control, and the MG-26 rlimits, are fixed at create time.</param>
+    /// <param name="Ceiling">Reasons the engine CAN change on a live container: memory, CPU and pids are
+    /// all writable through Docker's container-update endpoint.</param>
+    public sealed record JailPostureVerdict(
+        IReadOnlyList<string> Recreate, IReadOnlyList<string> Ceiling)
+    {
+        /// <summary>The jail must be destroyed and rebuilt — its posture cannot be repaired in place.</summary>
+        public bool MustRecreate => Recreate.Count > 0;
+
+        /// <summary>The jail's resource ceiling has drifted and can be re-applied without recreating it.</summary>
+        public bool MustRetighten => Ceiling.Count > 0;
+
+        public string Describe() => string.Join("; ", Recreate.Concat(Ceiling));
+
+        internal static readonly JailPostureVerdict Clean =
+            new(Array.Empty<string>(), Array.Empty<string>());
+    }
+
+    /// <summary>
+    /// <b>Audit F28 — does this already-running jail still match the posture we would create today?</b>
+    ///
+    /// <para>The reuse path in <see cref="DockerSandboxEngine"/> re-checks mounts, DNS, network and the
+    /// secret layout, and every one of those questions is "was this container created by a build that
+    /// knows about X?". Two things it never asked were the ones an operator can change from the UI and
+    /// the ones a Mainguard upgrade tightens: the per-jail ceiling, and the hardening set. So lowering
+    /// the ceiling reached no jail already running, and a jail created before MG-26 was reused
+    /// indefinitely with no CPU cap at all — hardened everywhere except the axis a prompt-injected agent
+    /// reaches with <c>while :; do :; done</c>.</para>
+    ///
+    /// <para><b>The split between the two lists is the whole design.</b> Hardening is fixed at create,
+    /// so drift there can only be answered by recreating — the same answer every other reuse check
+    /// gives. A ceiling is not: Docker's update endpoint writes memory, CPU and pids to a live cgroup,
+    /// so the ceiling is re-applied IN PLACE and a running agent keeps its session. Recreating for a
+    /// ceiling change would mean an operator moving a slider killed every live jail, which is a worse
+    /// product than the bug.</para>
+    ///
+    /// <para>Pure, and it takes the engine's <see cref="HostConfig"/> as an argument, so every drift
+    /// shape is unit-assertable with no Docker daemon. A null <paramref name="actual"/> reports NO drift:
+    /// the convention across every sibling probe is that an unanswerable question is not a reason to
+    /// destroy a container.</para>
+    /// </summary>
+    public static JailPostureVerdict InspectPosture(HostConfig? actual, SandboxLimits expected)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        if (actual is null)
+        {
+            return JailPostureVerdict.Clean;
+        }
+
+        var recreate = new List<string>();
+        var ceiling = new List<string>();
+
+        if (actual.Privileged)
+            recreate.Add("the jail is privileged");
+        if (!actual.ReadonlyRootfs)
+            recreate.Add("the rootfs is writable (created before ReadonlyRootfs)");
+
+        var capDrop = actual.CapDrop ?? new List<string>();
+        if (!capDrop.Any(c => string.Equals(c, "ALL", StringComparison.OrdinalIgnoreCase)))
+            recreate.Add("G2 control 4: capabilities were not dropped (no CapDrop ALL)");
+
+        var capAdd = actual.CapAdd ?? new List<string>();
+        if (capAdd.Any(c => c.Contains("SYS_PTRACE", StringComparison.OrdinalIgnoreCase)))
+            recreate.Add("G2 control 4: CAP_SYS_PTRACE is in the effective set");
+
+        var securityOpt = actual.SecurityOpt ?? new List<string>();
+        if (!securityOpt.Any(o => o.Contains("no-new-privileges", StringComparison.OrdinalIgnoreCase)))
+            recreate.Add("G-15: no-new-privileges is missing");
+
+        var seccomp = securityOpt.FirstOrDefault(o => o.StartsWith("seccomp=", StringComparison.Ordinal));
+        if (seccomp is null)
+            recreate.Add("G2 control 3: no seccomp profile");
+        else if (seccomp.Contains("unconfined", StringComparison.OrdinalIgnoreCase))
+            recreate.Add("G2 control 3: seccomp=unconfined");
+
+        if (string.Equals(actual.UsernsMode, UsernsRemapPolicy.OptOutUsernsMode, StringComparison.OrdinalIgnoreCase))
+            recreate.Add("MG-17: the jail opts OUT of the daemon's userns remap");
+
+        // MG-26 rlimits. Docker's update endpoint does not write ulimits, so an absent or slack one is a
+        // recreate, not a retighten. Checked by presence-and-value: these are compiled constants, so the
+        // only way they differ is a Mainguard upgrade — exactly when a recreate is the right answer.
+        var ulimits = actual.Ulimits ?? new List<Ulimit>();
+        foreach (var (name, want) in new[] { ("nofile", expected.NoFile), ("nproc", expected.NProc) })
+        {
+            var found = ulimits.FirstOrDefault(u => string.Equals(u.Name, name, StringComparison.Ordinal));
+            if (found is null)
+                recreate.Add($"MG-26: no '{name}' ulimit");
+            else if (found.Hard != want || found.Soft != want)
+                recreate.Add($"MG-26: '{name}' ulimit is {found.Soft}/{found.Hard}, expected {want}/{want}");
+        }
+
+        if (actual.Memory != expected.MemoryBytes)
+            ceiling.Add($"memory is {actual.Memory}, expected {expected.MemoryBytes}");
+
+        var wantNanoCpus = NanoCpus(expected.Cpus);
+        if (actual.NanoCPUs != wantNanoCpus)
+        {
+            ceiling.Add(actual.NanoCPUs <= 0
+                ? $"no CPU ceiling at all (created before MG-26), expected {wantNanoCpus} NanoCPUs"
+                : $"CPU ceiling is {actual.NanoCPUs} NanoCPUs, expected {wantNanoCpus}");
+        }
+
+        if ((actual.PidsLimit ?? 0) != expected.Pids)
+            ceiling.Add($"pids ceiling is {actual.PidsLimit?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unset"}, expected {expected.Pids}");
+
+        return new JailPostureVerdict(recreate, ceiling);
+    }
 
     private static void AssertResourceCeilings(CreateContainerParameters create)
     {
