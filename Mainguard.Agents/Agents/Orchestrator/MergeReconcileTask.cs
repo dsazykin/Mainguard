@@ -219,9 +219,24 @@ public sealed class MergeReconcileTask : IBootTask
                 return ReconcileVerdict.Undecidable;
             }
 
-            return IsAncestor(repoPath, authorizedTip, currentMain)
-                ? ReconcileVerdict.Merged
-                : ReconcileVerdict.Undecidable;
+            if (!IsAncestor(repoPath, authorizedTip, currentMain))
+            {
+                return ReconcileVerdict.Undecidable;
+            }
+
+            // Main contains the authorized tip. That is necessary and — on its own — not sufficient: it is
+            // equally true when the branch moved on after BeginMerge and somebody merged the NEWER tip by
+            // hand, which puts the authorized commit on main together with commits nobody verified, and
+            // was recorded as this lease's merge. So the branch is asked whether it has since advanced,
+            // and whether that advance is what landed. Main moving further along its OWN history after
+            // the merge (a later commit on main) is untouched by this: the branch name still resolves to
+            // the authorized tip there.
+            if (LaterBranchWorkLanded(repoPath, lease, authorizedTip, currentMain))
+            {
+                return ReconcileVerdict.Undecidable;
+            }
+
+            return ReconcileVerdict.Merged;
         }
 
         // (5) The branch ref is gone. The journal is the only remaining witness, and it is used ONLY in
@@ -284,6 +299,39 @@ public sealed class MergeReconcileTask : IBootTask
 
         return Mainguard.Agents.Services.ExternalPrMergeService.PrNumberFor(agentId) is int number
             && description.Contains($"pull request #{number}", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Whether the branch has moved PAST the tip this lease authorized, and that later tip is what main
+    /// now carries — i.e. what landed is a superset of what was verified.
+    ///
+    /// <para>Only answerable when the lease records a branch sha and this checkout still has the branch;
+    /// with neither, this is not a fact anyone here can establish and the answer is "no" so that the
+    /// containment verdict above stands rather than being refused out of ignorance.</para>
+    /// </summary>
+    private static bool LaterBranchWorkLanded(
+        string repoPath, Mainguard.Git.Models.MergeLeaseRow lease, string authorizedTip, string currentMain)
+    {
+        if (string.IsNullOrEmpty(lease.ExpectedBranchSha))
+        {
+            return false;
+        }
+
+        var byName = ResolveAgentRef(repoPath, lease.AgentId);
+        if (byName is null)
+        {
+            return false;
+        }
+
+        var nameSha = RevParse(repoPath, byName);
+        var authorizedSha = RevParse(repoPath, authorizedTip);
+        if (nameSha.Length == 0 || authorizedSha.Length == 0
+            || string.Equals(nameSha, authorizedSha, StringComparison.Ordinal))
+        {
+            return false; // the branch has not moved; nothing beyond the authorization exists to have landed.
+        }
+
+        return IsAncestor(repoPath, nameSha, currentMain);
     }
 
     /// <summary>

@@ -94,6 +94,41 @@ public class MergeQueueStateMachineTests
         return h.Queue;
     }
 
+    /// <summary>
+    /// F41 — <c>Cancel</c> keeps a row that is a RECORD of what happened, and still forgets one that is
+    /// only bookkeeping.
+    ///
+    /// <para>Its one caller is the intake's closed-upstream sweep, which fires for every pull request that
+    /// is no longer OPEN — and a pull request Mainguard itself merged is not open. So the entry recorded
+    /// <c>Merged</c> a moment earlier was deleted at the very next poll, and the queue's answer to "did
+    /// this merge?" became "there is no such entry" — the same answer it gives for a PR somebody closed
+    /// unmerged. The closed event could not tell the two apart.</para>
+    /// </summary>
+    [Fact]
+    public async Task Cancel_KeepsATerminalRow_AndStillForgetsALiveOne()
+    {
+        var h = new Harness();
+        h.Build();
+
+        h.Queue.EnsureEntry("merged-pr", MergeEntryOrigin.External);
+        await VerifiedAsync(h, "merged-pr");
+        h.Queue.ConfirmHumanMerge("merged-pr", "sha-merged", MergeAuthorization.ExternalDispatch("lease-1"));
+        Assert.Equal(WorkerMergeState.Merged, h.Queue.GetState("merged-pr"));
+
+        // ...and one that never got anywhere, which the sweep really should forget.
+        h.Queue.EnsureEntry("abandoned-pr", MergeEntryOrigin.External);
+
+        h.Queue.Cancel("merged-pr");
+        h.Queue.Cancel("abandoned-pr");
+
+        // The record survives, in memory AND in the store the next daemon start reads.
+        Assert.Equal(WorkerMergeState.Merged, h.Queue.GetState("merged-pr"));
+        Assert.Contains(h.StateStore.LoadAll("repo"), r => r.AgentId == "merged-pr");
+
+        // The live entry is gone entirely — Cancel is still "the entry is gone, not a terminal state".
+        Assert.DoesNotContain(h.StateStore.LoadAll("repo"), r => r.AgentId == "abandoned-pr");
+    }
+
     // ---- The stale re-entry door -----------------------------------------
 
     /// <summary>
