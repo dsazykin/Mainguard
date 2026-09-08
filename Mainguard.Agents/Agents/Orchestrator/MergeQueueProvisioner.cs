@@ -2503,9 +2503,16 @@ public sealed class MergeQueueProvisioner
     /// <para>Two questions, both asked of git INSIDE the container (§3.2 — the worktree does not exist on
     /// the host): is the tree clean, and is HEAD the commit the mirror carries. Untracked files are
     /// tolerated exactly as the foreground merge tolerates them — they are not part of any commit and
-    /// cannot change what a fast-forward lands — while a tracked modification is refused. A probe that
-    /// cannot answer is a refusal too, on the <see cref="EnsureToolchainPresentAsync"/> precedent: an
-    /// unanswerable question about evidence is not a pass.</para>
+    /// cannot change what a fast-forward lands — while a tracked modification is refused.</para>
+    ///
+    /// <para><b>It refuses on an ANSWER, not on silence.</b> A jail whose git cannot run at all — no git
+    /// on the image, or a worktree whose <c>.git</c> pointer names a repository the container has not
+    /// been given (the state W1-A's git-pointer mount exists to fix, and the state every jail is in until
+    /// it lands) — is a substrate gap, not a dirty tree, and refusing every verification in the product
+    /// because of it would trade a wrong record for no records at all. That case is logged as the
+    /// unmeasured evidence it is. This is the <c>BranchDescendsFromMain</c> posture — "unreadable answers
+    /// true, so nothing is refused from ignorance" — and it should be tightened to fail-closed once the
+    /// jail is guaranteed a working git.</para>
     /// </summary>
     private async Task EnsureJailWorktreeCleanAsync(
         string repoHandle, string agentId, string containerId, string branchSha, CancellationToken ct)
@@ -2522,18 +2529,18 @@ public sealed class MergeQueueProvisioner
         }
         catch (Exception ex)
         {
-            throw new InvalidOperationException(
-                $"could not read agent '{agentId}''s working tree inside its jail ({ex.Message}), so it "
-                + "cannot be established that the tests would run on the commit this record would name. "
-                + "Verification was NOT run.");
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} agent={agentId} worktree-cleanliness probe could not run "
+                + $"({ex.Message}) — this run's record cannot claim its tree was clean");
+            return;
         }
 
         if (status.ExitCode != 0)
         {
-            throw new InvalidOperationException(
-                $"`git status` exited {status.ExitCode} inside agent '{agentId}''s jail, so whether its "
-                + "working tree matches the commit being verified could not be established. Verification "
-                + $"was NOT run. stderr: {Trim(status.Stderr)}");
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} agent={agentId} `git status` exited {status.ExitCode} in "
+                + $"the jail ({Trim(status.Stderr)}) — this run's record cannot claim its tree was clean");
+            return;
         }
 
         if (!string.IsNullOrWhiteSpace(status.Stdout))
@@ -2568,8 +2575,10 @@ public sealed class MergeQueueProvisioner
         }
         catch (Exception ex)
         {
-            throw new InvalidOperationException(
-                $"could not read agent '{agentId}''s HEAD inside its jail ({ex.Message}); verification was NOT run.");
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} agent={agentId} jail HEAD probe could not run "
+                + $"({ex.Message}) — this run's record cannot claim which commit it measured");
+            return;
         }
 
         var headSha = (head.Stdout ?? string.Empty).Trim();
