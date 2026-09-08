@@ -551,14 +551,39 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       caller reaching for one is a composition bug. `-u root` runs as the current user.)
     - `MacDaemonController.cs` (lifecycle of the LOCAL mainguardd on macos-host: idempotent start
       from the app payload through the dotnet muxer — never the payload apphost, which current
-      macOS SIGKILLs outside its first-run location — pgrep-by-payload-dll discovery, and
-      SIGTERM-then-SIGKILL stop.)
+      macOS SIGKILLs outside its first-run location — and SIGTERM-then-SIGKILL stop.
+      **F55:** liveness is now `IsInstanceLockHeld()` — an exclusive open of `<data root>/daemon.lock`,
+      the daemon's own single-instance lock — instead of `pgrep -f <payload dll>`, which was a
+      check-then-act with a multi-second window and could not see a daemon started from a *different*
+      payload directory, i.e. exactly the second instance that does the damage. `pgrep` survives only as
+      the fallback when no lock file exists at all (a pre-F55 daemon mid-upgrade). `InstanceLockFileName`
+      mirrors `Mainguard.Server.Runtime.DaemonInstanceLock.FileName`, which this assembly cannot
+      reference; `DaemonSecondInstanceTests` pins the two equal.
+      **F63(a):** `TryResolveAbsoluteMuxerPath()` resolves an ABSOLUTE dotnet (DOTNET_HOST_PATH →
+      DOTNET_ROOT → the official installer → both Homebrew prefixes → `~/.dotnet`, symlinks resolved) or
+      returns null; `DotnetMuxerPath()` keeps the bare-name fallback for interactive children only.)
     - `MacDaemonUpdater.cs` (the macos-host `IDaemonUpdater`: the daemon runs OFF the payload the
-      app ships, so tier-1 refresh is stop + start from it — no staging copy, no systemd, no VM.)
+      app ships, so tier-1 refresh is stop + start from it — no staging copy, no systemd, no VM.
+      **F55/F63:** when the LaunchAgent is installed the refresh re-stages the payload and calls
+      `launchctl kickstart -k` instead, so launchd performs the one atomic restart. The old
+      unconditional stop+start fought the job: `KeepAlive` respawned the daemon the instant SIGTERM
+      landed, and the "start" then raced that respawn into two daemons contending for the port.)
     - `MacDaemonLaunchAgent.cs` (optional launchd integration — "keep the agent platform running
-      at login": a per-user LaunchAgent starting mainguardd from the app payload with KeepAlive,
-      installed/booted via `launchctl bootstrap gui/<uid>`, nothing elevated; with it installed a
-      refresh degenerates to "stop and let launchd respawn from the same payload dir".)
+      at login": a per-user LaunchAgent installed/booted via `launchctl bootstrap gui/<uid>`, nothing
+      elevated, plus `KickstartAsync` for the updater. **F63** fixed five defects in the plist:
+      (a) an absolute dotnet muxer, and a refusal to install without one — launchd's PATH has neither
+      `/usr/local/share/dotnet` nor Homebrew, so a bare `dotnet` was a job that could not exec;
+      (b) `KeepAlive` is a `{ Crashed, SuccessfulExit:false }` dict with a `ThrottleInterval`, not an
+      unconditional `<true/>` that respawned a permanently-failing job forever;
+      (c) every interpolated value goes through `SecurityElement.Escape` — an `&` in a home directory
+      produced a plist `launchctl bootstrap` silently refused;
+      (d) `StandardOutPath`/`StandardErrorPath` under `~/.mainguard/logs`, so a crash BEFORE the
+      daemon's own logging pipeline exists leaves something behind, plus an `EnvironmentVariables` PATH
+      carrying Homebrew and the muxer's own directory;
+      (e) `StagePayload` copies the payload to `~/.mainguard/daemon-payload/` and the job runs from
+      there, never from inside the `.app` bundle — a bundle replaced in place gives a lazily-loading
+      daemon a mix of old and new assemblies. `RenderPlist`/`StagePayload` are internal so
+      `MacLaunchAgentPlistTests` can assert the document without touching launchd.)
     - `MacOobeState.cs` (the macos-host first-run marker — deliberately simpler than the WSL OOBE's
       staged machine: no reboot-resume, no elevation, no VM import, so "completed once" is the only
       stage worth persisting; deleting `macos-oobe.json` re-runs the flow.)

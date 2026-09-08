@@ -2521,7 +2521,33 @@
   enforced, with an unset-stays-unlimited control), `DatabaseBootstrapTests` (the daemon-DB bootstrap
   can never block the gRPC bind — a stale `__EFMigrationsLock` row from a daemon killed mid-migration
   is cleared before `Migrate()`, the migration runs under a watchdog, and expiry falls back to the
-  in-memory stores). **P2-14 daemon in-proc tests:** `InputLockGrpcTests` (a **raw** `TerminalService`
+  in-memory stores).
+  **Audit W2D (daemon host + auth) tests:**
+  `DaemonSecondInstanceTests` (**F55** — a second REAL Kestrel daemon aimed at the live one's port
+  leaves `daemon.token`, `daemon-server.cer` and `daemon-client.pfx` byte-for-byte unchanged, because
+  the credentials are minted in memory and written only from `ApplicationStarted`; a second daemon on a
+  DIFFERENT port against the same data root — which no bind error could ever have caught — is refused by
+  `DaemonInstanceLock`; the lock itself refuses a second acquire and releases on dispose; and the lock
+  file name is pinned equal across the `Mainguard.Server` / `Mainguard.Agents` assembly boundary, which
+  is the only place that duplication can be checked),
+  `ReadOnlyAttachTests` (**F64** — a locked attach cannot Resize the managed worker's terminal while an
+  unlocked one still can; a lock applied MID-attach is honoured on the next frame, i.e. the lock is read
+  live rather than snapshotted; `TryClaimInput` is exclusive and released on dispose; and concurrent
+  `WriteInputAsync` calls are not interleaved at the byte level),
+  `CoordinatorAllowlistTests` (**F11/F43** — a coordinator token is refused on `SpawnAgent`, `StopAgent`,
+  `HarvestAgentCredentials`, `TerminalService/Attach`, `KillSwitchService/Engage`+`Resume`,
+  `RunVerification`, `GetVerificationLog`, `GetMergeDiff` and `StreamQueue`, each asserted on the ROLE
+  gate's own message; plus the two structural facts — every entry of the retained `CoordinatorDeniedMethods`
+  record is absent from `CoordinatorAllowedMethods`, and the allowlist is enumerated against every RPC in
+  the generated service descriptors so the coordinator's whole reachable surface is one short, reviewable
+  list rather than an invisible default),
+  `MacLaunchAgentPlistTests` (**F63** — the rendered plist parses as XML and round-trips a path
+  containing `&` and `<`; `ProgramArguments[0]` is an absolute muxer, never a bare `dotnet`; `KeepAlive`
+  is a conditional dict with a `ThrottleInterval`; `StandardOutPath`/`StandardErrorPath` are set; the job
+  PATH carries Homebrew and the muxer's own directory; the staged payload lives under the data root
+  rather than inside an `.app` bundle and is COPIED, never symlinked; and `InstallAsync` writes nothing
+  when the payload is absent).
+  **P2-14 daemon in-proc tests:** `InputLockGrpcTests` (a **raw** `TerminalService`
   client — not `DaemonClient` — attaching to a `TerminalLockRegistry`-locked agent reads the banner
   then gets `PermissionDenied` on an input frame; the unlocked control echoes), `RoleInterceptorTests`
   (MG-12/MG-30 — a coordinator token now genuinely AUTHENTICATES and is then denied by the ROLE layer
