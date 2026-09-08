@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using Mainguard.Git;
 
 namespace Mainguard.Agents.Agents.Bootstrap;
 
@@ -225,8 +226,32 @@ public sealed class MacDaemonController
         yield return "/opt/homebrew/bin/dotnet";          // Homebrew, Apple silicon
         yield return "/usr/local/bin/dotnet";             // Homebrew, Intel
         yield return "/opt/homebrew/opt/dotnet/bin/dotnet";
-        yield return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotnet", "dotnet");
+
+        // MainguardPaths.HomeDirectory(), never a bare Environment.GetFolderPath. On Unix the plain
+        // call returns "" for a home that has not been materialized, and Path.Combine("", ".dotnet",
+        // "dotnet") then yields the RELATIVE ".dotnet/dotnet" — which is precisely the crash-loop this
+        // method exists to prevent once it is baked into a launchd plist. HomeDirectory() passes
+        // DoNotVerify, falls back to $HOME, and throws rather than handing back something relative.
+        // MainguardPathsGuardTests enforces this repo-wide.
+        //
+        // Resolved outside the yield with its throw swallowed on purpose: an unresolvable home must
+        // cost this ONE candidate, not abandon the enumeration. Were it left to propagate, a machine
+        // with no HOME would fail resolution outright instead of falling through to the absolute
+        // install locations above, which are the ones most likely to be right on a service boot.
+        string? home = null;
+        try
+        {
+            home = MainguardPaths.HomeDirectory();
+        }
+        catch (InvalidOperationException)
+        {
+            // No HOME and no passwd entry. The candidates above stand on their own.
+        }
+
+        if (!string.IsNullOrEmpty(home))
+        {
+            yield return Path.Combine(home, ".dotnet", "dotnet");
+        }
     }
 
     /// <summary>
