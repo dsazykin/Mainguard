@@ -549,7 +549,14 @@ public sealed class AgentIpcServer : IDisposable
 
             var listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
             listener.Bind(new UnixDomainSocketEndPoint(socketPath));
-            listener.Listen(backlog: 8);
+            // The kernel's pending-accept queue must be able to hold at least as many connections as the
+            // daemon deliberately serves at once, or the two bounds fight: a burst up to
+            // MaxInFlightConnections — which this endpoint is designed to accept — was being refused by
+            // the kernel at connect() with a backlog of 8, before the daemon's own cap could answer it
+            // with a reason. A jail then saw an unexplained ECONNREFUSED where the contract promises an
+            // honest refusal. The daemon's cap stays the real bound; this just stops the queue from
+            // pre-empting it.
+            listener.Listen(backlog: AgentIpcPaths.MaxInFlightConnections + 8);
 
             if (!OperatingSystem.IsWindows())
             {

@@ -27,6 +27,20 @@ namespace Mainguard.Server.Tests;
 /// </summary>
 public sealed class DaemonSecondInstanceTests
 {
+    /// <summary>
+    /// Control plane only. The model gateway defaults to <c>auto</c>, i.e. a private host IPv4 resolved
+    /// at option-construction time — which on a laptop can stop being assignable between the resolve and
+    /// the bind (Wi-Fi flap, a Docker bridge coming and going) and fails startup with EADDRNOTAVAIL, a
+    /// failure <c>TestDaemonHost</c> deliberately does not retry. None of these tests is about the
+    /// gateway, so it is switched off rather than left as an uncontrolled input.
+    /// </summary>
+    private static DaemonOptions ControlPlaneOnly(string tokenPath) => new()
+    {
+        LocalDev = true,
+        TokenPath = tokenPath,
+        GatewayBindAddress = null,
+    };
+
     [Fact]
     public async Task SecondDaemon_LosingThePortRace_DoesNotRotateTheLiveTokenOrCertificates()
     {
@@ -34,7 +48,7 @@ public sealed class DaemonSecondInstanceTests
         var directory = Path.GetDirectoryName(tokenPath)!;
 
         await using var live = await TestDaemonHost.StartAsync(
-            new DaemonOptions { LocalDev = true, TokenPath = tokenPath });
+            ControlPlaneOnly(tokenPath));
 
         var tokenBefore = await File.ReadAllTextAsync(tokenPath);
         var serverCertBefore = await File.ReadAllBytesAsync(
@@ -47,7 +61,7 @@ public sealed class DaemonSecondInstanceTests
         // A second daemon aimed at the SAME port and the SAME data root — the exact collision the
         // finding describes (a launchd respawn, a second app instance, an operator running the daemon by
         // hand next to the installed one).
-        var loser = new DaemonOptions { LocalDev = true, TokenPath = tokenPath, Port = live.Port };
+        var loser = ControlPlaneOnly(tokenPath) with { Port = live.Port };
         await Assert.ThrowsAnyAsync<Exception>(async () =>
         {
             await using var second = await DaemonHost.StartAsync(loser, CancellationToken.None);
@@ -78,14 +92,14 @@ public sealed class DaemonSecondInstanceTests
         var tokenPath = TestDaemonHost.TempTokenPath("mainguard-f55-lock");
 
         await using var live = await TestDaemonHost.StartAsync(
-            new DaemonOptions { LocalDev = true, TokenPath = tokenPath });
+            ControlPlaneOnly(tokenPath));
 
         var tokenBefore = await File.ReadAllTextAsync(tokenPath);
 
         var failure = await Assert.ThrowsAnyAsync<Exception>(async () =>
         {
             await using var second = await TestDaemonHost.StartAsync(
-                new DaemonOptions { LocalDev = true, TokenPath = tokenPath });
+                ControlPlaneOnly(tokenPath));
         });
 
         Assert.Contains(

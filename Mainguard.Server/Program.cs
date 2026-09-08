@@ -76,8 +76,8 @@ catch (IOException ex)
         // Diagnostics must never mask the failure they diagnose.
     }
 
-    throw new DaemonStartupException(options.Port,
-        $"Mainguard daemon could not bind loopback port {options.Port} (already in use?).", ex);
+    Console.Error.WriteLine(DaemonHost.BindFailureMessage(options.Port));
+    throw new DaemonStartupException(options.Port, DaemonHost.BindFailureMessage(options.Port), ex);
 }
 
 return 0;

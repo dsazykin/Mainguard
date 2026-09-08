@@ -857,8 +857,7 @@ public static class DaemonHost
         catch (IOException ex)
         {
             await app.DisposeAsync();
-            throw new DaemonStartupException(options.Port,
-                $"Mainguard daemon could not bind loopback port {options.Port} (already in use?).", ex);
+            throw new DaemonStartupException(options.Port, BindFailureMessage(options.Port), ex);
         }
         catch (Exception)
         {
@@ -871,6 +870,28 @@ public static class DaemonHost
 
         return app;
     }
+
+    /// <summary>
+    /// The operator-facing text for a failed control-plane bind.
+    ///
+    /// <para><b>Why this is more than "address in use" (F55, observed 2026-09-08).</b> The realistic cause
+    /// on a development machine is a second daemon started from another build or worktree, and the thing
+    /// the operator most needs to know is what did NOT happen: the daemon already on the port is fine, it
+    /// keeps running, and this instance wrote nothing. Before the credential writes moved behind the bind
+    /// that was not true — the loser rewrote the shared <c>daemon.token</c> and <c>daemon-client.pfx</c>
+    /// on its way to this exception, which orphaned an eight-day-old session that was still holding the
+    /// port and still healthy, and left the bare bind error as the only clue. A message that says only
+    /// "address already in use" gives the accidental victim nothing to act on.</para>
+    /// </summary>
+    internal static string BindFailureMessage(int port) =>
+        $"Mainguard daemon could not bind loopback port {port} — something is already listening there, "
+        + "which on a development machine is almost always another mainguardd (a second build, a second "
+        + "worktree, or a login LaunchAgent). THIS instance has stopped and written nothing: the daemon "
+        + "that holds the port keeps running, and its session token and mTLS material are untouched, so "
+        + "any client already talking to it is unaffected. To take the port over, stop that daemon first "
+        + $"(`lsof -nP -iTCP:{port} -sTCP:LISTEN`); to run a second one deliberately, give it its own "
+        + "--port AND its own data root (MAINGUARD_DATA_ROOT) — two daemons sharing one data root is the "
+        + "condition the single-instance lock refuses.";
 
     /// <summary>
     /// The <c>--local-dev --smoke</c> path: start, self-probe an authenticated

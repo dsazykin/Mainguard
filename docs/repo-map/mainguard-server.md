@@ -30,6 +30,12 @@
   - The `AddGrpc` block sets `MaxReceiveMessageSize`/`MaxSendMessageSize` to 16 MiB (handoff from
     `fix/audit-w1d-logging-and-secrets`): the 4 MiB receive default is below what a merge diff or a
     scrollback page legitimately carries, and the send side is unbounded by default.
+  - **`BindFailureMessage`** — the operator-facing text for a failed control-plane bind, named rather
+    than inlined because it is now the only notice the *accidental victim* of a port collision gets. It
+    says what did NOT happen (the daemon holding the port keeps running, its credentials are untouched,
+    this instance wrote nothing), names the likely cause (a second build/worktree/LaunchAgent) and gives
+    the two ways out (`lsof` the port, or run the second daemon with its own `--port` AND its own
+    `MAINGUARD_DATA_ROOT`).
   - `StartAsync` (typed port-bound failure; every failure path now disposes the host) and
     `RunSmokeAsync` (authenticated loopback self-probe,
     which now goes over the real pinned mTLS transport); **MG-19: `ConfigureServices` runs BEFORE
@@ -494,7 +500,10 @@
     only `outbox/` keeps `0777`, because the agent genuinely creates, reads and renames its own files
     there. On top of that each endpoint PINS the first local peer identity that connects
     (`Runtime/UnixPeerCredentials`) and refuses any later connection from a different uid, which is the
-    enforceable form of the check when no uid can be known in advance —
+    enforceable form of the check when no uid can be known in advance. The listen backlog is
+    `MaxInFlightConnections + 8` rather than a flat 8, so the kernel's pending-accept queue can hold the
+    burst the daemon's own cap is designed to answer — with the old value a jail could get an
+    unexplained `ECONNREFUSED` where the contract promises an honest refusal with a reason —
     **and beside it the role's `MAINGUARD.md` operating instructions**, written in the same call so the
     shim and the text that makes it discoverable cannot be staged independently: a shim is useless to a
     CLI that was never told it exists, which is what every jail was until now. Since **defect G2**
