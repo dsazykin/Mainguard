@@ -1114,6 +1114,29 @@
   not parse as JSON does not travel at all. Mutations watched red: keyed on one shim filename instead of
   the mount (5), fail-open on unparseable content (1); plus, in the daemon suite, the scrub removed from
   each direction (1 each) and dropping the whole file instead of the rule (1).
+  **F45 adds the `CarryOnly` allowlist section**: the attack stated as a test (a jail writes
+  `permissions.defaultMode: bypassPermissions` beside a `SessionStart` hook — both dropped, the real
+  `Bash(git status:*)` grant kept), each executable key named one by one in a `[Theory]` so re-admitting
+  one means deleting an assertion that says what it is (`apiKeyHelper`, `statusLine`, `mcpServers`,
+  `env`, `enableAllProjectMcpServers`), an unknown vendor key dropped BECAUSE it is unknown, unbounded
+  grants dropped from `allow` while `deny` travels as written (dropping a deny would WIDEN the next
+  jail), a clean file still byte-identical, nothing-carriable ⇒ nothing travels (not an empty `{}` that
+  reads like a file the user wrote), non-JSON failing closed, and the mount rule still removed — the
+  allowlist has to subsume `Scrub`, since `permissions.allow` is exactly where the D5b grant lived.
+- **`Mainguard.Tests/CliLoginVaultTests.cs`** also pins the **F2 repo scope**: the key is per kind AND
+  per repo with a fixed-width hex suffix, two repos never resolve to one entry, `("a_b","c")` and
+  `("a","b_c")` cannot collide across the separator, a blank scope yields null rather than a shared
+  bucket, a login saved in one repo is not readable from another (over a plain dictionary — the keystore
+  is a name→value map to this type, so the assertion is about the only thing the vault controls), and
+  `LegacyKeystoreKeyFor` names the pre-F2 entry that nothing reads any more.
+- **`Mainguard.Tests/AdapterManifestTests.cs`** gains the **lockfile schema** section: a declared
+  `lockfile` is validated at parse (escaping/absolute path → `Malformed`, bad hash → `BadHash`), a
+  well-formed one round-trips onto the spec, and — the honest one — the SHIPPED channel declares none,
+  so no install is lockfile-pinned and the manifest's residual-gap paragraph is still accurate. That
+  last test fails the day somebody adds a lockfile without landing the install-side half.
+- **`Mainguard.Tests/ApiKeySettingsViewModelTests.cs`** gains the **F51** pair: provider confinability is
+  read out of the shipped manifest (anthropic/google yes, openai no) rather than a hand-kept table, and
+  the stored-key row warns only for an unconfinable provider that actually has a key.
 - **`Mainguard.Server.Tests/CoordinatorSpawnKindTests.cs`** — defect D1, over the real Unix socket an
   in-jail shim writes to. A coordinator's `spawn coder` used to answer `Ok, Status: AwaitingPlan` while
   creating a jail with no CLI in it; it is now refused, mints no session, creates no jail, and the refusal
@@ -1141,7 +1164,21 @@
   refuses, not merely because the caller passed nothing. An inherited allowlist is inherited execution.
   **OUT:** `StoppingAnUnattendedWorker_PersistsNothing_EvenThoughTheFileIsRightThere` — the fake jail
   HAS the settings file (the attended test above harvests it from the same engine), so an empty result
-  can only be `CliSettingsHarvestPolicy`.
+  can only be `CliHarvestPolicy`.
+  **OUT, the CREDENTIAL leg (F2):** the same shape one field over —
+  `StoppingAnAttendedSession_HarvestsTheLogin` is the baseline that proves the rig serves the file, then
+  `StoppingAnUnattendedWorker_HarvestsNoLogin_EvenThoughTheFileIsRightThere` and
+  `HarvestingALiveUnattendedWorker_ReturnsNothing` (the live sweep runs against EVERY agent on the
+  daemon, so a gate on the stop path alone would leave an unattended worker's login being collected
+  every few seconds while it ran). `AnOversizedCredentialFile_IsRefused_NotTruncated` and
+  `ASettingsShapedCredentialPath_IsHeldToTheSettingsCeiling` (sized BETWEEN the two ceilings, so only
+  the right cap can explain the refusal) exercise the cap through a fake engine that emulates the real
+  in-shell `wc -c` — a fake that answered 0 with the bytes and let the daemon measure them afterwards
+  would be testing a check the production path does not have.
+  `ASettingsShapedCredentialPath_IsScrubbedOfRoleScopedGrants` reaches D5b into the files that were
+  exempt from it. **EVICTION (F50):** `StoppingTheLastSessionOfAKind_DropsTheDaemonsCachedCredentials`
+  and its paired non-eviction `StoppingOneOfTwoSessions_KeepsTheCacheForTheSurvivor` — eviction is "the
+  last one left", not "one of them stopped".
   **ROLE (defect D5b):** `AStoredJailGrantForTheDaemonsOwnMount_NeverReachesAJail` +
   `StoppingAnAttendedJail_HarvestsTheApprovalsWithoutTheJailsOwnToolGrant` — a stored grant naming
   `AgentIpcPaths.SandboxMount` is scrubbed on the way IN (which is what neutralises an already-poisoned
@@ -2488,7 +2525,13 @@
   charged nothing. Covers: routing to the agent's bound upstream, `BudgetLedger` actually charged,
   an over-budget agent refused 402 with nothing forwarded, an OAuth agent passing through untouched
   and NOT 401'd (the regression that would hurt most), and an unknown token on the legacy model-host
-  shape still refused so the pass-through is not an auth bypass**),
+  shape still refused so the pass-through is not an auth bypass. **F46 adds the Google shape** —
+  `ConfinedGeminiAgent_PresentingXGoogApiKey_IsIdentifiedAndForwarded` and
+  `…_GetsTheRealKeyInGooglesHeader_AndItsOwnTokenIsDropped`: the same class of defect as this file's
+  headline one, one provider over. Identification read only `x-api-key`/`authorization` while gemini-cli
+  sends `x-goog-api-key`, so a "confinable, verified" adapter 404'd on every model call; the test rig's
+  token header is now a parameter, because which header the token arrives in is a property of the CLI,
+  not of the gateway**),
   `GatewayPipelineWiringTests` (**that the gateway is SERVING, not merely bound — the bind tests pass
   in a world where the port answers 404 to everything, which is exactly what the daemon did before
   the middleware was wired. Issues a real HTTP request over the real Kestrel listener, because
@@ -2513,7 +2556,17 @@
   carried by the proxy (paired with a not-allowlisted negative control so an offline runner cannot pass
   it for the wrong reason); and an unreachable gateway SKIPS confinement so the agent keeps its raw key
   and its working direct route — the precondition that makes gateway-on-by-default safe. Only the
-  provider itself is faked, via the `DaemonHost` `configureServices` seam**),
+  provider itself is faked, via the `DaemonHost` `configureServices` seam.
+  **Two legs added by this batch.** `ConfinedGeminiJail_IsIdentifiedByItsGoogleHeader_AndGetsTheRealKeyInTheSameShape`
+  (F46) launches a REAL jail of a second adapter kind — the world's registry now also carries a
+  `gemini-cli` marker, and `LaunchAsync` takes an `agentKind` — and issues the request in the shape
+  gemini-cli sends: nothing about the confinement machinery was Anthropic-specific except the two header
+  names nobody had generalised, and every test here used the one shape.
+  `ResumedJail_ComesBackWithTheTokenTheDaemonNowHolds_AndAnOobKey` (F24) relaunches the SAME agent id —
+  which is what a resume does — and compares the jail's own `agent.env` to the token the daemon
+  CURRENTLY holds, not to the one the first launch produced: the reuse branch restored logins and
+  settings into a jail whose tmpfs secrets `docker start` had just emptied, and wrote neither the env
+  file nor `oob.key`**),
   `DailyBudgetCapBootTests` (MG-21 — the persisted PER-DAY caps survive a restart: boot built
   `BudgetCaps(..., 0, 0)`, and 0 means UNLIMITED, so a daily budget silently stopped being enforced
   after every daemon restart while `GetBudgets` still reported it; resolves the ledger from a freshly

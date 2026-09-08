@@ -235,7 +235,14 @@
     seed arbitrary agent-home files), and `HarvestCliCredentialsAsync` reads those files back out of the
     jail's tmpfs `$HOME` (base64 over the exec pipe, best-effort — a failed harvest never blocks a stop)
     so `AgentSpawnService.StopAsync` can hand them to the client for the host OS keychain
-    (`AgentStopResult`). Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
+    (`AgentStopResult`). **F2 — the credential leg now has the two protections the settings leg had:**
+    a size ceiling checked IN THE SHELL (`AdapterCredentialPolicy.MaxBytesFor`, the same `wc -c` script
+    the settings harvest uses, so an oversized file is never read into the daemon's memory) and REFUSED
+    rather than truncated; and a declared credential path that is really a settings file (gemini-cli's /
+    qwen-code's `settings.json`) is put through `CliSettingsGrantScrub.Scrub` and held to the settings
+    ceiling WHERE IT SITS, in both directions (`FilterCliCredentials` applies the same pair on restore,
+    so an already-poisoned store is neutralised with no migration). WHETHER either harvest may run is
+    the caller's decision — see `CliHarvestPolicy`. Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
     refused outright (`Conflict`), so a conflicted keep-alive rebase used to put one raw
     `Docker.DotNet.DockerApiException` stack trace per declared path into the operator log — a warning
     meaning "as expected", which is how the warnings that mean something stop being read. A frozen jail is
@@ -382,11 +389,18 @@
     harvested CLI login, **nor any CLI SETTINGS**, and seeds none of them). The settings gate is the
     stronger of the three: an inherited permission allowlist is inherited *execution*, so a jail holding
     a pull request's code must start asking about every command. `cliSettings` carries the repo's saved
-    approvals in; `CliSettingsHarvestPolicy` (in this file) gates them flowing back OUT — only a
-    HUMAN-ATTENDED session is harvested, because a `Managed` worker's terminal is daemon-locked
-    read-only, so anything in its settings file was written by the agent, not approved by a person.
-    Restore is deliberately wider than harvest (a Managed worker still receives the repo's approvals or
-    it stalls on prompts nobody can answer). `AgentStopResult` carries `CliSettings` + `RepoHandle` so
+    approvals in; **`CliHarvestPolicy`** (in this file; was `CliSettingsHarvestPolicy` until it stopped
+    being only about settings) gates them flowing back OUT — only a HUMAN-ATTENDED session is harvested,
+    because a `Managed` worker's terminal is daemon-locked read-only, so anything in its settings file
+    was written by the agent, not approved by a person. Restore is deliberately wider than harvest (a
+    Managed worker still receives the repo's approvals or it stalls on prompts nobody can answer).
+    **F2 — the same gate now covers CREDENTIALS** (`HarvestCredentialsIfAttendedAsync`, at both the live
+    `HarvestCredentialsAsync` and the `StopAsync` call sites). It did not before, and the asymmetry made
+    no sense in either direction it was argued: a coordinator's workers are spawned `Managed` running
+    real adapter kinds, so every one of them WAS harvested — the daemon read CLI login files out of an
+    unattended jail, on the word of the only party in it, and filed them in the host's durable
+    credential store. An OAuth refresh token is strictly more dangerous than a command allowlist, and it
+    was the one with no gate. `AgentStopResult` carries `CliSettings` + `RepoHandle` so
     the client files them under the right repository rather than whichever one is open. See
     [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md).
     **Phase 2** adds `heldTaskTitle`/`heldTaskPrompt`/
