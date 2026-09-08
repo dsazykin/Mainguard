@@ -1558,6 +1558,14 @@
   and Restart went on to a spawn the daemon refused under the one-coordinator cap with no hint the stop
   had failed. These drive all three over a refusing seam; the Restart/Stop halves live in
   `CoordinatorCliStartTests` with the `FakeCliHost.EndFailure` switch)**,
+  **`MirrorRefreshOnFocusTests` (F67 — `ControlCenterViewModel` subscribed to `desktop.MainWindow.Activated`
+  in its constructor, which in the shipped Pro app runs inside `CreateShellWindow` while
+  `desktop.MainWindow` is still the `StartupWindow` about to be closed; the handler went to the loading
+  screen and the on-focus mirror nudge was dead for every user, masked by the 60 s timer still running.
+  These assert the SUBSCRIPTION TARGET across a `BindMainWindowActivation` swap — the new window refreshes,
+  the replaced one does not, a repeat bind does not stack handlers, and disposal detaches — driving
+  `WindowBase.HandleActivated`, the method Avalonia's own backends call, rather than a real platform
+  activation)**,
   **`CoordinatorComposerDeliveryTests` (F73 — the composer is cleared BEFORE the send and the send used to
   swallow, so a message that never left vanished entirely: composer empty, transcript unchanged, nothing
   said. Pins that the text comes back verbatim with a stated reason, that a success still clears, and that
