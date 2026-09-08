@@ -110,7 +110,15 @@ public sealed class MergeQueueRestartResumeTests : IDisposable
 
         // ...and it is a verification, not a state edit: the command really executed in the jail and the
         // immutable record was written against the queue's authoritative main.
-        Assert.Equal(new[] { "npm test" }, restartedJail.Commands.Select(c => string.Join(' ', c)));
+        Assert.Equal(
+            new[]
+            {
+                // The two pre-run evidence questions, then the command itself.
+                "git status --porcelain --untracked-files=no",
+                "git rev-parse HEAD",
+                "npm test",
+            },
+            restartedJail.Commands.Select(c => string.Join(' ', c)));
         Assert.Equal(ContainerId, restartedJail.LastContainerId);
         var record = _verifications.Latest(repoHash, AgentId);
         Assert.NotNull(record);
@@ -381,6 +389,15 @@ public sealed class MergeQueueRestartResumeTests : IDisposable
             lock (_commands)
             {
                 _commands.Add(command);
+            }
+
+            // The daemon's two pre-run evidence questions (clean worktree, HEAD == the commit being
+            // verified) are answered as "clean, unreadable HEAD" and are NOT held at the gate: the gate
+            // exists to hold the VERIFICATION open across a simulated daemon kill, and blocking on a
+            // preflight probe would park the run before it ever started.
+            if (command.Count > 0 && string.Equals(command[0], "git", StringComparison.Ordinal))
+            {
+                return new SandboxExecResult(0, "", "");
             }
 
             _entered.TrySetResult();

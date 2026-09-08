@@ -193,7 +193,9 @@ public class MergeAuditEventTests
 
         var merged = Assert.Single(h.Audit.Read(), e => e.Type == MergeQueue.MergedEvent);
         var gates = merged.Fields["gates"];
-        Assert.Contains("changed-test-command: test command changed vs main — acknowledged", gates, StringComparison.Ordinal);
+        // Per item, because the waivers are per item: the evidence line names each drift item with its
+        // own state rather than one verdict standing for all of them.
+        Assert.Contains("changed-test-command: test command (acknowledged) changed vs main", gates, StringComparison.Ordinal);
         Assert.Contains("flagged-change review: no flagged items", gates, StringComparison.Ordinal);
     }
 

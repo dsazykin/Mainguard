@@ -563,7 +563,9 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
         Assert.False(ctx.Queue.CanMerge(AgentId, out _));
 
-        ctx.ChangedTestCommand!.Acknowledge(AgentId, ChangedTestCommandGate.TestCommandItem, null);
+        // The TOOLCHAIN is what drifted here, so the toolchain is what gets waived. Acknowledging the
+        // test-command item would leave this gate shut — which is the point of the per-item waiver.
+        ctx.ChangedTestCommand!.Acknowledge(AgentId, ChangedTestCommandGate.ToolchainItem, null);
         Assert.True(ctx.Queue.CanMerge(AgentId, out _));
     }
 
@@ -882,8 +884,9 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>
-    /// A repo declaring nothing keeps behaving exactly as it did before this feature existed: no
-    /// probes, no extra execs, straight to the verification command.
+    /// A repo declaring nothing runs no toolchain PROBES: the only execs in its jail are the daemon's two
+    /// pre-run evidence questions (is the worktree clean, is HEAD the commit being verified) and then the
+    /// verification command itself.
     /// </summary>
     [Fact]
     public async Task ARepoWithNoToolchainDeclaration_RunsNoProbes()
@@ -894,7 +897,14 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         var ctx = NewProvisioner(exitCode: 0, out var engine).EnsureQueue(repoHash)!;
         await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
 
-        Assert.Equal(new[] { "npm test" }, engine.Commands.Select(c => string.Join(' ', c)));
+        Assert.Equal(
+            new[]
+            {
+                "git status --porcelain --untracked-files=no",
+                "git rev-parse HEAD",
+                "npm test",
+            },
+            engine.Commands.Select(c => string.Join(' ', c)));
     }
 
     [Fact]
@@ -2429,11 +2439,27 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         /// so a test that only ever saw the LAST one could not tell which toolchain was probed.</summary>
         public List<IReadOnlyList<string>> Commands { get; } = new();
 
+        /// <summary>
+        /// What the daemon's own pre-run git probes answer inside the fake jail. Defaults to a clean
+        /// worktree (exit 0, no output), which is what every test here means by "the agent's branch is
+        /// its committed work". A test that wants the dirty-tree refusal sets this.
+        /// </summary>
+        public SandboxExecResult GitProbeResult { get; set; } = new(0, "", "");
+
         public Task<SandboxExecResult> ExecAsync(string containerId, IReadOnlyList<string> command, CancellationToken ct = default)
         {
             LastContainerId = containerId;
             LastCommand = command;
             Commands.Add(command);
+
+            // The verify path asks git two questions in the jail before it runs anything (is the tree
+            // clean, is HEAD the commit being verified). Answering them with the blanket "output" this
+            // double gives every other command would read as a permanently dirty worktree.
+            if (command.Count > 0 && string.Equals(command[0], "git", StringComparison.Ordinal))
+            {
+                return Task.FromResult(GitProbeResult);
+            }
+
             return Task.FromResult(new SandboxExecResult(_exitFor?.Invoke(command) ?? _exitCode, "output", ""));
         }
 
