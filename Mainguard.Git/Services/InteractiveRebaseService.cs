@@ -125,10 +125,14 @@ public class InteractiveRebaseService : IInteractiveRebaseService
         var todoPath = Path.Combine(Path.GetTempPath(), "mainguard-todo-" + Guid.NewGuid().ToString("N") + ".txt");
         File.WriteAllLines(todoPath, todoLines);
 
-        // Invariant 5: the generated todo is logged for diagnosability. The applied
-        // payload is logged from the --rebase-editor shim (Program.cs) as git runs it.
+        // Invariant 5: the generated todo is logged for diagnosability — as a step COUNT, never the
+        // body. Each line carries a commit subject, i.e. attacker-influenced text from any branch
+        // the user fetched, and Debug.WriteLine goes to the OS debug channel (OutputDebugString /
+        // os_log), which is world-readable and not something the user opted into. The count is what
+        // makes the invariant checkable against what the shim reports it applied; the todo itself is
+        // on disk at todoPath for the lifetime of the rebase if a human needs the body.
         System.Diagnostics.Debug.WriteLine(
-            "[Mainguard] Interactive rebase generated todo:\n" + string.Join('\n', todoLines));
+            $"[Mainguard] Interactive rebase generated todo: {todoLines.Count} step(s).");
 
         var self = GitService.GetSelfInvocationPrefix();
         var env = new Dictionary<string, string>
