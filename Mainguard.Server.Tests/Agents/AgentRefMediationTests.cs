@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
+using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Server.Tests.Fixtures;
 using Xunit;
 
@@ -92,6 +93,79 @@ public sealed class AgentRefMediationTests
         Assert.Equal(nameof(AgentRefPublishOutcome.RefusedNonFastForward), audited.Fields["outcome"]);
         Assert.Equal(published, audited.Fields["old"]);
         Assert.Equal(rewritten, audited.Fields["new"]);
+    }
+
+    /// <summary>
+    /// <b>Audit F44 (residual) — an armed hand-back permit is spent by the next publish that MOVES the
+    /// ref, not only by one that needs the rewrite exception.</b>
+    ///
+    /// <para>The permit is a human's answer to "may this agent rewrite the branch as it stands right
+    /// now". It used to be read and consumed only inside the non-fast-forward branch, so the ordinary
+    /// case — the worker pushes an ordinary follow-up commit first — sailed past it and left the
+    /// authorisation armed against whatever the agent did afterwards. Asserted from the outside: after a
+    /// plain fast-forward publish, the rewrite that the permit WOULD have excused is refused.</para>
+    /// </summary>
+    [Fact]
+    public void Publish_FastForward_SpendsAnArmedHandBackPermit()
+    {
+        using var env = new MediationEnv();
+        var hash = env.Provision();
+        var worktree = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var bare = env.BarePath(hash);
+
+        // The human's one authorisation, armed before anything is published.
+        var permits = new RebaseConflictParkingStore();
+        permits.MarkHandedBack(hash, "a1");
+        env.Worktrees.PermitHandedBackRewrite(permits.IsHandedBack, (r, a) => permits.ClearHandedBack(r, a));
+
+        // An ordinary fast-forward publish. It needs no exception — and that is the point.
+        var published = env.CommitInWorktree(worktree, "one.txt", "one\n");
+        Assert.Equal(AgentRefPublishOutcome.Published, env.Worktrees.Publish(hash, "a1").Outcome);
+        Assert.False(permits.IsHandedBack(hash, "a1"));
+
+        // Now the rewrite the stale permit used to excuse. Rule 2 applies again, as it should.
+        AgentTestGit.RunChecked(worktree, "reset", "--hard", "HEAD~1");
+        var rewritten = env.CommitInWorktree(worktree, "one.txt", "rewritten\n");
+        Assert.NotEqual(published, rewritten);
+
+        var result = env.Worktrees.Publish(hash, "a1");
+
+        Assert.Equal(AgentRefPublishOutcome.RefusedNonFastForward, result.Outcome);
+        Assert.Equal(published, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a1").Trim());
+    }
+
+    /// <summary>
+    /// The other half of the same rule: a permit that IS needed still works, and is still spent. Without
+    /// this, "spend it on any publish" could be satisfied by never honouring it at all.
+    /// </summary>
+    [Fact]
+    public void Publish_OfAHandedBackRewrite_IsAcceptedOnce_AndOnlyOnce()
+    {
+        using var env = new MediationEnv();
+        var hash = env.Provision();
+        var worktree = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var bare = env.BarePath(hash);
+
+        var permits = new RebaseConflictParkingStore();
+        env.Worktrees.PermitHandedBackRewrite(permits.IsHandedBack, (r, a) => permits.ClearHandedBack(r, a));
+
+        env.CommitInWorktree(worktree, "one.txt", "one\n");
+        Assert.Equal(AgentRefPublishOutcome.Published, env.Worktrees.Publish(hash, "a1").Outcome);
+
+        // A human chooses "let the agent resolve", and the worker's finished rebase rewrites the tip.
+        permits.MarkHandedBack(hash, "a1");
+        AgentTestGit.RunChecked(worktree, "reset", "--hard", "HEAD~1");
+        var resolved = env.CommitInWorktree(worktree, "one.txt", "resolved\n");
+
+        Assert.Equal(AgentRefPublishOutcome.Published, env.Worktrees.Publish(hash, "a1").Outcome);
+        Assert.Equal(resolved, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a1").Trim());
+
+        // …and the authorisation is gone, so a SECOND rewrite is refused.
+        AgentTestGit.RunChecked(worktree, "reset", "--hard", "HEAD~1");
+        env.CommitInWorktree(worktree, "one.txt", "again\n");
+
+        Assert.Equal(AgentRefPublishOutcome.RefusedNonFastForward, env.Worktrees.Publish(hash, "a1").Outcome);
+        Assert.Equal(resolved, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a1").Trim());
     }
 
     /// <summary>
