@@ -779,7 +779,11 @@
     output→engine, debounced resize, plus the `TerminalControl.MapKey` VT-byte table, **and stress
     S1 / G5's observability half: input the gateway cannot deliver surfaces on the pane as
     `InputDeliveryError` instead of vanishing into an unobserved task, clears once input lands again,
-    and a teardown cancel raises no banner**),
+    and a teardown cancel raises no banner**, **plus F71's bound: a view is not guaranteed to arrive —
+    the coordinator terminal is rebuilt on every projection refresh whether or not its section is on
+    screen — so pre-attach output is capped at `TerminalViewModel.PendingOutputCapBytes` (2 MB, matching
+    `VtScreen.PendingFeedCapBytes`), dropping the OLDEST frames so the tail a human actually sees survives,
+    while a short replay is still delivered whole**),
     **`TerminalInputSerializationTests`** (stress S1 / G5 — the silent keystroke loss. A
     `RacyRequestStream` models the real gRPC writer's contract exactly (one in-flight `WriteAsync`,
     otherwise `Can't write the message because the previous write is in progress`) and holds each
@@ -1534,6 +1538,44 @@
   "Nothing queued" mid-session with every daemon row intact and every other RPC still succeeding; the
   agent pump's reconnect had a regression test and the queue pump's did not. These pin it via the
   `QueueStreamOverride` seam — the exact analogue of `AgentEventStreamOverride`)**,
+  **`SpendLedgerReplayTests` (F65 — `StreamSpend` is a REPLAY stream: the daemon walks the whole spend
+  ledger for each subscriber, and this client accumulates, so every re-subscribe — a daemon restart, a
+  tier-1 update bouncing `mainguardd`, an HTTP/2 reset — used to add one full ledger to the Resources
+  rail's total AND to every per-agent row. Both halves are pinned through the new `SpendStreamOverride`
+  seam, on the user-visible figures (`Current.SpendTodayUsd`, `GetAgentUsage().SpendUsd`) rather than on
+  the accumulators)**,
+  **`ProjectionRaiseIsolationTests` (F68 — the plan, conversation, spend and resource appliers raise on
+  their pump's thread, so a throwing subscriber propagated into the `await foreach`, ended the stream, and
+  cost every update until the reconnect delay elapsed. `ApplyAgentEvent`/`ApplyQueueUpdate` were already
+  hardened; these pin the other four, each asserting the projection was still committed)**,
+  **`QueueUpdateScopingTests` (F69 — a queue update the OLD pump had already dequeued lands after
+  `SetActiveRepo` swaps repos and rewrote the projection with the previous repository's rows. The daemon
+  refuses a merge for an entry that is not the bound repo's, so nothing wrong reaches git; the rail simply
+  lied until the next push. Pinned by holding the old stream's message across the swap)**,
+  **`AgentStopFailureSurfacingTests` (F66 — `EndAgentAsync` swallowed every failure, so three surfaces
+  reported a stop that never happened: the escalated-worker card's error branch was structurally
+  unreachable while the worker kept its slot, the exit sweep logged a clean stop for jails still running,
+  and Restart went on to a spawn the daemon refused under the one-coordinator cap with no hint the stop
+  had failed. These drive all three over a refusing seam; the Restart/Stop halves live in
+  `CoordinatorCliStartTests` with the `FakeCliHost.EndFailure` switch)**,
+  **`CoordinatorComposerDeliveryTests` (F73 — the composer is cleared BEFORE the send and the send used to
+  swallow, so a message that never left vanished entirely: composer empty, transcript unchanged, nothing
+  said. Pins that the text comes back verbatim with a stated reason, that a success still clears, and that
+  a restore never overwrites something typed since)**,
+  **`VtScreenCsiBoundTests` (F61 — OSC capture was bounded at 100k and CSI was not bounded at all, so
+  `ESC [` plus megabytes of digits grew a `StringBuilder` and then a proportional `Split`, on the UI
+  thread, in the parser the DEFAULT engine runs. Pins `VtScreen.CsiParamCapChars`: an overflowed sequence
+  is abandoned rather than applied on truncated parameters, an ordinary SGR run is untouched, and a 4 MB
+  flood parses in bounded time)**,
+  **`VerificationPanelViewModelTests` (the previously untested `VerificationPanelViewModel`: the three-way
+  verdict — a failed run must not read as an un-run one — staleness qualified inside the verdict clause
+  rather than appended after it, the log fetched on demand and cached per verdict, "reading is not
+  re-running" asserted by counting `RunVerificationAsync`, and the four log notices kept apart)**,
+  **`FlaggedChangesPanelViewModelTests` (the previously untested `FlaggedChangesPanelViewModel`: a
+  checkmark only where the GATE recorded it, a refusal or a transport failure stated on the row and never
+  ticked, an unreachable gate disabling the controls and saying why, a row's notice surviving an unrelated
+  queue push, the kind read out of the item ID rather than the category word, the worker-declared-deviation
+  heading, and a reflection guard that no acknowledge-all ever appears)**,
   **`CoordinatorProjectionRepairTests` (ISSUES-LOG #19: the Coordinator panel read "No coordinator
   running" while the daemon's own `ListAgents` answered `role=coordinator` for that agent once a minute
   for 20+ minutes — to this same client, on a call whose answer was thrown away except for the ids. The
@@ -2276,7 +2318,9 @@
   **`StopAllAgentsOnExitTests` (2026-09-04 — the exit leg: `ControlCenterViewModel.StopAllAgentsAsync`
   ends every live mock agent and leaves the records (branches stay until teardown), honours an exhausted
   budget between agents, and the manifest's surface is the one `ProductionShutdownEnvironment` reaches —
-  the ordering itself is in `AppShutdownSequenceTests`, whose lines now carry "Stopping agents…"),**
+  the ordering itself is in `AppShutdownSequenceTests`, whose lines now carry "Stopping agents…"; the
+  F66 half — that a refused stop is NAMED rather than swept up as success — is in
+  `AgentStopFailureSurfacingTests`),**
   **`MirrorFreshnessTests` (2026-09-04 — the mirror-age line: the wire's `mirror_main_refreshed_at` /
   `mirror_main_refresh_error` reach `IMergeQueueService`, absent stays absent, and
   `QueueRailViewModel.MirrorFreshness` words the age and renders a failed refresh as a warning carrying
