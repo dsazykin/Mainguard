@@ -47,6 +47,14 @@
     forward → on 429 `Report429` + PTY pause + backoff + retry + resume → settle actuals; the CLI only
     ever sees a delayed 200) + `ModelUsageParser` (provider usage → actual tokens) + the ASP.NET
     `ModelProxyMiddleware` fronting model hosts with per-agent-port attribution (`IAgentPortMap`).
+    **F46 — Google's header shape.** Identification (`ExtractPresentedToken`) read only `x-api-key` and
+    `authorization`, and injection was Anthropic-or-Bearer; gemini-cli sends `x-goog-api-key`, so a
+    confined Gemini agent resolved to no agent, found no upstream binding, and fell through unfronted —
+    404 per model call, for an adapter the table calls confinable and verified. `x-goog-api-key` is now
+    read on the way in, dropped from what is relayed, and written on the way out for a `googleapis.com`
+    upstream (`IsGoogleHost`). Pinned by `GatewayUpstreamBindingTests` (unit) and
+    `GatewayConfinementDockerTests.ConfinedGeminiJail_…` (a real jail, since the existing Docker
+    coverage used the Anthropic shape only).
   - **`Runtime/GatewayHostedService.cs`** — runs the RT-D1 boot sequence + the token-bucket pump loop on
     host start.
   - **`Runtime/WorkerReadinessHostedService.cs`** — the boot slot whose ENTIRE job is to **resolve**
@@ -527,6 +535,12 @@
     kind) **CLI settings** (`RememberCliSettings`/`TryGetCliSettings`), so an IPC-spawned worker inherits
     the repo's approved-command list instead of stalling on prompts. A blank repo handle forms no scope
     and is dropped rather than collapsed into a shared bucket (MG-6). Never persisted, never logged.
+    **F50 — it now evicts**: `Forget(repo, kind)` when the last session of that kind in that repo stops
+    and `ForgetRepo(repo)` when the repo has none left (both driven from `AgentSpawnService.StopAsync`,
+    after the harvest that legitimately refreshes it), plus `HasAnythingFor(repo, kind)` as the
+    observable a test asserts on. Nothing evicted anything before, so a provider key and a set of
+    harvested OAuth files stayed resident for the daemon's whole lifetime and stopping every agent left
+    them there.
 - **`Runtime/CoordinatorSpawnGate.cs`** (**MG-2**) — the pure admission decision in front of the
   coordinator's in-jail spawn shim:
   `Evaluate(activeManagedWorkers, maxActiveWorkers, admission, planGate?)` returns a refusal reason or

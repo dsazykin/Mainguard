@@ -768,6 +768,31 @@ public sealed class SandboxAgentLauncher
 
         // The one lookup that answers BOTH "who is calling" and "where does it go": the token the jail
         // receives resolves, gateway-side, to this agent id, its budget, and this upstream host.
+        //
+        // ── Scheduled token rotation, and why AgentGatewayCredentials.TokenDelivery is NOT wired here ──
+        //
+        // The gateway can rotate an agent's mg_sess_ token on an interval (AgentGatewayCredentials.
+        // RotateStale), and it refuses to unless a TokenDelivery hook confirms the jail received the
+        // replacement. Wiring that hook was handed to this line. It is deliberately still unwired, and
+        // this is the finding rather than an omission:
+        //
+        //   THERE IS NO DELIVERY CHANNEL TO A RUNNING CLI. The token reaches the jail in
+        //   /run/secrets/agent/agent.env, and SandboxCliLaunch.WrapperScript sources that file ONCE and
+        //   then `exec`s the CLI ("set -a; . <file>; set +a; ... exec \"$@\""). A process's environment
+        //   is fixed at exec, so rewriting the file reaches the NEXT process in that jail and no other.
+        //   A hook that rewrote agent.env and reported success would therefore rotate the daemon's idea
+        //   of the token while the live CLI kept presenting the old one — which keeps working for the
+        //   overlap window (5 minutes) and then stops. The agent does not fail mid-request; it fails
+        //   permanently, an hour after it started, with a 401 nobody can explain.
+        //
+        //   Rewriting the file and reporting FAILURE (so the old token is kept) is safe but is exactly
+        //   the inert behaviour that exists today, plus a write.
+        //
+        // What would close it: a credential channel the CLI re-reads per request rather than at exec —
+        // claude-code's `apiKeyHelper` is one, but it is adapter-specific, and it is a settings key this
+        // batch deliberately stops carrying between jails (F45). So it needs a decision about a
+        // per-adapter delivery, not a hook call. Until then a token's exposure is bounded by the jail's
+        // lifetime, which is what it was before rotation existed.
         var token = _credentials.Issue(agentId, modelApiKey, upstreamHost);
         _log.LogInformation(
             "gateway confinement issued: agent={Agent} upstream={Upstream} baseUrlVar={Var}",
