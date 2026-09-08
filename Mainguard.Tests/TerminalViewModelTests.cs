@@ -203,6 +203,80 @@ public sealed class TerminalViewModelTests
     public void MapKey_UnhandledKey_ShouldReturnNull()
         => Assert.Null(TerminalControl.MapKey(Key.LeftShift, KeyModifiers.None));
 
+    /// <summary>
+    /// Pre-attach output is BOUNDED.
+    ///
+    /// <para>A view is not guaranteed to arrive. The coordinator terminal is rebuilt on every projection
+    /// refresh whether or not its section is on screen, and each rebuild opens a live daemon attach whose
+    /// frames land in this VM with no view to feed. A chatty CLI — a build log, a test run — therefore
+    /// accumulated its entire output in managed memory for as long as the pane stayed off screen, with no
+    /// bound in size or in time. <c>VtScreen</c> caps its own pre-geometry feed at 2 MB for exactly this
+    /// reason; this layer had no cap, so the engine's discipline was defeated one level above it.</para>
+    /// </summary>
+    [Fact]
+    public void PendingOutput_IsCapped_WhenNoViewEverAttaches()
+    {
+        var gateway = new FakeTerminalGateway();
+        using var vm = new TerminalViewModel(gateway);
+
+        // Ten times the cap, in realistic-sized PTY frames. No AttachView anywhere — that is the case.
+        var frame = new byte[64 * 1024];
+        for (var pushed = 0; pushed < TerminalViewModel.PendingOutputCapBytes * 10; pushed += frame.Length)
+        {
+            gateway.PushOutput(frame);
+        }
+
+        Assert.True(
+            vm.PendingOutputBytes <= TerminalViewModel.PendingOutputCapBytes,
+            $"the terminal VM held {vm.PendingOutputBytes} bytes for a view that never attached — "
+            + $"the cap is {TerminalViewModel.PendingOutputCapBytes}");
+    }
+
+    /// <summary>The cap drops the OLDEST frames, because a terminal's meaning is in its tail: what a human
+    /// sees when the pane finally attaches must be the most recent output, not the first screenful from
+    /// twenty minutes ago with everything since discarded.</summary>
+    [Fact]
+    public void CappedPendingOutput_KeepsTheTail_AndFlushesItOnAttach()
+    {
+        var gateway = new FakeTerminalGateway();
+        using var vm = new TerminalViewModel(gateway);
+
+        var frame = new byte[64 * 1024];
+        for (var pushed = 0; pushed < TerminalViewModel.PendingOutputCapBytes * 3; pushed += frame.Length)
+        {
+            gateway.PushOutput(frame);
+        }
+
+        var last = System.Text.Encoding.ASCII.GetBytes("the newest line");
+        gateway.PushOutput(last);
+
+        var view = new FakeTerminalView();
+        vm.AttachView(view);
+
+        Assert.Equal(last, view.Fed[^1]);
+        Assert.Equal(0, vm.PendingOutputBytes);
+    }
+
+    /// <summary>The cap must not change the ordinary case: a short replay arriving before the view is
+    /// flushed whole, exactly as before. This is the behaviour the buffer exists for, and the bound is
+    /// far above it.</summary>
+    [Fact]
+    public void ShortPreAttachReplay_IsStillDeliveredWhole()
+    {
+        var gateway = new FakeTerminalGateway();
+        using var vm = new TerminalViewModel(gateway);
+
+        gateway.PushOutput(new byte[] { (byte)'a' });
+        gateway.PushOutput(new byte[] { (byte)'b' });
+
+        var view = new FakeTerminalView();
+        vm.AttachView(view);
+
+        Assert.Equal(2, view.Fed.Count);
+        Assert.Equal(new byte[] { (byte)'a' }, view.Fed[0]);
+        Assert.Equal(new byte[] { (byte)'b' }, view.Fed[1]);
+    }
+
     private sealed class FakeTerminalView : ITerminalView
     {
         public List<byte[]> Fed { get; } = new();

@@ -149,11 +149,27 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// crucially, keeps Stop reachable so a launch that never returns can still be cancelled.</summary>
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(ShowStopCoordinator))]
+    [NotifyPropertyChangedFor(nameof(CanRunCoordinatorLifecycle))]
     private bool _isStartingCoordinator;
 
     /// <summary>A stop/teardown is in flight — disables the lifecycle buttons so a full teardown
     /// (which cancels any startup + ends the CLI) isn't double-fired.</summary>
-    [ObservableProperty] private bool _isStoppingCoordinator;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanRunCoordinatorLifecycle))]
+    private bool _isStoppingCoordinator;
+
+    /// <summary>
+    /// Whether Start/Restart can actually do anything right now — the exact condition
+    /// <see cref="RunStartupAsync"/> gates on, exposed so the buttons can say it.
+    ///
+    /// <para>Start and Restart used to bind <c>!IsStartingCoordinator</c> alone, while the command body
+    /// refuses on <c>IsStartingCoordinator || IsStoppingCoordinator</c>. During the seconds a stop is in
+    /// flight — which is precisely when someone reaches for Restart, because the coordinator looks
+    /// wedged — the button was therefore enabled, took the click, and returned without doing anything or
+    /// saying anything. An enabled control that no-ops is worse than a disabled one: the human learns
+    /// nothing, and presses it again.</para>
+    /// </summary>
+    public bool CanRunCoordinatorLifecycle => !IsStartingCoordinator && !IsStoppingCoordinator;
 
     [ObservableProperty] private string _coordinatorStartError = "";
 
@@ -308,12 +324,9 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         // The mirror's main is pulled forward from the checkout on the daemon's interval; a human coming
         // back to this window is the other moment they are about to read it, so it is asked once more then
         // (owner decision 2026-09-04). Best-effort: no window yet means the interval sweep still covers it.
-        if ((Application.Current?.ApplicationLifetime
-                as Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime)?
-                .MainWindow is { } mainWindow)
-        {
-            mainWindow.Activated += (_, _) => _ = _queue.RefreshMirrorMainAsync();
-        }
+        BindMainWindowActivation(
+            (Application.Current?.ApplicationLifetime
+                as Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime)?.MainWindow);
 
         // P2-13 §6, finally wired: a transition INTO a waiting/blocked state raises an OS-level
         // notification (Notification Center on macOS, shell toast elsewhere), suppressed only when
@@ -595,6 +608,13 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             .OrderBy(a => a.Role == AgentRoles.Coordinator ? 1 : 0)
             .ToList();
         Editions.ProComposition.LogOobe($"exit: stopping {live.Count} live agent(s)");
+
+        // Named, not counted. Until EndAgentAsync started throwing, this catch was unreachable and the
+        // exit log recorded a clean sweep for jails that were never stopped — and on macOS there is no
+        // `wsl --terminate` afterwards to make that harmless, so those containers really do outlive the
+        // app. The names go in the log AND into the exception below, so the shutdown sequence's own
+        // "stopping agents failed" line carries them instead of the sequence reporting success.
+        var failures = new List<string>();
         foreach (var agent in live)
         {
             ct.ThrowIfCancellationRequested();
@@ -604,10 +624,63 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                failures.Add($"{agent.AgentId} ({ex.Message})");
                 Editions.ProComposition.LogOobe($"exit: stopping agent {agent.AgentId} failed (continuing): {ex.Message}");
             }
         }
+
+        if (failures.Count > 0)
+        {
+            // Thrown only after every agent has been attempted — one refusal must not keep the next from
+            // being stopped (the contract on IAgentPlatformSurface.StopAllAgentsAsync). AppShutdownSequence
+            // catches this and logs it as non-fatal, which is the honest record: the exit continues, and
+            // it no longer claims the jails went away.
+            throw new InvalidOperationException(
+                $"{failures.Count} of {live.Count} agent(s) did not stop and are still running: "
+                + string.Join("; ", failures));
+        }
     }
+
+    /// <summary>The window whose activation currently nudges the mirror refresh, so a re-bind can detach
+    /// the previous one instead of stacking handlers.</summary>
+    private Avalonia.Controls.Window? _activationWindow;
+
+    /// <summary>
+    /// Points the "refresh the mirror when the window is focused" nudge at <paramref name="window"/>.
+    ///
+    /// <para><b>Why this is a method rather than a line in the constructor.</b> It WAS a line in the
+    /// constructor, and it never fired in the shipped app. This VM is built by
+    /// <c>ProManifest.CreateControlCenter</c> during <c>MainWindowViewModel</c>'s constructor — which the
+    /// Pro head runs from inside the startup loader's completion handler, while
+    /// <c>desktop.MainWindow</c> is still the <c>StartupWindow</c>. The handler was therefore attached to
+    /// the loading screen, which is reassigned and closed a few lines later; the real main window got
+    /// nothing, and on-focus refresh was dead for every user. Only the 60-second timer ever ran, which is
+    /// exactly why nobody noticed — the rail was stale for up to a minute rather than permanently.</para>
+    ///
+    /// <para>Idempotent and null-tolerant: called once at construction (harnesses and the OOBE path that
+    /// opens the shell directly are already correct there) and again by the startup loader right after it
+    /// swaps <c>desktop.MainWindow</c>.</para>
+    /// </summary>
+    public void BindMainWindowActivation(Avalonia.Controls.Window? window)
+    {
+        if (ReferenceEquals(_activationWindow, window))
+        {
+            return;
+        }
+
+        if (_activationWindow is not null)
+        {
+            _activationWindow.Activated -= OnMainWindowActivated;
+        }
+
+        _activationWindow = window;
+        if (_activationWindow is not null)
+        {
+            _activationWindow.Activated += OnMainWindowActivated;
+        }
+    }
+
+    private void OnMainWindowActivated(object? sender, EventArgs e) => _ = _queue.RefreshMirrorMainAsync();
 
     /// <summary>Terminal lifecycle states — the same set <see cref="LiveAgentCount"/> excludes.</summary>
     private static bool IsTerminalState(AgentLifecycleState state) =>
@@ -913,11 +986,22 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
     /// <summary>Restart the coordinator: stop the live one, then spawn a fresh one with the picked CLI. The
     /// new terminal replaces the old inline (RefreshCoordinatorCli rebinds on the new agent id). Restart is
-    /// an intentional continuation, so — unlike Stop — it does not ask for confirmation.</summary>
+    /// an intentional continuation, so — unlike Stop — it does not ask for confirmation.
+    ///
+    /// <para><b>The spawn is conditional on the stop.</b> The daemon enforces one coordinator per repo, so
+    /// spawning after a refused stop can only be refused in turn — and the message the human then read was
+    /// about the SPAWN ("the daemon refused the start"), never about the stop that actually failed. The old
+    /// coordinator was still running the whole time. Stop first, and only if it went.</para></summary>
     [RelayCommand]
     private Task RestartCoordinatorAsync() => RunStartupAsync(async ct =>
     {
-        await StopCoordinatorCoreAsync();
+        if (!await StopCoordinatorCoreAsync())
+        {
+            // StopCoordinatorCoreAsync already put the reason on the card; adding a spawn refusal on top
+            // would bury it under a second, less true sentence.
+            return;
+        }
+
         await StartCoordinatorCoreAsync(ct);
     });
 
@@ -1016,12 +1100,19 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             _startupCts?.Cancel();
             CoordinatorConnectTimedOut = false;
             CoordinatorStartError = "";
-            await StopCoordinatorCoreAsync();
+            var stopped = await StopCoordinatorCoreAsync();
 
             // A deliberate stop blanks the terminal so it is OBVIOUS the coordinator ended — the
-            // dead-replay stays only for deaths the user didn't ask for. Guarded on the coordinator
-            // actually being down: clearing a still-live mirror would desync it from later deltas.
-            if (!IsCoordinatorLive)
+            // dead-replay stays only for deaths the user didn't ask for.
+            //
+            // Gated on whether the STOP succeeded, not on IsCoordinatorLive. IsCoordinatorLive is a
+            // projection of the agent-event stream, and the transition out of the live state arrives on
+            // that stream some time AFTER StopAgent returns — so whether the terminal blanked came down to
+            // whether the delta happened to beat this line. Same click, two different screens, and the
+            // losing race left the dead CLI's last frame on display under a card that says it is stopped.
+            // A refused stop must still leave the live mirror alone: clearing it would desync it from the
+            // deltas the still-running coordinator keeps sending.
+            if (stopped)
             {
                 CoordinatorTerminal?.ClearView();
             }
@@ -1113,7 +1204,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// session, else the host's last-started id) and ends it; the agent stream then transitions it out of
     /// the live state. When only a not-yet-projected launch existed, cancelling its RPC (above) is the
     /// teardown and there is no id to end.</summary>
-    private async Task StopCoordinatorCoreAsync()
+    /// <returns>True when the coordinator is down — either the daemon stopped it, or there was nothing
+    /// to stop. False means the stop was REFUSED and the coordinator is still running, which is what
+    /// <see cref="RestartCoordinatorAsync"/> must not spawn on top of.</returns>
+    private async Task<bool> StopCoordinatorCoreAsync()
     {
         var coordinatorId = Mainguard.Agents.UI.ViewModels.Agents.AgentListProjection
             .LifoOrder(_agents.ListAgents()
@@ -1124,13 +1218,27 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         {
             RefreshAgents();
             RefreshCoordinatorCli();
-            return;
+            return true; // nothing was running — a stop with no subject is a stop that succeeded
         }
 
-        try { await _agents.EndAgentAsync(coordinatorId); }
-        catch (Exception ex) { CoordinatorStartError = ex.Message; }
+        var stopped = true;
+        try
+        {
+            await _agents.EndAgentAsync(coordinatorId);
+        }
+        catch (Exception ex)
+        {
+            // Reported on the coordinator card AND returned, because the two callers need different
+            // things from it: Stop needs the sentence, Restart needs to not go on to a spawn the daemon
+            // will refuse under the one-coordinator cap while leaving the human no hint the stop failed.
+            CoordinatorStartError =
+                $"The coordinator was not stopped — {ex.Message}. It is still running.";
+            stopped = false;
+        }
+
         RefreshAgents();
         RefreshCoordinatorCli();
+        return stopped;
     }
 
     private void RefreshKill()
@@ -1268,6 +1376,34 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     // The merge rail's "review" action opens the P2-11 cockpit built from the real branch-vs-main diff.
     private void OpenReview(string agentId) => _ = OpenReviewAsync(agentId);
 
+    /// <summary>The token every merge driven from this surface runs under — see <see cref="MergeToken"/>.</summary>
+    private System.Threading.CancellationTokenSource? _mergeCts;
+
+    /// <summary>
+    /// A fresh token for one human merge, replacing (and cancelling) any previous one.
+    ///
+    /// <para>The merge's middle leg is real network work — a host pull-request fetch, or a <c>git fetch</c>
+    /// over the sync remote — performed while the daemon holds the repository's single merge lease. Bound
+    /// only to the adapter's own lifetime token, as it was, a host that hangs held that lease until the app
+    /// was closed, and Dispose could then be waiting on the abandon that follows. Owned here, the wait ends
+    /// when the surface that started it goes away.</para>
+    /// </summary>
+    private System.Threading.CancellationToken MergeToken()
+    {
+        CancelPendingMerge();
+        _mergeCts = new System.Threading.CancellationTokenSource();
+        return _mergeCts.Token;
+    }
+
+    /// <summary>Ends any merge this surface is still waiting on. The adapter hands the lease back on the
+    /// cancel, so the entry is mergeable again rather than stranded.</summary>
+    private void CancelPendingMerge()
+    {
+        try { _mergeCts?.Cancel(); } catch { /* already disposed */ }
+        _mergeCts?.Dispose();
+        _mergeCts = null;
+    }
+
     /// <summary>P2-47 #7: build the <see cref="ReviewCockpitContext"/> from the live GetMergeDiff RPC and
     /// mount the cockpit. On the mock/design harness — or when no repo/diff is available — it degrades to
     /// opening the agent's document, so nothing is fabricated and the surface never dead-ends.</summary>
@@ -1341,7 +1477,11 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                                 : $"Can't bring local — {result.Reason}",
                             !result.Done);
                     },
-                    onMerge: id => _ = Services.MergeActionRunner.RunAsync(_queue, id),
+                    // Run under a token this surface owns, so a merge whose host-side fetch hangs is not
+                    // holding the repository's one merge lease with nothing able to release it short of
+                    // closing the app. Cancelled when the cockpit is closed or the VM is disposed; the
+                    // adapter's abandon arm then hands the lease straight back.
+                    onMerge: id => _ = Services.MergeActionRunner.RunAsync(_queue, id, ct: MergeToken()),
                     live: new Services.DaemonFlaggedChangeSource(_queue),
                     onReject: async (id, reason) =>
                     {
@@ -1430,6 +1570,20 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// repo-opens are what let a clear land after another call's bind and strand the queue pump.</summary>
     private readonly System.Threading.SemaphoreSlim _provisionGate = new(1, 1);
 
+    /// <summary>Re-projects the merge-queue rail on the UI thread, wherever the caller happens to be
+    /// running. <see cref="QueueRailViewModel.Refresh"/> mutates a bound <c>ObservableCollection</c>, which
+    /// is a UI-thread-only operation in Avalonia.</summary>
+    private System.Threading.Tasks.Task RefreshQueueOnUiThreadAsync()
+    {
+        if (Dispatcher.UIThread.CheckAccess())
+        {
+            Queue.Refresh();
+            return System.Threading.Tasks.Task.CompletedTask;
+        }
+
+        return Dispatcher.UIThread.InvokeAsync(Queue.Refresh).GetTask();
+    }
+
     private async System.Threading.Tasks.Task<Mainguard.UI.Editions.RepoProvisionOutcome?> ProvisionRepoCoreAsync(
         Services.DaemonBackedOrchestrator daemon, string repoPath)
     {
@@ -1451,7 +1605,17 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
         _lastProvisioned = null;
         daemon.ClearActiveRepo();
-        Queue.Refresh();
+
+        // Marshalled, like every other refresh in this VM (OnChanged/OnSampled/OnAgentEvent all post).
+        //
+        // This one did not, and it is the one that runs OFF the UI thread most reliably: the caller awaits
+        // `_provisionGate.WaitAsync().ConfigureAwait(false)` first, so the SECOND of two overlapping repo
+        // opens — a picker double-click, "Reopen Last Repository?" landing on a palette open — resumes on
+        // a thread-pool thread and mutates QueueRailViewModel.Entries, a bound ObservableCollection, from
+        // there. Avalonia's collection handler throws on the thread check, the exception unwinds out of
+        // ProvisionRepoCoreAsync, and the shell reports "agent provisioning failed" with the queue pump
+        // already torn down by ClearActiveRepo — the ISSUES-LOG #11 blank rail reached by a new route.
+        await RefreshQueueOnUiThreadAsync().ConfigureAwait(false);
 
         try
         {
@@ -1533,6 +1697,8 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         _queue.Changed -= OnChanged;
         _telemetry.Sampled -= OnSampled;
         ThemeManager.ThemeChanged -= OnThemeChanged;
+        BindMainWindowActivation(null); // detach the on-focus mirror nudge
+        CancelPendingMerge(); // a merge still waiting on a hung host must not outlive this surface
         // (_provisionGate is deliberately NOT disposed: a provision can still be in flight here, and a
         // disposed SemaphoreSlim would turn its Release into an ObjectDisposedException on the way out.
         // It allocates no wait handle, so there is nothing to leak.)

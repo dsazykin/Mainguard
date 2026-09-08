@@ -115,7 +115,12 @@
     installed→new version chips, the honest consent copy, Upgrade now / Later, and the `VmUpgradePlan`
     step checklist reusing `VmUpgradeOfferViewModel`, which replaced the deleted `VmUpgradeOfferWindow`;
     a degraded/failed essential step shows honest status and hands `MainWindowViewModel` a
-    `StartupResult` banner), `ShutdownWindow`/`ShutdownWindowViewModel` (the small full-exit teardown
+    `StartupResult` banner; **its code-behind's `OnCompletedSwap` also re-points the control center's
+    on-focus mirror refresh at the window that now IS the main window (F67)** — the VM is constructed
+    inside `CreateShellWindow`, at which moment `desktop.MainWindow` is still this loader, so what it
+    bound at construction was a window about to be closed and the on-focus nudge was dead in the shipped
+    app; only the 60-second timer ever ran, which is why it went unnoticed. See
+    `ControlCenterViewModel.BindMainWindowActivation`), `ShutdownWindow`/`ShutdownWindowViewModel` (the small full-exit teardown
     window driving Core's `AppShutdownSequence` — a changing status line for releasing the `VmKeepAlive`
     holder and, when StopVmOnExit is on, "Stopping Mainguard OS…", with completion before process exit),
     `MainguardOsPageView`/`MainguardOsPageViewModel` (Pro-only Settings **Mainguard OS** page — replaces
@@ -308,7 +313,18 @@
       `Detail` (e.g. the reconciler's adoption line) is no longer rendered as launch progress nor allowed
       to buy the watchdog's 20-minute working budget. Restart itself no longer degrades into a silent
       Stop when nothing is picked in the (hidden-while-live) CLI picker: it falls back to the installed
-      CLI, and says why when there is none. And the honest dead-coordinator
+      CLI, and says why when there is none. **(F66) Restart's spawn is CONDITIONAL on its stop leg**:
+      `StopCoordinatorCoreAsync` returns whether the coordinator is actually down, and a refused stop
+      aborts the restart with the STOP's reason on the card — the daemon enforces one coordinator per
+      repo, so spawning over a live one could only be refused in turn, and the only sentence the human
+      ever saw was about the start while the old coordinator kept running. **(F73) Start/Restart bind
+      `CanRunCoordinatorLifecycle`** (`!IsStartingCoordinator && !IsStoppingCoordinator`), the exact
+      condition `RunStartupAsync` gates on — they used to bind `!IsStartingCoordinator` alone, so during a
+      stop (precisely when someone reaches for Restart) the button was enabled, took the click, and
+      silently no-opped. **(F73) The deliberate-stop terminal blanking is gated on the stop's result, not
+      on `IsCoordinatorLive`**: that flag is a projection of the agent-event stream and the transition
+      arrives after `StopAgent` returns, so whether the terminal blanked came down to which won the race —
+      and the losing case left a dead CLI's last frame under a card saying it had stopped. And the honest dead-coordinator
       card (`IsCoordinatorDead` — the newest coordinator-role session reached a terminal state: says it
       ended, keeps its terminal open for the replay — `ShowCoordinatorTerminal` stays true (the daemon
       retains the bound session's replay — the CLI's final output is the why), and un-gates the start card
@@ -402,7 +418,10 @@
       `ResourceMonitorView` (the
       Resources **tab** — task-manager style: totals header + CPU history decomposing into one live row
       per agent (CPU/RAM/spend/state/task, stable order so an open context menu never gets yanked),
-      right-click Pause/Resume + End task with a C-pattern confirmation; **P2-47 #4 adds the editable
+      right-click Pause/Resume + End task with a C-pattern confirmation (**F66: a refused End now toasts
+      the daemon's reason and says the agent is still running**, matching what Pause/Resume already did —
+      before, `EndAgentAsync` swallowed and the dialog simply closed over a row that never changed, whose
+      only available reading was that the end had worked and the rail was slow); **P2-47 #4 adds the editable
       per-day spend cap** (USD/day + tokens/day round-tripping through
       `ITelemetryService.Get/SetSpendBudgetAsync` → the `SetBudgets` RPC, preserving the per-agent caps);
       `MainWindowViewModel.ResourceMonitor` holds the lazily-created monitor as `object?` (2d) and drops
@@ -719,7 +738,13 @@
     box, because that text is delivered back to the worker to revise against, plus the revision counter
     against the daemon's budget and a warning when the next rejection would stop the worker rather than
     produce another plan; an `EscalatedPlanViewModel` card has **deliberately no buttons** — the loop is
-    over and the next move is the human's; and `BackpressureText`/`IsCapSaturatedByBlockedWorkers` render
+    over and the next move is the human's (it does carry **End this worker** — the same act as Resources →
+    End task — whose refusal branch became REACHABLE only once `EndAgentAsync` stopped swallowing, F66);
+    **(F73) `SendAsync` restores the composer on failure**: the box is cleared before the await, so a
+    swallowed transport failure took the human's typed message with it and left a transcript that simply
+    never showed the turn — `SendErrorText`/`HasSendError` state it and `CoordinatorPanelView` renders it
+    above the composer, and a restore never overwrites something typed since; and
+    `BackpressureText`/`IsCapSaturatedByBlockedWorkers` render
     the daemon's stall line, since a coordinator that has quietly stopped spawning is indistinguishable
     from a hang. Both decisions run through one `PlanCardViewModel.DecideAsync` that resets `IsDeciding` in
     a `finally` and reports a failure in `DecisionErrorText`/`HasDecisionError`: this gate is *blocking*, so
@@ -783,7 +808,14 @@
     `RpcException(Cancelled)` and anything the gateway wrapped one in) are classified out. It used to
     catch only `OperationCanceledException`, which is how three characters typed at a jailed CLI
     vanished with nothing said (stress S1 / G5). A dropped SIGWINCH is deliberately NOT surfaced —
-    self-correcting, and not something the operator typed — but it is no longer left unobserved. Derives
+    self-correcting, and not something the operator typed — but it is no longer left unobserved.
+    **Output that arrives before a view attaches is buffered and BOUNDED (F71)** at
+    `PendingOutputCapBytes` (2 MB, matching `VtScreen.PendingFeedCapBytes` and comfortably above the
+    daemon's 512 KB replay ring): a view is not guaranteed to arrive at all — the coordinator terminal is
+    rebuilt on every projection refresh whether or not its section is on screen — so a chatty CLI used to
+    accumulate its entire stream in managed memory, unbounded in size and time, defeating the engine's own
+    cap one level above it. The cap drops the OLDEST frames, because a terminal's meaning is in its tail.
+    Derives
     from `ViewModelBase` (not bare `ObservableObject`) so `ViewLocator` resolves it to `TerminalView`
     inside a `ContentControl` — the coordinator surface and the agent dock both rely on that resolution.
   - `BootstrapProgressViewModel` (P2-05: drives the `MainguardOsBootstrapper` off the UI thread,
@@ -929,7 +961,15 @@
     **wheel-scroll through the scrollback ring** — the 10k-line buffer always existed but the control
     never rendered it, so the terminal looked unscrollable (user-reported in the live cycle test):
     3 lines/notch via `VtScreen.ScrollbackLine` cells, cursor hidden while scrolled (the honest
-    "you are viewing history" signal), any keystroke snaps back to live). **Geometry deferral
+    "you are viewing history" signal), any keystroke snaps back to live). **CSI parameter accumulation is
+    bounded (F61)** by `VtScreen.CsiParamCapChars`: OSC capture was capped at 100k and CSI was not capped
+    at all, so `ESC [` plus megabytes of digits grew a `StringBuilder` and then a proportional `Split`, on
+    the UI thread, in the parser the DEFAULT engine runs. Past the cap the sequence is ABANDONED rather
+    than clamped — a CSI whose parameters were truncated is not the sequence the application sent, and
+    executing a guess at it would repaint on made-up numbers. `TerminalEngineKind.Interim`
+    (`Mainguard.Server/Terminal/TerminalEngineConfig.cs`) documents that these client-side bounds are the
+    ones that ship and points here, so the number lives in exactly one place; the libvterm path parses in
+    the daemon and is bounded there. **Geometry deferral
     (ISSUES-LOG #22):** the control constructs its `VtScreen` with `awaitGeometry: true`, so the
     engine HOLDS fed bytes (bounded 2 MB, past which it parses rather than drops) until the first
     layout pass establishes the real (cols, rows) — `ArrangeOverride` now sizes the engine itself
@@ -1129,7 +1169,27 @@
     `IAgentService`/`IMergeQueueService`/`ICoordinatorService`/`IKillSwitchService`/`ITelemetryService`/`IVibeService`
     — that **replaces `MockOrchestrator` in the shipped app**. Runs the P2-02 `StreamAgentEvents`
     snapshot-then-deltas stream on a background pump, keeps a live agent projection served from
-    `ListAgents()`, and routes `EndAgentAsync`→`StopAgent`; construction never blocks on the daemon. It
+    `ListAgents()`, and routes `EndAgentAsync`→`StopAgent`; construction never blocks on the daemon.
+    **(F65) `SpendPumpAsync` zeroes the spend accumulators on every subscribe** — `StreamSpend` is a
+    REPLAY stream, so accumulating across re-subscribes added one full ledger to the Resources rail and to
+    every per-agent row on each daemon restart / tier-1 update / dropped HTTP/2 stream; the ledger's
+    identity is the SUBSCRIPTION, so a new one replaces the totals rather than extending them
+    (`SpendStreamOverride` is the test seam). **(F66) `EndAgentAsync` THROWS** rather than swallowing:
+    a `StopAgent` can fail while the daemon is perfectly reachable, and swallowing made three surfaces
+    report a stop that never happened — callers own the surfacing, and all of them now do. **(F73)
+    `SendAsync` throws too**, for the same reason plus a sharper one: the composer is cleared before the
+    await, so a swallowed failure took the human's typed message with it. **(F68) all four remaining
+    appliers raise through `RaiseIsolated`** (plan, conversation, spend, resource) — they run on their
+    pump's thread, so an unisolated raise let one throwing subscriber end the stream. **(F69)
+    `ApplyQueueUpdate` is scoped to the handle its subscription was opened for**: cancelling a pump does
+    not unwind a message it has already dequeued, so the old repo's last push used to rewrite the whole
+    projection after a `SetActiveRepo` swap. **(F72) `ConfirmMergeAsync(agentId, ct)`** is the cancellable
+    overload the surface drives (the interface form delegates with `CancellationToken.None`), so a hung
+    host-side fetch no longer holds the repo's one merge lease until app exit; `TryAbandonAsync`'s budget
+    is the named `AbandonBudget` (3 s, deliberately unlinked from `_cts` — shutdown cancelling the merge is
+    exactly when the lease most needs handing back). **(F73) `Dispose` never blocks the calling thread when
+    that thread is the UI thread**: the same teardown (final harvest + pump drain) runs on a background
+    task, because the two waits could freeze the closing window for ~7 s against an unresponsive daemon. It
     is NOT a mock — surfaces whose gRPC contract does not exist yet (merge-queue projection, coordinator
     conversation, kill switch, telemetry, Vibe) return empty/neutral state with a marked
     `P2-47 residual` and light up as their RPCs are added. **Phase 2:** `ApplyPlanUpdate` also keeps
@@ -1196,7 +1256,11 @@
     (both the review cockpit and the agent document invoke the merge fire-and-forget, so every refusal
     used to vanish into an unobserved task and the button read as "nothing happened"): awaits
     `ConfirmMergeAsync`, and turns each outcome into one visible line — the daemon's reason verbatim
-    (§3.4) as a warning toast, or `Merged agent/<id> into main.` — never throwing at its caller. It is
+    (§3.4) as a warning toast, or `Merged agent/<id> into main.` — never throwing at its caller. Its
+    `RunAsync` takes an optional **`CancellationToken` the surface owns** (F72), passed to the daemon
+    adapter's cancellable `ConfirmMergeAsync` overload where one is behind the seam; a cancel is REPORTED
+    ("Merge cancelled — nothing was merged and the queue is unchanged."), because a Merge button that goes
+    quiet is the same "nothing visibly happened" this class exists to prevent. It is
     now the one place for the entry-lifecycle actions too (`DiscardAsync`, `RejectAsync` — the
     review verdict "no", driven from the cockpit's two-step DangerQuiet Reject with an optional
     reason box — `ClearStalledVerificationAsync`, `ResumeAsync`), which need the same contract for a sharper reason: the
@@ -1278,8 +1342,13 @@
   (`IsAgentProvisionRetryVisible`/`RetryAgentProvisioningCommand`) instead of being swallowed; the
   Pro implementation clears the previously active repo before provisioning, so a failed/slow
   provision leaves the merge rail empty rather than pointed at the previously opened repo — pinned
-  by `Mainguard.Tests/RepoProvisioningHonestyTests`; the ctor takes only the degraded-banner STRING,
-  never the Pro `StartupResult`); every git + host-collab `Views/`↔`ViewModels/`, `RepoDashboardViewModel`,
+  by `Mainguard.Tests/RepoProvisioningHonestyTests`; **the Pro implementation's `Queue.Refresh` after the
+  clear is marshalled to the UI thread (F70)** — it runs after `await _provisionGate.WaitAsync()
+  .ConfigureAwait(false)`, so the SECOND of two overlapping repo opens resumed on a thread-pool thread and
+  mutated a bound `ObservableCollection`, which Avalonia's collection handler throws on; the exception
+  unwound out of `ProvisionRepoCoreAsync` and landed as an "agent provisioning failed" card with the queue
+  pump already torn down — the ISSUES-LOG #11 blank rail by a new route; the ctor takes only the
+  degraded-banner STRING, never the Pro `StartupResult`); every git + host-collab `Views/`↔`ViewModels/`, `RepoDashboardViewModel`,
   `Controls/`, `Converters/`; `Editions/ClientManifest`; the Client
   `ClientFirstRunWindow`/`ClientFirstRunViewModel`; `VersionsViewModel` (the daemon/OS-version rows
   come from the `Editions/ShellVersionProbe` Mainguard.UI seam — `null` under Client → honest

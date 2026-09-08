@@ -312,6 +312,61 @@ public class CoordinatorCliStartTests
         Assert.NotEqual(firstId, host.CoordinatorAgentId);    // a new session id
     }
 
+    /// <summary>
+    /// Restart whose STOP is refused must not go on to spawn.
+    ///
+    /// <para>The daemon enforces one coordinator per repo, so a spawn after a refused stop can only be
+    /// refused in turn — and the message the human then read was about the START ("the daemon refused
+    /// the start"), never about the stop that actually failed, while the old coordinator kept running the
+    /// whole time. Two wrong things at once: an act reported as a different act, and an agent reported as
+    /// stopped that was not.</para>
+    ///
+    /// <para>This became reachable at all only when <c>EndAgentAsync</c> stopped swallowing; before that
+    /// the stop leg could not report a failure even in principle.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public async Task RestartCoordinator_WhoseStopIsRefused_DoesNotSpawn_AndSaysTheStopFailed()
+    {
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        var host = new FakeCliHost();
+        using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+        await vm.LoadInstalledClisAsync();
+
+        await vm.StartCoordinatorCommand.ExecuteAsync(null);
+        var firstId = host.CoordinatorAgentId!;
+        Assert.Equal(1, host.StartCalls);
+
+        host.EndFailure = new InvalidOperationException("the daemon is briefly holding this agent");
+        await vm.RestartCoordinatorCommand.ExecuteAsync(null);
+
+        Assert.Equal(1, host.StartCalls);                       // no second spawn on top of a live one
+        Assert.Equal(firstId, host.CoordinatorAgentId);         // the old coordinator is still the one running
+        Assert.Contains("was not stopped", vm.CoordinatorStartError, StringComparison.Ordinal);
+        Assert.Contains("still running", vm.CoordinatorStartError, StringComparison.Ordinal);
+    }
+
+    /// <summary>The Stop half of the same fact: a refused stop says so, and — because the coordinator is
+    /// still drawing — leaves its terminal alone rather than blanking it as if the CLI had ended.</summary>
+    [AvaloniaFact]
+    public async Task StopCoordinator_WhoseStopIsRefused_SaysSo_AndLeavesTheSessionAlone()
+    {
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        var host = new FakeCliHost();
+        using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+        await vm.LoadInstalledClisAsync();
+        await vm.StartCoordinatorCommand.ExecuteAsync(null);
+        var firstId = host.CoordinatorAgentId!;
+
+        host.EndFailure = new InvalidOperationException("the daemon is briefly holding this agent");
+        vm.StopCoordinatorCommand.Execute(null);
+        await vm.StopPrompt!.ConfirmCommand.ExecuteAsync(null);
+
+        Assert.Equal(firstId, host.CoordinatorAgentId);         // it is still there
+        Assert.Contains("was not stopped", vm.CoordinatorStartError, StringComparison.Ordinal);
+        Assert.False(vm.IsStoppingCoordinator);
+        Assert.Null(vm.StopPrompt);
+    }
+
     // ---- ISSUES-LOG #12: a faulting Restart must not be able to abort the process ------------------
 
     /// <summary>
@@ -937,9 +992,19 @@ public class CoordinatorCliStartTests
 
         /// <summary>Models the daemon tearing the session down: the agent leaves the list, so the VM's
         /// projection flips out of the live state.</summary>
+        /// <summary>When set, the daemon REFUSES the stop and the agent keeps running — the state
+        /// <c>DaemonBackedOrchestrator.EndAgentAsync</c> used to swallow, which made the escalated card's
+        /// error branch unreachable and let Restart spawn on top of a live coordinator.</summary>
+        public Exception? EndFailure { get; set; }
+
         public Task EndAgentAsync(string agentId)
         {
             EndedAgentIds.Add(agentId);
+            if (EndFailure is { } failure)
+            {
+                return Task.FromException(failure); // refused: the session is untouched
+            }
+
             Agents.RemoveAll(a => a.AgentId == agentId);
             if (CoordinatorAgentId == agentId) CoordinatorAgentId = null;
             return Task.CompletedTask;
