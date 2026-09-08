@@ -6,6 +6,7 @@ using Mainguard.Agents.Daemon;
 using Mainguard.Server.Auth;
 using Mainguard.Server.Runtime;
 using Mainguard.Server.Tests.Fixtures;
+using Microsoft.Data.Sqlite;
 using Xunit;
 
 namespace Mainguard.Server.Tests;
@@ -42,7 +43,7 @@ public sealed class DaemonSecondInstanceTests
     };
 
     [Fact]
-    public async Task SecondDaemon_LosingThePortRace_DoesNotRotateTheLiveTokenOrCertificates()
+    public async Task SecondDaemon_LosingThePortRace_LeavesTheLiveDaemonsStateUntouched()
     {
         var tokenPath = TestDaemonHost.TempTokenPath("mainguard-f55");
         var directory = Path.GetDirectoryName(tokenPath)!;
@@ -55,6 +56,13 @@ public sealed class DaemonSecondInstanceTests
             DaemonTransportFiles.ServerCertificatePath(directory));
         var clientCertBefore = await File.ReadAllBytesAsync(
             DaemonTransportFiles.ClientCertificatePath(directory));
+
+        // The third piece of shared state, and the one the token/cert fix did not cover: EF's migration
+        // lock. A row here is how a daemon says "I am mid-migration, do not touch this DB". The loser's
+        // ClearStaleMigrationLock ran during ConfigureServices — before the bind, before anything could
+        // tell it it had lost — and deleted the row unconditionally, on the assumption that a row present
+        // at boot must be orphaned.
+        SeedMigrationLockRow(DbPathIn(directory));
 
         Assert.Equal(live.Token, tokenBefore);
 
@@ -77,8 +85,46 @@ public sealed class DaemonSecondInstanceTests
             clientCertBefore,
             await File.ReadAllBytesAsync(DaemonTransportFiles.ClientCertificatePath(directory)));
 
+        // ...including the migration lock row, which is now protected by the same instance lock rather
+        // than by an assumption about who the DB's only writer is.
+        Assert.Equal(1, CountMigrationLockRows(DbPathIn(directory)));
+
         // And the live daemon is still the one those credentials belong to.
         Assert.Equal(live.Token, await File.ReadAllTextAsync(tokenPath));
+    }
+
+    /// <summary>
+    /// The migration-lock leg on its own, driven through the bootstrap entry point rather than a whole
+    /// host: while a daemon holds the data root the row it owns is left alone, and once that daemon is
+    /// gone the same call clears it — so the original 2026-07-17 boot hang stays fixed. Both directions
+    /// matter; a fix that only ever skipped would trade one outage for the other.
+    /// </summary>
+    [Fact]
+    public void MigrationLockRow_IsLeftAloneWhileADaemonHoldsTheDataRoot_AndClearedOnceItIsGone()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(), "mainguard-f55-eflock", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var dbPath = Path.Combine(directory, "mainguard-daemon.db");
+
+        Assert.True(Mainguard.Server.Gateway.GatewayServiceRegistration.TryPrepareDatabase(
+            dbPath, out _, lockDirectory: directory));
+        SeedMigrationLockRow(dbPath);
+
+        using (DaemonInstanceLock.Acquire(directory))
+        {
+            // Another daemon is up, so its row is not stale and must survive. EF waits on it and the
+            // migration watchdog turns that wait into the in-memory fallback — recoverable. Deleting it
+            // under a running migration is not.
+            Mainguard.Server.Gateway.GatewayServiceRegistration.TryPrepareDatabase(
+                dbPath, out _, watchdog: TimeSpan.FromSeconds(5), lockDirectory: directory);
+            Assert.Equal(1, CountMigrationLockRows(dbPath));
+        }
+
+        // Nobody holds the data root now, so the row IS orphaned — cleared, exactly as before.
+        Assert.True(Mainguard.Server.Gateway.GatewayServiceRegistration.TryPrepareDatabase(
+            dbPath, out _, watchdog: TimeSpan.FromSeconds(15), lockDirectory: directory));
+        Assert.Equal(0, CountMigrationLockRows(dbPath));
     }
 
     /// <summary>
@@ -147,6 +193,34 @@ public sealed class DaemonSecondInstanceTests
         Assert.Equal(
             DaemonInstanceLock.FileName,
             Mainguard.Agents.Agents.Bootstrap.MacDaemonController.InstanceLockFileName);
+    }
+
+    /// <summary>The daemon SQLite path beside a session token (mirrors <c>DaemonHost.ResolveDataPath</c>).</summary>
+    private static string DbPathIn(string directory) => Path.Combine(directory, "mainguard-daemon.db");
+
+    /// <summary>Writes the row a daemon that is busy — or was killed — mid-migration leaves behind.</summary>
+    private static void SeedMigrationLockRow(string dbPath)
+    {
+        using var connection = new SqliteConnection($"Data Source={dbPath}");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            "CREATE TABLE IF NOT EXISTS \"__EFMigrationsLock\" (" +
+            "\"Id\" INTEGER NOT NULL CONSTRAINT \"PK___EFMigrationsLock\" PRIMARY KEY, " +
+            "\"Timestamp\" TEXT NOT NULL); " +
+            "DELETE FROM \"__EFMigrationsLock\"; " +
+            "INSERT INTO \"__EFMigrationsLock\" (\"Id\", \"Timestamp\") " +
+            "VALUES (1, '2026-01-01T00:00:00.0000000Z');";
+        command.ExecuteNonQuery();
+    }
+
+    private static long CountMigrationLockRows(string dbPath)
+    {
+        using var connection = new SqliteConnection($"Data Source={dbPath}");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM \"__EFMigrationsLock\";";
+        return (long)command.ExecuteScalar()!;
     }
 
     private static string[] Flatten(Exception error)

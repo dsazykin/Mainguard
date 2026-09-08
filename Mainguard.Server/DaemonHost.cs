@@ -348,7 +348,11 @@ public static class DaemonHost
             builder,
             ResolveDataPath(options, builder.Configuration, tokenPath),
             log: message => migration.LogInformation("{Milestone}", message),
-            options: options);
+            options: options,
+            // F55, second leg: the data root whose instance lock guards ClearStaleMigrationLock. Named
+            // here rather than derived from the DB path because --data-path can separate the two, and
+            // this is the ONE place that knows both.
+            lockDirectory: transportCertificates.Directory);
 
         // P2-15 retention: 90-day expiry as chained redactions (once at boot + daily). No-op on the
         // in-memory fallback journal.

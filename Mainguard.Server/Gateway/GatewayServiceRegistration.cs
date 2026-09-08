@@ -28,8 +28,18 @@ namespace Mainguard.Server.Gateway;
 /// </summary>
 public static class GatewayServiceRegistration
 {
+    /// <param name="lockDirectory">
+    /// F55: the DATA ROOT this daemon's <c>Runtime.DaemonInstanceLock</c> guards — which is not
+    /// necessarily <paramref name="dbPath"/>'s directory, because <c>--data-path</c> can point the DB
+    /// somewhere else. Passed in rather than derived so the guard around
+    /// <see cref="ClearStaleMigrationLock"/> can never end up locking a directory no daemon holds (which
+    /// would clear a LIVE daemon's row) or one it never uses (which would skip the clear forever).
+    /// Null falls back to the DB's own directory, which is the correct answer in every configuration
+    /// that does not split the two.
+    /// </param>
     public static void Register(
-        WebApplicationBuilder builder, string dbPath, Action<string>? log = null, DaemonOptions? options = null)
+        WebApplicationBuilder builder, string dbPath, Action<string>? log = null, DaemonOptions? options = null,
+        string? lockDirectory = null)
     {
         var services = builder.Services;
 
@@ -43,7 +53,7 @@ public static class GatewayServiceRegistration
         IBudgetStore budgetStore;
         IMergeLeaseStore mergeLeaseStore;
         Func<AppDbContext>? dbFactory = null;
-        if (TryPrepareDatabase(dbPath, out var factory, log: log))
+        if (TryPrepareDatabase(dbPath, out var factory, log: log, lockDirectory: lockDirectory))
         {
             dbFactory = factory;
             spendStore = new DbSpendStore(factory);
@@ -700,7 +710,8 @@ public static class GatewayServiceRegistration
     private static readonly TimeSpan MigrationWatchdog = TimeSpan.FromSeconds(60);
 
     internal static bool TryPrepareDatabase(
-        string dbPath, out Func<AppDbContext> factory, TimeSpan? watchdog = null, Action<string>? log = null)
+        string dbPath, out Func<AppDbContext> factory, TimeSpan? watchdog = null, Action<string>? log = null,
+        string? lockDirectory = null)
     {
         var effectiveWatchdog = watchdog ?? MigrationWatchdog;
         try
@@ -712,7 +723,16 @@ public static class GatewayServiceRegistration
                 Directory.CreateDirectory(dir);
             }
 
-            ClearStaleMigrationLock(dbPath, log);
+            if (!ClearStaleMigrationLock(dbPath, lockDirectory ?? Path.GetDirectoryName(dbPath), log))
+            {
+                // F55: another daemon owns this data root. Do not migrate a database that is not ours —
+                // and do not spend the watchdog's 60 s discovering that EF cannot take a lock the live
+                // daemon is holding. This process is about to be refused by the instance lock anyway;
+                // the in-memory fallback keeps that refusal fast and leaves the other daemon's DB alone.
+                log?.Invoke("another daemon owns this data root → in-memory fallback (this instance will not start)");
+                factory = null!;
+                return false;
+            }
 
             // Migrate under a watchdog. A daemon killed mid-migration (e.g. a WSL idle-stop of the
             // whole distro) orphans EF's __EFMigrationsLock row, and EF retries acquiring it forever
@@ -746,34 +766,80 @@ public static class GatewayServiceRegistration
     }
 
     /// <summary>
-    /// The daemon is this DB's only writer (one systemd instance per VM; test hosts isolate their
-    /// own paths), so a migration-lock row present at boot was orphaned by a previous instance that
-    /// died mid-migration — clear it so <c>Migrate()</c> doesn't wait on a holder that no longer
-    /// exists. Best-effort: on a fresh DB or a pre-lock EF schema the table is absent and the delete
-    /// simply fails, leaving Migrate() + the watchdog to decide.
+    /// Clears an orphaned EF <c>__EFMigrationsLock</c> row so <c>Migrate()</c> doesn't wait forever on a
+    /// holder that no longer exists — but only while this process can prove no other daemon is running.
+    ///
+    /// <para><b>F55, the second leg.</b> This method's premise used to be an ASSUMPTION: "the daemon is
+    /// this DB's only writer, so a lock row at boot was orphaned". It runs from
+    /// <see cref="Register"/> during <c>ConfigureServices</c>, long before the port bind, so a second
+    /// daemon started against the same data root deleted the LIVE daemon's row on its way to discovering
+    /// it had lost — the same defect, and the same window, as the session-token and mTLS rotation that
+    /// moved behind the bind. The row is EF's own mutual exclusion during a migration; deleting it under
+    /// a daemon that is mid-migration is exactly what it exists to prevent.</para>
+    ///
+    /// <para><b>The premise is now enforced instead of assumed.</b> The delete happens only while this
+    /// process holds the data root's <c>DaemonInstanceLock</c>, taken transiently and released
+    /// immediately. Holding it at the moment of the delete is precisely the property required: if nobody
+    /// else holds the data root, no live daemon owns that row, so the row IS orphaned. A daemon that
+    /// starts after the release is a new daemon that will take the lock itself and re-migrate — the gap
+    /// cannot reintroduce the defect, because the defect is "delete while another daemon is live" and
+    /// that is the one state the lock excludes.</para>
+    ///
+    /// <para>Skipping is always safe, which is why <c>TryAcquire</c> rather than <c>Acquire</c>: a
+    /// refused lock means a daemon IS live, and a live daemon's row is not stale. Left in place, EF
+    /// waits on it and the migration watchdog in <see cref="TryPrepareDatabase"/> turns that wait into
+    /// the in-memory fallback — noisy, recoverable, and vastly better than corrupting a running
+    /// migration.</para>
+    ///
+    /// <para>Still best-effort in every other respect: on a fresh DB or a pre-lock EF schema the table is
+    /// absent and the delete simply fails, leaving Migrate() + the watchdog to decide.</para>
     /// </summary>
-    private static void ClearStaleMigrationLock(string dbPath, Action<string>? log = null)
+    /// <returns>
+    /// False when another daemon owns this data root — the caller must then neither clear nor migrate.
+    /// True in every other case, including "there was nothing to clear".
+    /// </returns>
+    private static bool ClearStaleMigrationLock(string dbPath, string? lockDirectory, Action<string>? log = null)
     {
-        try
+        // No data root to reason about (an in-memory or relative DB path in a unit test): fall through to
+        // the historical behaviour rather than refusing, since there is no daemon to protect either.
+        Mainguard.Server.Runtime.DaemonInstanceLock? guard = null;
+        if (!string.IsNullOrEmpty(lockDirectory))
         {
-            if (!File.Exists(dbPath))
+            guard = Mainguard.Server.Runtime.DaemonInstanceLock.TryAcquire(lockDirectory);
+            if (guard is null)
             {
-                log?.Invoke("no lock table (fresh db)");
-                return;
+                log?.Invoke(
+                    "another daemon holds this data root — leaving its migration lock alone "
+                    + "(a live daemon's lock row is not stale)");
+                return false;
             }
+        }
 
-            using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}");
-            connection.Open();
-            using var command = connection.CreateCommand();
-            command.CommandText = "DELETE FROM \"__EFMigrationsLock\";";
-            var rows = command.ExecuteNonQuery();
-            log?.Invoke(rows > 0 ? "stale migration lock cleared" : "no stale migration lock");
-        }
-        catch (Exception)
+        using (guard)
         {
-            // Absent table / unreadable file — nothing to clear.
-            log?.Invoke("no lock table");
+            try
+            {
+                if (!File.Exists(dbPath))
+                {
+                    log?.Invoke("no lock table (fresh db)");
+                    return true;
+                }
+
+                using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}");
+                connection.Open();
+                using var command = connection.CreateCommand();
+                command.CommandText = "DELETE FROM \"__EFMigrationsLock\";";
+                var rows = command.ExecuteNonQuery();
+                log?.Invoke(rows > 0 ? "stale migration lock cleared" : "no stale migration lock");
+            }
+            catch (Exception)
+            {
+                // Absent table / unreadable file — nothing to clear.
+                log?.Invoke("no lock table");
+            }
         }
+
+        return true;
     }
 
     /// <summary>

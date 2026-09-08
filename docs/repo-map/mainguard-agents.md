@@ -1882,7 +1882,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `JailReapPolicy.cs` (2026-09-04, owner decision — the pure rule behind the daemon's jail reaper:
       a jail is stopped when its merge-queue entry is terminal (Merged/Rejected/Discarded — the work has
       left it) or when no CLI has been bound to it for `CoordinatorLimits.IdleJailReapMinutes`; a jail
-      with a live CLI is never touched, whatever it is doing. `JailReapVerdict` carries the cause the
+      with a live CLI is never touched, whatever it is doing.
+      **F59 narrowed the second rule:** a jail whose entry is still IN FLIGHT (Working/Verifying/
+      Verified/StaleVerified/AwaitingReview/VerificationFailed) is no longer reaped for idleness alone.
+      "No CLI is bound" stopped meaning "nothing is happening" the moment a daemon restart stopped
+      killing the agents — an adopted jail has no bound CLI because its PTY belonged to the previous
+      daemon process and Docker cannot re-attach a running exec, so every one of them would have been
+      stopped mid-task half an hour after a restart. A jail left running costs memory the operator
+      reclaims with Stop; a jail reaped mid-task costs work nobody can get back. RESIDUAL, deliberate:
+      a jail whose CLI exited unobserved keeps an in-flight entry and is never reaped here — that is the
+      population the CLI re-bind-on-adoption work fixes, since re-binding is what restores the daemon's
+      ability to see the exit. `JailReapVerdict` carries the cause the
       audit event records. Before this only a human pressing Stop ever removed a jail — the 26 GB of
       idle 2 GiB jails an owner measured.)
     - `CoordinatorLimits.cs` (**phase 2** — the daemon-side caps record, lifted out of `CoordinatorTools.cs`

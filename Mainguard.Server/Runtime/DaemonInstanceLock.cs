@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using System.Threading;
 
 namespace Mainguard.Server.Runtime;
 
@@ -66,7 +67,52 @@ public sealed class DaemonInstanceLock : IDisposable
     /// root byte-for-byte untouched. The holder's pid is written into the file for diagnosis only —
     /// nothing reads it to make a decision, because a pid is not a lock.</para>
     /// </summary>
-    public static DaemonInstanceLock Acquire(string directory)
+    public static DaemonInstanceLock Acquire(string directory) => Acquire(directory, stamp: true);
+
+    /// <summary>
+    /// The non-throwing form: takes the lock, or returns <c>null</c> when another daemon holds it.
+    ///
+    /// <para>For work that must not run while a daemon is live but is <b>optional</b> — the caller has a
+    /// correct "do nothing" branch. Its one production caller is
+    /// <c>GatewayServiceRegistration.ClearStaleMigrationLock</c>: clearing an orphaned
+    /// <c>__EFMigrationsLock</c> row is only ever safe when nobody else is running, and skipping it is
+    /// safe by construction (a genuinely live holder's row is not stale, and EF's own watchdog covers the
+    /// case where it is).</para>
+    ///
+    /// <para>Does <b>not</b> stamp the holder pid: this lock is taken and released in a breath, and a
+    /// record naming a process that is about to stop holding it would make the refusal message worse
+    /// rather than better.</para>
+    /// </summary>
+    /// <param name="wait">
+    /// How long to keep trying before concluding that a real daemon holds the root. A daemon holds this
+    /// lock for its whole life, so a genuine conflict never clears and the wait is pure latency; what the
+    /// wait is FOR is the other transient holder — two hosts coming up together, which the in-proc test
+    /// tier does routinely because every fixture shares one data root by design. Without it a
+    /// millisecond-wide overlap between two transient acquires would read as "a daemon is running" and
+    /// silently drop a test host onto the in-memory stores.
+    /// </param>
+    public static DaemonInstanceLock? TryAcquire(string directory, TimeSpan? wait = null)
+    {
+        var deadline = DateTime.UtcNow + (wait ?? TimeSpan.FromSeconds(2));
+        while (true)
+        {
+            try
+            {
+                return Acquire(directory, stamp: false);
+            }
+            catch (DaemonAlreadyRunningException)
+            {
+                if (DateTime.UtcNow >= deadline)
+                {
+                    return null;
+                }
+
+                Thread.Sleep(50);
+            }
+        }
+    }
+
+    private static DaemonInstanceLock Acquire(string directory, bool stamp)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directory);
         Directory.CreateDirectory(directory);
@@ -88,12 +134,17 @@ public sealed class DaemonInstanceLock : IDisposable
             throw new DaemonAlreadyRunningException(path, DescribeHolder(path), ex);
         }
 
+        if (!stamp)
+        {
+            return new DaemonInstanceLock(path, stream);
+        }
+
         try
         {
             stream.SetLength(0);
-            var stamp = Encoding.UTF8.GetBytes(
+            var pidBytes = Encoding.UTF8.GetBytes(
                 Environment.ProcessId.ToString(CultureInfo.InvariantCulture) + "\n");
-            stream.Write(stamp);
+            stream.Write(pidBytes);
             stream.Flush(flushToDisk: true);
             if (!OperatingSystem.IsWindows())
             {
@@ -213,8 +264,12 @@ public sealed class DaemonAlreadyRunningException : Exception
 {
     public DaemonAlreadyRunningException(string lockPath, string holder, Exception? inner = null)
         : base($"Another Mainguard daemon is already running against this data root — {holder} holds "
-               + $"'{lockPath}'. Stop it before starting another; two daemons on one data root rotate "
-               + "each other's session token and mTLS material and clear each other's migration lock.",
+               + $"'{lockPath}'. THIS instance has stopped and written nothing: the daemon that holds "
+               + "the data root keeps running, and its session token and mTLS material are untouched, so "
+               + "any client already talking to it is unaffected. Stop that daemon before starting "
+               + "another, or give this one its own data root (MAINGUARD_DATA_ROOT) as well as its own "
+               + "--port. Two daemons on one data root rotate each other's session token and mTLS "
+               + "material and clear each other's migration lock, which is why this is refused.",
                inner)
     {
         LockPath = lockPath;

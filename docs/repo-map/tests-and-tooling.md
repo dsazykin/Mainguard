@@ -2529,7 +2529,10 @@
   DIFFERENT port against the same data root — which no bind error could ever have caught — is refused by
   `DaemonInstanceLock`; the lock itself refuses a second acquire and releases on dispose; and the lock
   file name is pinned equal across the `Mainguard.Server` / `Mainguard.Agents` assembly boundary, which
-  is the only place that duplication can be checked),
+  is the only place that duplication can be checked; and — the second leg — the loser leaves the live
+  daemon's `__EFMigrationsLock` row in place too, plus a focused test that the row is left alone while a
+  daemon holds the data root AND still cleared once it is gone, since a fix that only ever skipped would
+  trade the 2026-07-17 boot hang back in),
   `ReadOnlyAttachTests` (**F64** — a locked attach cannot Resize the managed worker's terminal while an
   unlocked one still can; a lock applied MID-attach is honoured on the next frame, i.e. the lock is read
   live rather than snapshotted; `TryClaimInput` is exclusive and released on dispose; and concurrent

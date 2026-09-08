@@ -47,7 +47,17 @@
     gateway stack via `Gateway/GatewayServiceRegistration` (the spend-ledger SQLite path resolved next
     to the isolated session token, `ResolveDataPath`); also registers the P2-09 `SessionLeader` + its
     durable `LeaderRegistry` (path next to the token, `ResolveLeaderRegistryPath`).
-- **`Gateway/GatewayServiceRegistration.cs`** — DI wiring for the P2-08 gateway (`AiGateway`,
+- **`Gateway/GatewayServiceRegistration.cs`** — **F55, second leg:** `TryPrepareDatabase` /
+  `ClearStaleMigrationLock` now take a `lockDirectory` (the DATA ROOT, threaded from `DaemonHost` because
+  `--data-path` can separate it from the DB's own directory) and clear EF's `__EFMigrationsLock` row ONLY
+  while holding `Runtime.DaemonInstanceLock`, taken transiently via `TryAcquire`. The method's premise —
+  "the daemon is this DB's only writer, so a row at boot was orphaned" — was an assumption, and it ran
+  during `ConfigureServices`, so a second daemon deleted the LIVE daemon's row before it ever discovered
+  the port was taken. Holding the lock at the moment of the delete is exactly the property required: if
+  nobody else holds the data root, no live daemon owns that row. A refused lock now short-circuits the
+  whole DB preparation to the in-memory fallback rather than spending the 60 s watchdog discovering that
+  EF cannot take a lock the live daemon holds — this instance is about to be refused anyway, and it must
+  not migrate a database that is not its own. DI wiring for the P2-08 gateway (`AiGateway`,
   `BudgetLedger`, `AdmissionController`, `SwarmReconciler`, `DaemonBootSequence` — both boot reconcile
   steps get the daemon's `IAuditLog` + log sink so a pass that prunes agents or reaps PTY sessions
   leaves an artifact); best-effort
