@@ -313,7 +313,18 @@
       `Detail` (e.g. the reconciler's adoption line) is no longer rendered as launch progress nor allowed
       to buy the watchdog's 20-minute working budget. Restart itself no longer degrades into a silent
       Stop when nothing is picked in the (hidden-while-live) CLI picker: it falls back to the installed
-      CLI, and says why when there is none. And the honest dead-coordinator
+      CLI, and says why when there is none. **(F66) Restart's spawn is CONDITIONAL on its stop leg**:
+      `StopCoordinatorCoreAsync` returns whether the coordinator is actually down, and a refused stop
+      aborts the restart with the STOP's reason on the card — the daemon enforces one coordinator per
+      repo, so spawning over a live one could only be refused in turn, and the only sentence the human
+      ever saw was about the start while the old coordinator kept running. **(F73) Start/Restart bind
+      `CanRunCoordinatorLifecycle`** (`!IsStartingCoordinator && !IsStoppingCoordinator`), the exact
+      condition `RunStartupAsync` gates on — they used to bind `!IsStartingCoordinator` alone, so during a
+      stop (precisely when someone reaches for Restart) the button was enabled, took the click, and
+      silently no-opped. **(F73) The deliberate-stop terminal blanking is gated on the stop's result, not
+      on `IsCoordinatorLive`**: that flag is a projection of the agent-event stream and the transition
+      arrives after `StopAgent` returns, so whether the terminal blanked came down to which won the race —
+      and the losing case left a dead CLI's last frame under a card saying it had stopped. And the honest dead-coordinator
       card (`IsCoordinatorDead` — the newest coordinator-role session reached a terminal state: says it
       ended, keeps its terminal open for the replay — `ShowCoordinatorTerminal` stays true (the daemon
       retains the bound session's replay — the CLI's final output is the why), and un-gates the start card
@@ -407,7 +418,10 @@
       `ResourceMonitorView` (the
       Resources **tab** — task-manager style: totals header + CPU history decomposing into one live row
       per agent (CPU/RAM/spend/state/task, stable order so an open context menu never gets yanked),
-      right-click Pause/Resume + End task with a C-pattern confirmation; **P2-47 #4 adds the editable
+      right-click Pause/Resume + End task with a C-pattern confirmation (**F66: a refused End now toasts
+      the daemon's reason and says the agent is still running**, matching what Pause/Resume already did —
+      before, `EndAgentAsync` swallowed and the dialog simply closed over a row that never changed, whose
+      only available reading was that the end had worked and the rail was slow); **P2-47 #4 adds the editable
       per-day spend cap** (USD/day + tokens/day round-tripping through
       `ITelemetryService.Get/SetSpendBudgetAsync` → the `SetBudgets` RPC, preserving the per-agent caps);
       `MainWindowViewModel.ResourceMonitor` holds the lazily-created monitor as `object?` (2d) and drops
@@ -724,7 +738,13 @@
     box, because that text is delivered back to the worker to revise against, plus the revision counter
     against the daemon's budget and a warning when the next rejection would stop the worker rather than
     produce another plan; an `EscalatedPlanViewModel` card has **deliberately no buttons** — the loop is
-    over and the next move is the human's; and `BackpressureText`/`IsCapSaturatedByBlockedWorkers` render
+    over and the next move is the human's (it does carry **End this worker** — the same act as Resources →
+    End task — whose refusal branch became REACHABLE only once `EndAgentAsync` stopped swallowing, F66);
+    **(F73) `SendAsync` restores the composer on failure**: the box is cleared before the await, so a
+    swallowed transport failure took the human's typed message with it and left a transcript that simply
+    never showed the turn — `SendErrorText`/`HasSendError` state it and `CoordinatorPanelView` renders it
+    above the composer, and a restore never overwrites something typed since; and
+    `BackpressureText`/`IsCapSaturatedByBlockedWorkers` render
     the daemon's stall line, since a coordinator that has quietly stopped spawning is indistinguishable
     from a hang. Both decisions run through one `PlanCardViewModel.DecideAsync` that resets `IsDeciding` in
     a `finally` and reports a failure in `DecisionErrorText`/`HasDecisionError`: this gate is *blocking*, so
@@ -1322,8 +1342,13 @@
   (`IsAgentProvisionRetryVisible`/`RetryAgentProvisioningCommand`) instead of being swallowed; the
   Pro implementation clears the previously active repo before provisioning, so a failed/slow
   provision leaves the merge rail empty rather than pointed at the previously opened repo — pinned
-  by `Mainguard.Tests/RepoProvisioningHonestyTests`; the ctor takes only the degraded-banner STRING,
-  never the Pro `StartupResult`); every git + host-collab `Views/`↔`ViewModels/`, `RepoDashboardViewModel`,
+  by `Mainguard.Tests/RepoProvisioningHonestyTests`; **the Pro implementation's `Queue.Refresh` after the
+  clear is marshalled to the UI thread (F70)** — it runs after `await _provisionGate.WaitAsync()
+  .ConfigureAwait(false)`, so the SECOND of two overlapping repo opens resumed on a thread-pool thread and
+  mutated a bound `ObservableCollection`, which Avalonia's collection handler throws on; the exception
+  unwound out of `ProvisionRepoCoreAsync` and landed as an "agent provisioning failed" card with the queue
+  pump already torn down — the ISSUES-LOG #11 blank rail by a new route; the ctor takes only the
+  degraded-banner STRING, never the Pro `StartupResult`); every git + host-collab `Views/`↔`ViewModels/`, `RepoDashboardViewModel`,
   `Controls/`, `Converters/`; `Editions/ClientManifest`; the Client
   `ClientFirstRunWindow`/`ClientFirstRunViewModel`; `VersionsViewModel` (the daemon/OS-version rows
   come from the `Editions/ShellVersionProbe` Mainguard.UI seam — `null` under Client → honest

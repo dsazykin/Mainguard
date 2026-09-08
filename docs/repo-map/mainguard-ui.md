@@ -130,7 +130,10 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   `Editions/IAgentPlatformSurface` (its `StopAllAgentsAsync` — 2026-09-04, owner decision — is the
   exit leg of "Stop agents and Mainguard OS on exit": the shutdown sequence ends every live agent
   through the ordinary Stop before any VM leg, which is what makes the setting honest on macOS where
-  there is no VM), `Editions/IProToolsSurface` (reshaped for the Settings-window
+  there is no VM; **(F66) the Pro implementation still attempts EVERY agent — one refusal must not strand
+  the rest — and then THROWS naming the ones it could not stop**, which `AppShutdownSequence` catches and
+  logs as non-fatal: while `EndAgentAsync` swallowed, the exit log recorded a clean sweep over jails that
+  were still running, and on macOS there is no VM terminate afterwards to make that harmless), `Editions/IProToolsSurface` (reshaped for the Settings-window
   rework: its methods used to each be `Task ManageXAsync(Window owner)` — open a dialog; the page
   factories now — `CreateAiProvidersPage`, `CreateAgentClisPage`, `CreateToolchainsPage` (the
   user-managed language-toolchain page, added with the toolchain channel), `CreateDaemonLogsPage`,
