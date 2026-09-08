@@ -290,6 +290,11 @@
     `MergeQueueProvisioner.RefreshMainFromCheckout` for each live queue, so a pull made on main outside
     Mainguard reaches the queue without a repo-open and the rail's "refreshed N min ago" is a bound.
     `SweepOnce()` is public for the wiring test; the on-demand `RefreshMirrorMain` RPC is the same call.
+    **F44:** that refresh fetches UNFORCED (`TryRefreshMirrorMainAfterMerge(handle, force: false, …)`).
+    It used to force, so a reset or force-push on the user's main rewound the MIRROR while the same
+    method's reconcile deliberately refuses to walk the QUEUE's main backwards — leaving the mirror behind
+    the queue with nothing to correct it. Only the merge-confirm path forces, where origin's main is
+    authoritative by definition; unforced, git refuses the rewind and the human reads it as the error.
   - **`Runtime/JailReaperHostedService.cs`** (2026-09-04, owner decision) — the jail reaper: every
     `CoordinatorLimits.JailReapSweepSeconds` it walks `AgentSessionStore.List()`, asks `JailReapPolicy`
     with the entry state, whether `TerminalSessionManager.TryGetBound` holds a live CLI, and how long it
@@ -727,7 +732,20 @@
   `ChangedTestCommandGate` alone, so a branch the daemon blocked reached the human with nothing to
   clear — and `AcknowledgeFlaggedChange` routes any non-RT-D2 item id to that gate's store. Both use
   `PeekStore`, never `StoreFor`: creating a store from a read/ack would fabricate a fully-acknowledged
-  record and bypass the gate's default-DENY. **L2/L4 audit (§20 of the phase-3 decisions doc):** `ConfirmMerge` derives the actor from
+  record and bypass the gate's default-DENY. **F42 — the RT-D2 gate now has TWO wire ids,
+  `changed-test-command` and `changed-toolchain`, and `FlaggedItemsFor` projects one row per armed item.**
+  It was one row cleared by one ack that waived every item the gate held, so a human reading the branch's
+  new test command also waived, unseen, the toolchain that runs it — in direct contradiction of this RPC's
+  own "per item, never all" summary. `GateItemFor(itemId)` maps the wire id onto the gate item and
+  `ChangedTestCommandGate.Acknowledge(agent, item, actor)` waives exactly that one.
+  **F43 (partial) — `RunVerification` and `GetMergeDiff` call `DenyCoordinator`.** The first EXECUTES a
+  repository's test suite inside another agent's jail on demand with no cooldown (the coordinator's own
+  `request_verification` op has a readiness cooldown; this door has none) and the second returns a
+  co-tenant branch's full diff — the same read `GetScrollback`/`StreamPlans` are already denied for.
+  Optional `ConnectionRoleRegistry`/`SessionTokenFile` ctor params (DI-filled; absent in the slim unit
+  fixtures) make the check a handler-level assertion of the same boundary. **The durable fix is the
+  `RoleInterceptor` deny-list, which is not this file** — see the PR body for the exact method strings
+  owed there. **L2/L4 audit (§20 of the phase-3 decisions doc):** `ConfirmMerge` derives the actor from
   `IApproverIdentityResolver` and passes `MergeAuthorization.ConfirmRpc(actor, leaseId)` into
   `TryConfirmHumanMerge` (which is where `queue_entry_merged` is appended), and `AcknowledgeFlaggedChange`
   passes the same daemon-derived actor into `ChangedTestCommandGate.Acknowledge`. This service also owns
@@ -750,7 +768,20 @@
   `git merge --ff-only agent/<id>` leaves main AT the source's tip. Stated as a limit rather than
   stretched: the P2-12 external leg lands the host's merge commit, which is not the PR head, so the same
   equality would be false for every honest external merge (that path has its own head CAS, K4). Each
-  refusal releases the lease and audits `merge_confirm_refused` with `stage = "identity"`. **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
+  refusal releases the lease and audits `merge_confirm_refused` with `stage = "identity"`.
+  **W2-B/F36 — the late-record path is a gate, not a formality.** When the queue's gate refuses, the
+  daemon used to record `Merged` anyway (source `confirm_rpc_late`) whenever the reported sha equalled
+  `lease.ExpectedBranchSha` — but the identity screen above has ALREADY refused every Local confirm for
+  which that is false, so the condition was true by construction and every gate refusal became a terminal
+  Merged plus a fired cascade on nothing but the caller's own claim about a ref on its own machine. It now
+  calls `MergeQueueProvisioner.TryObserveMergeLanded`, which fetches main FROM the user's checkout (the
+  mirror's `origin`) and asks git two questions — is main the sha this confirm reports, and does it
+  contain the tip the lease authorized. An unobservable merge is refused with both halves of the reason
+  and the lease kept for the reconcile. **F37 — a branch main ALREADY contains can now reach `Merged`.**
+  `--ff-only` of a contained branch exits 0 and moves nothing, so the client honestly reports the
+  pre-merge sha and the "nothing moved" screen refused it forever; reachable after an `Undecidable` boot
+  reconcile or a hand pull, and once there only Discard could close the row. The same observation answers
+  it, so the record is the truth rather than a refusal. **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
   mirror (`MergeQueueProvisioner.TryRefreshMirrorMainAfterMerge`, best-effort) — without it, a spawn
   between a merge and the next repo-open based its worktree on the stale mirror main and
   `EnsureQueue`'s reconcile walked the queue's authoritative main BACKWARDS to it, leaving

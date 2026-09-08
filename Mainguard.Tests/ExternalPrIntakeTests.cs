@@ -18,7 +18,9 @@ namespace Mainguard.Tests;
 /// <summary>
 /// P2-12 external agent PR intake (plan §6 tests 1–5,7 + TI-P2-12 1–8; the §6/TI union). Every test is
 /// driven through the T-23 provider seam and the worktree/fetch seams — no live network, no Docker. The
-/// merge-path dispatch (test 6) lives in <see cref="MergeDispatchTests"/>.
+/// merge-path dispatch (test 6) was covered by <c>MergeDispatchTests</c>, deleted along with the
+/// never-wired <c>MergeDispatch</c> it exercised; the shipped dispatch is
+/// <c>DaemonBackedOrchestrator.ConfirmMergeAsync</c>.
 /// </summary>
 public class ExternalPrIntakeTests
 {

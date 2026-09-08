@@ -259,8 +259,12 @@
   `--ff-only` refusal that is NOT staleness must not be labelled staleness or invalidate the
   verification — with a control proving the same call merges once the lock clears),
   the always-`--ignore-scripts` poisoned-postinstall canary with an injected
-  EBUSY retry, and the RT-D1 `DaemonCrashMidMerge` committed-but-unconfirmed exactly-once +
-  never-committed release), `Integration/StaleCascadeTests` (two/three-worker cascade → re-verify →
+  EBUSY retry, the RT-D1 `DaemonCrashMidMerge` committed-but-unconfirmed exactly-once +
+  never-committed release, and the three W2-B/F39 checkout-damage tests —
+  `ForegroundMerge_MidRebase_IsRefused_AndMainNeverMoves` (parked by `rebase --exec false`, so
+  `status --porcelain` is EMPTY and the old clean-tree precondition waved it through),
+  `PostMergeRefresh_UsesTheManagerTheLockfileNames_NotNpm` (a `pnpm-lock.yaml` repo must not have `npm`
+  run in it), and `ForegroundMerge_StartedFromAnotherBranch_RestoresTheUsersCheckout`), `Integration/StaleCascadeTests` (two/three-worker cascade → re-verify →
   merge blocked until fresh; fail-after-rebase → Working), `Headless/MergeQueueRenderHarness` (the
   real-`MergeQueue` rail in every theme → `merge_queue_<Theme>.png`; note this renders
   `MergeQueueView`, which is **harness-only** — the shipped Control Center hosts `QueueRailView`),
@@ -1650,8 +1654,8 @@
   gateway-less constructor** to fall back to, Save/Subscribe go through `IPrIntakeGateway` and re-render
   from what came BACK, and a daemon refusal leaves `ErrorMessage` set and `StatusMessage` null rather
   than a silent success) and
-  `MergeDispatchTests` (the origin-routed merge step — local→foreground service, external→host merge
-  API, both fire `NotifyMainMoved`). **P2-14 governance tests (Core):** `TaskPlanSchemaTests` (the
+  (`MergeDispatchTests` was **deleted** with the never-wired `MergeDispatch` it covered; the shipped
+  origin routing is `DaemonBackedOrchestrator.ConfirmMergeAsync`). **P2-14 governance tests (Core):** `TaskPlanSchemaTests` (the
   schema corpus — valid + every invalid shape → exact error sets, unknown-field rejection, oversized
   guard), `PlanApprovalTests` (reject→nothing released/no residue; approve persists the
   daemon-derived identity + survives restart; the pressure signal and its coordinator scoping),
@@ -3077,7 +3081,34 @@
   journal fallback used only for an entry that names this branch; an unreadable main read as undecidable
   rather than as "never committed"; the foreground merge consuming the ref it just fetched rather than a
   stale local `agent/<id>`, and refusing outright when neither is the sha the queue verified; and the
-  keep-alive guard re-reading the `GitDirState` it decided from after the `index.lock` backoff.
+  keep-alive guard re-reading the `GitDirState` it decided from after the `index.lock` backoff. **W2-B/F38
+  adds the pair that pins the reconcile to the tip the LEASE authorized:**
+  `ART_D1_Reconcile_IsUndecidable_WhenTheMergedTipIsNotTheOneTheLeaseAuthorized` (the worker pushes after
+  `BeginMerge`, a human merges the NEW tip by hand — main contains the authorized commit, so a name-based
+  containment test says "merged", and it is not: what landed is a superset nobody verified) and its
+  control `ART_D1_Reconcile_RecordsTheMerge_WhenTheAuthorizedTipIsWhatLanded`.
+- **`Mainguard.Tests/MergeQueueProvisionerTests.cs`** also carries the W2-B/F34–F35 evidence trio:
+  `ARefusedPreVerificationPublish_FailsTheRun_AndRecordsNothing` (the publish's answer was discarded, so a
+  refused non-fast-forward left `branchSha` on the OLD mirror tip while the command ran against the new
+  worktree — nothing executes and nothing is recorded),
+  `ADirtyJailWorktree_IsRefused_AndNothingIsRecordedVerified` (git ANSWERS `M feature.cs` in the jail; the
+  only exec is the probe), and
+  `AnArmThatThrows_LeavesTheGateClosed_AndDropsTheEarlierAcknowledgments` (a `SwitchableMergeDiff` that
+  starts failing on the second arm — the store is FORGOTTEN, so `CanMerge` answers the MG-40 default-DENY
+  rather than the previous tip's acknowledgments).
+  `MergeQueueStateMachineTests.Cancel_KeepsATerminalRow_AndStillForgetsALiveOne` pins F41.
+- **`Mainguard.Server.Tests/MergeConfirmGateTests.cs`** (MG-11 + W2-B/F36–F37) — every `ConfirmMerge`
+  refusal asserts its REASON, not merely that something was refused. Its `LandedMergeWorld` helper builds
+  a REAL checkout whose main was fast-forwarded onto the agent tip plus a bare mirror of it at the path
+  `IRepoProvisioner.BareRepoPathFor` names, because the F36 fix is "stop believing the caller and go and
+  look" and a fixture of literal sha constants can only exercise the refusal half:
+  `ConfirmMerge_WhenTheGateRefusesAndTheMergeCannotBeObserved_IsRefused` (the claim on its own is not the
+  proof; the lease stays outstanding for the reconcile),
+  `ConfirmMerge_WhenTheGateRefusesAndTheMergeIsObservedOnTheCheckout_RecordsItAsConfirmRpcLate` (asserting
+  the `MergeAuthorization.ConfirmRpcLateSource` the merge record lands under),
+  `ConfirmMerge_WhenMainAlreadyContainsTheAuthorizedTip_RecordsItAsMerged` (F37 — `--ff-only` of a
+  contained branch moves nothing, and the row could previously reach no terminal but Discard) and its
+  control `ConfirmMerge_WhenNothingMovedAndMainDoesNotContainTheBranch_IsStillRefused`.
 Not in the solution (scratch/experiments, don't rely on them): `Mainguard.StyleConsole`, `Mainguard.StyleTests`, `Mainguard.AvaloniaTests`.
 
 ---

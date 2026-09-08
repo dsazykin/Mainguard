@@ -120,7 +120,7 @@ public sealed class MergeQueueProvisioner
     /// <param name="registry">The registry the gRPC layer resolves repo handles through.</param>
     /// <param name="repos">Locates the daemon-side bare mirror for a repo hash (main sha + config trees).</param>
     /// <param name="leases">The RT-D1 merge-lease store. <b>Must be the same singleton</b> the foreground
-    /// merge, <c>BeginMerge</c> and <see cref="MergeDispatch"/> use — the one-outstanding-merge-per-repo
+    /// merge and <c>BeginMerge</c> use — the one-outstanding-merge-per-repo
     /// invariant is only an invariant while every origin contends for the same store (MG-23).</param>
     /// <param name="resolveContainerId">(repoHash, agentId) → the agent's live jail, or null when it has
     /// none. Verification runs in the worker's own sandbox; no jail means no verification (never the host).</param>

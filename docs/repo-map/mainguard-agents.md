@@ -1431,6 +1431,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     product spine, daemon-side, no UI).**
     - `MergeQueue.cs` (the exhaustive, persisted `IMergeQueue` state machine —
       `GetState`/`LastChangedAt`/`LastVerification`/`RunVerificationAsync`/`NotifyMainMoved`/`CanMerge`;
+      **F41: `Cancel(agentId)` keeps a row that already reached `Merged` or `Rejected`.** Its only caller
+      is the intake's closed-upstream sweep, which fires for every pull request that is no longer OPEN —
+      and a PR Mainguard itself merged is not open, so the entry recorded `Merged` a moment earlier was
+      deleted at the very next poll and the queue's answer to "did this merge?" became "there is no such
+      entry", indistinguishable from a PR somebody closed unmerged. `Discarded` is deliberately NOT in the
+      kept set (a discard already means "forget this", and `Hydrate` keeps it as a tombstone anyway);
       **H2: a FAILED run settles to `WorkerMergeState.VerificationFailed`, not to `Working`** — `Working`
       is where a NEVER-verified entry sits, so red and never-run used to be the same value and every
       surface said "not verified yet" about a branch whose tests had just failed; the new state is
@@ -1547,21 +1553,35 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `VerificationCommandResolver` (resolve from the main-side baseline, SHA-256 the config, detect
       drift, honor a human command pin) + the composable `ChangedTestCommandGate : IMergeGate` —
       which now **audits every acknowledgment** (L2/L4, §20 of the phase-3 decisions doc): its
-      `Acknowledge(agentId, acknowledgedBy)` appends one `acknowledged_flagged_change` per waived item
-      carrying the config `path`, the `from`/`to` excerpt + full SHA-256, and the daemon-derived actor —
-      it previously recorded the waiver in a plain `HashSet` and wrote nothing, for the one click that
-      lets a branch self-green. `SetFlagged` takes an optional `CommandDrift(ConfigPath, FromMain,
-      ToBranch)` (supplied by `MergeQueueProvisioner` from the two committed trees) and `MergeEvidence`
-      reports what it established for the merge record).
+      `Acknowledge(agentId, item, acknowledgedBy)` appends one `acknowledged_flagged_change` for the
+      waived item carrying the config `path`, the `from`/`to` excerpt + full SHA-256, and the
+      daemon-derived actor — it previously recorded the waiver in a plain `HashSet` and wrote nothing, for
+      the one click that lets a branch self-green. **F42: the waiver is PER ITEM.** Acknowledgment used to
+      take only an agent id and clear every armed item at once, so a human reading the branch's new test
+      command also waived the `ToolchainItem` that runs it, contradicting the acknowledge RPC's own "per
+      item, never all" contract; `_acknowledged` is keyed `(agent, item)`, `IsUnacknowledged(agent, item)`
+      answers per item, `Allows` names only the items still outstanding, and the daemon projects one
+      `FlaggedItem` row per item (`changed-test-command` / `changed-toolchain`). `SetFlagged` takes an
+      optional `CommandDrift(ConfigPath, FromMain, ToBranch)` (supplied by `MergeQueueProvisioner` from the
+      two committed trees) and `MergeEvidence` reports each item's own state for the merge record).
       `VerificationStore.cs` (`IVerificationStore` — **insert-only, no update** (invariant 2);
-      `InMemoryVerificationStore`/`DbVerificationStore`). `MergeQueuePersistence.cs` (`DbMergeQueueStore`
+      `InMemoryVerificationStore`/`DbVerificationStore`; `ById(repoHash, id)` resolves the record a queue
+      row's persisted `LastVerificationId` names, which is what `MergeQueue.Hydrate` now reads instead of
+      "the newest record this agent has" — the pointer was written on every save and read by nothing, so a
+      restart could re-attach a verdict from a different run to a state settled by another). `MergeQueuePersistence.cs` (`DbMergeQueueStore`
       + the RT-D1 `IMergeLeaseStore`/`InMemoryMergeLeaseStore`/`DbMergeLeaseStore` — one outstanding lease
       per repo; K3/§23.4 `TryBegin` also records `ExpectedBranchSha`, the `agent/<id>` tip the queue's
       verification was measured on, so the lease states the IDENTITY it authorizes and not merely that a
       merge is in flight). `MergeReconcileTask.cs` (the RT-D1 `IBootTask` in the boot merge-reconcile slot:
       **K1/§23.2** — synthesizes a missing `ConfirmMerge` + fires `NotifyMainMoved` only when the merge is
       proved to be THIS lease's, asked of git (main moved forward from the lease's expected sha AND now
-      contains `agent/<id>`); falls back to the T-19 journal only when the branch ref is gone, and then
+      contains the tip the lease AUTHORIZED). **F42/F38: the tip, not the name.** `Classify` used to
+      resolve `agent/<id>` by name and ask containment of whatever it pointed at now, so a worker that
+      pushed after `BeginMerge` plus a hand merge of that later, unverified tip was recorded as this
+      lease's merge; it now prefers `lease.ExpectedBranchSha` when this checkout carries that object, and
+      refuses (`Undecidable`) when the branch has advanced past the authorized tip AND that later tip is
+      what main carries — main moving further along its own history after the merge is unaffected. Falls
+      back to the T-19 journal only when the branch ref is gone, and then
       only to an identity-bound entry (this lease's window, naming this branch, its own snapshots recording
       main moving from the expected sha to now). Three verdicts — `Merged`, `NeverCommitted`, and
       `Undecidable`, which releases the lease and records NOTHING. It used to fire on "main moved at all"
@@ -1651,12 +1671,26 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       published `agent/<id>` really contains the queue's main — the one predicate the whole re-entry
       exists to establish, and the answer no cycle-kind can fake. Both refuse only on a POSITIVE
       mismatch; an unreadable mirror or an empty sha answers nothing, and refusing from ignorance would
-      strand every substrate-less caller. `ArmFlaggedChangeReview` runs the
+      strand every substrate-less caller.
+      **W2-B/F34 — the verified bytes ARE the recorded bytes.** `ResolveJailAndPublishForVerification`
+      now READS the pre-verification publish's answer (it was discarded): a mirror that does not end up
+      carrying the agent's tip — a refused non-fast-forward after an amend, a branch the agent's own repo
+      lacks, a git failure — means `branchSha` would resolve the OLD tip while the command ran against the
+      new worktree, so nothing runs. `EnsureJailWorktreeCleanAsync` then asks git IN THE JAIL, before the
+      command, whether the tree is clean (`status --porcelain --untracked-files=no`) and whether HEAD is
+      the commit the record will name; a tracked modification or a HEAD/mirror mismatch refuses. It
+      refuses on an ANSWER, never on silence: a jail whose git cannot run — no git on the image, or a
+      worktree whose `.git` pointer names a repository the container was not given, which is every jail
+      until W1-A's git-pointer mount lands — is logged as unmeasured evidence rather than treated as a
+      dirty tree, the `BranchDescendsFromMain` posture. Tighten to fail-closed once the jail is
+      guaranteed a working git. `ArmFlaggedChangeReview` runs the
       required `IMergeBranchDiffService` + `FlaggedChangeDetector.DetectFlagged` at verification time (the
-      same cadence the RT-D2 gate is armed at, so a re-push re-classifies and drops stale acks). A diff
-      that cannot be computed leaves the store **unset** — an empty set reads as fully acknowledged, so
-      writing one would fail open; the branch is denied by the gate's MG-40 default-DENY instead, and the
-      verification result is left untouched. `ArmFlaggedChangeReview` then calls **`ReviewLockfiles`**
+      same cadence the RT-D2 gate is armed at, so a re-push re-classifies and drops stale acks). **F35:**
+      the WHOLE arm is guarded, and a classification that throws anywhere in it calls
+      `FlaggedChangeGate.ForgetStore` — an empty set reads as fully acknowledged so writing one would fail
+      open, and merely LEAVING the previous store (what it used to do) kept the previous tip's flagged set
+      and the human's ticks alive across a failed re-arm; the branch is denied by the gate's MG-40
+      default-DENY instead, and the verification result is left untouched. `ArmFlaggedChangeReview` then calls **`ReviewLockfiles`**
       (P2-11 §3.6): for every path `Review.LockfileReview.KindFor` recognises it reads BOTH full blobs out
       of the mirror with the same `git show` the RT-D2 provenance uses (main vs `agent/<id>`) and folds the
       semantic rows — package added/removed/bumped, install scripts, offline-OSV CVE — into the same
@@ -1765,7 +1799,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `FlaggedChangeGate.cs` (the P2-11 `IMergeGate` ANDed into `CanMerge` — holds a per-agent
       `Review.AcknowledgmentStore`; blocks until every flagged item for the current hash is acked
       item-by-item; the security boundary against hostile agent code. Fails closed on an agent it has
-      never seen (MG-40). **Now actually wired**: `MergeQueueProvisioner.Build` constructs it into every
+      never seen (MG-40). `ForgetStore(agentId)` drops an agent's store back to that default-DENY —
+      **F35**: `ArmFlaggedChangeReview` used to log-and-return when the diff threw, leaving the PREVIOUS
+      tip's flagged set and the human's ticks standing, so v2 of a branch (one that had since added a CI
+      workflow) verified green against v1's acknowledgments with `CanMerge` true, reachable from a
+      transient `packed-refs.lock`. The whole arm is now guarded and a throw forgets the store. **Now actually wired**: `MergeQueueProvisioner.Build` constructs it into every
       repo queue — it previously existed only in tests and one dead ViewModel branch. `StoreFor` creates
       on demand and is for the review that classifies a diff; every READ path (the daemon's flagged-item
       projection, the ack RPC) uses **`PeekStore`**, which never creates — a fresh store holds no items and
@@ -1823,17 +1861,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       idempotent (a live worker costs no cap and starts nothing) and never throws for an ordinary
       refusal/provisioning failure; `ReleaseWorkerAsync` tears down the whole worker (jail + MG-36 segment
       + package cache + worktree), not just the worktree. Implemented daemon-side by
-      `Runtime/ExternalPrWorkerHost.cs`. `MergeDispatch.cs` (`IMergeDispatch`/`MergeDispatch` — the
-      pluggable per-entry merge step: a `Local` origin routes to the P2-10 `IForegroundMergeService` (its
-      own `onMerged` fires `NotifyMainMoved`), an `External` origin to the P2-12
-      `IExternalPrMergeExecutor` then `Queue.ConfirmHumanMerge`→`NotifyMainMoved`; the human review gate
-      (P2-11 cockpit) is unchanged. Both origins take the SAME per-repo lease and re-read `CanMerge` + the
-      expected `main@sha` **under** it (MG-23). **No production caller** — the shipped merge is driven
-      from the Windows GUI (`DaemonBackedOrchestrator.ConfirmMergeAsync`), because both transports need
-      host-side things the daemon lacks: the user's checkout, and the host token, which lives only in the
-      host OS keychain and is never copied into the VM. It performs no host call of its own — it delegates
-      to the same executor the GUI runs, so there is one answer to "how does an upstream PR merge"; if it
-      is ever wired it must contend for the daemon's single `IMergeLeaseStore`.) `PrIntakeStore.cs`
+      `Runtime/ExternalPrWorkerHost.cs`. (**`MergeDispatch.cs` was DELETED** in the W2-B audit pass, with
+      its `MergeDispatchTests`. It was the daemon-side pluggable per-entry merge step and had no
+      production caller, by construction rather than by omission: both transports need host-side things
+      the daemon does not have — the user's checkout for a local merge, and the host token for an external
+      one, which lives only in the host OS keychain and is never copied into the VM. The routing it
+      described is performed for real by `DaemonBackedOrchestrator.ConfirmMergeAsync`, over the daemon's
+      own lease, so keeping it meant keeping a second, divergeable copy of the merge conversation with its
+      own lease-store owner — the exact MG-23 hazard its own doc comment warned about.) `PrIntakeStore.cs`
       (`IPrIntakeStore` — subscriptions + seen head SHAs + tracked-PR set **+ the daemon's
       `PrIntakeSettings`** (`Enabled`, `PollIntervalSeconds`, `BotAuthors`, with `Normalized()` clamping
       the cadence to [10,3600] and substituting `DefaultBotAuthors` for an empty list — a stored row is
@@ -2287,6 +2322,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     `IOperationJournal` op (undoable/replayable — reuses the single journal, not a second one). The RT-D1 two-step conversation (`BeginMerge` lease →
     `PerformJournaledMerge` → `ConfirmMerge`); post-merge dependency refresh is **always
     `--ignore-scripts`** (poisoned lifecycle hooks never run) wrapped in NTFS `EPERM`/`EBUSY` retry.
+    **F39 — three ways it used to damage the user's checkout, all closed.** (1) `InProgressOperation`
+    refuses a repository mid-rebase/merge/cherry-pick/revert/bisect, asked of git's own state files via
+    `rev-parse --git-path`: `status --porcelain` is EMPTY during a rebase stopped at an `edit`/`break`
+    step or a failed `--exec`, so the clean-tree precondition said yes and the merge then switched
+    branches out from under the in-flight sequence. (2) The checkout is BORROWED: `MergeOnMain` is split
+    out so a `finally` restores the branch the user was on, instead of parking them on main for good.
+    (3) `_depsRefreshRunner` takes the DETECTED package manager `(workingDir, manager, args)` — it was
+    detected and then discarded while the default runner hardcoded `npm`, so a merge in a pnpm/yarn repo
+    wrote a `package-lock.json` the project does not use and a differently-resolved `node_modules` into
+    the user's tree; `DetectPackageManager` reads pnpm/yarn/bun/npm off the lockfile that is present.
   - `ExternalPrMergeService.cs` — the P2-12 **external** counterpart of that middle leg
     (`IExternalPrMergeExecutor`), for an `External` (intake'd upstream PR) entry: the merge happens **on
     the host**, never by fast-forwarding the mirrored `agent/pr-<n>` branch — that local ff would
