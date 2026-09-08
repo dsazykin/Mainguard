@@ -363,6 +363,18 @@ public sealed class SandboxAgentLauncher
                 AgentId: agentId,
                 WorktreePath: worktreePath,
                 ImageRef: spawnImageRef,
+                // Audit F28, launcher side: this IS the current ceiling. `JailLimitsSettings.Current` is
+                // read live at every spawn, so an operator who lowers the per-jail memory/CPU ceiling
+                // reaches every jail created after the change, and the argument is not decorative here.
+                //
+                // What it does not reach is a REUSED jail: `DockerSandboxEngine.SpawnAsync` decides reuse
+                // on mounts, DNS, network, secret layout and image digest and never on the limits, so a
+                // running jail keeps the ceiling it was born with — and a pre-MG-26 jail is reused with no
+                // CPU cap at all. That check belongs in the engine's reuse decision, next to the other
+                // eight, and re-deciding it here would be a second copy of a rule (MG-12) that could only
+                // disagree with the first. It is being fixed there by PR #368, which re-applies memory,
+                // CPU and pids in place on the live cgroup rather than recreating the jail and losing the
+                // agent's session; this line is what feeds it the value to apply.
                 Limits: _jailLimits?.Current ?? SandboxLimits.Default,
                 Secrets: secrets,
                 AgentUid: AgentUid,
@@ -462,6 +474,38 @@ public sealed class SandboxAgentLauncher
                 // The jail is real and about to be forgotten by everything that could stop it later.
                 try { await _environment.Sandboxes.RemoveAsync(handle.ContainerId, CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception removeEx) { _log.LogWarning(removeEx, "rollback: could not remove jail {Container}", handle.ContainerId); }
+            }
+
+            // Audit F27 — the grant that had no release on this path. The MG-36 per-agent network segment
+            // is created BEFORE `SpawnAsync`, so it exists for every failure from the image pull onwards,
+            // and this rollback removed the container and the worktree and left it. Only a clean teardown
+            // reclaimed one. Docker's default local address pool is about 32 networks, so a few dozen
+            // failed spawns exhaust it and every subsequent spawn fails at network creation — on a machine
+            // with no running agents, which is what makes the cause unguessable from the symptom.
+            //
+            // Ordered AFTER the container removal, exactly as in `TeardownAsync`: Docker refuses to delete
+            // a network that still has a live endpoint on it. Unconditional on `handle`, because the
+            // segment is created before the container and the failures that leak it are precisely the ones
+            // where no handle exists. `CancellationToken.None` for the F19 reason — a rollback that gives
+            // up half way leaves residue nothing else will collect.
+            if (!string.IsNullOrEmpty(repoHandle))
+            {
+                try
+                {
+                    await _environment.Egress
+                        .RemoveAgentSegmentAsync(repoHandle, agentId, CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception segmentEx)
+                {
+                    // Reported, not swallowed silently: this is the one line that says a segment may have
+                    // leaked, and `SandboxSegmentReaper` is the backstop rather than the plan.
+                    _log.LogWarning(
+                        segmentEx,
+                        "rollback: could not release the network segment for repo={Repo} agent={Agent} — "
+                        + "it may be leaked until the segment reaper sweeps it",
+                        repoHandle, agentId);
+                }
             }
 
             if (withoutRepositoryAccess)
@@ -626,7 +670,14 @@ public sealed class SandboxAgentLauncher
     /// segment, then its worktree. Never throws.</summary>
     public async Task TeardownAsync(string? repoHash, string agentId, string containerId, CancellationToken ct = default)
     {
-        try { await _environment.Sandboxes.RemoveAsync(containerId, ct).ConfigureAwait(false); }
+        // Audit F19, the second line of defence. `ct` stays in the signature because every caller has one
+        // and passes it, but teardown does NOT honour it: past this point the session record is already
+        // gone, so a cancelled removal leaves a running container nothing in the app can see, sitting on a
+        // worktree this same call is about to delete. The `catch` above makes that silent, which is what
+        // turned a client disconnect mid-Stop into an unowned jail. The caller side is fixed too
+        // (`AgentSpawnService.StopAsync` passes `CancellationToken.None`); this is the place that cannot
+        // be got wrong by the next caller.
+        try { await _environment.Sandboxes.RemoveAsync(containerId, CancellationToken.None).ConfigureAwait(false); }
         catch { /* never fail a stop from teardown */ }
 
         if (!string.IsNullOrEmpty(repoHash))
@@ -647,7 +698,16 @@ public sealed class SandboxAgentLauncher
             // default), so a segment leaked per agent would eventually make spawning fail with an
             // address-pool exhaustion error that reads like anything but the cause. Ordered AFTER the
             // container removal because Docker refuses to delete a network with a live endpoint.
-            try { await _environment.Egress.RemoveAgentSegmentAsync(repoHash, agentId, ct).ConfigureAwait(false); }
+            // Not on `ct` either, and for a sharper reason than the container removal: a leaked segment is
+            // never reclaimed by anything, and Docker's local bridge address pool is ~32 networks, so a
+            // cancelled stop per agent walks the daemon into an address-pool exhaustion that reads like
+            // anything but its cause.
+            try
+            {
+                await _environment.Egress
+                    .RemoveAgentSegmentAsync(repoHash, agentId, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
             catch { /* never fail a stop from teardown */ }
 
             if (publish is Mainguard.Agents.Agents.AgentRefPublishOutcome.RefusedNonFastForward
@@ -1148,6 +1208,52 @@ public sealed class SandboxAgentLauncher
     /// today, and exactly the kind of latent grant that stops being harmless the day something else is
     /// mounted at that path. No dir, no shim, no grant.</para>
     /// </summary>
+    /// <summary>
+    /// The launch line for a CLI being <b>re-bound into a jail that is already running</b> — the adoption
+    /// path, after a daemon restart. Null when this daemon has no installed adapter for the kind, which is
+    /// the honest answer: there is no CLI to start.
+    ///
+    /// <para><b>What it deliberately omits is the first user turn.</b> <see cref="BuildLaunchArgv"/> puts
+    /// <see cref="AgentKickoffPrompt"/> first on the line so a fresh jail's CLI does something instead of
+    /// idling at an empty input box. An adopted agent has already had that turn — days ago, possibly —
+    /// and re-issuing it would tell a worker halfway through a task to go and ask the daemon what it is
+    /// here to plan. The role's operating instructions and the shim pre-approval ARE re-applied, because
+    /// both are properties of the process being started rather than of the conversation: this is a new
+    /// <c>docker exec</c>, so it has neither until it is given them.</para>
+    ///
+    /// <para><b>What it cannot restore is the CLI's conversation.</b> The exec'd CLI died with the daemon's
+    /// PTY; this starts a new one in the same jail, against the same workspace, the same
+    /// <c>agent/&lt;id&gt;</c> branch and the same in-jail <c>$HOME</c> — so the work is intact and
+    /// whatever the vendor CLI persists for itself is where it left it, but the daemon does not claim to
+    /// have resumed a session it never owned. The agent is steerable again; that is the claim.</para>
+    /// </summary>
+    /// <param name="agentKind">The CLI kind, off the adopted jail's own <c>mainguard.kind</c> label.</param>
+    /// <param name="role">The IPC endpoint role the re-bound endpoint was given.</param>
+    /// <param name="ipcDirPath">The re-bound endpoint's directory, or null when this agent has none —
+    /// which suppresses the shim pre-approval, exactly as it does at spawn.</param>
+    /// <param name="planMode">The mode the re-bound endpoint's instructions were rendered for; the same
+    /// value, so the two deliveries of one jail's briefing cannot disagree (defect G2).</param>
+    internal IReadOnlyList<string>? BuildReattachLaunchArgv(
+        string agentKind,
+        AgentIpcEndpointRole role,
+        string? ipcDirPath,
+        Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode planMode)
+    {
+        var adapter = _adapters.TryGet(agentKind);
+        var launchCommand = adapter?.Launch;
+        if (launchCommand is not { Count: > 0 })
+        {
+            return null;
+        }
+
+        if (adapter?.SystemPromptArg is { Length: > 0 } promptArg)
+        {
+            launchCommand = launchCommand.Append(promptArg).Append(InstructionsFor(role, planMode)).ToList();
+        }
+
+        return ApplyShimPreApproval(launchCommand, adapter, ipcDirPath, role);
+    }
+
     internal static IReadOnlyList<string>? ApplyShimPreApproval(
         IReadOnlyList<string>? launchCommand,
         InstalledAdapterMarker? adapter,

@@ -112,11 +112,13 @@ public sealed class AgentSessionReconciler
     /// the ownership question <paramref name="ownsRepo"/> answers for adoption is already settled here.
     /// </param>
     /// <param name="onAdopted">
-    /// Called with each session this pass adopts, after its record exists. The composition root uses it to
-    /// re-bind the jail's IPC endpoint (<c>AgentSpawnService.TryReattachEndpoint</c>): adoption used to
-    /// rebuild the session record and nothing else, so an adopted coordinator's tools and an adopted
-    /// worker's plan channel stayed dead until the agent was restarted. A throwing hook is logged and does
-    /// not fail the pass.
+    /// Called with each session this pass adopts, after its record exists — and again for a session it
+    /// moves from paused back to running, because a frozen jail cannot be exec'd into and its re-attach has
+    /// to wait for the pass that thaws it. The composition root uses it to re-bind the jail's IPC endpoint
+    /// AND its CLI (<c>AgentSpawnService.TryReattachAdoptedAgent</c>): adoption used to rebuild the session
+    /// record and re-bind the endpoint, and nothing re-bound the CLI, so an adopted coordinator had four
+    /// live tools and no process to call them (audit F6). A throwing hook is logged and does not fail the
+    /// pass, and the hook is idempotent, so being called from both arms is safe.
     /// </param>
     public AgentSessionReconciler(
         AgentSessionStore store,
@@ -177,6 +179,18 @@ public sealed class AgentSessionReconciler
                 continue;
             }
 
+            // Audit F14 — the stop-vs-reconcile race. A teardown removes the record FIRST and then spends
+            // seconds harvesting the CLI's logins out of the jail before the container goes; a pass landing
+            // in that window sees a live container with no record and adopts it, resurrecting a session
+            // nothing will ever remove and whose presence then refuses the entry's Resume. "No record" is
+            // only evidence of an orphan when nobody is in the middle of removing the record.
+            if (_store.IsTearingDown(key))
+            {
+                _log.LogDebug(
+                    "agent-session reconcile: {Agent} is being torn down — not adopting its jail", key.AgentId);
+                continue;
+            }
+
             // Not this daemon's jail. Docker is machine-wide and the labels carry no daemon identity, so
             // the only honest ownership test is whether we host the repository it belongs to.
             if (!OwnsRepo(key.RepoHash))
@@ -201,7 +215,7 @@ public sealed class AgentSessionReconciler
                 if (container.Paused)
                 {
                     _store.MarkState(key, PausedState, AdoptedPausedReason);
-                    _store.MarkFrozen(key, DockerPausedFrozenReason);
+                    MarkEngineFreeze(key);
                 }
                 else
                 {
@@ -217,16 +231,9 @@ public sealed class AgentSessionReconciler
                 continue;
             }
 
-            if (_onAdopted is not null && _store.Find(key) is { } adoptedSession)
+            if (_store.Find(key) is { } adoptedSession)
             {
-                try
-                {
-                    _onAdopted(adoptedSession);
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex, "agent-session reconcile: post-adoption hook failed for {Agent}", key.AgentId);
-                }
+                Reattach(adoptedSession);
             }
         }
 
@@ -259,7 +266,7 @@ public sealed class AgentSessionReconciler
             if (container.Paused && !IsPaused(session.State))
             {
                 _store.MarkState(key, PausedState, DriftedToPausedReason);
-                _store.MarkFrozen(key, DockerPausedFrozenReason);
+                MarkEngineFreeze(key);
                 corrected.Add(session.Id);
             }
             else if (!container.Paused && IsPaused(session.State))
@@ -267,6 +274,13 @@ public sealed class AgentSessionReconciler
                 _store.MarkState(key, WorkingState, DriftedToRunningReason);
                 _store.MarkFrozen(key, null);
                 corrected.Add(session.Id);
+
+                // A thawed jail is re-attachable, and until it thawed it was not: `docker exec` into a
+                // SIGSTOPped container blocks, so the adoption pass deliberately skipped the CLI re-bind
+                // for a jail it adopted as Paused. This is the pass that makes it possible, so this is
+                // where it is retried. The hook is idempotent — it does nothing for a session that
+                // already has a bound CLI — which is what lets it be called from both arms.
+                Reattach(session);
             }
         }
 
@@ -408,6 +422,46 @@ public sealed class AgentSessionReconciler
 
     internal const string LostReason =
         "The jail is no longer running — Docker has no live container for this agent.";
+
+    /// <summary>
+    /// Writes the engine's own reading onto the pause axis — <b>unless something more specific is already
+    /// there</b>.
+    ///
+    /// <para>All this pass can observe is <c>State.Paused == true</c>. The axis records WHO froze the
+    /// jail, and that is what every release path keys on: <c>DockerPausedFrozenReason</c> means "the
+    /// engine says it is frozen and nothing inside the app claims to have done it", which is precisely
+    /// the answer that makes the human Unpause the last exit. Overwriting a rehydrated "a human paused
+    /// it" or a parked-conflict reason with it would re-tell the same lie the restart used to tell, one
+    /// pass later — and overwriting the kill switch's own mark would offer an operator a plain Unpause
+    /// for a jail whose release also owes a terminal-lock reversal.</para>
+    /// </summary>
+    private void MarkEngineFreeze(AgentSessionKey key)
+    {
+        if (_store.FrozenReason(key) is null)
+        {
+            _store.MarkFrozen(key, DockerPausedFrozenReason);
+        }
+    }
+
+    /// <summary>Hands one session to the re-attach hook. Called from BOTH the adoption arm and the
+    /// paused → running arm, because a jail adopted frozen cannot be exec'd into and has to be re-attached
+    /// by whichever pass finds it thawed. A throwing hook is logged and does not fail the pass.</summary>
+    private void Reattach(AgentSession session)
+    {
+        if (_onAdopted is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _onAdopted(session);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "agent-session reconcile: re-attach hook failed for {Agent}", session.Id);
+        }
+    }
 
     /// <summary>Never lets an ownership probe (a filesystem stat, in production) fail the pass.</summary>
     private bool OwnsRepo(string repoHash)

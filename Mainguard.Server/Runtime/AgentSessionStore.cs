@@ -78,11 +78,42 @@ public sealed class AgentSessionStore
     /// is the fact those guards read; the writers are the paths that actually freeze or thaw a jail.
     /// </summary>
     private readonly Dictionary<AgentSessionKey, string> _frozen = new();
+
+    /// <summary>
+    /// The pause axis as it stood when the previous daemon died, keyed the same way.
+    ///
+    /// <para>It cannot be loaded straight into <see cref="_frozen"/>, because that map is scoped to live
+    /// sessions and there are none yet: <see cref="MarkFrozen(AgentSessionKey,string?)"/> deliberately
+    /// refuses a key it holds no session for. So the marks wait here and are applied by
+    /// <see cref="Spawn"/> — which is the method the reconciler's adoption pass calls, so a surviving
+    /// frozen jail comes back frozen, with the reason that froze it, at the instant it comes back at
+    /// all. A mark is consumed when it is applied; one whose jail never returns is dropped by the first
+    /// <see cref="Stop(AgentSessionKey)"/> or simply never read.</para>
+    /// </summary>
+    private readonly Dictionary<AgentSessionKey, string> _rehydratedFrozen = new();
+
+    private readonly Mainguard.Agents.Agents.Orchestrator.IAgentRestartLedger _persist;
     private ulong _seq;
 
     public AgentSessionStore(IAuditLog audit)
+        : this(audit, null)
+    {
+    }
+
+    /// <param name="persist">The restart store the pause axis is written through to, or null for the
+    /// process-wide one. The test seam.</param>
+    internal AgentSessionStore(
+        IAuditLog audit, Mainguard.Agents.Agents.Orchestrator.IAgentRestartLedger? persist)
     {
         _audit = audit;
+        _persist = persist ?? Mainguard.Agents.Agents.Orchestrator.AgentRestartLedger.Process;
+        foreach (var record in _persist.LoadAll())
+        {
+            foreach (var frozen in record.Frozen)
+            {
+                _rehydratedFrozen[new AgentSessionKey(frozen.RepoHash, record.AgentId)] = frozen.Reason;
+            }
+        }
     }
 
     /// <summary>Every live session on the daemon, across every repo. Ordered by (id, repo) so a repeated
@@ -135,6 +166,15 @@ public sealed class AgentSessionStore
             }
 
             _sessions[session.Key] = session;
+
+            // A jail that was frozen when the previous daemon died comes back frozen. Applied here rather
+            // than left for the reconciler's own MarkFrozen because the reconciler only knows what DOCKER
+            // says (paused / not paused); the axis carries WHO froze it, which is what every release path
+            // keys on and what a restart used to erase (audit F3).
+            if (_rehydratedFrozen.Remove(session.Key, out var rehydrated))
+            {
+                _frozen[session.Key] = rehydrated;
+            }
         }
 
         _audit.Append(new AuditEvent("spawn", new Dictionary<string, string>
@@ -206,17 +246,47 @@ public sealed class AgentSessionStore
     /// <summary>Records — or with <c>null</c>, clears — that this session's jail is frozen. See <c>_frozen</c>.</summary>
     public void MarkFrozen(AgentSessionKey key, string? reason)
     {
+        bool changed;
         lock (_gate)
         {
             if (string.IsNullOrEmpty(reason))
             {
-                _frozen.Remove(key);
+                changed = _frozen.Remove(key) | _rehydratedFrozen.Remove(key);
             }
             else if (_sessions.ContainsKey(key))
             {
+                changed = !(_frozen.TryGetValue(key, out var current)
+                            && string.Equals(current, reason, StringComparison.Ordinal));
                 _frozen[key] = reason;
             }
+            else
+            {
+                changed = false;
+            }
         }
+
+        if (changed)
+        {
+            PersistFrozen(key, string.IsNullOrEmpty(reason) ? null : reason);
+        }
+    }
+
+    /// <summary>Writes one (repo, agent) freeze mark through to the restart ledger. The axis is the fact
+    /// every release path reads, so it has to outlive the process that wrote it — see the ledger.</summary>
+    private void PersistFrozen(AgentSessionKey key, string? reason)
+    {
+        _persist.Update(key.AgentId, record =>
+        {
+            var frozen = record.Frozen
+                .Where(f => !string.Equals(f.RepoHash, key.RepoHash, StringComparison.Ordinal))
+                .ToList();
+            if (reason is not null)
+            {
+                frozen.Add(new Mainguard.Agents.Agents.Orchestrator.RestartFrozenJail(key.RepoHash, reason));
+            }
+
+            return record with { Frozen = frozen };
+        });
     }
 
     /// <summary>The id-only form, for the supervisor seam; a no-op when two repos hold the id.</summary>
@@ -338,10 +408,19 @@ public sealed class AgentSessionStore
     public bool Stop(AgentSessionKey key)
     {
         bool removed;
+        bool wasFrozen;
         lock (_gate)
         {
             removed = _sessions.Remove(key);
-            _frozen.Remove(key);
+            wasFrozen = _frozen.Remove(key) | _rehydratedFrozen.Remove(key);
+        }
+
+        if (wasFrozen)
+        {
+            // The jail is being torn down, so the axis mark it carried is now about nothing. Dropped here
+            // as well as in memory: a mark left in the ledger would re-freeze the next session that ever
+            // reuses this (repo, id) — and `pr-<n>` ids are reused by design.
+            PersistFrozen(key, null);
         }
 
         if (removed)
@@ -355,6 +434,70 @@ public sealed class AgentSessionStore
         }
 
         return removed;
+    }
+
+    /// <summary>
+    /// The (repo, agent) pairs whose teardown is in flight — the record is already gone and the container
+    /// is not yet.
+    ///
+    /// <para><b>Audit F14.</b> <c>StopAsync</c> removes the session record first and then spends seconds on
+    /// two harvest execs before it tears the container down. The reconciler adopts any live container with
+    /// no record, and it runs every 30 seconds, so it lands in that window and resurrects the session it is
+    /// watching be stopped. The resurrected record is never removed by anything — the reconciler marks a
+    /// dead jail <c>Unresponsive</c> and leaves it — so <c>Resume</c> then refused "this entry already has
+    /// a live agent" for the half hour it took the reaper to clear the ghost.</para>
+    ///
+    /// <para>Held here rather than in <c>AgentSpawnService</c> because the reconciler must be able to ask,
+    /// and the store is the one thing both of them already hold. It is a set of keys and nothing else: the
+    /// stop path owns the lifetime, and a leaked entry could only ever suppress an adoption, which the
+    /// next pass performs anyway once the entry is released.</para>
+    /// </summary>
+    private readonly HashSet<AgentSessionKey> _tearingDown = new();
+
+    /// <summary>Marks this session's teardown as in flight until the returned scope is disposed.</summary>
+    public IDisposable BeginTeardown(AgentSessionKey key)
+    {
+        lock (_gate)
+        {
+            _tearingDown.Add(key);
+        }
+
+        return new TeardownScope(this, key);
+    }
+
+    /// <summary>True while a teardown for this (repo, agent) is running — the reconciler's adoption guard.</summary>
+    public bool IsTearingDown(AgentSessionKey key)
+    {
+        lock (_gate)
+        {
+            return _tearingDown.Contains(key);
+        }
+    }
+
+    private sealed class TeardownScope : IDisposable
+    {
+        private AgentSessionStore? _owner;
+        private readonly AgentSessionKey _key;
+
+        public TeardownScope(AgentSessionStore owner, AgentSessionKey key)
+        {
+            _owner = owner;
+            _key = key;
+        }
+
+        public void Dispose()
+        {
+            var owner = Interlocked.Exchange(ref _owner, null);
+            if (owner is null)
+            {
+                return;
+            }
+
+            lock (owner._gate)
+            {
+                owner._tearingDown.Remove(_key);
+            }
+        }
     }
 
     /// <summary>The id-only stop, for the daemon-global entry points. Stops the one session with this id;

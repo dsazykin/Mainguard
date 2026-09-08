@@ -85,6 +85,22 @@ internal static class TestDataRootIsolation
         Environment.SetEnvironmentVariable(
             Mainguard.Server.Runtime.AgentSessionReconcilerService.DisableVariable, "1");
 
+        // The same isolation again, for the one piece of daemon state that is a process-wide singleton
+        // rather than a path: the restart ledger behind the human pause, the kill switch's containment,
+        // the pause axis, the conflict parking and the hand-back permit. Its production default is ONE
+        // JSON file under the data root, which every test in this assembly would share — and this suite
+        // runs its collections in parallel, so two tests using the same agent id would couple through it.
+        // A FORGETTING ledger — not an in-memory one, and the difference is measured: the five ledgers
+        // rehydrate in their constructors, so one remembering instance shared by the assembly made every
+        // rig inherit the previous rig's state, and a kill switch built after another test rehydrated
+        // that test's contained agent and unpaused its container. Forgetting restores exactly the
+        // behaviour these ledgers had before they were durable, which is what every test predating them
+        // asserts; a test that is ABOUT restart survival builds its own JsonAgentRestartLedger over its
+        // own temp file, which is the honest shape anyway (a restart is two stores over one path, not
+        // one store remembering).
+        Mainguard.Agents.Agents.Orchestrator.AgentRestartLedger.UseForTests(
+            Mainguard.Agents.Agents.Orchestrator.NullAgentRestartLedger.Instance);
+
         var existing = Environment.GetEnvironmentVariable(MainguardPaths.DataRootOverrideVariable);
         if (!string.IsNullOrWhiteSpace(existing))
         {

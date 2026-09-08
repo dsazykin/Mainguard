@@ -79,6 +79,96 @@ public sealed class JailReaperTests : IDisposable
         Assert.Equal("IdleWithoutCli", audited.Fields["cause"]);
     }
 
+    /// <summary>
+    /// <b>Audit F20 — the reaper is not the one who decides a dead agent's work is finished.</b>
+    ///
+    /// <para>A session the reconciler has marked <c>Unresponsive</c> has no jail left: Docker has no live
+    /// container for it, so there is no memory, no CPU and no container to reclaim, which is this sweep's
+    /// entire remit. What a reap would still do is delete the agent's worktree — the only place its
+    /// uncommitted work exists — putting the decision to discard it in the hands of a 30-minute clock. The
+    /// record stays, visible and Stoppable, until a person makes that call.</para>
+    /// </summary>
+    [Fact]
+    public async Task AJailTheReconcilerCallsUnresponsive_IsLeftForAHuman_NotReapedOnATimer()
+    {
+        var spawns = _host.Services.GetRequiredService<AgentSpawnService>();
+        var store = _host.Services.GetRequiredService<AgentSessionStore>();
+        var agentId = await spawns.SpawnAsync(Repo, "claude-code", null, AgentRoles.Managed, CancellationToken.None);
+        var key = new AgentSessionKey(Repo, agentId);
+        var session = store.Find(key);
+        Assert.False(string.IsNullOrEmpty(session?.ContainerId), "the fake substrate must produce a jail");
+
+        _host.Services.GetRequiredService<TerminalSessionManager>().Release(key);
+        // Exactly what AgentSessionReconciler writes when a session's container is gone.
+        store.MarkState(key, AgentSessionReconciler.LostState, AgentSessionReconciler.LostReason);
+
+        var t0 = new DateTimeOffset(2026, 9, 4, 12, 0, 0, TimeSpan.Zero);
+        Assert.Empty(await Reaper.SweepOnceAsync(t0));
+        Assert.Empty(await Reaper.SweepOnceAsync(t0.AddHours(6)));
+
+        Assert.NotNull(store.Find(key));
+        Assert.DoesNotContain(session!.ContainerId!, _environment.RemovedContainers);
+
+        // ...and the human's Stop still works on it — that is what "left for a human" has to mean.
+        Assert.True((await spawns.StopAsync(key, CancellationToken.None)).Stopped);
+        Assert.Null(store.Find(key));
+    }
+
+    /// <summary>
+    /// <b>Audit F27 — the sweep is wired.</b> `SandboxSegmentReaper` was complete and tested and reached
+    /// nothing: the leak recovery was inert until a caller ran it. The reaper host is that caller, and the
+    /// two sweeps it runs are on different axes and different cadences — a jail goes idle in minutes, a
+    /// leaked segment matters only once a few dozen have exhausted Docker's address pool.
+    ///
+    /// <para>The reap is audited by segment name, which is what an operator has to go on: a network that
+    /// no longer exists cannot be inspected afterwards.</para>
+    /// </summary>
+    [Fact]
+    public async Task TheSegmentSweep_RunsFromTheReaperHost_AndAuditsWhatItReclaimed()
+    {
+        var swept = 0;
+        var host = new JailReaperHostedService(
+            _host.Services.GetRequiredService<AgentSessionStore>(),
+            _host.Services.GetRequiredService<TerminalSessionManager>(),
+            _host.Services.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry>(),
+            _host.Services.GetRequiredService<AgentSpawnService>(),
+            _host.Services.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits>(),
+            _host.Services.GetRequiredService<IAuditLog>(),
+            _host.Services.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>(),
+            sweepSegments: _ =>
+            {
+                swept++;
+                return Task.FromResult<IReadOnlyList<string>>(new[] { "mainguard-agent-deadbeef" });
+            });
+
+        var reaped = await host.SweepSegmentsOnceAsync(DateTimeOffset.UtcNow);
+
+        Assert.Equal(1, swept);
+        Assert.Equal(new[] { "mainguard-agent-deadbeef" }, reaped);
+        var audited = Assert.Single(
+            _host.Services.GetRequiredService<IAuditLog>().Read(),
+            e => e.Type == JailReaperHostedService.SegmentReapedEvent);
+        Assert.Equal("mainguard-agent-deadbeef", audited.Fields["segment"]);
+    }
+
+    /// <summary>A segment sweep that throws must not take the jail sweep — the load-bearing half of this
+    /// host — down with it. A reaper that throws is a reaper someone disables.</summary>
+    [Fact]
+    public async Task AThrowingSegmentSweep_IsSwallowed()
+    {
+        var host = new JailReaperHostedService(
+            _host.Services.GetRequiredService<AgentSessionStore>(),
+            _host.Services.GetRequiredService<TerminalSessionManager>(),
+            _host.Services.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry>(),
+            _host.Services.GetRequiredService<AgentSpawnService>(),
+            _host.Services.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits>(),
+            _host.Services.GetRequiredService<IAuditLog>(),
+            _host.Services.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>(),
+            sweepSegments: _ => throw new InvalidOperationException("the engine did not answer"));
+
+        Assert.Empty(await host.SweepSegmentsOnceAsync(DateTimeOffset.UtcNow));
+    }
+
     public void Dispose()
     {
         _host.Dispose();

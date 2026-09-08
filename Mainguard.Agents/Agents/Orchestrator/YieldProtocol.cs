@@ -190,6 +190,10 @@ public sealed class YieldProtocol : IYieldProtocol
         _arbiter = arbiter;
     }
 
+    /// <summary>The pause-axis reason (and the state reason) for a jail the keep-alive cascade froze
+    /// because its agent did not yield in time. One constant, so the word and the axis cannot drift.</summary>
+    public const string YieldPausedReason = "Yield timed out; jail paused for the update.";
+
     public async Task<IYieldToken> RequestYieldAsync(string agentId, TimeSpan? timeout = null, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(agentId))
@@ -201,6 +205,7 @@ public sealed class YieldProtocol : IYieldProtocol
         var channel = _channelFor(agentId);
 
         _supervisor.MarkState(agentId, "Yielding", "Cooperative update requested.");
+
         await channel.SendAsync(UpdateRequested, ct).ConfigureAwait(false);
 
         var ready = await channel.WaitForAsync(UpdateReady, window, ct).ConfigureAwait(false);
@@ -240,7 +245,13 @@ public sealed class YieldProtocol : IYieldProtocol
             throw;
         }
 
-        _supervisor.MarkState(agentId, "Paused", "Yield timed out; jail paused for the update.");
+        _supervisor.MarkState(agentId, "Paused", YieldPausedReason);
+        // Audit F16: the WORD without the axis. The merge queue's reflection rewrites the state word on
+        // every transition, so a yield-paused jail read `Working` again the moment its entry moved, and
+        // every frozen-jail guard keyed on the word waved a delivery into a SIGSTOPped process. The axis
+        // is the fact those guards read; written here and cleared in the resume below, so this cycle has
+        // one owner for both directions instead of relying on the reconciler's 30-second pass to notice.
+        _supervisor.MarkFrozen(agentId, YieldPausedReason);
 
         return new YieldToken(agentId, YieldOutcome.ByPause, async () =>
         {
@@ -250,12 +261,20 @@ public sealed class YieldProtocol : IYieldProtocol
             if (_arbiter?.IsHumanPaused(agentId) == true)
             {
                 _supervisor.MarkState(agentId, "Paused", "Paused by you.");
+                // The jail stays frozen, so the axis stays set — but it is now the HUMAN's freeze, not
+                // this cycle's, and the reason has to say so or the card would keep telling the operator
+                // to wait for a queue update that finished.
+                _supervisor.MarkFrozen(agentId, "Paused by you.");
                 return;
             }
 
             await _sandbox.UnpauseAsync(containerId, CancellationToken.None).ConfigureAwait(false);
             _supervisor.ResumeInput(agentId);
             _supervisor.MarkState(agentId, "Working", null);
+            // The other half of the pair (audit F16). The axis has no timer and no second writer: a mark
+            // left here refuses this worker's prompts and its verification for good, and defers the
+            // readiness trigger with them.
+            _supervisor.MarkFrozen(agentId, null);
         }, hold);
     }
 

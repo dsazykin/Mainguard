@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace Mainguard.Agents.Agents.Orchestrator;
 
@@ -15,11 +16,20 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// one log line, neither of which any surface reads. So the card told a person to resolve a conflict
 /// without telling them what conflicted, and offered no operation that could act on it.</para>
 ///
-/// <para><b>Deliberately NOT persisted</b>, for the reason <c>MergeQueue</c>'s working reasons are not: it
-/// is a measurement of one worktree at one instant, and a measurement written to SQLite outlives its own
-/// truth. A daemon restart re-measures — the parked rebase is still on disk, and the swarm reconciler is
-/// what re-establishes whether its jail survived at all. The durable record of the handoff is the audit
-/// event, which is written on the same code path and is not replaced by this.</para>
+/// <para><b>Persisted, having originally not been</b> — and the original reasoning is worth stating because
+/// it was half right. It said: this is a measurement of one worktree at one instant, a daemon restart
+/// re-measures, the durable record is the audit event. The first two clauses are the mistake. Nothing
+/// re-measures: the parking is written by the keep-alive cascade's conflict arm, which runs when a rebase
+/// conflicts, and a restart is not a rebase. The parked worktree really is still on disk, the jail really
+/// is still frozen — and with this record gone, Resolve and Abort both answered "no rebase parked", the
+/// hand-back had no permit to grant, and a <c>Stop</c> force-removed the mid-rebase worktree (audit F3).
+/// The audit event is a record for a human reading a log, not one any operation can act on.</para>
+///
+/// <para>What the original note was right about is the <i>content</i>: <see cref="ConflictedPaths"/> is a
+/// measurement and can go stale. It is carried across a restart anyway, because a possibly-stale list of
+/// conflicted files is strictly more use to the human being asked to resolve them than no list at all, and
+/// because the alternative on offer was not a fresh measurement but a card that denied the conflict
+/// existed.</para>
 /// </summary>
 /// <param name="AgentId">The entry whose branch is parked.</param>
 /// <param name="WorktreePath">
@@ -61,11 +71,49 @@ public sealed class RebaseConflictParkingStore
     private readonly ConcurrentDictionary<(string Repo, string Agent), ParkedRebaseConflict> _parked =
         new();
 
+    private readonly IAgentRestartLedger _persist;
+
+    /// <summary>The daemon's store, written through to the durable restart ledger.</summary>
+    public RebaseConflictParkingStore()
+        : this(null)
+    {
+    }
+
+    /// <param name="persist">The restart store, or null for the process-wide one. The test seam.</param>
+    internal RebaseConflictParkingStore(IAgentRestartLedger? persist)
+    {
+        _persist = persist ?? AgentRestartLedger.Process;
+        foreach (var record in _persist.LoadAll())
+        {
+            foreach (var parked in record.Parked)
+            {
+                _parked[(parked.RepoHash, record.AgentId)] = new ParkedRebaseConflict(
+                    record.AgentId, parked.WorktreePath, parked.MainBranch,
+                    parked.ConflictedPaths, parked.ParkedAt);
+            }
+
+            foreach (var repo in record.HandedBackRepos)
+            {
+                _handedBack[(repo, record.AgentId)] = 0;
+            }
+        }
+    }
+
     /// <summary>Records (or replaces) the parking for one entry.</summary>
     public void Park(string repoHandle, ParkedRebaseConflict conflict)
     {
         ArgumentNullException.ThrowIfNull(conflict);
-        _parked[(repoHandle ?? string.Empty, conflict.AgentId)] = conflict;
+        var repo = repoHandle ?? string.Empty;
+        _parked[(repo, conflict.AgentId)] = conflict;
+        _persist.Update(conflict.AgentId, record => record with
+        {
+            Parked = record.Parked
+                .Where(p => !string.Equals(p.RepoHash, repo, StringComparison.Ordinal))
+                .Append(new RestartParkedConflict(
+                    repo, conflict.WorktreePath, conflict.MainBranch,
+                    conflict.ConflictedPaths.ToList(), conflict.ParkedAt))
+                .ToList(),
+        });
     }
 
     /// <summary>The parking for one entry, or null when this entry is not parked mid-rebase.</summary>
@@ -81,8 +129,23 @@ public sealed class RebaseConflictParkingStore
     /// back to finish. It is deliberately NOT called on a successful later rebase cycle: that cycle parks
     /// or clears through the same two entry points, and a third writer is how a stale record survives.</para>
     /// </summary>
-    public bool Clear(string repoHandle, string agentId) =>
-        _parked.TryRemove((repoHandle ?? string.Empty, agentId ?? string.Empty), out _);
+    public bool Clear(string repoHandle, string agentId)
+    {
+        var repo = repoHandle ?? string.Empty;
+        var id = agentId ?? string.Empty;
+        if (!_parked.TryRemove((repo, id), out _))
+        {
+            return false;
+        }
+
+        _persist.Update(id, record => record with
+        {
+            Parked = record.Parked
+                .Where(p => !string.Equals(p.RepoHash, repo, StringComparison.Ordinal))
+                .ToList(),
+        });
+        return true;
+    }
 
     // ---- the hand-back mark ----------------------------------------------------------------------
     //
@@ -93,17 +156,44 @@ public sealed class RebaseConflictParkingStore
     // rewrite: set by the hand-back, consumed by the first publish it lets through, keyed like the parking.
     private readonly ConcurrentDictionary<(string Repo, string Agent), byte> _handedBack = new();
 
-    /// <summary>Records that a human handed this entry's conflict back to its agent to finish the rebase.</summary>
-    public void MarkHandedBack(string repoHandle, string agentId) =>
-        _handedBack[(repoHandle ?? string.Empty, agentId ?? string.Empty)] = 0;
+    /// <summary>Records that a human handed this entry's conflict back to its agent to finish the rebase.
+    ///
+    /// <para>Durable: the permit authorises ONE history rewrite that the ref mediator's rule 2 otherwise
+    /// refuses, and the rewrite it authorises arrives whenever the agent finishes — minutes later, across
+    /// a restart as easily as not. A permit lost with the daemon leaves the handed-back branch refused on
+    /// every sweep, forever, which is precisely the failure the permit was introduced to fix.</para></summary>
+    public void MarkHandedBack(string repoHandle, string agentId)
+    {
+        var repo = repoHandle ?? string.Empty;
+        var id = agentId ?? string.Empty;
+        _handedBack[(repo, id)] = 0;
+        _persist.Update(id, record => record.HandedBackRepos.Contains(repo, StringComparer.Ordinal)
+            ? record
+            : record with { HandedBackRepos = record.HandedBackRepos.Append(repo).ToList() });
+    }
 
     /// <summary>True while a hand-back is outstanding — the mediator may accept one rewrite of this branch.</summary>
     public bool IsHandedBack(string repoHandle, string agentId) =>
         _handedBack.ContainsKey((repoHandle ?? string.Empty, agentId ?? string.Empty));
 
     /// <summary>Consumes the mark: the rewrite it authorised has reached the mirror (or the entry is gone).</summary>
-    public bool ClearHandedBack(string repoHandle, string agentId) =>
-        _handedBack.TryRemove((repoHandle ?? string.Empty, agentId ?? string.Empty), out _);
+    public bool ClearHandedBack(string repoHandle, string agentId)
+    {
+        var repo = repoHandle ?? string.Empty;
+        var id = agentId ?? string.Empty;
+        if (!_handedBack.TryRemove((repo, id), out _))
+        {
+            return false;
+        }
+
+        _persist.Update(id, record => record with
+        {
+            HandedBackRepos = record.HandedBackRepos
+                .Where(r => !string.Equals(r, repo, StringComparison.Ordinal))
+                .ToList(),
+        });
+        return true;
+    }
 }
 
 /// <summary>
