@@ -125,6 +125,14 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         // which per-owner secret directories THIS spawn expects (see staleSecretLayout below).
         var credentials = CredTmpfsSpec.Create(request.AgentUid, request.SupervisorUid);
 
+        // Built here, not beside the create, because BOTH paths need it now (F24). The secrets live on
+        // tmpfs, so `docker start` hands a reused jail an EMPTY /run/secrets — and the reuse branch used
+        // to restore the CLI's login and settings into that jail while writing neither the env file nor
+        // the supervisor key. The launcher mints a fresh gateway token on every launch and Issue drops
+        // the previous one, so a resumed jail came up with no token where the daemon expected one it had
+        // just replaced: every model call 401s, and the out-of-band supervisor has no key at all.
+        var envContent = CredentialInjector.BuildEnvFileContent(request.Secrets.AgentEnv);
+
         var existing = await FindByNameAsync(name, ct).ConfigureAwait(false);
         if (existing is not null)
         {
@@ -197,6 +205,21 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 {
                     if (!string.Equals(existing.State, "running", StringComparison.OrdinalIgnoreCase))
                         await _docker.Containers.StartContainerAsync(existing.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
+
+                    // F24: the jail's secrets, written FIRST and unconditionally — before the login and
+                    // settings restores below, which are the two things this branch already did.
+                    //
+                    // Unconditional rather than write-if-absent, which is the rule the restores below
+                    // follow. Those carry the user's own state and a still-running jail may hold a
+                    // fresher copy than the host's; these two carry THIS launch's secrets, and this
+                    // launch already replaced them daemon-side. A token the file still held would be one
+                    // Issue has already retired, so keeping it would preserve a value that authenticates
+                    // nothing.
+                    await WriteSecretFileAsync(existing.ID, credentials.CredentialPath,
+                        Encoding.UTF8.GetBytes(envContent), credentials.AgentUid, ct).ConfigureAwait(false);
+                    await WriteSecretFileAsync(existing.ID, credentials.OobKeyPath,
+                        request.Secrets.OobKey, credentials.SupervisorUid, ct).ConfigureAwait(false);
+
                     // A restarted jail's tmpfs $HOME came back empty — restore the CLI's saved login
                     // state. Write-if-absent, so a still-running jail's fresher tokens are never
                     // clobbered by the host keychain's older copy.
@@ -254,7 +277,6 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             AgentParentId: request.AgentParentId);
 
         var create = ContainerSpecBuilder.Build(spec);
-        var envContent = CredentialInjector.BuildEnvFileContent(request.Secrets.AgentEnv);
         for (var attempt = 1; ; attempt++)
         {
             var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);

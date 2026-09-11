@@ -66,6 +66,16 @@ public sealed class GatewayConfinementDockerTests
     private const string ApiKeyVar = "ANTHROPIC_API_KEY";
     private const string UpstreamHost = "api.anthropic.com";
 
+    // F46 — the second adapter this world knows about, and the one whose confinement was silently
+    // broken: a different base-URL variable, a different key variable, a different upstream, and above
+    // all a DIFFERENT HEADER. Every assertion in this file used Anthropic's shape, which is exactly why
+    // "CONFINABLE, verified" in the adapter table was not true of gemini-cli.
+    private const string GeminiAdapterId = "gemini-cli";
+    private const string GeminiBaseUrlVar = "GOOGLE_GEMINI_BASE_URL";
+    private const string GeminiApiKeyVar = "GEMINI_API_KEY";
+    private const string GeminiUpstreamHost = "generativelanguage.googleapis.com";
+    private const string GeminiRealKey = "AIza-REAL-PROVIDER-KEY-DO-NOT-LEAK";
+
     /// <summary>41 tokens — the usage the fake provider reports, so the ledger assertion is exact.</summary>
     private const string ProviderBody =
         "{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":25,\"output_tokens\":16},\"content\":\"pong\"}";
@@ -109,6 +119,50 @@ public sealed class GatewayConfinementDockerTests
         // --- and the ledger was charged for it -----------------------------------------------------
         var ledger = world.Daemon.Services.GetRequiredService<BudgetLedger>();
         Assert.Equal(41, ledger.GetTotals(jail.AgentId).Tokens);
+    }
+
+    /// <summary>
+    /// <b>F46 — the same journey, in Google's header shape.</b> This file's other confinement tests all
+    /// send <c>x-api-key</c>, so they proved the path worked for exactly one of the two adapters the
+    /// table calls confinable. gemini-cli sends <c>x-goog-api-key</c>; the gateway read neither that
+    /// header on the way in nor wrote it on the way out, so a confined Gemini jail 404'd on every model
+    /// call while the daemon reported it as confined.
+    ///
+    /// <para>Same world, same shipped launcher, same egress proxy — only the adapter and the header
+    /// change, which is the point: nothing about the confinement machinery was Anthropic-specific
+    /// except the two header names nobody had generalised.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task ConfinedGeminiJail_IsIdentifiedByItsGoogleHeader_AndGetsTheRealKeyInTheSameShape()
+    {
+        await using var world = await ConfinementWorld.StartAsync(new BudgetCaps(0, 0, 0, 0));
+        var jail = await world.LaunchAsync(
+            "byok-gemini-1", modelApiKey: GeminiRealKey, agentKind: GeminiAdapterId);
+
+        // The jail was confined under the adapter's OWN declared variables.
+        var env = await world.ReadSecretsFileAsync(jail);
+        Assert.Contains(GeminiBaseUrlVar + "=" + world.GatewayBaseUrl, env, StringComparison.Ordinal);
+        var token = ValueOf(env, GeminiApiKeyVar);
+        Assert.StartsWith("mg_sess_", token, StringComparison.Ordinal);
+        Assert.DoesNotContain(GeminiRealKey, env, StringComparison.Ordinal);
+
+        // The request, in the shape gemini-cli actually sends it.
+        var call = await world.CurlFromJailAsync(
+            jail,
+            "curl -sS -o /tmp/out -w '%{http_code}' -X POST "
+            + "\"$" + GeminiBaseUrlVar + "/v1beta/models/gemini-2.5-pro:generateContent\" "
+            + "-H \"x-goog-api-key: $" + GeminiApiKeyVar + "\" -H 'content-type: application/json' "
+            + "-d '{\"contents\":[]}'; echo; head -c 300 /tmp/out");
+
+        Assert.StartsWith("200", call, StringComparison.Ordinal);
+
+        var sent = Assert.Single(world.Upstream.Requests);
+        Assert.Equal(GeminiUpstreamHost, sent.Host);
+        Assert.Equal("https", sent.Scheme);
+        // The daemon's key went out in GOOGLE's header — a Bearer would not authenticate this API…
+        Assert.Equal(GeminiRealKey, sent.GoogleApiKeyHeader);
+        // …and the jail's token did not travel at all.
+        Assert.DoesNotContain(token, sent.AllHeaderValues, StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -192,6 +246,76 @@ public sealed class GatewayConfinementDockerTests
     // ---------------------------------------------------------------------------------------------
     // 3. The regression that matters most: an OAuth agent still works.
     // ---------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// <b>F24 — a resumed jail must come back with secrets that work.</b>
+    ///
+    /// <para>The reuse branch restored the CLI's login and settings into a jail it had just
+    /// <c>docker start</c>ed, and wrote neither the env file nor the supervisor key. Both live on tmpfs,
+    /// which Docker recreates EMPTY on start — and the launcher mints a fresh gateway token on every
+    /// launch while <c>Issue</c> retires the previous one. So a resumed jail came up either with no
+    /// token at all or with one the daemon had already replaced: every model call 401s, and the
+    /// out-of-band supervisor has no key.</para>
+    ///
+    /// <para><b>Which relaunch actually reaches that branch, and why this test relaunches a
+    /// COORDINATOR.</b> The engine reuses a container only when the jail's <c>/workspace</c> bind is
+    /// still good (<c>WorkspaceMountAliveAsync</c>) — a worktree deleted and re-created at the same path
+    /// leaves the bind dangling, so such a jail is deliberately rebuilt (the resume Docker flake,
+    /// phase-3 decisions §27.3). For a repo-backed agent, the launcher's two worktree doors both rule
+    /// reuse out: <c>CreateAgentWorktree</c> REFUSES an id whose <c>agent/&lt;id&gt;</c> already exists,
+    /// and the resume door, <c>AdoptAgentWorktree</c>, clears the residue and re-creates the worktree —
+    /// which is exactly the condition that forces a rebuild. A coordinator has no worktree at all
+    /// (contract §2, <c>withoutRepositoryAccess</c>), so <c>/workspace</c> is its own tmpfs bound to
+    /// nothing and the reuse branch is reachable through the shipped launcher. It is also a real
+    /// production shape rather than a convenient one: a coordinator's container outlives the daemon, and
+    /// <c>AgentSpawnService</c> puts the role on its labels precisely "so the next daemon can adopt a
+    /// surviving coordinator back AS a coordinator" — relaunching it onto a tmpfs Docker recreated empty
+    /// is the case F24 is about.</para>
+    ///
+    /// <para>An earlier version of this test relaunched a repo-backed agent and asserted only that the
+    /// container id came back the same. That launch took the FRESH SPAWN path and threw
+    /// <c>AgentWorktreeConflictException</c> on worktree creation, so every assertion below it was
+    /// unreached and F24 was unproven. <see cref="Jail.Reused"/> is now asserted first, so the test
+    /// cannot silently stop exercising the branch it exists for.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task ResumedJail_ComesBackWithTheTokenTheDaemonNowHolds_AndAnOobKey()
+    {
+        await using var world = await ConfinementWorld.StartAsync(new BudgetCaps(0, 0, 0, 0));
+        var first = await world.LaunchAsync("byok-resume-1", modelApiKey: RealKey, asCoordinator: true);
+        var firstToken = ValueOf(await world.ReadSecretsFileAsync(first), ApiKeyVar);
+
+        // STOPPED first, which is the half that makes this the F24 case rather than a no-op: both secret
+        // files live on tmpfs, and Docker recreates a tmpfs EMPTY on start. A relaunch of a still-running
+        // jail would find the old files in place and could pass on a branch that wrote nothing.
+        await world.StopJailAsync(first);
+
+        // The relaunch: same repo, same agent id, so the engine finds and re-starts the container.
+        var resumed = await world.LaunchAsync("byok-resume-1", modelApiKey: RealKey, asCoordinator: true);
+        Assert.True(
+            resumed.Reused,
+            "this test is about the REUSE branch — a relaunch that created a new container proves "
+            + "nothing about the two tmpfs files that branch has to rewrite");
+        Assert.Equal(first.ContainerId, resumed.ContainerId);
+
+        var env = await world.ReadSecretsFileAsync(resumed);
+        var liveToken = world.Daemon.Services
+            .GetRequiredService<Mainguard.Server.Gateway.AgentGatewayCredentials>()
+            .TokenFor(resumed.AgentId);
+
+        Assert.StartsWith("mg_sess_", ValueOf(env, ApiKeyVar), StringComparison.Ordinal);
+        // The file holds the CURRENT token — the one the gateway will accept — not the retired one.
+        Assert.Equal(liveToken, ValueOf(env, ApiKeyVar));
+        Assert.NotEqual(firstToken, ValueOf(env, ApiKeyVar));
+        Assert.Contains(BaseUrlVar + "=" + world.GatewayBaseUrl, env, StringComparison.Ordinal);
+
+        // The supervisor's key was rewritten too — the other tmpfs file the reuse branch never touched.
+        // Read as root, because the point of that file's ownership is that the agent uid cannot.
+        var oob = await world.ExecAsync(
+            resumed, "wc -c < " + CredTmpfsSpec.DefaultOobKeyPath + " 2>/dev/null || echo missing",
+            asUid: 0);
+        Assert.Equal("32", oob.Trim());
+    }
 
     /// <summary>
     /// <b>The highest-value test here.</b> An agent that authenticates interactively holds no API key, so
@@ -464,23 +588,39 @@ public sealed class GatewayConfinementDockerTests
         }
 
         /// <summary>Spawns a jail through the daemon's own launcher — the shipped spawn chain.</summary>
+        /// <param name="asCoordinator">The role lock (coordinator contract §2): no worktree, no per-agent
+        /// repo, no mirror. Passed exactly as <c>AgentSpawnService</c> passes it for
+        /// <see cref="AgentRoles.Coordinator"/> — both the flag and the role, because the role is what
+        /// goes onto the jail's labels and is how a later daemon adopts a surviving coordinator back as
+        /// one.</param>
         public async Task<Jail> LaunchAsync(
             string agentId, string? modelApiKey,
-            IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
+            IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
+            string agentKind = AdapterId,
+            bool asCoordinator = false)
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(4));
             var launcher = Daemon.Services.GetRequiredService<SandboxAgentLauncher>();
 
             var launch = await launcher.TryLaunchAsync(
-                RepoHash, agentId, agentKind: AdapterId, modelApiKey: modelApiKey,
-                ipcDirPath: null, ct: cts.Token, extraEnv: null, cliCredentials: cliCredentials);
+                RepoHash, agentId, agentKind: agentKind, modelApiKey: modelApiKey,
+                ipcDirPath: null, ct: cts.Token, extraEnv: null, cliCredentials: cliCredentials,
+                withoutRepositoryAccess: asCoordinator,
+                agentRole: asCoordinator ? AgentRoles.Coordinator : string.Empty);
 
             Assert.NotNull(launch);
             _jails.Add((RepoHash, agentId, launch!.ContainerId));
-            return new Jail(agentId, launch.ContainerId);
+            return new Jail(agentId, launch.ContainerId, launch.Reused);
         }
 
         public Task<string> ReadSecretsFileAsync(Jail jail) => ExecAsync(jail, "cat " + CredentialPath);
+
+        /// <summary>Stops the jail's container without removing it — the state a relaunch finds, and the
+        /// one that empties its tmpfs. Driven through the daemon's own engine rather than the raw client,
+        /// so it is the same stop the product performs.</summary>
+        public Task StopJailAsync(Jail jail) =>
+            Daemon.Services.GetRequiredService<IAgentEnvironment>()
+                .Sandboxes.StopAsync(jail.ContainerId, CancellationToken.None);
 
         /// <summary>Runs a shell line inside the jail, as the agent uid by default, with the container's
         /// own env. <paramref name="asUid"/> overrides the identity for the assertions that must look at
@@ -621,6 +761,20 @@ public sealed class GatewayConfinementDockerTests
 
             File.WriteAllText(
                 Path.Combine(registryDir, AdapterId + ".json"), InstalledAdapterMarker.Serialize(marker));
+
+            // F46: the same registry also knows gemini-cli, so a jail of that kind can be launched
+            // through the shipped chain rather than through a hand-built spec.
+            var gemini = new InstalledAdapterMarker(
+                GeminiAdapterId, "0.52.0", new[] { "/opt/mainguard/adapters/bin/gemini" },
+                ApiKeyEnvVar: GeminiApiKeyVar,
+                EgressHosts: new[] { GeminiUpstreamHost },
+                CredentialPaths: new[] { ".gemini/oauth_creds.json", ".gemini/settings.json" },
+                BaseUrlEnvVar: GeminiBaseUrlVar,
+                ModelHost: GeminiUpstreamHost);
+
+            File.WriteAllText(
+                Path.Combine(registryDir, GeminiAdapterId + ".json"),
+                InstalledAdapterMarker.Serialize(gemini));
         }
 
         internal static void SeedRepoAt(string path)
@@ -714,7 +868,10 @@ public sealed class GatewayConfinementDockerTests
         }
     }
 
-    private sealed record Jail(string AgentId, string ContainerId);
+    /// <param name="Reused">What the launcher reported: true when the engine re-started an existing
+    /// container rather than creating one. The F24 test asserts on it, because "the same container id
+    /// came back" and "the reuse branch ran" are not the same claim.</param>
+    private sealed record Jail(string AgentId, string ContainerId, bool Reused = false);
 
     /// <summary>
     /// The daemon's provider transport, replaced: records what the daemon actually sent upstream (so the
@@ -744,6 +901,7 @@ public sealed class GatewayConfinementDockerTests
                     request.RequestUri!.Host,
                     request.RequestUri.Scheme,
                     request.Headers.TryGetValues("x-api-key", out var key) ? key.FirstOrDefault() : null,
+                    request.Headers.TryGetValues("x-goog-api-key", out var goog) ? goog.FirstOrDefault() : null,
                     headers));
             }
         }
@@ -778,5 +936,6 @@ public sealed class GatewayConfinementDockerTests
     }
 
     private sealed record UpstreamRequest(
-        string Host, string Scheme, string? ApiKeyHeader, IReadOnlyList<string> AllHeaderValues);
+        string Host, string Scheme, string? ApiKeyHeader, string? GoogleApiKeyHeader,
+        IReadOnlyList<string> AllHeaderValues);
 }

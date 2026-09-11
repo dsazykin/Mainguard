@@ -64,6 +64,17 @@ public sealed class CliSettingsBoundaryTests
     private const string CoordinatorShimGrant =
         "Bash(" + AgentIpcPaths.SandboxMount + "/" + AgentIpcPaths.SpawnShimFileName + " *)";
 
+    /// <summary>The adapter's declared login-state files. Two of them, because the F2 fix treats them
+    /// differently: an ordinary token blob, and one that is a SETTINGS file sitting in this field —
+    /// the shape gemini-cli and qwen-code ship (see <see cref="AdapterCredentialPolicy"/>).</summary>
+    private static readonly string[] DeclaredCredentialPaths = { ".probe/auth.json", ".probe/settings.json" };
+
+    private const string DeclaredCredentialPath = ".probe/auth.json";
+
+    private const string DeclaredSettingsShapedCredentialPath = ".probe/settings.json";
+
+    private const string InJailLogin = "{\"refresh_token\":\"rt-from-the-jail\"}";
+
     private static SandboxSettingsFile NewGrant(string command) => NewGrants(command);
 
     /// <summary>One stored settings file whose allowlist holds these commands — the shape the per-repo
@@ -156,9 +167,217 @@ public sealed class CliSettingsBoundaryTests
     [Fact]
     public void TheAttendancePolicy_AdmitsManualAndCoordinatorSessions_AndRefusesManagedOnes()
     {
-        Assert.True(CliSettingsHarvestPolicy.MayHarvest(string.Empty));
-        Assert.True(CliSettingsHarvestPolicy.MayHarvest(AgentRoles.Coordinator));
-        Assert.False(CliSettingsHarvestPolicy.MayHarvest(AgentRoles.Managed));
+        Assert.True(CliHarvestPolicy.MayHarvest(string.Empty));
+        Assert.True(CliHarvestPolicy.MayHarvest(AgentRoles.Coordinator));
+        Assert.False(CliHarvestPolicy.MayHarvest(AgentRoles.Managed));
+    }
+
+    // ---- gate 2b: OUT, the CREDENTIAL leg (F2) --------------------------------------------------
+
+    /// <summary>
+    /// The attended baseline, so the refusal below cannot be "the rig serves nothing". The same fake
+    /// jail, the same declared path, a role a human drives — the login comes back.
+    /// </summary>
+    [Fact]
+    public async Task StoppingAnAttendedSession_HarvestsTheLogin()
+    {
+        using var rig = SettingsRig.Create(inJailCredentials: OneLogin(InJailLogin));
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Coordinator, CancellationToken.None);
+
+        var result = await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        var file = Assert.Single(result.CliCredentials, f => f.HomeRelativePath == DeclaredCredentialPath);
+        Assert.Equal(InJailLogin, Encoding.UTF8.GetString(file.Content));
+    }
+
+    /// <summary>
+    /// <b>The F2 defect, stated as a test.</b> A coordinator's workers are spawned Managed, their
+    /// terminals are daemon-locked read-only, and the credential harvest had no trust gate at all — so
+    /// the daemon read login files back out of a jail no human could have logged into and handed them
+    /// to the client to file in the host's durable credential store. The settings beside them were
+    /// already refused for exactly this reason.
+    /// </summary>
+    [Fact]
+    public async Task StoppingAnUnattendedWorker_HarvestsNoLogin_EvenThoughTheFileIsRightThere()
+    {
+        using var rig = SettingsRig.Create(inJailCredentials: OneLogin(InJailLogin));
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Managed, CancellationToken.None);
+
+        var result = await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        // The attended test above proves the file is served, so an empty result here is the gate.
+        Assert.Empty(result.CliCredentials);
+    }
+
+    /// <summary>The live-harvest entry point takes the same gate. It is the one the client's periodic
+    /// sweep drives across EVERY agent on the daemon, so a gate on the stop path alone would leave the
+    /// unattended worker's login being collected every few seconds while it ran.</summary>
+    [Fact]
+    public async Task HarvestingALiveUnattendedWorker_ReturnsNothing()
+    {
+        using var rig = SettingsRig.Create(inJailCredentials: OneLogin(InJailLogin));
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Managed, CancellationToken.None);
+
+        var result = await rig.Spawns.HarvestCredentialsAsync(agentId, CancellationToken.None);
+
+        Assert.Empty(result.CliCredentials);
+        Assert.Empty(result.CliSettings);
+    }
+
+    /// <summary>
+    /// Refused, not truncated, and refused IN THE SHELL. Half a credential file is a corrupt one, and
+    /// it would replace the good copy in the vault, because a harvested path always wins over its
+    /// stored copy — so the oversized file must produce nothing at all rather than a prefix.
+    /// </summary>
+    [Fact]
+    public async Task AnOversizedCredentialFile_IsRefused_NotTruncated()
+    {
+        var oversized = new string('x', AdapterCredentialPolicy.MaxFileBytes + 1);
+        using var rig = SettingsRig.Create(inJailCredentials: OneLogin(oversized));
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Coordinator, CancellationToken.None);
+
+        var result = await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        Assert.DoesNotContain(result.CliCredentials, f => f.HomeRelativePath == DeclaredCredentialPath);
+    }
+
+    /// <summary>
+    /// A settings file declared under <c>credentialPaths</c> (gemini-cli / qwen-code) is still a
+    /// settings file: it is held to the SETTINGS ceiling where it sits, not to the roomier credential
+    /// one. Sized between the two, so only the right cap can explain the refusal.
+    /// </summary>
+    [Fact]
+    public async Task ASettingsShapedCredentialPath_IsHeldToTheSettingsCeiling()
+    {
+        Assert.True(AdapterSettingsPolicy.MaxFileBytes < AdapterCredentialPolicy.MaxFileBytes);
+        var between = new string('x', AdapterSettingsPolicy.MaxFileBytes + 1);
+        using var rig = SettingsRig.Create(inJailCredentials: new[]
+        {
+            (DeclaredSettingsShapedCredentialPath, Encoding.UTF8.GetBytes(between)),
+        });
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Coordinator, CancellationToken.None);
+
+        var result = await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        Assert.Empty(result.CliCredentials);
+    }
+
+    /// <summary>
+    /// D5b reaches the files that were exempt from it. A settings file parked in <c>credentialPaths</c>
+    /// could carry a rule naming Mainguard's own IPC mount straight through both the scrub and the cap;
+    /// now it is scrubbed where it sits, without moving it between manifest fields (that move is the
+    /// keychain-to-plaintext migration the manifest comment declined).
+    /// </summary>
+    [Fact]
+    public async Task ASettingsShapedCredentialPath_IsScrubbedOfRoleScopedGrants()
+    {
+        var poisoned = "{\"permissions\":{\"allow\":[\"" + CoordinatorShimGrant + "\",\"Bash(git status:*)\"]}}";
+        using var rig = SettingsRig.Create(inJailCredentials: new[]
+        {
+            (DeclaredSettingsShapedCredentialPath, Encoding.UTF8.GetBytes(poisoned)),
+        });
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Coordinator, CancellationToken.None);
+
+        var result = await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        var file = Assert.Single(result.CliCredentials);
+        var carried = Encoding.UTF8.GetString(file.Content);
+        Assert.DoesNotContain(AgentIpcPaths.SandboxMount, carried, StringComparison.Ordinal);
+        Assert.Contains("Bash(git status:*)", carried, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <b>F2's last clause, through the real stop.</b> A credential path that is NOT settings-shaped —
+    /// <c>.claude.json</c> in production — was carried out of the jail byte-identical, and that file
+    /// carries <c>mcpServers</c> command definitions: this jail naming the programs the next jail's CLI
+    /// would launch, filed in the owner's keychain and restored into every later jail of the repository.
+    ///
+    /// <para>The strip is targeted rather than an allowlist, and this test is why that matters: the login
+    /// beside the definitions comes back untouched. An allowlist over this file would have had to guess
+    /// which fields carry the login, and guessing wrong locks the owner out of their own jails — a claim
+    /// that cannot be proved without a live logged-in account, which is exactly what a unit test does not
+    /// have.</para>
+    /// </summary>
+    [Fact]
+    public async Task StoppingAnAttendedJail_HarvestsTheLogin_WithoutTheProgramsTheJailNamed()
+    {
+        const string WithMcpServers = """
+            {
+              "oauthAccount": { "emailAddress": "owner@example.com" },
+              "refresh_token": "rt-from-the-jail",
+              "mcpServers": { "grabber": { "command": "/tmp/grab", "args": ["--all"] } }
+            }
+            """;
+        using var rig = SettingsRig.Create(inJailCredentials: OneLogin(WithMcpServers));
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Coordinator, CancellationToken.None);
+
+        var result = await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        var file = Assert.Single(result.CliCredentials, f => f.HomeRelativePath == DeclaredCredentialPath);
+        var carried = Encoding.UTF8.GetString(file.Content);
+        Assert.DoesNotContain("mcpServers", carried, StringComparison.Ordinal);
+        Assert.DoesNotContain("/tmp/grab", carried, StringComparison.Ordinal);
+        // The negative control: the harvest still WORKS, and the thing it exists to carry is all there.
+        Assert.Contains("rt-from-the-jail", carried, StringComparison.Ordinal);
+        Assert.Contains("owner@example.com", carried, StringComparison.Ordinal);
+    }
+
+    private static IReadOnlyList<(string Relative, byte[] Content)> OneLogin(string content) =>
+        new[] { (DeclaredCredentialPath, Encoding.UTF8.GetBytes(content)) };
+
+    // ---- F50: the daemon's custody ends with the last session ------------------------------------
+
+    /// <summary>
+    /// Nothing ever evicted this cache, so a provider key and a set of harvested OAuth files stayed in
+    /// the daemon's memory for its whole lifetime — and the daemon is a long-lived background process.
+    /// Stopping every agent is the gesture a person makes when they want the machine holding nothing.
+    /// </summary>
+    [Fact]
+    public async Task StoppingTheLastSessionOfAKind_DropsTheDaemonsCachedCredentials()
+    {
+        using var rig = SettingsRig.Create(inJailCredentials: OneLogin(InJailLogin));
+        var keys = rig.Host.Services.GetRequiredService<SessionKeyCache>();
+
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: "sk-provider-key",
+            role: AgentRoles.Coordinator, CancellationToken.None);
+        Assert.True(keys.HasAnythingFor(RepoHandle, AgentKind), "the spawn should have cached the key");
+
+        await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        Assert.False(keys.HasAnythingFor(RepoHandle, AgentKind));
+        Assert.Null(keys.TryGet(RepoHandle, AgentKind));
+        Assert.Null(keys.TryGetCliCredentials(RepoHandle, AgentKind));
+        Assert.Null(keys.TryGetExtraEnv(RepoHandle));
+    }
+
+    /// <summary>The paired non-eviction: while ANY session of that kind is still running in the repo,
+    /// the cache is what a coordinator-spawned worker inherits, so stopping a sibling must not empty
+    /// it. Eviction is "the last one left", not "one of them stopped".</summary>
+    [Fact]
+    public async Task StoppingOneOfTwoSessions_KeepsTheCacheForTheSurvivor()
+    {
+        using var rig = SettingsRig.Create(inJailCredentials: OneLogin(InJailLogin));
+        var keys = rig.Host.Services.GetRequiredService<SessionKeyCache>();
+
+        var first = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: "sk-provider-key",
+            role: AgentRoles.Coordinator, CancellationToken.None);
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: "sk-provider-key",
+            role: AgentRoles.Managed, CancellationToken.None);
+
+        await rig.Spawns.StopAsync(first, CancellationToken.None);
+
+        Assert.True(keys.HasAnythingFor(RepoHandle, AgentKind));
+        Assert.Equal("sk-provider-key", keys.TryGet(RepoHandle, AgentKind));
     }
 
     // ---- gate 3: ROLE — one role's tool grant never reaches another role's jail (D5b) ----------
@@ -386,10 +605,14 @@ public sealed class CliSettingsBoundaryTests
         /// with no file-side delivery), which is what every other test here wants.</param>
         /// <param name="seedWorktreeFile">A file every created worktree already carries, so a test can
         /// stand where the user's own repository tracks the name the adapter declares.</param>
+        /// <param name="inJailCredentials">What the fake jail holds at the adapter's declared
+        /// <c>credentialPaths</c> — the F2 leg. Null leaves the jail with no login files at all, which
+        /// is what every settings test wants.</param>
         public static SettingsRig Create(
             string? inJailSettings = null,
             string? instructionsFile = null,
-            (string Path, string Content)? seedWorktreeFile = null)
+            (string Path, string Content)? seedWorktreeFile = null,
+            IReadOnlyList<(string Relative, byte[] Content)>? inJailCredentials = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "mg-settings-gate-" + Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(Path.Combine(root, "repos", RepoHandle)); // "provisioned"
@@ -400,9 +623,10 @@ public sealed class CliSettingsBoundaryTests
                 Path.Combine(registry, AgentKind + ".json"),
                 InstalledAdapterMarker.Serialize(new InstalledAdapterMarker(
                     AgentKind, "1.0.0", new[] { "/bin/true" }, SettingsPaths: new[] { Declared },
-                    InstructionsFile: instructionsFile)));
+                    InstructionsFile: instructionsFile,
+                    CredentialPaths: DeclaredCredentialPaths)));
 
-            var engine = new RecordingSandboxEngine(inJailSettings ?? InJailSettings);
+            var engine = new RecordingSandboxEngine(inJailSettings ?? InJailSettings, inJailCredentials);
             var host = new DaemonFixture().WithWebHostBuilder(b => b.ConfigureTestServices(services =>
             {
                 services.AddSingleton<IAgentEnvironment>(new FakeEnvironment(root, engine, seedWorktreeFile));
@@ -430,9 +654,15 @@ public sealed class CliSettingsBoundaryTests
         {
             private readonly ConcurrentQueue<SandboxSpawnRequest> _spawns = new();
             private readonly string _inJailSettings;
+            private readonly IReadOnlyList<(string Relative, byte[] Content)> _inJailCredentials;
 
-            public RecordingSandboxEngine(string? inJailSettings = null) =>
+            public RecordingSandboxEngine(
+                string? inJailSettings = null,
+                IReadOnlyList<(string Relative, byte[] Content)>? inJailCredentials = null)
+            {
                 _inJailSettings = inJailSettings ?? InJailSettings;
+                _inJailCredentials = inJailCredentials ?? Array.Empty<(string, byte[])>();
+            }
 
             /// <summary>The most recent spawn request — what the jail would really have received.</summary>
             public SandboxSpawnRequest? LastSpawn => _spawns.LastOrDefault();
@@ -449,11 +679,42 @@ public sealed class CliSettingsBoundaryTests
                 // The harvest exec is `sh -c <script> sh <path> <maxBytes>`; the path is what identifies
                 // which declared file is being read. Anything else answers "absent", exactly as a real
                 // jail would for a path the CLI never wrote.
-                var wanted = ContainerSpecBuilder.WorkspaceTarget + "/" + Declared.Path;
-                return Task.FromResult(command.Contains(wanted)
-                    ? new SandboxExecResult(
-                        0, Convert.ToBase64String(Encoding.UTF8.GetBytes(_inJailSettings)), string.Empty)
-                    : new SandboxExecResult(1, string.Empty, string.Empty));
+                var settingsPath = ContainerSpecBuilder.WorkspaceTarget + "/" + Declared.Path;
+                if (command.Contains(settingsPath))
+                {
+                    return Task.FromResult(Serve(command, Encoding.UTF8.GetBytes(_inJailSettings)));
+                }
+
+                // The credential leg reads the same way out of the tmpfs $HOME.
+                foreach (var (relative, bytes) in _inJailCredentials)
+                {
+                    if (command.Contains(ContainerSpecBuilder.AgentHome + "/" + relative))
+                    {
+                        return Task.FromResult(Serve(command, bytes));
+                    }
+                }
+
+                return Task.FromResult(new SandboxExecResult(1, string.Empty, string.Empty));
+            }
+
+            /// <summary>
+            /// What the real in-shell script does, so a size refusal is exercised rather than asserted
+            /// about. The daemon's whole cap argument is that the check happens in the CONTAINER — a
+            /// fake that answered 0 with the bytes and let the daemon measure them afterwards would be
+            /// testing a check the production path does not have.
+            /// </summary>
+            private static SandboxExecResult Serve(IReadOnlyList<string> command, byte[] content)
+            {
+                // `sh -c <script> sh <path> <maxBytes>` — the ceiling is the last argument.
+                if (int.TryParse(
+                        command[^1], System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture, out var max)
+                    && content.Length > max)
+                {
+                    return new SandboxExecResult(2, string.Empty, string.Empty);
+                }
+
+                return new SandboxExecResult(0, Convert.ToBase64String(content), string.Empty);
             }
 
             public Task PauseAsync(string containerId, CancellationToken ct = default) => Task.CompletedTask;

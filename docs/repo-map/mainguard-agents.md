@@ -981,6 +981,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       adds `staleSecretLayout` to the reuse staleness list, because tmpfs entries are fixed at create and
       reusing a pre-upgrade jail would exec a non-root owner into a directory that does not exist —
       resurrecting the same EPERM for every container that outlived the upgrade.
+      **F24 — the reuse path now writes the jail's SECRETS too** (`agent.env` + `oob.key`, before the
+      restores below it). Both live on tmpfs, which Docker recreates EMPTY on `docker start`, and the
+      launcher mints a fresh gateway token every launch while `Issue` retires the previous one — so a
+      resumed jail came back either with no token or with one the daemon had already replaced (every
+      model call 401s, and the OOB supervisor has no key at all). Written UNCONDITIONALLY, unlike the
+      write-if-absent restores beside them: those carry the user's state and a live jail may hold a
+      fresher copy, while these carry THIS launch's secrets, which the launch has already replaced
+      daemon-side. Pinned by `GatewayConfinementDockerTests.ResumedJail_…`.
       `RestoreCliCredentialsAsync`/**`RestoreCliSettingsAsync`** run on BOTH the create and the reuse
       paths, write-if-absent as the AGENT uid over exec stdin — `docker cp` would write UNDER the tmpfs
       `$HOME` and report success while the container sees nothing, and write-if-absent stops the host's
@@ -2094,7 +2102,40 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       neutralises an already-poisoned store with no migration, and on harvest
       (`HarvestCliSettingsAsync`), which stops the store re-acquiring one and makes it self-heal at the
       next attended stop. Covered by `Mainguard.Tests/CliSettingsGrantScrubTests.cs` +
-      `CliSettingsBoundaryTests` gate 3).
+      `CliSettingsBoundaryTests` gate 3.
+      **F45 — `CarryOnly(content)` is now the entry point for a declared `settingsPaths` file**: an
+      ALLOWLIST of carried keys (`permissions` — itself reduced to `allow`/`ask`/`deny`/
+      `additionalDirectories` — plus `model`, `outputStyle`, `includeCoAuthoredBy`) rather than a
+      denylist, so `hooks`, `apiKeyHelper`, `statusLine`, `mcpServers`, `env` and
+      `permissions.defaultMode` stop crossing between jails, and an unbounded grant (`Bash(*)`,
+      `Bash(:*)`, a bare tool name) is dropped from `allow`/`ask` while `deny` travels as written.
+      Non-JSON fails closed. `Scrub` (mount-only) stays for the settings files parked under
+      `credentialPaths` — gemini-cli's and qwen-code's — whose schema is a different vendor's.
+      **F2's last clause — `StripExecutableConfig(content, out unreviewedTopLevelKeys)`** is the third
+      entry point, for the credential files that are NOT settings-shaped (`.claude.json` above all), and
+      it is `CarryOnly` INVERTED: it removes the keys that name a program — `ExecutableConfigKeys`
+      (`mcpServers`, `enableAllProjectMcpServers`, `hooks`, `apiKeyHelper`, `statusLine`, `env`), at ANY
+      depth, because claude-code keeps a project's servers under `projects.<dir>.mcpServers` — and
+      carries every other key untouched, byte-identical when nothing matched. An allowlist over this file
+      was rejected: it is the file that says the user is logged in, and no unit test can prove a guessed
+      auth field right without a live account, whereas "a program name is not a credential" is provable
+      as written. `ExecutableConfigKeys` is the ONE list — `CarriedTopLevelKeys` is its complement and the
+      two are asserted disjoint, so the legs cannot drift (MG-12). Unparseable content follows `Scrub`
+      rather than `CarryOnly` (it travels unless it spells one of those keys as a JSON key), because
+      `.gemini/installation_id` is a bare UUID by design and a blanket refusal would cost a real login.
+      Every top-level key outside `ReviewedCredentialKeys` is reported to the caller to LOG BY NAME —
+      already reduced to a plain identifier or `<non-identifier>`, never a value — so a vendor that ships
+      a new executable key surfaces instead of passing silently. The daemon-owned mount is deliberately
+      NOT scrubbed from these files; that is the settings leg's boundary).
+    - `AdapterCredentialPolicy.cs` (**F2** — the limits and shape rules of the CREDENTIAL round trip,
+      the twin of `AdapterSettingsPolicy`. `MaxFileBytes` (1 MiB, refused not truncated: half a
+      credential file is a corrupt one and it would REPLACE the good copy in the vault),
+      `IsSettingsShaped(path)` (a declared credential path whose file name is `settings.json` — the
+      gemini-cli / qwen-code files parked in that field for the migration reason the manifest explains;
+      matched on the name so a sixth adapter is covered the day it is added), and `MaxBytesFor(path)`
+      (the settings ceiling for those, this one for everything else — one place, so the harvest's
+      in-shell `wc -c` and the restore-side filter cannot drift). Consumed by
+      `SandboxAgentLauncher.HarvestCliCredentialsAsync` and `FilterCliCredentials`).
     - `AdapterSettingsPath.cs` (the `settingsPaths` declaration — the NON-credential twin of
       `credentialPaths`, so a CLI's permission allowlist survives a spawn instead of the user
       re-approving every command. `AdapterSettingsRoot` (`home` = the tmpfs `$HOME`, `workspace` = the

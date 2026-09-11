@@ -36,6 +36,10 @@ public sealed class GatewayUpstreamBindingTests
     private const string RealKey = "sk-ant-REAL-PROVIDER-KEY";
     private const string Agent = "agent-7";
 
+    // F46: the Google shape — a different upstream, a different header, a different key prefix.
+    private const string GoogleUpstream = "generativelanguage.googleapis.com";
+    private const string GoogleKey = "AIza-REAL-PROVIDER-KEY";
+
     // The core regression: a request whose Host is the GATEWAY is still fronted, forwarded to the
     // agent's BOUND upstream, and charged to that agent's budget.
     [Fact]
@@ -54,6 +58,53 @@ public sealed class GatewayUpstreamBindingTests
         Assert.Equal("https", capture.Request.RequestUri.Scheme);
         // MG-4: the daemon's key went upstream; the agent's token did not.
         Assert.Equal(RealKey, capture.Request.Headers.GetValues("x-api-key").First());
+    }
+
+    /// <summary>
+    /// <b>F46 — the same class of defect as this file's headline one, one provider over.</b> The
+    /// adapter table lists gemini-cli as confinable and verified, and the spawn path really does replace
+    /// its key with an <c>mg_sess_</c> token. But identification read only <c>x-api-key</c> and
+    /// <c>authorization</c>, and gemini-cli sends <c>x-goog-api-key</c> — so every call resolved to no
+    /// agent, found no upstream binding, and fell through unfronted. Nothing caught it because the
+    /// Docker test that covers confinement uses the Anthropic header shape, exactly as the tests above
+    /// this one used a Host header production never sends.
+    /// </summary>
+    [Fact]
+    public async Task ConfinedGeminiAgent_PresentingXGoogApiKey_IsIdentifiedAndForwarded()
+    {
+        var creds = new AgentGatewayCredentials();
+        var token = creds.Issue(Agent, GoogleKey, GoogleUpstream);
+        var capture = new CapturingHandler();
+
+        var seen = await InvokeAsync(
+            creds, capture, token,
+            tokenHeader: "x-goog-api-key",
+            path: "/v1beta/models/gemini-2.5-pro:generateContent");
+
+        Assert.Equal(StatusCodes.Status200OK, seen.StatusCode);
+        Assert.False(seen.PassedThrough, "an identified agent's call must never fall through unfronted");
+        Assert.Equal(GoogleUpstream, capture.Request!.RequestUri!.Host);
+    }
+
+    /// <summary>The injection half. Identifying the agent is worth nothing if the real key then goes
+    /// upstream as <c>Authorization: Bearer</c>, which is not how the Generative Language API takes an
+    /// API key — and the agent's own token must not travel at all.</summary>
+    [Fact]
+    public async Task ConfinedGeminiAgent_GetsTheRealKeyInGooglesHeader_AndItsOwnTokenIsDropped()
+    {
+        var creds = new AgentGatewayCredentials();
+        var token = creds.Issue(Agent, GoogleKey, GoogleUpstream);
+        var capture = new CapturingHandler();
+
+        await InvokeAsync(
+            creds, capture, token,
+            tokenHeader: "x-goog-api-key",
+            path: "/v1beta/models/gemini-2.5-pro:generateContent");
+
+        var sent = capture.Request!.Headers.GetValues("x-goog-api-key").ToArray();
+        Assert.Equal(new[] { GoogleKey }, sent);
+        Assert.DoesNotContain(token, sent);
+        Assert.False(capture.Request.Headers.Contains("authorization"));
     }
 
     // The budget half: the ledger is actually written on the real path. This is the assertion that was
@@ -135,7 +186,9 @@ public sealed class GatewayUpstreamBindingTests
         string? presentedToken,
         BudgetLedger? ledger = null,
         int? estimate = null,
-        string requestHost = GatewayHost)
+        string requestHost = GatewayHost,
+        string tokenHeader = "x-api-key",
+        string path = "/v1/messages")
     {
         var gateway = new AiGateway(
             TokenBucket.FromKeyHealth(null, () => DateTimeOffset.UtcNow),
@@ -158,13 +211,16 @@ public sealed class GatewayUpstreamBindingTests
         context.Request.Scheme = "http";
         // The production shape: the confined CLI dials the GATEWAY, so this is the gateway's address.
         context.Request.Host = new HostString(requestHost);
-        context.Request.Path = "/v1/messages";
+        context.Request.Path = path;
         context.Request.Body = new System.IO.MemoryStream(Encoding.UTF8.GetBytes("{}"));
         context.Response.Body = new System.IO.MemoryStream();
 
         if (presentedToken is not null)
         {
-            context.Request.Headers["x-api-key"] = presentedToken;
+            // F46: which header the token arrives in is a property of the CLI, not of the gateway —
+            // gemini-cli sends x-goog-api-key. Parameterised so a test can send the shape its adapter
+            // really sends instead of the one this file happened to be written with.
+            context.Request.Headers[tokenHeader] = presentedToken;
         }
 
         if (estimate is not null)

@@ -117,6 +117,24 @@ public sealed record PlatformBinaryLink(
     [property: JsonPropertyName("sources")] IReadOnlyList<string> Sources,
     [property: JsonPropertyName("target")] string Target);
 
+/// <summary>
+/// A pinned dependency closure for one adapter: the lockfile shipped beside the manifest, and the
+/// sha256 of that lockfile's own bytes.
+///
+/// <para><paramref name="Path"/> is relative to the channel manifest, so a hosted channel and the
+/// bundled one address it the same way, and it is validated to be a plain relative path — the same rule
+/// <c>credentialPaths</c> and <c>platformBinary</c> are held to, for the same reason: this is a field
+/// that names a FILE, and a manifest is reviewed rather than trusted.</para>
+///
+/// <para><paramref name="Sha256"/> pins the lockfile itself. Without it the lockfile would be one more
+/// unverified input, and pinning a dependency closure with an unpinned closure description buys
+/// nothing.</para>
+/// </summary>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record AdapterLockfile(
+    [property: JsonPropertyName("path")] string Path,
+    [property: JsonPropertyName("sha256")] string Sha256);
+
 /// <summary>The command that proves the pinned CLI is installed and at the right version.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record HealthProbe(
@@ -265,7 +283,30 @@ public sealed record AdapterSpec(
     /// the vendor's placeholder itself instead of running the vendor's postinstall. Null = this CLI's
     /// package is self-contained (its <c>bin</c> entry is the real entry point) and nothing extra is
     /// needed. See <see cref="PlatformBinaryLink"/>.</summary>
-    [property: JsonPropertyName("platformBinary")] PlatformBinaryLink? PlatformBinary = null)
+    [property: JsonPropertyName("platformBinary")] PlatformBinaryLink? PlatformBinary = null,
+    /// <summary>
+    /// The pinned dependency CLOSURE for this CLI — the field the "RESIDUAL GAP" note in
+    /// <c>adapters.starter.json</c> has been describing as missing.
+    ///
+    /// <para><b>What the gap is.</b> <c>sha256</c> above pins the top-level tarball and
+    /// <c>provenance</c> states what can be verified about its origin. Installing that tarball then
+    /// resolves its whole dependency tree LIVE from the registry, and none of those packages is pinned,
+    /// hashed or reproducible — including, for claude-code and opencode, the platform sub-package that
+    /// contains the bytes that actually execute. <c>--ignore-scripts</c> removes the INSTALL-TIME
+    /// execution of that code; it does not remove the code.</para>
+    ///
+    /// <para><b>What this field is, and what it is not yet.</b> It is the schema half: an adapter may
+    /// name a lockfile shipped beside the manifest, pinned by its own sha256, which a future
+    /// <c>npm ci</c>-shaped install stages and installs against instead of resolving live. Declaring it
+    /// is OPTIONAL and nothing in the install path consumes it yet — the reshape of
+    /// <see cref="InstallCmd"/> and the per-adapter lockfiles are the other half, and they change how
+    /// every CLI is installed, so they are deliberately not being landed alongside a credentials fix.
+    /// Until an adapter declares one, that adapter's install is exactly as reproducible as it was.</para>
+    ///
+    /// <para>Validated when present (plain relative path, real sha256) so a manifest cannot start
+    /// naming files outside the channel directory the day the install side does read it.</para>
+    /// </summary>
+    [property: JsonPropertyName("lockfile")] AdapterLockfile? Lockfile = null)
 {
     /// <summary>The parsed <see cref="Provenance"/> rung. Only ever reached after
     /// <see cref="AdapterManifest.Parse"/> validated it, so an unrecognised value here is a bug, not a
@@ -384,6 +425,19 @@ public sealed record AdapterManifest(
                 if (!IsHomeRelativeFilePath(platform.Target))
                     throw new AdapterManifestException(AdapterManifestError.BadPlatformBinary,
                         $"Adapter '{a.Id}' platformBinary target '{platform.Target}' must be a plain relative path under the adapters prefix.");
+            }
+
+            // The lockfile is OPTIONAL (nothing installs against one yet — see AdapterSpec.Lockfile),
+            // but a declared one is validated now rather than the day it is first read: it names a file
+            // and carries a hash, and both are exactly the fields a manifest edit could abuse.
+            if (a.Lockfile is { } lockfile)
+            {
+                if (!IsHomeRelativeFilePath(lockfile.Path))
+                    throw new AdapterManifestException(AdapterManifestError.Malformed,
+                        $"Adapter '{a.Id}' lockfile path '{lockfile.Path}' must be a plain relative path beside the manifest.");
+                if (!IsSha256(lockfile.Sha256))
+                    throw new AdapterManifestException(AdapterManifestError.BadHash,
+                        $"Adapter '{a.Id}' lockfile sha256 must be 64 hex chars — an unpinned lockfile pins nothing.");
             }
 
             // The pre-approval pair. Both-or-neither, and the format must carry the placeholder —

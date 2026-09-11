@@ -199,3 +199,107 @@ Every one was run green, then broken and observed red: the restore (fresh jail r
 harvest (0 files instead of 2), the untrusted gate (1 inherited grant), the attendance gate (a Managed
 worker's file persisted), the path filter (3 files through instead of 1), the manifest disjointness
 check, the per-repo scope segment, and the bundled `settingsPaths` declaration.
+
+---
+
+# The credential leg (F2 / F45 batch)
+
+The document above is about the SETTINGS leg. Its sibling — the CLI **login** round trip declared in
+`credentialPaths` — was built first and, it turned out, had none of the boundaries described above.
+This section records what changed and, as importantly, what did not.
+
+## The asymmetry that was the defect
+
+The settings leg was gated three ways: an untrusted jail inherits nothing, only a human-attended
+session is harvested, and a harvested file is scrubbed and size-capped. The credential leg beside it,
+reading files out of the same agent-writable tmpfs `$HOME`, had **no trust gate at all** and **no size
+cap**, and its durable store was keyed by adapter kind alone while the settings store was per
+repository.
+
+Each of those is worse on the credential leg than on the settings leg, not better:
+
+- **Trust.** A coordinator's workers are spawned `AgentRoles.Managed` running real adapter kinds, and
+  a Managed worker's terminal is daemon-locked read-only (P2-14). So every one of them *was* harvested:
+  the daemon read login files out of a jail no human could have logged into and handed them to the
+  client for the host keychain. The settings file from that same jail was already refused, on the
+  reasoning that nobody could have approved anything in it. An OAuth refresh token mints access tokens
+  for the user's whole provider account; it is the more dangerous of the two, and it was the ungated one.
+- **Scope.** Settings were per repository *because* a permission allowlist is a standing grant of
+  execution. A refresh token is strictly more than that, and it was shared across every repository.
+- **Size.** The settings harvest refuses a file over 256 KiB, checked in the shell so an oversized file
+  never enters the daemon's memory. The credential harvest read whatever was there.
+
+The external-PR jails escaped only by accident: kind `external-pr` has no adapter entry, so its
+`credentialPaths` list is empty. The restore side was properly blocked (`withoutHostCredentials`).
+
+## What now holds
+
+1. **One policy, both legs.** `CliSettingsHarvestPolicy` became `CliHarvestPolicy` and gates the
+   credential harvest at both call sites (`HarvestCredentialsAsync` — the client's periodic sweep — and
+   `StopAsync`). Gating only the stop path would leave an unattended worker's login being collected
+   every few seconds while it ran. Restore stays deliberately wider: a Managed worker still *receives*
+   the repo's login, it just cannot write to it.
+2. **The vault key carries the repo.** `cli_login_<kind>_<32 hex of the repo handle>`. The repo half is
+   hashed unconditionally to a fixed width so no `(kind, repo)` pair can re-parse as another's key.
+   **Migration: none, deliberately.** A read fallback to the old unscoped entry would hand every
+   repository the old shared blob — the defect restated — so nothing reads it. The owner signs in once
+   per repository, exactly as they already do for their approved-command list. The stale entry is left
+   in place rather than deleted: it is inert, and destroying a credential on the user's behalf during an
+   upgrade is not something an upgrade should do.
+3. **A cap, refused not truncated.** `AdapterCredentialPolicy.MaxFileBytes` (1 MiB), checked with the
+   same in-shell `wc -c` the settings leg uses. Half a credential file is not a smaller credential file,
+   it is a corrupt one — and it would REPLACE the good copy in the vault, because a harvested path
+   always wins over its stored copy.
+4. **The two settings files parked in `credentialPaths` are covered where they sit.** gemini-cli and
+   qwen-code declare `.gemini/settings.json` / `.qwen/settings.json` as credentials; the manifest is
+   explicit that this predates `settingsPaths` and that moving them would migrate live data out of the
+   keychain. So they were not moved. They are matched by file name
+   (`AdapterCredentialPolicy.IsSettingsShaped`), scrubbed by `CliSettingsGrantScrub` and held to the
+   settings ceiling, in both directions.
+
+## The settings scrub is now an allowlist (F45)
+
+`CliSettingsGrantScrub.Scrub` removed IPC-mount strings and carried everything else byte-identical. So
+a settings file crossing between jails could carry `permissions.defaultMode: "bypassPermissions"`
+(which makes the whole allowlist decoration), `hooks` (commands run at CLI lifecycle events — a
+`SessionStart` hook executes before the first prompt is shown), `apiKeyHelper` (a command whose stdout
+becomes the model credential), `statusLine`, `mcpServers`, `env`, and `Bash(*)`.
+
+`CarryOnly` replaces it for declared `settingsPaths`: an allowlist of carried keys, plus a rule filter
+that drops grants of a whole tool from `allow`/`ask` while carrying `deny` as written (dropping a deny
+would *widen* the next jail). A denylist was considered and rejected — the schema is the vendor's,
+updated inside the jail by an updater the jail runs, so a denylist is a bet re-taken silently on every
+CLI release in the direction of "carried".
+
+## What was NOT done, and why
+
+- **`.claude.json` content allowlist — attempted and dropped.** That file is declared as a credential
+  but is really claude-code's whole application state (~75 KB on a real machine: caches, tip counters,
+  and a `projects` map holding per-directory prompt history, approved tool lists and `mcpServers`
+  entries). Reducing it to its login fields was implemented, then dropped, because the reduction could
+  not be *proven* safe: demonstrating that a jail still authenticates afterwards requires a real logged
+  in state, and the only one available was the owner's own live credentials. What was established in a
+  real container running the pinned CLI is that an allowlist-shaped file is structurally accepted — it
+  starts normally, no onboarding, no parse error, failing only on the absent token — but that is not
+  the same claim, and the failure mode that matters (a good token rejected because the account record
+  was reduced) is exactly what it cannot see. Shipping it would have risked every jail prompting for a
+  fresh login, which is the complaint this whole round trip exists to fix. It needs a deliberate test
+  login the verifier is allowed to use.
+- **Scheduled gateway-token rotation — the delivery hook is still unwired, and that is a finding.**
+  `AgentGatewayCredentials.RotateStale` refuses to rotate unless a `TokenDelivery` hook confirms the
+  jail received the replacement. There is no channel that can: the token reaches the jail in
+  `/run/secrets/agent/agent.env`, and `SandboxCliLaunch.WrapperScript` sources that file **once** and
+  then `exec`s the CLI. A process's environment is fixed at exec, so rewriting the file reaches the next
+  process in that jail and no other. A hook that rewrote it and reported success would rotate the
+  daemon's idea of the token while the live CLI kept presenting the old one — which works for the
+  5-minute overlap and then stops. The agent would not fail mid-request; it would fail permanently, an
+  hour after starting, with an unexplainable 401. Closing it needs a credential channel the CLI re-reads
+  per request, which is adapter-specific (claude-code's `apiKeyHelper` is one — and it is a key this
+  batch deliberately stops carrying between jails). Until then a token's exposure is bounded by the
+  jail's lifetime, which is what it was before rotation existed.
+- **Per-adapter dependency lockfiles.** The manifest schema now expresses them (`lockfile: { path,
+  sha256 }`, validated at parse), but no adapter declares one and nothing consumes the field. The other
+  half — generating a closure per adapter, checking those files in, staging them in the VM and
+  reshaping `installCmd` into an `npm ci` against the staged lockfile — changes how every CLI is
+  installed and needs its own in-VM install matrix. A test asserts the shipped channel declares none,
+  so the manifest's residual-gap paragraph cannot quietly become wrong.
