@@ -257,19 +257,45 @@ public sealed class GatewayConfinementDockerTests
     /// token at all or with one the daemon had already replaced: every model call 401s, and the
     /// out-of-band supervisor has no key.</para>
     ///
-    /// <para>Asserted by relaunching the SAME agent id, which is what a resume does, and then reading
-    /// the jail's own env file back and comparing it to the token the daemon currently holds — not to
-    /// the one the first launch produced.</para>
+    /// <para><b>Which relaunch actually reaches that branch, and why this test relaunches a
+    /// COORDINATOR.</b> The engine reuses a container only when the jail's <c>/workspace</c> bind is
+    /// still good (<c>WorkspaceMountAliveAsync</c>) — a worktree deleted and re-created at the same path
+    /// leaves the bind dangling, so such a jail is deliberately rebuilt (the resume Docker flake,
+    /// phase-3 decisions §27.3). For a repo-backed agent, the launcher's two worktree doors both rule
+    /// reuse out: <c>CreateAgentWorktree</c> REFUSES an id whose <c>agent/&lt;id&gt;</c> already exists,
+    /// and the resume door, <c>AdoptAgentWorktree</c>, clears the residue and re-creates the worktree —
+    /// which is exactly the condition that forces a rebuild. A coordinator has no worktree at all
+    /// (contract §2, <c>withoutRepositoryAccess</c>), so <c>/workspace</c> is its own tmpfs bound to
+    /// nothing and the reuse branch is reachable through the shipped launcher. It is also a real
+    /// production shape rather than a convenient one: a coordinator's container outlives the daemon, and
+    /// <c>AgentSpawnService</c> puts the role on its labels precisely "so the next daemon can adopt a
+    /// surviving coordinator back AS a coordinator" — relaunching it onto a tmpfs Docker recreated empty
+    /// is the case F24 is about.</para>
+    ///
+    /// <para>An earlier version of this test relaunched a repo-backed agent and asserted only that the
+    /// container id came back the same. That launch took the FRESH SPAWN path and threw
+    /// <c>AgentWorktreeConflictException</c> on worktree creation, so every assertion below it was
+    /// unreached and F24 was unproven. <see cref="Jail.Reused"/> is now asserted first, so the test
+    /// cannot silently stop exercising the branch it exists for.</para>
     /// </summary>
     [RequiresDockerFact]
     public async Task ResumedJail_ComesBackWithTheTokenTheDaemonNowHolds_AndAnOobKey()
     {
         await using var world = await ConfinementWorld.StartAsync(new BudgetCaps(0, 0, 0, 0));
-        var first = await world.LaunchAsync("byok-resume-1", modelApiKey: RealKey);
+        var first = await world.LaunchAsync("byok-resume-1", modelApiKey: RealKey, asCoordinator: true);
         var firstToken = ValueOf(await world.ReadSecretsFileAsync(first), ApiKeyVar);
 
-        // The resume: same repo, same agent id, so the launcher finds and reuses the container.
-        var resumed = await world.LaunchAsync("byok-resume-1", modelApiKey: RealKey);
+        // STOPPED first, which is the half that makes this the F24 case rather than a no-op: both secret
+        // files live on tmpfs, and Docker recreates a tmpfs EMPTY on start. A relaunch of a still-running
+        // jail would find the old files in place and could pass on a branch that wrote nothing.
+        await world.StopJailAsync(first);
+
+        // The relaunch: same repo, same agent id, so the engine finds and re-starts the container.
+        var resumed = await world.LaunchAsync("byok-resume-1", modelApiKey: RealKey, asCoordinator: true);
+        Assert.True(
+            resumed.Reused,
+            "this test is about the REUSE branch — a relaunch that created a new container proves "
+            + "nothing about the two tmpfs files that branch has to rewrite");
         Assert.Equal(first.ContainerId, resumed.ContainerId);
 
         var env = await world.ReadSecretsFileAsync(resumed);
@@ -562,24 +588,39 @@ public sealed class GatewayConfinementDockerTests
         }
 
         /// <summary>Spawns a jail through the daemon's own launcher — the shipped spawn chain.</summary>
+        /// <param name="asCoordinator">The role lock (coordinator contract §2): no worktree, no per-agent
+        /// repo, no mirror. Passed exactly as <c>AgentSpawnService</c> passes it for
+        /// <see cref="AgentRoles.Coordinator"/> — both the flag and the role, because the role is what
+        /// goes onto the jail's labels and is how a later daemon adopts a surviving coordinator back as
+        /// one.</param>
         public async Task<Jail> LaunchAsync(
             string agentId, string? modelApiKey,
             IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
-            string agentKind = AdapterId)
+            string agentKind = AdapterId,
+            bool asCoordinator = false)
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(4));
             var launcher = Daemon.Services.GetRequiredService<SandboxAgentLauncher>();
 
             var launch = await launcher.TryLaunchAsync(
                 RepoHash, agentId, agentKind: agentKind, modelApiKey: modelApiKey,
-                ipcDirPath: null, ct: cts.Token, extraEnv: null, cliCredentials: cliCredentials);
+                ipcDirPath: null, ct: cts.Token, extraEnv: null, cliCredentials: cliCredentials,
+                withoutRepositoryAccess: asCoordinator,
+                agentRole: asCoordinator ? AgentRoles.Coordinator : string.Empty);
 
             Assert.NotNull(launch);
             _jails.Add((RepoHash, agentId, launch!.ContainerId));
-            return new Jail(agentId, launch.ContainerId);
+            return new Jail(agentId, launch.ContainerId, launch.Reused);
         }
 
         public Task<string> ReadSecretsFileAsync(Jail jail) => ExecAsync(jail, "cat " + CredentialPath);
+
+        /// <summary>Stops the jail's container without removing it — the state a relaunch finds, and the
+        /// one that empties its tmpfs. Driven through the daemon's own engine rather than the raw client,
+        /// so it is the same stop the product performs.</summary>
+        public Task StopJailAsync(Jail jail) =>
+            Daemon.Services.GetRequiredService<IAgentEnvironment>()
+                .Sandboxes.StopAsync(jail.ContainerId, CancellationToken.None);
 
         /// <summary>Runs a shell line inside the jail, as the agent uid by default, with the container's
         /// own env. <paramref name="asUid"/> overrides the identity for the assertions that must look at
@@ -827,7 +868,10 @@ public sealed class GatewayConfinementDockerTests
         }
     }
 
-    private sealed record Jail(string AgentId, string ContainerId);
+    /// <param name="Reused">What the launcher reported: true when the engine re-started an existing
+    /// container rather than creating one. The F24 test asserts on it, because "the same container id
+    /// came back" and "the reuse branch ran" are not the same claim.</param>
+    private sealed record Jail(string AgentId, string ContainerId, bool Reused = false);
 
     /// <summary>
     /// The daemon's provider transport, replaced: records what the daemon actually sent upstream (so the

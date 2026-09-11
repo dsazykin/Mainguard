@@ -2579,11 +2579,19 @@
   `gemini-cli` marker, and `LaunchAsync` takes an `agentKind` — and issues the request in the shape
   gemini-cli sends: nothing about the confinement machinery was Anthropic-specific except the two header
   names nobody had generalised, and every test here used the one shape.
-  `ResumedJail_ComesBackWithTheTokenTheDaemonNowHolds_AndAnOobKey` (F24) relaunches the SAME agent id —
-  which is what a resume does — and compares the jail's own `agent.env` to the token the daemon
-  CURRENTLY holds, not to the one the first launch produced: the reuse branch restored logins and
-  settings into a jail whose tmpfs secrets `docker start` had just emptied, and wrote neither the env
-  file nor `oob.key`**),
+  `ResumedJail_ComesBackWithTheTokenTheDaemonNowHolds_AndAnOobKey` (F24) STOPS a jail and relaunches the
+  same agent id, then compares the jail's own `agent.env` to the token the daemon CURRENTLY holds, not
+  to the one the first launch produced: the reuse branch restored logins and settings into a jail whose
+  tmpfs secrets `docker start` had just emptied, and wrote neither the env file nor `oob.key`. It
+  relaunches a COORDINATOR (`withoutRepositoryAccess`), because that is the only shape in which the
+  shipped launcher reaches the engine's reuse branch at all: `CreateAgentWorktree` refuses an id whose
+  `agent/<id>` exists, and `AdoptAgentWorktree` re-creates the worktree, which is exactly what
+  `WorkspaceMountAliveAsync` rebuilds a container for (§27.3) — while a coordinator has no worktree, and
+  its container is the one `AgentSpawnService` labels so a later daemon can adopt it back. `Jail.Reused`
+  is asserted BEFORE the secrets, because the first version of this test relaunched a repo-backed agent,
+  threw `AgentWorktreeConflictException` on worktree creation, and left every assertion below it
+  unreached — F24's fix shipped unproven. Mutation watched red: the two `WriteSecretFileAsync` calls
+  removed from the reuse branch**),
   `DailyBudgetCapBootTests` (MG-21 — the persisted PER-DAY caps survive a restart: boot built
   `BudgetCaps(..., 0, 0)`, and 0 means UNLIMITED, so a daily budget silently stopped being enforced
   after every daemon restart while `GetBudgets` still reported it; resolves the ledger from a freshly
