@@ -1123,6 +1123,19 @@
   jail), a clean file still byte-identical, nothing-carriable ⇒ nothing travels (not an empty `{}` that
   reads like a file the user wrote), non-JSON failing closed, and the mount rule still removed — the
   allowlist has to subsume `Scrub`, since `permissions.allow` is exactly where the D5b grant lived.
+  **F2's last clause adds the `StripExecutableConfig` section** (the credential leg — `.claude.json`): a
+  realistic file (oauth account, user id, per-project state) plus `mcpServers` loses the definitions and
+  keeps everything else, asserted STRUCTURALLY by `AssertEveryOtherKeyIsUnchanged` — same key names, same
+  order, each value serialising to exactly the JSON it arrived as — because "we touched nothing else" is
+  the whole claim that lets this run over a login file with no live account to test against. Then: the
+  per-project `projects.<dir>.mcpServers` block goes too (top-level-only would have left the real finding
+  in place) while the rest of that project entry survives; each program-naming key one at a time in a
+  `[Theory]`; `CarriedTopLevelKeys` and `ExecutableConfigKeys` asserted DISJOINT so the two legs cannot
+  drift; an unreviewed key CARRIED and its name reported (a targeted strip, not an allowlist) while its
+  value never is; a key name that is not a plain identifier reported as `<non-identifier>`, since a JSON
+  key is chosen by whoever wrote the file and inside a jail that can be the agent; a clean credential file
+  returned byte-identical; and unparseable content travelling unless it spells one of those keys (a bare
+  UUID is what `.gemini/installation_id` is, and refusing it would cost a real login).
 - **`Mainguard.Tests/CliLoginVaultTests.cs`** also pins the **F2 repo scope**: the key is per kind AND
   per repo with a fixed-width hex suffix, two repos never resolve to one entry, `("a_b","c")` and
   `("a","b_c")` cannot collide across the separator, a blank scope yields null rather than a shared
@@ -1176,7 +1189,11 @@
   in-shell `wc -c` — a fake that answered 0 with the bytes and let the daemon measure them afterwards
   would be testing a check the production path does not have.
   `ASettingsShapedCredentialPath_IsScrubbedOfRoleScopedGrants` reaches D5b into the files that were
-  exempt from it. **EVICTION (F50):** `StoppingTheLastSessionOfAKind_DropsTheDaemonsCachedCredentials`
+  exempt from it, and `StoppingAnAttendedJail_HarvestsTheLogin_WithoutTheProgramsTheJailNamed` closes
+  F2's last clause through the real stop: a credential path that is NOT settings-shaped (production's
+  `.claude.json`) comes back with its `mcpServers` command definitions gone and the login beside them
+  untouched — the negative control being that the refresh token and the account email are both still
+  there, so a filter that simply dropped the file would fail it. **EVICTION (F50):** `StoppingTheLastSessionOfAKind_DropsTheDaemonsCachedCredentials`
   and its paired non-eviction `StoppingOneOfTwoSessions_KeepsTheCacheForTheSurvivor` — eviction is "the
   last one left", not "one of them stopped".
   **ROLE (defect D5b):** `AStoredJailGrantForTheDaemonsOwnMount_NeverReachesAJail` +

@@ -292,6 +292,43 @@ public sealed class CliSettingsBoundaryTests
         Assert.Contains("Bash(git status:*)", carried, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// <b>F2's last clause, through the real stop.</b> A credential path that is NOT settings-shaped —
+    /// <c>.claude.json</c> in production — was carried out of the jail byte-identical, and that file
+    /// carries <c>mcpServers</c> command definitions: this jail naming the programs the next jail's CLI
+    /// would launch, filed in the owner's keychain and restored into every later jail of the repository.
+    ///
+    /// <para>The strip is targeted rather than an allowlist, and this test is why that matters: the login
+    /// beside the definitions comes back untouched. An allowlist over this file would have had to guess
+    /// which fields carry the login, and guessing wrong locks the owner out of their own jails — a claim
+    /// that cannot be proved without a live logged-in account, which is exactly what a unit test does not
+    /// have.</para>
+    /// </summary>
+    [Fact]
+    public async Task StoppingAnAttendedJail_HarvestsTheLogin_WithoutTheProgramsTheJailNamed()
+    {
+        const string WithMcpServers = """
+            {
+              "oauthAccount": { "emailAddress": "owner@example.com" },
+              "refresh_token": "rt-from-the-jail",
+              "mcpServers": { "grabber": { "command": "/tmp/grab", "args": ["--all"] } }
+            }
+            """;
+        using var rig = SettingsRig.Create(inJailCredentials: OneLogin(WithMcpServers));
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Coordinator, CancellationToken.None);
+
+        var result = await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        var file = Assert.Single(result.CliCredentials, f => f.HomeRelativePath == DeclaredCredentialPath);
+        var carried = Encoding.UTF8.GetString(file.Content);
+        Assert.DoesNotContain("mcpServers", carried, StringComparison.Ordinal);
+        Assert.DoesNotContain("/tmp/grab", carried, StringComparison.Ordinal);
+        // The negative control: the harvest still WORKS, and the thing it exists to carry is all there.
+        Assert.Contains("rt-from-the-jail", carried, StringComparison.Ordinal);
+        Assert.Contains("owner@example.com", carried, StringComparison.Ordinal);
+    }
+
     private static IReadOnlyList<(string Relative, byte[] Content)> OneLogin(string content) =>
         new[] { (DeclaredCredentialPath, Encoding.UTF8.GetBytes(content)) };
 

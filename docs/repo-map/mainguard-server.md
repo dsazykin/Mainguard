@@ -241,7 +241,16 @@
     rather than truncated; and a declared credential path that is really a settings file (gemini-cli's /
     qwen-code's `settings.json`) is put through `CliSettingsGrantScrub.Scrub` and held to the settings
     ceiling WHERE IT SITS, in both directions (`FilterCliCredentials` applies the same pair on restore,
-    so an already-poisoned store is neutralised with no migration). WHETHER either harvest may run is
+    so an already-poisoned store is neutralised with no migration). **F2's last clause: a credential path
+    that is NOT settings-shaped — `.claude.json` — used to cross byte-identical in both directions, and it
+    carries `mcpServers` command definitions.** Both legs now put it through
+    `CliSettingsGrantScrub.StripExecutableConfig`, which removes only the keys that name a program and
+    leaves every other key alone (a targeted strip rather than an allowlist: this is the file that says the
+    user is logged in, and an allowlist over it cannot be proved safe without a live account). The
+    unreviewed top-level key NAMES it reports are logged by `LogUnreviewedCredentialKeys` on both legs —
+    names only, already reduced to plain identifiers, never a value — so a vendor's new executable key
+    surfaces instead of passing silently. `BuildSecrets`/`FilterCliCredentials` take an optional `ILogger`
+    for that; the spawn chain passes the daemon's. WHETHER either harvest may run is
     the caller's decision — see `CliHarvestPolicy`. Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
     refused outright (`Conflict`), so a conflicted keep-alive rebase used to put one raw
     `Docker.DotNet.DockerApiException` stack trace per declared path into the operator log — a warning

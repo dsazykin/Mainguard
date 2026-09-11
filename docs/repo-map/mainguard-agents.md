@@ -2110,7 +2110,23 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `permissions.defaultMode` stop crossing between jails, and an unbounded grant (`Bash(*)`,
       `Bash(:*)`, a bare tool name) is dropped from `allow`/`ask` while `deny` travels as written.
       Non-JSON fails closed. `Scrub` (mount-only) stays for the settings files parked under
-      `credentialPaths` — gemini-cli's and qwen-code's — whose schema is a different vendor's).
+      `credentialPaths` — gemini-cli's and qwen-code's — whose schema is a different vendor's.
+      **F2's last clause — `StripExecutableConfig(content, out unreviewedTopLevelKeys)`** is the third
+      entry point, for the credential files that are NOT settings-shaped (`.claude.json` above all), and
+      it is `CarryOnly` INVERTED: it removes the keys that name a program — `ExecutableConfigKeys`
+      (`mcpServers`, `enableAllProjectMcpServers`, `hooks`, `apiKeyHelper`, `statusLine`, `env`), at ANY
+      depth, because claude-code keeps a project's servers under `projects.<dir>.mcpServers` — and
+      carries every other key untouched, byte-identical when nothing matched. An allowlist over this file
+      was rejected: it is the file that says the user is logged in, and no unit test can prove a guessed
+      auth field right without a live account, whereas "a program name is not a credential" is provable
+      as written. `ExecutableConfigKeys` is the ONE list — `CarriedTopLevelKeys` is its complement and the
+      two are asserted disjoint, so the legs cannot drift (MG-12). Unparseable content follows `Scrub`
+      rather than `CarryOnly` (it travels unless it spells one of those keys as a JSON key), because
+      `.gemini/installation_id` is a bare UUID by design and a blanket refusal would cost a real login.
+      Every top-level key outside `ReviewedCredentialKeys` is reported to the caller to LOG BY NAME —
+      already reduced to a plain identifier or `<non-identifier>`, never a value — so a vendor that ships
+      a new executable key surfaces instead of passing silently. The daemon-owned mount is deliberately
+      NOT scrubbed from these files; that is the settings leg's boundary).
     - `AdapterCredentialPolicy.cs` (**F2** — the limits and shape rules of the CREDENTIAL round trip,
       the twin of `AdapterSettingsPolicy`. `MaxFileBytes` (1 MiB, refused not truncated: half a
       credential file is a corrupt one and it would REPLACE the good copy in the vault),
