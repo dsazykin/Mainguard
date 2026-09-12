@@ -546,8 +546,32 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                 && _queues.TryObserveMergeLanded(
                     request.RepoHandle, request.NewMainSha, lease.ExpectedBranchSha, out _))
             {
-                ctx.Queue.ConfirmHumanMerge(
-                    request.AgentId, request.NewMainSha, MergeAuthorization.ConfirmRpcLate(actor, lease.LeaseId));
+                // N2 (2026-09-12) — the queue's OWN gate and compare-and-swap decide first, and the
+                // observed-late path is the FALLBACK rather than the whole of it.
+                //
+                // This branch used to call ConfirmHumanMerge (the unconditional reconcile entry point)
+                // directly, so a contained-branch confirm recorded Merged with CanMergeLocked and the main
+                // CAS never consulted: an entry whose gate closed between BeginMerge and ConfirmMerge (the
+                // worker pushed → Working; a flagged item was raised; a co-tenant moved main) took the one
+                // path through this RPC that no gate guarded. "Main already contains the branch" is an
+                // argument for recording the merge, not for skipping the checks — so the gate is asked,
+                // and only a gate REFUSAL over a merge git has already been observed to carry falls
+                // through to the late record. Observation first either way: the gate passing says nothing
+                // about whether the work landed, which is precisely the claim this path is about.
+                var containedSource = MergeAuthorization.ConfirmRpc(actor, lease.LeaseId);
+                if (!ctx.Queue.TryConfirmHumanMerge(
+                        request.AgentId, request.NewMainSha, lease.ExpectedMainSha, out var containedReason,
+                        containedSource))
+                {
+                    ctx.Queue.ConfirmHumanMerge(
+                        request.AgentId, request.NewMainSha,
+                        MergeAuthorization.ConfirmRpcLate(actor, lease.LeaseId));
+                    _log.LogWarning(
+                        "ConfirmMerge recorded LATE repo={Repo} agent={Agent}: main already contained the "
+                        + "authorized branch tip {Branch}, but the gate said \"{Reason}\"",
+                        request.RepoHandle, request.AgentId, lease.ExpectedBranchSha, containedReason);
+                }
+
                 ctx.Leases.Confirm(request.RepoHandle, request.LeaseId, request.NewMainSha);
                 _log.LogInformation(
                     "ConfirmMerge recorded repo={Repo} agent={Agent}: main did not move because it already "
@@ -597,6 +621,42 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             throw new RpcException(new Status(StatusCode.FailedPrecondition, mismatch));
         }
 
+        // (1.6) …and the belt the identity check above is NOT (2026-09-12).
+        //
+        // Everything up to here compares the caller's claim against values the DAEMON put on the lease —
+        // which makes a wrong claim hard to make by accident, and trivial to make on purpose: BeginMerge
+        // hands `ExpectedBranchSha` to the client, so a client that reports it back without merging
+        // anything satisfies every check above and was recorded Merged, with the stale cascade fired at
+        // every co-tenant, on the claim alone. F36 built the daemon the means to stop guessing and LOOK
+        // (the mirror's origin is the user's checkout) and then applied it only where the gate had already
+        // refused — i.e. the path a well-behaved client never takes. So it is applied here too, to the
+        // ordinary confirm, and the "observed" half of the contract is now true of every Local confirm
+        // rather than of the exception.
+        //
+        // The conditions are the same three the late path uses, and each is a real inability rather than a
+        // convenience: an External entry lands the host's merge commit (never the PR head — its identity
+        // is the K4 head CAS, not this equality); an empty ExpectedBranchSha is the mirror's own "not
+        // measured", so there is no authorized tip to look for; and no provisioner means no mirror to look
+        // in (the slimmest fixtures — production always has one). A confirm the daemon CAN check and
+        // cannot verify is refused with the lease kept, exactly as at the late path: the caller says the
+        // merge happened, the daemon looked, and the checkout does not agree.
+        if (_queues is not null
+            && ctx.Queue.GetOrigin(request.AgentId) != Mainguard.Agents.Agents.MergeEntryOrigin.External
+            && !string.IsNullOrEmpty(lease.ExpectedBranchSha)
+            && !_queues.TryObserveMergeLanded(
+                request.RepoHandle, request.NewMainSha, lease.ExpectedBranchSha, out var unobserved))
+        {
+            var unseen =
+                "This confirm reports the branch tip it was authorized for, but the daemon "
+                + $"could not observe this merge on the checkout: {unobserved}. Nothing was recorded.";
+            _log.LogWarning(
+                "ConfirmMerge refused repo={Repo} agent={Agent}: reported merge not observed on the checkout ({Reason})",
+                request.RepoHandle, request.AgentId, unobserved);
+            AuditConfirmRefused(request, actor, "identity", lease.ExpectedMainSha, unseen);
+            throw new RpcException(new Status(StatusCode.FailedPrecondition,
+                unseen + " The merge lease stays outstanding until the daemon can establish what landed."));
+        }
+
         // (2)+(3) Gate and freshness, atomically with the Merged transition.
         if (!ctx.Queue.TryConfirmHumanMerge(
                 request.AgentId, request.NewMainSha, lease.ExpectedMainSha, out var reason,
@@ -617,20 +677,22 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             // machine. A client that reported the expected sha without merging anything got the merge
             // recorded for it. So the daemon LOOKS instead: the mirror's origin is the user's checkout,
             // and TryObserveMergeLanded fetches main from it and asks git two questions — is main the sha
-            // this confirm reports, and does it contain the tip the lease authorized. No provisioner (the
-            // slimmest fixtures) means no observation, which is a refusal, not a pass.
+            // this confirm reports, and does it contain the tip the lease authorized.
+            //
+            // That look now happens at (1.6), BEFORE the gate, for every confirm the daemon can check —
+            // so control only reaches this branch having already passed it, and asking git the same two
+            // questions a second time would be a second forced fetch for an answer already in hand. What
+            // is re-stated here is the CONDITION under which (1.6) ran at all: no provisioner (the
+            // slimmest fixtures — production always has one) means the daemon has no mirror to look in,
+            // which is a refusal, not a pass.
             var claimsTheAuthorizedTip =
                 ctx.Queue.GetOrigin(request.AgentId) != Mainguard.Agents.Agents.MergeEntryOrigin.External
                 && !string.IsNullOrEmpty(lease.ExpectedBranchSha)
                 && string.Equals(request.NewMainSha, lease.ExpectedBranchSha, StringComparison.OrdinalIgnoreCase);
 
-            var landedTheAuthorizedTip = false;
-            var notLanded = "the daemon has no mirror for this repository, so it could not observe what landed";
-            if (claimsTheAuthorizedTip && _queues is not null)
-            {
-                landedTheAuthorizedTip = _queues.TryObserveMergeLanded(
-                    request.RepoHandle, request.NewMainSha, lease.ExpectedBranchSha, out notLanded);
-            }
+            var landedTheAuthorizedTip = claimsTheAuthorizedTip && _queues is not null;
+            const string notLanded =
+                "the daemon has no mirror for this repository, so it could not observe what landed";
 
             if (landedTheAuthorizedTip)
             {

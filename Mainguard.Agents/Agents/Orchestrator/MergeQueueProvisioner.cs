@@ -2505,14 +2505,31 @@ public sealed class MergeQueueProvisioner
     /// tolerated exactly as the foreground merge tolerates them — they are not part of any commit and
     /// cannot change what a fast-forward lands — while a tracked modification is refused.</para>
     ///
-    /// <para><b>It refuses on an ANSWER, not on silence.</b> A jail whose git cannot run at all — no git
-    /// on the image, or a worktree whose <c>.git</c> pointer names a repository the container has not
-    /// been given (the state W1-A's git-pointer mount exists to fix, and the state every jail is in until
-    /// it lands) — is a substrate gap, not a dirty tree, and refusing every verification in the product
-    /// because of it would trade a wrong record for no records at all. That case is logged as the
-    /// unmeasured evidence it is. This is the <c>BranchDescendsFromMain</c> posture — "unreadable answers
-    /// true, so nothing is refused from ignorance" — and it should be tightened to fail-closed once the
-    /// jail is guaranteed a working git.</para>
+    /// <para><b>It fails CLOSED — on silence as well as on an answer (2026-09-12).</b> It first shipped
+    /// fail-open: a jail whose git could not run at all — no git on the image, or a worktree whose
+    /// <c>.git</c> pointer names a repository the container has not been given — was logged as unmeasured
+    /// and the run proceeded, on the reasoning that refusing every verification because of a substrate gap
+    /// trades a wrong record for no records at all. That reasoning only held while the gap was universal,
+    /// and it is not a posture worth keeping: "the daemon could not check that the bytes under test are
+    /// the bytes it will record" and "the bytes under test ARE the bytes it will record" are different
+    /// facts, and a <see cref="VerificationRecord"/> that cannot tell them apart is exactly the decorative
+    /// evidence this work exists to remove. So an unrunnable probe, a non-zero <c>git status</c> and an
+    /// unreadable <c>HEAD</c> each refuse, naming the substrate gap — the same posture
+    /// <see cref="EnsureToolchainPresentAsync"/> already takes towards a jail that cannot answer its
+    /// toolchain probe, and the opposite of <c>BranchDescendsFromMain</c>'s (whose unreadable case is a
+    /// *mirror* read, not a claim about the bytes under test).</para>
+    ///
+    /// <para>The one silence still not treated as a failure is the MIRROR's: an empty
+    /// <paramref name="branchSha"/> is the mirror's own "not measured" (see
+    /// <c>VerificationRecord.BranchSha</c>), so there is no commit to pair the jail against and the HEAD
+    /// half is skipped rather than refused. The cleanliness half has already run by then.</para>
+    ///
+    /// <para><b>Merge order (binding).</b> A jail's git can answer only once the worktree's <c>.git</c>
+    /// pointer resolves to a repository the container has actually been given — the read-only pointer
+    /// mount W1-A (PR #363) installs. This method must therefore not reach a release ahead of #363:
+    /// land #363 first, then this. An inverted order fails safe rather than silently (every verification
+    /// refuses with "the jail's git could not answer" and nothing is recorded), but it is a fleet-wide
+    /// stop, so it is stated here rather than discovered.</para>
     /// </summary>
     private async Task EnsureJailWorktreeCleanAsync(
         string repoHandle, string agentId, string containerId, string branchSha, CancellationToken ct)
@@ -2530,17 +2547,26 @@ public sealed class MergeQueueProvisioner
         catch (Exception ex)
         {
             _log?.Invoke(
-                $"merge queue repo={repoHandle} agent={agentId} worktree-cleanliness probe could not run "
-                + $"({ex.Message}) — this run's record cannot claim its tree was clean");
-            return;
+                $"merge queue repo={repoHandle} agent={agentId} verification REFUSED — worktree-cleanliness "
+                + $"probe could not run ({ex.Message})");
+            throw new InvalidOperationException(
+                $"the daemon could not ask git whether agent '{agentId}''s working tree is clean — the "
+                + $"probe could not run in its jail ({ex.Message}). A run now could test uncommitted bytes "
+                + "and record the result against a commit that does not contain them, so verification was "
+                + "NOT run. This is a jail-provisioning failure, not a failing test.");
         }
 
         if (status.ExitCode != 0)
         {
             _log?.Invoke(
-                $"merge queue repo={repoHandle} agent={agentId} `git status` exited {status.ExitCode} in "
-                + $"the jail ({Trim(status.Stderr)}) — this run's record cannot claim its tree was clean");
-            return;
+                $"merge queue repo={repoHandle} agent={agentId} verification REFUSED — `git status` exited "
+                + $"{status.ExitCode} in the jail ({Trim(status.Stderr)})");
+            throw new InvalidOperationException(
+                $"git could not report whether agent '{agentId}''s working tree is clean: `git status` "
+                + $"exited {status.ExitCode} inside its jail. A run now could test uncommitted bytes and "
+                + "record the result against a commit that does not contain them, so verification was NOT "
+                + "run. This is a jail-provisioning failure, not a failing test. git said: "
+                + $"{Trim(status.Stderr)}");
         }
 
         if (!string.IsNullOrWhiteSpace(status.Stdout))
@@ -2556,9 +2582,9 @@ public sealed class MergeQueueProvisioner
         }
 
         // The other half: clean, but on a DIFFERENT commit than the mirror carries. An empty branchSha is
-        // the mirror's own "not measured" (see VerificationRecord.BranchSha) and nothing is asserted from
-        // ignorance; an unreadable HEAD in the jail is likewise not treated as a mismatch, only as a
-        // reason the pairing could not be checked at all.
+        // the MIRROR's own "not measured" (see VerificationRecord.BranchSha) — there is no commit to pair
+        // the jail against, so the pairing is skipped rather than failed. The JAIL's silence is not
+        // treated that way: an unreadable HEAD is refused below.
         if (branchSha.Length == 0)
         {
             return;
@@ -2576,14 +2602,30 @@ public sealed class MergeQueueProvisioner
         catch (Exception ex)
         {
             _log?.Invoke(
-                $"merge queue repo={repoHandle} agent={agentId} jail HEAD probe could not run "
-                + $"({ex.Message}) — this run's record cannot claim which commit it measured");
-            return;
+                $"merge queue repo={repoHandle} agent={agentId} verification REFUSED — jail HEAD probe "
+                + $"could not run ({ex.Message})");
+            throw new InvalidOperationException(
+                $"the daemon could not ask git which commit agent '{agentId}''s jail is checked out at — "
+                + $"the probe could not run ({ex.Message}). The record would then name a commit nothing "
+                + "established the tests ran on, so verification was NOT run. This is a jail-provisioning "
+                + "failure, not a failing test.");
         }
 
         var headSha = (head.Stdout ?? string.Empty).Trim();
-        if (head.ExitCode == 0 && headSha.Length > 0
-            && !string.Equals(headSha, branchSha, StringComparison.OrdinalIgnoreCase))
+        if (head.ExitCode != 0 || headSha.Length == 0)
+        {
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} agent={agentId} verification REFUSED — jail HEAD unreadable "
+                + $"(`git rev-parse HEAD` exited {head.ExitCode})");
+            throw new InvalidOperationException(
+                $"git could not say which commit agent '{agentId}''s jail is checked out at "
+                + $"(`git rev-parse HEAD` exited {head.ExitCode}). The record would then name "
+                + $"{branchSha[..Math.Min(8, branchSha.Length)]} with nothing establishing that the tests "
+                + "ran on it, so verification was NOT run. This is a jail-provisioning failure, not a "
+                + $"failing test. git said: {Trim(head.Stderr)}");
+        }
+
+        if (!string.Equals(headSha, branchSha, StringComparison.OrdinalIgnoreCase))
         {
             _log?.Invoke(
                 $"merge queue repo={repoHandle} agent={agentId} verification REFUSED — jail HEAD "
@@ -2675,6 +2717,18 @@ public sealed class MergeQueueProvisioner
     /// <paramref name="reportedMainSha"/>, and it contains <paramref name="branchSha"/> — the tip the
     /// lease authorized. Anything that cannot be established answers false with the reason, because the
     /// act being gated (a terminal Merged plus a cascade at every co-tenant) is the irreversible one.</para>
+    ///
+    /// <para><b>It READS before it writes (2026-09-12).</b> The first version opened with the forced
+    /// fetch — the one that may walk the mirror's main BACKWARDS — and only then decided. So a confirm
+    /// that was about to be REFUSED still rewound the mirror to whatever the checkout happened to hold:
+    /// exactly the damage the unforced periodic refresh was changed to avoid, re-entered through the
+    /// door marked "confirm". <c>git ls-remote origin</c> answers the same question and mutates nothing,
+    /// so both facts are now established first — the sha equality from the remote read, the ancestry from
+    /// objects the mirror already has — and the mirror is only moved AFTER the observation is accepted,
+    /// which is the one moment origin's main is authoritative by definition. The single case that still
+    /// fetches before accepting is a mirror that does not carry the reported commit at all: the equality
+    /// is established by then, so the fetch lands the mirror on precisely the sha the checkout reports,
+    /// and it is the only way left to see a merge the client made a moment ago.</para>
     /// </summary>
     /// <param name="repoHandle">The repository whose mirror to consult.</param>
     /// <param name="reportedMainSha">The post-merge main the caller reported.</param>
@@ -2689,33 +2743,42 @@ public sealed class MergeQueueProvisioner
             return false;
         }
 
-        // Forced: a confirm is the one moment origin's main is authoritative by definition, and this is
-        // the same read the confirmed path performs. It is also the only way to SEE a merge the client
-        // made a moment ago.
-        if (!TryRefreshMirrorMainAfterMerge(repoHandle, force: true, out var fetchReason))
-        {
-            reason = $"the daemon could not read main from the checkout ({fetchReason})";
-            return false;
-        }
-
         var barePath = _repos.BareRepoPathFor(repoHandle);
         var mainBranch = ResolveDefaultBranch(barePath);
-        var mirrorMain = RevParse(barePath, mainBranch);
-        if (mirrorMain.Length == 0)
+
+        // Fact one, read without touching anything: what main IS on the user's checkout. `ls-remote`
+        // against the mirror's own origin is the same source the fetch would read and writes no ref.
+        var checkoutMain = LsRemoteMain(barePath, mainBranch);
+        if (checkoutMain.Length == 0)
         {
-            reason = $"'{mainBranch}' could not be read in the mirror after the fetch";
+            reason =
+                $"the daemon could not read '{mainBranch}' from the checkout (git ls-remote origin "
+                + $"refs/heads/{mainBranch} answered nothing)";
             return false;
         }
 
-        if (!string.Equals(mirrorMain, reportedMainSha, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(checkoutMain, reportedMainSha, StringComparison.OrdinalIgnoreCase))
         {
             reason =
-                $"'{mainBranch}' on the checkout is {mirrorMain[..Math.Min(8, mirrorMain.Length)]}, not the "
+                $"'{mainBranch}' on the checkout is {checkoutMain[..Math.Min(8, checkoutMain.Length)]}, not the "
                 + $"{reportedMainSha[..Math.Min(8, reportedMainSha.Length)]} this confirm reports";
             return false;
         }
 
-        if (!TryGit(barePath, out _, "merge-base", "--is-ancestor", branchSha, mirrorMain))
+        // Fact two: does that commit contain the tip the lease authorized. Answered from the mirror's own
+        // object store whenever it already carries the commit — which is the ordinary case, because a
+        // Local `--ff-only` leaves main AT agent/<id>, and the mirror is where that ref was published. The
+        // fetch is the fallback for the case where it genuinely cannot be answered otherwise.
+        if (!TryGit(barePath, out _, "cat-file", "-e", checkoutMain + "^{commit}")
+            && !TryRefreshMirrorMainAfterMerge(repoHandle, force: true, out _))
+        {
+            reason =
+                $"the daemon's mirror does not carry {checkoutMain[..Math.Min(8, checkoutMain.Length)]} and "
+                + "could not fetch it from the checkout, so what that commit contains cannot be established";
+            return false;
+        }
+
+        if (!TryGit(barePath, out _, "merge-base", "--is-ancestor", branchSha, checkoutMain))
         {
             reason =
                 $"'{mainBranch}' on the checkout does not contain "
@@ -2723,7 +2786,56 @@ public sealed class MergeQueueProvisioner
             return false;
         }
 
+        // Accepted — and only now is the mirror moved. Best-effort: the merge is observed either way and
+        // the caller's own post-confirm refresh (and the next provision) will catch the mirror up.
+        if (!TryRefreshMirrorMainAfterMerge(repoHandle, force: true, out var fetchReason))
+        {
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} merge observed on the checkout but the mirror could not be "
+                + $"pulled forward — {fetchReason}");
+        }
+
         reason = "";
+        return true;
+    }
+
+    /// <summary>
+    /// The sha <c>origin</c> (the user's checkout) currently has on <paramref name="mainBranch"/>, read
+    /// with <c>ls-remote</c> — no ref in the mirror is created, moved or deleted. Empty when the remote
+    /// does not answer or does not advertise the branch.
+    /// </summary>
+    private static string LsRemoteMain(string barePath, string mainBranch)
+    {
+        if (!TryGit(barePath, out var output, "ls-remote", "--exit-code", "origin", "refs/heads/" + mainBranch))
+        {
+            return string.Empty;
+        }
+
+        // "<sha>\trefs/heads/<main>" — the first field of the first line.
+        var line = output.Split('\n', StringSplitOptions.RemoveEmptyEntries) is { Length: > 0 } lines
+            ? lines[0]
+            : string.Empty;
+        var tab = line.IndexOf('\t');
+        var sha = (tab > 0 ? line[..tab] : line).Trim();
+        return IsObjectId(sha) ? sha : string.Empty;
+    }
+
+    /// <summary>A 40- or 64-character lowercase hex object id (sha-1 or sha-256), and nothing else.</summary>
+    private static bool IsObjectId(string value)
+    {
+        if (value.Length is not (40 or 64))
+        {
+            return false;
+        }
+
+        foreach (var c in value)
+        {
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            {
+                return false;
+            }
+        }
+
         return true;
     }
 
