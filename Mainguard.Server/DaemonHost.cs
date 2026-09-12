@@ -330,6 +330,10 @@ public static class DaemonHost
             builder,
             ResolveDataPath(options, builder.Configuration, tokenPath),
             log: message => migration.LogInformation("{Milestone}", message),
+            // Degraded persistence is an ERROR, not a milestone: an audit chain that fell back to the
+            // in-memory journal, or a key ring with its master key in plaintext, has to be legible in
+            // migration.log/journal without knowing to look for it.
+            logError: (message, ex) => migration.LogError(ex, "{Milestone}", message),
             options: options);
 
         // P2-15 retention: 90-day expiry as chained redactions (once at boot + daily). No-op on the

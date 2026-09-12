@@ -10,10 +10,16 @@ namespace Mainguard.Server.Logging;
 
 /// <summary>
 /// Structured access logging for every RPC under the daemon's <c>Rpc</c> category: method, peer,
-/// status, duration. Request and response bodies are rendered ONLY through
-/// <see cref="SecretFieldMask.Redact"/>, so a <c>// SECRET</c> field's value/length/prefix never
-/// reaches a log sink (G-13). The field-mask test invokes an RPC carrying a sentinel secret and asserts
-/// the captured logs contain zero occurrences of it.
+/// status, duration.
+///
+/// <para><b>Bodies are never logged (F56).</b> Request and response messages are rendered only
+/// through <see cref="SecretFieldMask.Summarize"/>, which emits the op, the wire size, the
+/// allowlisted ids and bounded scalars, and a count of what it withheld. Field content — prompts,
+/// chat and plan text, scrollback rows, merge diffs, verification logs, decrypted audit payloads —
+/// does not reach this logger at any level, so nothing depends on someone having remembered to mark
+/// a new field. There is deliberately no "verbose bodies" switch: <c>rpc.log</c> rolls 5 MB × 3 on
+/// disk and, under systemd, doubles into the journal, and a toggle that writes user content there is
+/// a leak waiting for the first person who flips it while debugging.</para>
 ///
 /// <para>It also records <b>handler faults</b>: a non-<see cref="RpcException"/> thrown out of a handler
 /// otherwise reaches the client as a bare <c>Unknown</c> with nothing recorded daemon-side (the class of
@@ -133,17 +139,17 @@ public sealed class SecretMaskingInterceptor : Interceptor
 
     private void LogRequest(ServerCallContext context, IMessage? request)
     {
-        var body = request is null ? "<stream>" : SecretFieldMask.Redact(request);
-        _logger.LogInformation("rpc-begin method={Method} peer={Peer} request={Request}",
-            context.Method, context.Peer, body);
+        var summary = request is null ? "<stream>" : SecretFieldMask.Summarize(request);
+        _logger.LogInformation("rpc-begin method={Method} peer={Peer} req={Request}",
+            context.Method, context.Peer, summary);
     }
 
     private void LogCompletion(ServerCallContext context, StatusCode status, Stopwatch sw, IMessage? response)
     {
-        var body = response is null ? "<none>" : SecretFieldMask.Redact(response);
+        var summary = response is null ? "<none>" : SecretFieldMask.Summarize(response);
         _logger.LogInformation(
-            "rpc-end method={Method} peer={Peer} status={Status} duration_ms={Duration} response={Response}",
-            context.Method, context.Peer, status, sw.ElapsedMilliseconds, body);
+            "rpc-end method={Method} peer={Peer} status={Status} duration_ms={Duration} res={Response}",
+            context.Method, context.Peer, status, sw.ElapsedMilliseconds, summary);
     }
 
     /// <summary>

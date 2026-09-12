@@ -25,7 +25,21 @@ if (options.Smoke)
 // Normal daemon run. Build via the shared host configuration so the in-proc test
 // tier (WebApplicationFactory<Program>) exercises the same pipeline. app.Run() is
 // reached so the test harness can intercept host startup.
-var app = DaemonHost.Build(options);
+WebApplication app;
+try
+{
+    app = DaemonHost.Build(options);
+}
+catch (AuditPersistenceUnavailableException ex)
+{
+    // Fail closed, and say so in the one place a human is certainly looking: the console/journal at
+    // the moment the daemon did not come up. The alternative — a daemon that binds and quietly keeps
+    // no audit trail — is the failure this refusal exists to prevent, so it must not be papered over
+    // with an unhandled-exception stack trace either.
+    Console.Error.WriteLine(ex.Message);
+    return 78; // EX_CONFIG: a configuration the operator has to fix, not a crash.
+}
+
 try
 {
     app.Run();

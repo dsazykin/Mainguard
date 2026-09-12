@@ -2,6 +2,9 @@ using System;
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using Microsoft.Extensions.Logging;
@@ -21,6 +24,15 @@ namespace Mainguard.Server.Logging;
 /// never open a file twice or interleave a partial line. <see cref="Dispose"/> is a deliberate no-op on
 /// the shared writers — the other provider still needs them and each write is flushed, so process exit
 /// loses nothing.</para>
+///
+/// <para><b>Owner-only on disk (F56).</b> The logs directory is created <c>0700</c> and every log
+/// file is pre-created <c>0600</c> before a byte is written, so a line never lands under the
+/// process umask (the default <c>0022</c> made <c>rpc.log</c> world-readable). On Windows the
+/// directory and each file get an inheritance-free single-ACE DACL for the current user, mirroring
+/// <c>SessionTransportCertificates.WriteRestricted</c> — the repo's one pattern for this. Rolled
+/// files inherit the mode through <see cref="File.Move(string,string,bool)"/>. Hardening is
+/// best-effort like every other file operation here: a failure to tighten a mode drops through to
+/// the write rather than costing the daemon its diagnostics.</para>
 ///
 /// <para><b>Diagnostics must never break the daemon.</b> Every file operation is wrapped in a
 /// try/catch that swallows: a read-only disk or a vanished directory silently drops the line rather
@@ -46,7 +58,11 @@ public sealed class SubsystemFileLoggerProvider : ILoggerProvider
         _maxBytes = maxBytes < 64 ? 64 : maxBytes;
         _maxRoll = maxRoll < 1 ? 1 : maxRoll;
         _minLevel = minLevel;
-        try { Directory.CreateDirectory(logsDir); }
+        try
+        {
+            Directory.CreateDirectory(logsDir);
+            RestrictedFiles.HardenDirectory(logsDir);
+        }
         catch { /* first write retries the create; a create failure must never throw */ }
     }
 
@@ -62,6 +78,111 @@ public sealed class SubsystemFileLoggerProvider : ILoggerProvider
     {
         // No-op: writers are process-static and shared with the other (bootstrap/runtime) provider.
         // Per-line flush means nothing is buffered to lose; the OS reclaims handles at process exit.
+    }
+
+    /// <summary>
+    /// Owner-only creation for the logs directory and each log file (F56). Unix gets <c>0700</c> /
+    /// <c>0600</c>; Windows gets an inheritance-free single full-control ACE for the current user.
+    /// This mirrors <c>Mainguard.Server.Auth.SessionTransportCertificates.WriteRestricted</c> — the
+    /// repo's existing pattern for a secret-bearing file — rather than inventing a second one.
+    /// Every method is best-effort and never throws: a mode that cannot be tightened must not cost
+    /// the daemon its logs.
+    /// </summary>
+    internal static class RestrictedFiles
+    {
+        private const UnixFileMode DirMode =
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+
+        private const UnixFileMode FileMode0600 = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+
+        /// <summary>Reduces an existing directory to owner-only.</summary>
+        internal static void HardenDirectory(string path)
+        {
+            try
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    RestrictWindowsDirectory(path);
+                }
+                else
+                {
+                    File.SetUnixFileMode(path, DirMode);
+                }
+            }
+            catch
+            {
+                // Best effort — see the type doc.
+            }
+        }
+
+        /// <summary>Creates <paramref name="path"/> owner-only when it does not exist yet. A no-op
+        /// once the file is there, so it costs one <c>File.Exists</c> per line and never re-chmods a
+        /// mode an operator deliberately widened.</summary>
+        internal static void EnsureRestrictedFile(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    return;
+                }
+
+                using (new FileStream(path, System.IO.FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                }
+
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    RestrictWindowsFile(path);
+                }
+                else
+                {
+                    File.SetUnixFileMode(path, FileMode0600);
+                }
+            }
+            catch
+            {
+                // Another writer won the create race, or the disk refused — the append below decides.
+            }
+        }
+
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private static void RestrictWindowsFile(string path)
+        {
+            var info = new FileInfo(path);
+            var security = info.GetAccessControl();
+            using var identity = WindowsIdentity.GetCurrent();
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            foreach (FileSystemAccessRule rule in security.GetAccessRules(true, false, typeof(SecurityIdentifier)))
+            {
+                security.RemoveAccessRule(rule);
+            }
+
+            security.AddAccessRule(new FileSystemAccessRule(
+                identity.User!, FileSystemRights.FullControl, AccessControlType.Allow));
+            info.SetAccessControl(security);
+        }
+
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        private static void RestrictWindowsDirectory(string path)
+        {
+            var info = new DirectoryInfo(path);
+            var security = info.GetAccessControl();
+            using var identity = WindowsIdentity.GetCurrent();
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            foreach (FileSystemAccessRule rule in security.GetAccessRules(true, false, typeof(SecurityIdentifier)))
+            {
+                security.RemoveAccessRule(rule);
+            }
+
+            security.AddAccessRule(new FileSystemAccessRule(
+                identity.User!,
+                FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+            info.SetAccessControl(security);
+        }
     }
 
     /// <summary>The AsyncLocal scope stack rendered as <c>(scope)</c> — set by <c>ILogger.BeginScope</c>
@@ -142,6 +263,9 @@ public sealed class SubsystemFileLoggerProvider : ILoggerProvider
                 try
                 {
                     RollIfNeeded(text.Length);
+                    // Pre-create owner-only: File.AppendAllText would otherwise create the file under
+                    // the process umask, and the first line is already in it by the time a chmod runs.
+                    RestrictedFiles.EnsureRestrictedFile(_path);
                     File.AppendAllText(_path, text, Utf8NoBom);
                 }
                 catch
