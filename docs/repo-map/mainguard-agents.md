@@ -1060,10 +1060,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       LIST does not populate `Containers` — fails closed if either list is unavailable, and swallows
       per-network failures so one bad network never stops the sweep. **Not wired from this file's own
       branch — `fix/audit-w3a-restart-survival` (PR #369) owns the wiring and the launcher's rollback
-      release**, and imports this file byte-identical: the daemon-side caller is one `SweepAsync` per
+      release**, and carries its own copy of this file: the daemon-side caller is one `SweepAsync` per
       sweep in `Mainguard.Server/Runtime/JailReaperHostedService`, and the grant at
       `SandboxAgentLauncher.cs:347` gets its matching `RemoveAgentSegmentAsync` on the rollback path
       there. Splitting it that way keeps both branches off a three-way conflict in the launcher.
+      **Merge note:** the two copies were byte-identical until the `Created`-`Kind` fix landed here
+      (`JudgeAsync` now uses `.ToUniversalTime()`, never `SpecifyKind(..., Utc)` — Docker.DotNet parses
+      RFC3339 with `RoundtripKind`, so an offset-suffixed `Created` from a non-UTC dockerd comes back
+      `Kind=Local` and stamping it Utc shifts the age by the host offset, defeating the grace), so an
+      add/add merge takes **this** file's contents and **#369's** wiring.
       Refusals are pinned in `Mainguard.Tests/SandboxResidueReapingTests.cs`.
       **MG-27:** the proxy's image ref is resolved to
       its content digest and both compared and created against that).
