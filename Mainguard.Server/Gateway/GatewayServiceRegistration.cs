@@ -672,7 +672,7 @@ public static class GatewayServiceRegistration
     /// "carries on looking healthy" failure this work set out to remove, so it now refuses to boot
     /// and the message names both remedies.</para>
     /// </summary>
-    private static void RegisterAuditLog(
+    internal static void RegisterAuditLog(
         IServiceCollection services,
         Func<AppDbContext>? dbFactory,
         string dbPath,

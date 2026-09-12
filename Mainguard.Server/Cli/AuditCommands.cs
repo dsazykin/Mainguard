@@ -63,7 +63,11 @@ public static class AuditCommands
             // writer — on a box with no key-ring protector it exited 1 with "Refusing to store
             // 'audit-payload-key'…" where it used to report an intact empty chain, and on every other
             // box it left a key behind that the operator never asked for.
-            var crypto = AuditCrypto.TryOpenExisting(new SecureKeyring(keyringDir));
+            // Not even the key-ring DIRECTORY is created here: a verify run on a box that has never
+            // run the daemon should leave the filesystem exactly as it found it.
+            var crypto = Directory.Exists(keyringDir)
+                ? AuditCrypto.TryOpenExisting(new SecureKeyring(keyringDir))
+                : null;
             if (crypto is null)
             {
                 // No master key means no encrypted payload can exist. An empty chain is intact by
