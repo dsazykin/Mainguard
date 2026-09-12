@@ -60,14 +60,58 @@ public sealed class DaemonInstanceLock : IDisposable
         System.IO.Path.Combine(System.IO.Path.GetFullPath(directory), FileName);
 
     /// <summary>
+    /// How long <see cref="Acquire(string)"/> keeps trying before concluding that a real daemon holds the
+    /// root. A daemon holds this lock for its whole life, so a genuine conflict never clears and the wait
+    /// costs a refused start a second and a half; what the wait is FOR is the momentary holder.
+    ///
+    /// <para><b>The momentary holder is the app itself.</b> <c>MacDaemonController.IsInstanceLockHeld</c>
+    /// answers "is a daemon up?" by opening this very file <c>FileShare.None</c> from the UI process, and
+    /// <c>MacStartupEnvironment</c>'s connect diagnosis calls it <i>while the daemon it is waiting for
+    /// starts</i>. Single-shot, the daemon reaching the Kestrel callback inside that probe's <c>using</c>
+    /// exited with "another daemon is already running" — and under launchd that refusal is a 30-second
+    /// throttled outage caused by the app merely checking whether the daemon was up. A probe holds the
+    /// lock for microseconds; a daemon holds it for hours. Retrying tells them apart without asking
+    /// anyone to coordinate.</para>
+    /// </summary>
+    public static readonly TimeSpan AcquireRetryWindow = TimeSpan.FromMilliseconds(1500);
+
+    /// <summary>
     /// Takes the exclusive lock on <paramref name="directory"/>, or throws
     /// <see cref="DaemonAlreadyRunningException"/> naming the holder when another daemon has it.
     ///
     /// <para>Called BEFORE anything is minted or written, so a losing instance leaves the winner's data
     /// root byte-for-byte untouched. The holder's pid is written into the file for diagnosis only —
     /// nothing reads it to make a decision, because a pid is not a lock.</para>
+    ///
+    /// <para>Retries for <see cref="AcquireRetryWindow"/> before giving up — see that field for why a
+    /// single-shot acquire made the Pro head's own liveness probe able to take the daemon down.</para>
     /// </summary>
-    public static DaemonInstanceLock Acquire(string directory) => Acquire(directory, stamp: true);
+    public static DaemonInstanceLock Acquire(string directory) => Acquire(directory, AcquireRetryWindow);
+
+    /// <summary>
+    /// The explicitly-clocked form. <see cref="TimeSpan.Zero"/> is the old single-shot behaviour, which
+    /// is what a test wanting an immediate refusal asks for.
+    /// </summary>
+    public static DaemonInstanceLock Acquire(string directory, TimeSpan wait)
+    {
+        var deadline = DateTime.UtcNow + wait;
+        while (true)
+        {
+            try
+            {
+                return Acquire(directory, stamp: true);
+            }
+            catch (DaemonAlreadyRunningException)
+            {
+                if (DateTime.UtcNow >= deadline)
+                {
+                    throw;
+                }
+
+                Thread.Sleep(25);
+            }
+        }
+    }
 
     /// <summary>
     /// The non-throwing form: takes the lock, or returns <c>null</c> when another daemon holds it.

@@ -40,8 +40,20 @@ public static class JailReapPolicy
     /// <param name="idleSince">When the reaper first saw this jail with no live CLI; null while it has one.</param>
     /// <param name="now">The reaper's clock.</param>
     /// <param name="idleAllowance"><see cref="CoordinatorLimits.IdleJailReapMinutes"/> as a span.</param>
+    /// <param name="terminalLostToRestart">
+    /// This jail was ADOPTED by the reconciler — it outlived the daemon that started it — and no CLI has
+    /// bound to it since. That is the one case where "no CLI is bound" is a fact about the daemon rather
+    /// than about the jail, and it is the only case the in-flight exemption below applies to.
+    /// <b>False for an ordinary jail</b>, including one whose worker finished and is waiting for a human:
+    /// that jail's missing CLI means the CLI is missing.
+    /// </param>
     public static JailReapVerdict Decide(
-        WorkerMergeState? entryState, bool hasLiveCli, DateTimeOffset? idleSince, DateTimeOffset now, TimeSpan idleAllowance)
+        WorkerMergeState? entryState,
+        bool hasLiveCli,
+        DateTimeOffset? idleSince,
+        DateTimeOffset now,
+        TimeSpan idleAllowance,
+        bool terminalLostToRestart = false)
     {
         if (entryState is WorkerMergeState.Merged or WorkerMergeState.Rejected or WorkerMergeState.Discarded)
         {
@@ -51,31 +63,30 @@ public static class JailReapPolicy
 
         if (!hasLiveCli && idleSince is { } since && now - since >= idleAllowance)
         {
-            // F59: "no CLI is bound" is not the same fact as "nothing is happening", and conflating them
-            // became dangerous the moment a daemon restart stopped killing the agents.
+            // F59, SCOPED. "No CLI is bound" is not the same fact as "nothing is happening" — but that is
+            // only true of one population, and the first cut of this rule exempted every in-flight entry
+            // instead.
             //
-            // Before F59, container disposal killed every bound CLI on shutdown, so a jail the daemon
-            // reattached to after a restart really was dead weight and reaping it at the idle allowance
-            // was right. Now the CLI survives — the jail keeps working — while the PTY it was started
-            // with belonged to the old daemon process and cannot be reattached (Docker has no re-attach
-            // for a running exec). So every adopted jail reads as "no CLI" from the moment the daemon
-            // comes back, and the reaper would stop a mid-task agent half an hour later, destroying
-            // uncommitted work: the same silent termination F59 removed from the shutdown path, arriving
-            // 30 minutes later by another door.
+            // The population it is true of: a jail the reconciler ADOPTED after a daemon restart. Its PTY
+            // belonged to the process that died and Docker has no re-attach for a running exec, so it
+            // reads as "no CLI" from the moment the daemon comes back while the agent inside it keeps
+            // working. Reaping that at the allowance is the silent mid-task termination F59 removed from
+            // the shutdown path, arriving thirty minutes later by another door, and it destroys
+            // uncommitted work — a bad trade in a way the reverse is not, since a jail left running costs
+            // memory an operator reclaims with Stop.
             //
-            // The daemon's own belief about the entry is the check that separates the two. An entry it
-            // considers in flight is one it expects output from; killing that jail because the daemon
-            // lost its terminal is a bad trade in a way the reverse is not — a jail left running costs
-            // memory the operator reclaims with Stop, while a jail reaped mid-task costs work nobody can
-            // get back.
+            // The population it is NOT true of, and which the unscoped rule swallowed whole: the ordinary
+            // worker that finished, whose CLI exited, and whose entry sits in AwaitingReview until a human
+            // looks at it. Nothing is happening in that jail and nothing will; exempting it kept every
+            // finished worker alive forever, which is precisely the twenty-jails-at-2-GiB population this
+            // reaper was written against. It reaps at the allowance, as it always did.
             //
-            // RESIDUAL, stated rather than hidden: a jail whose CLI genuinely exited while the daemon
-            // could not observe it (again, the restart case — the exit watcher died with the PTY) keeps
-            // an in-flight entry forever and is never reaped here. That is the population the CLI
-            // re-bind-on-adoption work fixes, because re-binding is what restores the daemon's ability
-            // to see the CLI exit and mark the session Dead. Until then it is the deliberate side of the
-            // trade, and rule 1 above still reaps the entry the moment it reaches a terminal state.
-            if (IsInFlight(entryState))
+            // RESIDUAL, stated rather than hidden: an adopted jail whose CLI genuinely exited while the
+            // daemon could not observe it is kept here indefinitely. That is the population re-binding a
+            // CLI on adoption fixes — re-binding is what restores the daemon's ability to see the exit and
+            // mark the session Dead, at which point this is no longer an adopted-without-terminal jail at
+            // all. Until then rule 1 above still reaps it the moment its entry reaches a terminal state.
+            if (terminalLostToRestart && IsInFlight(entryState))
             {
                 return JailReapVerdict.Keep;
             }

@@ -63,6 +63,35 @@ public sealed class AgentSessionReconcileTests
     }
 
     /// <summary>
+    /// Adoption also records WHY this session will read as having no terminal: its CLI's PTY belonged to
+    /// the daemon that died, and Docker cannot re-attach a running exec. That fact is the jail reaper's
+    /// single exemption from the idle rule, so it has to be written where adoption happens — and it has
+    /// to be scoped to adoption, because an ordinary worker whose CLI merely exited must still be reaped.
+    /// A jail this daemon's own store already knew about is not adopted and carries no mark.
+    /// </summary>
+    [Fact]
+    public async Task Reconcile_ShouldMarkAnAdoptedJail_AsHavingLostItsTerminalToTheRestart()
+    {
+        var store = NewStore();
+        var mine = store.Spawn("claude-code", repoHash: Repo, agentId: "agent-mine");
+        store.AttachSandbox(mine.Key, "container-mine");
+
+        var reconciler = Build(
+            store,
+            new AgentContainerState("agent-adopted", Repo, "container-adopted", Running: true, Kind: "claude-code"),
+            new AgentContainerState("agent-mine", Repo, "container-mine", Running: true, Kind: "claude-code"));
+
+        await reconciler.ReconcileAsync();
+
+        Assert.True(store.WasAdoptedWithoutTerminal(new AgentSessionKey(Repo, "agent-adopted")));
+        Assert.False(store.WasAdoptedWithoutTerminal(mine.Key));
+
+        // ...and the mark is spent the moment a CLI can be seen again.
+        store.ClearAdopted(new AgentSessionKey(Repo, "agent-adopted"));
+        Assert.False(store.WasAdoptedWithoutTerminal(new AgentSessionKey(Repo, "agent-adopted")));
+    }
+
+    /// <summary>
     /// A worker's coordinator link is part of its identity: every coordinator tool resolves the worker
     /// through <c>ParentAgentId</c>, so an adopted worker with no parent is one its coordinator can no
     /// longer see, steer or verify after a restart. The label carries it, and adoption must read it.

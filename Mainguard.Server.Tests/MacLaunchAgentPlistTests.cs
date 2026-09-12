@@ -104,6 +104,12 @@ public sealed class MacLaunchAgentPlistTests
         Assert.Contains("/opt/homebrew/bin", path);
         Assert.Contains("/usr/bin", path);
         Assert.Equal(Dotnet, ValueAfter(environment, "DOTNET_HOST_PATH").Value);
+
+        // N6: the job tells the daemon it is supervised, so a refusal to start against a data root some
+        // other daemon holds exits 0 instead of asking KeepAlive to exec it again every 30 seconds.
+        Assert.Equal(
+            "launchd",
+            ValueAfter(environment, DaemonExitCodes.SupervisorVariable).Value);
     }
 
     /// <summary>
@@ -121,22 +127,96 @@ public sealed class MacLaunchAgentPlistTests
     }
 
     [Fact]
-    public void StagePayload_CopiesOutOfTheSourceTree_Recursively()
+    public void StageIncomingPayload_CopiesOutOfTheSourceTree_Recursively()
+    {
+        var source = NewPayload("payload", "native");
+
+        var incoming = MacDaemonLaunchAgent.StageIncomingPayload(source);
+
+        Assert.NotNull(incoming);
+        Assert.NotEqual(Path.GetFullPath(source), Path.GetFullPath(incoming!));
+        Assert.Equal("payload", File.ReadAllText(Path.Combine(incoming!, "Mainguard.Server.dll")));
+        Assert.Equal(
+            "native", File.ReadAllText(Path.Combine(incoming!, "runtimes", "osx-arm64", "native.dylib")));
+
+        // Copied, never symlinked: a link back into the bundle reintroduces the mixed-assembly failure.
+        Assert.Null(new FileInfo(Path.Combine(incoming!, "Mainguard.Server.dll")).LinkTarget);
+
+        Assert.True(MacDaemonLaunchAgent.CommitStagedPayload(incoming!));
+        Assert.Equal(
+            "payload",
+            File.ReadAllText(Path.Combine(MacDaemonLaunchAgent.StagedPayloadDirectory(), "Mainguard.Server.dll")));
+    }
+
+    /// <summary>
+    /// B2: the staging copy must never be written into the directory the launchd job is executing from.
+    /// The first version deleted the staged directory and copied into it while the daemon ran out of it —
+    /// the mixed-assembly window (e) exists to close, reintroduced at every refresh, and worse than the
+    /// original because a lazy load during the copy finds a missing or half-written file. The live payload
+    /// is untouched until the rename swap, which happens only while the job is booted out.
+    /// </summary>
+    [Fact]
+    public void StageIncomingPayload_LeavesTheLivePayloadIntact_UntilTheSwap()
+    {
+        var staged = MacDaemonLaunchAgent.StagedPayloadDirectory();
+        Directory.CreateDirectory(staged);
+        File.WriteAllText(Path.Combine(staged, "Mainguard.Server.dll"), "running");
+        File.WriteAllText(Path.Combine(staged, "OnlyInTheOldBuild.dll"), "old");
+
+        var incoming = MacDaemonLaunchAgent.StageIncomingPayload(NewPayload("next", "native"));
+
+        Assert.NotNull(incoming);
+        Assert.NotEqual(Path.GetFullPath(staged), Path.GetFullPath(incoming!));
+        Assert.Equal("running", File.ReadAllText(Path.Combine(staged, "Mainguard.Server.dll")));
+
+        Assert.True(MacDaemonLaunchAgent.CommitStagedPayload(incoming!));
+        Assert.Equal("next", File.ReadAllText(Path.Combine(staged, "Mainguard.Server.dll")));
+
+        // Replaced wholesale, not merged: a file dropped between versions must not survive as a stale
+        // assembly — and the incoming directory is gone, so the next stage starts clean.
+        Assert.False(File.Exists(Path.Combine(staged, "OnlyInTheOldBuild.dll")));
+        Assert.False(Directory.Exists(MacDaemonLaunchAgent.IncomingPayloadDirectory()));
+    }
+
+    /// <summary>
+    /// A payload without the daemon assembly is a refusal, not a staging. The updater keys off this null:
+    /// kickstarting onto an incomplete payload gives launchd a daemon that crashes on a missing assembly,
+    /// and <c>Crashed:true</c> respawns it every 30 s forever.
+    /// </summary>
+    [Fact]
+    public void StageIncomingPayload_RefusesAPayloadWithNoDaemonAssembly()
+    {
+        var source = Path.Combine(Path.GetTempPath(), "mainguard-stage", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(source);
+        File.WriteAllText(Path.Combine(source, "something-else.txt"), "not a payload");
+
+        Assert.Null(MacDaemonLaunchAgent.StageIncomingPayload(source));
+        Assert.False(Directory.Exists(MacDaemonLaunchAgent.IncomingPayloadDirectory()));
+    }
+
+    /// <summary>A source that already IS the staged directory stages nothing and commits nothing.</summary>
+    [Fact]
+    public void StageIncomingPayload_OnTheStagedDirectoryItself_IsANoOp()
+    {
+        var staged = MacDaemonLaunchAgent.StagedPayloadDirectory();
+        Directory.CreateDirectory(staged);
+        File.WriteAllText(Path.Combine(staged, "Mainguard.Server.dll"), "running");
+
+        var incoming = MacDaemonLaunchAgent.StageIncomingPayload(staged);
+
+        Assert.Equal(staged, incoming);
+        Assert.True(MacDaemonLaunchAgent.CommitStagedPayload(incoming!));
+        Assert.Equal("running", File.ReadAllText(Path.Combine(staged, "Mainguard.Server.dll")));
+    }
+
+    /// <summary>A payload tree with the two files every staging assertion here reads.</summary>
+    private static string NewPayload(string daemon, string native)
     {
         var source = Path.Combine(Path.GetTempPath(), "mainguard-stage", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(Path.Combine(source, "runtimes", "osx-arm64"));
-        File.WriteAllText(Path.Combine(source, "Mainguard.Server.dll"), "payload");
-        File.WriteAllText(Path.Combine(source, "runtimes", "osx-arm64", "native.dylib"), "native");
-
-        var staged = MacDaemonLaunchAgent.StagePayload(source);
-
-        Assert.NotEqual(Path.GetFullPath(source), Path.GetFullPath(staged));
-        Assert.Equal("payload", File.ReadAllText(Path.Combine(staged, "Mainguard.Server.dll")));
-        Assert.Equal(
-            "native", File.ReadAllText(Path.Combine(staged, "runtimes", "osx-arm64", "native.dylib")));
-
-        // Copied, never symlinked: a link back into the bundle reintroduces the mixed-assembly failure.
-        Assert.Null(new FileInfo(Path.Combine(staged, "Mainguard.Server.dll")).LinkTarget);
+        File.WriteAllText(Path.Combine(source, "Mainguard.Server.dll"), daemon);
+        File.WriteAllText(Path.Combine(source, "runtimes", "osx-arm64", "native.dylib"), native);
+        return source;
     }
 
     private static XElement PlistDict(string plist) =>

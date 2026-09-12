@@ -640,6 +640,12 @@ public sealed class BoundTerminalSession : IDisposable
     /// running exec). But "the terminal is gone" and "SIGKILL the agent mid-task" are different acts, and
     /// only the first is a consequence of the daemon stopping. <see cref="Dispose"/> — the explicit
     /// StopAgent / teardown path — still kills, because there the kill is the request.</para>
+    ///
+    /// <para><b>The bug this used to be.</b> Both halves of teardown ended in
+    /// <c>ITerminalSession.Dispose</c>, and the production session is <see cref="PtySession"/>, whose
+    /// <c>Dispose</c> is a <c>Kill</c>. So detaching killed exactly what disposing killed and the F59
+    /// claim rested on a no-op. Detach now goes through <see cref="ITerminalSession.Release"/>, which
+    /// exists to be the difference.</para>
     /// </summary>
     public void Detach()
     {
@@ -648,7 +654,7 @@ public sealed class BoundTerminalSession : IDisposable
             return;
         }
 
-        TearDownDaemonSide();
+        TearDownDaemonSide(reapChild: false);
     }
 
     public void Dispose()
@@ -667,11 +673,15 @@ public sealed class BoundTerminalSession : IDisposable
             // Best-effort reap.
         }
 
-        TearDownDaemonSide();
+        TearDownDaemonSide(reapChild: true);
     }
 
-    /// <summary>The half of teardown that is the daemon's own state, shared by Dispose and Detach.</summary>
-    private void TearDownDaemonSide()
+    /// <summary>
+    /// The half of teardown that is the daemon's own state, shared by Dispose and Detach.
+    /// <paramref name="reapChild"/> chooses which half of the session contract ends the CLI's life:
+    /// <c>Dispose</c> reaps the child, <c>Release</c> lets go of it.
+    /// </summary>
+    private void TearDownDaemonSide(bool reapChild)
     {
         _pumpCts.Cancel();
         try
@@ -683,10 +693,22 @@ public sealed class BoundTerminalSession : IDisposable
             // Pump teardown races with PTY disposal.
         }
 
-        _session.Dispose();
+        if (reapChild)
+        {
+            _session.Dispose();
+        }
+        else
+        {
+            _session.Release();
+        }
+
         _streamer.Dispose();
         _pumpCts.Dispose();
-        _writeGate.Dispose();
+
+        // The write gate is deliberately NOT disposed: a keystroke racing teardown would then throw
+        // ObjectDisposedException out of WriteInputAsync instead of failing on the torn-down stream it
+        // is actually about. SemaphoreSlim only needs disposal when its AvailableWaitHandle was taken,
+        // and nothing here takes it.
         lock (_gate)
         {
             _vterm?.Dispose();

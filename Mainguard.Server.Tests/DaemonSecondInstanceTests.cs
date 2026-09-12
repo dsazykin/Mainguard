@@ -168,7 +168,8 @@ public sealed class DaemonSecondInstanceTests
         var first = DaemonInstanceLock.Acquire(directory);
         try
         {
-            Assert.Throws<DaemonAlreadyRunningException>(() => DaemonInstanceLock.Acquire(directory));
+            Assert.Throws<DaemonAlreadyRunningException>(
+                () => DaemonInstanceLock.Acquire(directory, TimeSpan.Zero));
         }
         finally
         {
@@ -179,6 +180,81 @@ public sealed class DaemonSecondInstanceTests
         using var second = DaemonInstanceLock.Acquire(directory);
         Assert.True(File.Exists(DaemonInstanceLock.PathIn(directory)));
     }
+
+    /// <summary>
+    /// B3 — a momentary holder is not a running daemon. <c>MacDaemonController.IsInstanceLockHeld</c>
+    /// answers "is the daemon up?" by opening this same file <c>FileShare.None</c> from the UI process,
+    /// and the Pro head's connect diagnosis calls it <i>while the daemon it is waiting for starts</i>.
+    /// Single-shot, a daemon that reached the Kestrel callback inside that probe's <c>using</c> exited
+    /// "already running" — and under launchd that is a 30-second throttled outage caused by the app
+    /// merely checking. The acquire retries, so a probe-length hold is waited out and a real daemon (which
+    /// holds the lock for its whole life) is still refused.
+    /// </summary>
+    [Fact]
+    public async Task InstanceLock_WaitsOutAMomentaryProbe_RatherThanRefusingTheDaemon()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(), "mainguard-instance-lock", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var path = DaemonInstanceLock.PathIn(directory);
+        File.WriteAllText(path, string.Empty);
+
+        var probeTaken = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var probe = Task.Run(() =>
+        {
+            // Exactly the shape of MacDaemonController.IsInstanceLockHeld: an exclusive open, held for
+            // the length of a `using`.
+            using var held = new FileStream(
+                path, FileMode.Open, FileAccess.ReadWrite, FileShare.None, bufferSize: 1);
+            probeTaken.SetResult();
+            Thread.Sleep(250);
+        });
+
+        await probeTaken.Task;
+        using (var acquired = DaemonInstanceLock.Acquire(directory))
+        {
+            Assert.Equal(path, acquired.Path);
+        }
+
+        await probe;
+    }
+
+    /// <summary>
+    /// N6 — the exit code of a refused start, and why it depends on who is listening. launchd's
+    /// <c>KeepAlive {SuccessfulExit:false}</c> restarts a job for as long as it exits non-zero, so a
+    /// developer's own daemon on the data root turned the login job into an exec every 30 seconds forever.
+    /// Under the supervisor the refusal is a clean exit; run by a human it keeps its named non-zero code,
+    /// because telling a script that a refusal succeeded is the other way to be wrong.
+    /// </summary>
+    [Fact]
+    public void RefusedStart_IsCleanUnderASupervisor_AndNamedWhenAHumanRanIt()
+    {
+        var previous = Environment.GetEnvironmentVariable(DaemonExitCodes.SupervisorVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(DaemonExitCodes.SupervisorVariable, null);
+            Assert.Equal(DaemonExitCodes.AlreadyRunning, DaemonExitCodes.RefusedStart());
+
+            Environment.SetEnvironmentVariable(DaemonExitCodes.SupervisorVariable, "launchd");
+            Assert.Equal(DaemonExitCodes.AlreadyRunningUnderSupervisor, DaemonExitCodes.RefusedStart());
+            Assert.Equal(0, DaemonExitCodes.AlreadyRunningUnderSupervisor);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(DaemonExitCodes.SupervisorVariable, previous);
+        }
+    }
+
+    /// <summary>
+    /// The supervisor variable is spelled on both sides of an assembly boundary the reference graph will
+    /// not let close — the same duplication as the lock file name, pinned the same way. Let it drift and
+    /// the plist sets a variable the daemon never reads, which looks exactly like the fix working.
+    /// </summary>
+    [Fact]
+    public void SupervisorVariable_IsTheSameOnBothSidesOfTheAssemblyBoundary()
+        => Assert.Equal(
+            DaemonExitCodes.SupervisorVariable,
+            Mainguard.Agents.Agents.Bootstrap.MacDaemonLaunchAgent.SupervisorVariable);
 
     /// <summary>
     /// The lock file name is spelled in two assemblies — the daemon owns it, and

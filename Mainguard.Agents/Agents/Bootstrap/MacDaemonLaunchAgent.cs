@@ -48,6 +48,21 @@ public sealed class MacDaemonLaunchAgent
     /// <summary>How long launchd waits between respawns of a job that keeps failing (F63b).</summary>
     private const int ThrottleSeconds = 30;
 
+    /// <summary>
+    /// N6: the environment variable this job sets so the daemon knows something will restart it.
+    ///
+    /// <para>A daemon that refuses to start because another one already holds the data root exits
+    /// non-zero, and <c>KeepAlive {SuccessfulExit:false}</c> reads a non-zero exit as "try again" — so a
+    /// developer's own daemon turned the login job into an exec every 30 seconds, indefinitely. Seeing
+    /// this variable, the daemon reports that refusal as a clean exit instead, which is the honest
+    /// answer to a supervisor: the state you exist to maintain already holds.</para>
+    ///
+    /// <para>Mirrors <c>Mainguard.Server.DaemonExitCodes.SupervisorVariable</c>, which this assembly
+    /// cannot reference (the daemon references the agent platform, not the other way round) — a test in
+    /// <c>Mainguard.Server.Tests</c> pins the two strings equal, exactly as for the lock file name.</para>
+    /// </summary>
+    internal const string SupervisorVariable = "MAINGUARD_SUPERVISOR";
+
     private static string PlistPath() => Path.Combine(
         Mainguard.Git.MainguardPaths.HomeDirectory(), "Library", "LaunchAgents", Label + ".plist");
 
@@ -86,7 +101,12 @@ public sealed class MacDaemonLaunchAgent
         var dotnet = MacDaemonController.TryResolveAbsoluteMuxerPath();
         if (dotnet is null) return false;
 
-        var staged = StagePayload(payloadDirectory);
+        // Staged BEFORE the job is stopped and committed after, so a reinstall over a running job never
+        // has the daemon executing out of a directory being rewritten (B2).
+        var incoming = StageIncomingPayload(payloadDirectory);
+        if (incoming is null) return false;
+
+        var staged = StagedPayloadDirectory();
         var dll = Path.Combine(staged, "Mainguard.Server.dll");
         var logs = LaunchdLogDirectory();
         Directory.CreateDirectory(logs);
@@ -96,8 +116,40 @@ public sealed class MacDaemonLaunchAgent
         File.WriteAllText(plist, RenderPlist(dotnet, dll, staged, logs));
 
         await LaunchctlAsync(ct, "bootout", GuiDomain() + "/" + Label).ConfigureAwait(false); // tolerate "not loaded"
+        if (!CommitStagedPayload(incoming)) return false;
         var loaded = await LaunchctlAsync(ct, "bootstrap", GuiDomain(), plist).ConfigureAwait(false);
         return loaded == 0;
+    }
+
+    /// <summary>
+    /// Restarts the job onto a payload staged by <see cref="StageIncomingPayload"/>: boot the job out,
+    /// swap the staged directory while nothing is executing from it, then bring it back.
+    ///
+    /// <para><b>Why not <c>kickstart -k</c> here.</b> Kickstart's whole merit is that the stop and the
+    /// start are one act — which is exactly what leaves no moment in which the payload can be replaced
+    /// safely. The window this opens is the opposite kind: for the second or so between bootout and
+    /// bootstrap there is NO daemon, where kickstart guaranteed there was never more than one. No daemon
+    /// is a state every client already handles (it reconnects); a daemon running half of one build's
+    /// assemblies and half of another's is not.</para>
+    ///
+    /// <para>Returns false when the swap failed — the caller reports a refused refresh rather than
+    /// restarting onto a payload that does not exist — and the job is brought back regardless, since
+    /// leaving it booted out would take the daemon down until the next login.</para>
+    /// </summary>
+    internal async Task<bool> RestartOntoStagedPayloadAsync(string incoming, CancellationToken ct = default)
+    {
+        await LaunchctlAsync(ct, "bootout", GuiDomain() + "/" + Label).ConfigureAwait(false);
+        var committed = CommitStagedPayload(incoming);
+
+        // Bootstrap brings the (RunAtLoad) job back. Kickstart is the fallback for the case where the
+        // bootout did not actually unload it — then the job is still registered and bootstrap says so.
+        var loaded = await LaunchctlAsync(ct, "bootstrap", GuiDomain(), PlistPath()).ConfigureAwait(false);
+        if (loaded != 0)
+        {
+            loaded = await KickstartAsync(ct).ConfigureAwait(false);
+        }
+
+        return committed && loaded == 0;
     }
 
     /// <summary>
@@ -136,6 +188,7 @@ public sealed class MacDaemonLaunchAgent
               <dict>
                 <key>DOTNET_HOST_PATH</key><string>{Escape(dotnet)}</string>
                 <key>PATH</key><string>{Escape(JobPath(dotnet))}</string>
+                <key>{Escape(SupervisorVariable)}</key><string>launchd</string>
               </dict>
               <key>ProcessType</key><string>Background</string>
             </dict>
@@ -178,20 +231,36 @@ public sealed class MacDaemonLaunchAgent
 
     private static string Escape(string value) => SecurityElement.Escape(value) ?? string.Empty;
 
+    /// <summary>The incoming copy, built beside the live one and renamed over it only while the job is
+    /// stopped. Never the directory the plist points at.</summary>
+    internal static string IncomingPayloadDirectory() => StagedPayloadDirectory() + ".new";
+
+    /// <summary>The previous staged copy, kept for the breath between the two renames.</summary>
+    private static string RetiredPayloadDirectory() => StagedPayloadDirectory() + ".old";
+
     /// <summary>
-    /// F63e: copies the payload out of whatever directory the app shipped it in (typically inside the
-    /// <c>.app</c> bundle) into <see cref="StagedPayloadDirectory"/>, which no app update rewrites.
+    /// F63e, phase one: copies the payload out of whatever directory the app shipped it in (typically
+    /// inside the <c>.app</c> bundle) into <see cref="IncomingPayloadDirectory"/> — <b>beside</b> the
+    /// directory the launchd job is executing from, never over it.
     ///
-    /// <para>Copied rather than symlinked deliberately: a symlink into the bundle reintroduces exactly
-    /// the failure mode — the running daemon lazily loads an assembly through the link and gets the NEW
-    /// bundle's copy, mixed with the old ones it already loaded.</para>
+    /// <para><b>Why this is two phases now.</b> The first version deleted the staged directory and copied
+    /// into it while the job was still running out of it. That is the exact mixed-assembly window (e)
+    /// exists to close, reintroduced at every refresh and made worse: a daemon that lazily loads an
+    /// assembly during the copy finds a missing or half-written file rather than merely an old one. The
+    /// copy now happens somewhere the running daemon never looks, and
+    /// <see cref="CommitStagedPayload"/> renames it into place while the job is booted out.</para>
     ///
-    /// <para>The staged copy is REPLACED wholesale rather than merged, so a file removed from the payload
-    /// between versions does not survive as a stale assembly. Returns the staged directory; on any IO
-    /// failure it returns the source, because a login job pointed at the bundle is still better than no
-    /// login job at all.</para>
+    /// <para>Copied rather than symlinked deliberately: a symlink into the bundle reintroduces the same
+    /// failure mode from the other side — the running daemon loads through the link and gets the NEW
+    /// bundle's copy mixed with the old ones it already loaded.</para>
+    ///
+    /// <para>Returns the incoming directory, or <c>null</c> when the copy could not be completed. Null is
+    /// a REFUSAL and callers must honour it: restarting onto a half-copied payload gives launchd a daemon
+    /// that crashes on a missing assembly, and <c>Crashed:true</c> then respawns it every 30 s forever.
+    /// When the source already IS the staged directory there is nothing to stage and the staged directory
+    /// is returned, so the commit below is a no-op.</para>
     /// </summary>
-    internal static string StagePayload(string payloadDirectory)
+    internal static string? StageIncomingPayload(string payloadDirectory)
     {
         var staged = StagedPayloadDirectory();
         if (SamePath(payloadDirectory, staged))
@@ -199,19 +268,104 @@ public sealed class MacDaemonLaunchAgent
             return staged;
         }
 
+        var incoming = IncomingPayloadDirectory();
         try
         {
-            if (Directory.Exists(staged))
+            if (Directory.Exists(incoming))
             {
-                Directory.Delete(staged, recursive: true);
+                Directory.Delete(incoming, recursive: true);
             }
 
-            CopyDirectory(payloadDirectory, staged);
-            return staged;
+            CopyDirectory(payloadDirectory, incoming);
+
+            // The one file the job cannot start without. A copy that "succeeded" without it is a payload
+            // that would produce the respawn loop, so it is treated as the failure it is.
+            if (!File.Exists(Path.Combine(incoming, "Mainguard.Server.dll")))
+            {
+                TryDelete(incoming);
+                return null;
+            }
+
+            return incoming;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return payloadDirectory;
+            TryDelete(incoming);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// F63e, phase two: renames <paramref name="incoming"/> over <see cref="StagedPayloadDirectory"/>.
+    ///
+    /// <para><b>Call this only while the job is stopped</b> — between <c>bootout</c> and the restart. Two
+    /// renames rather than a delete-and-copy: each is a single directory-entry swap, so there is no window
+    /// in which the staged directory is incomplete, and the previous copy survives as
+    /// <c>daemon-payload.old</c> until the new one is in place. The old copy is then deleted on a
+    /// best-effort basis; a leftover <c>.old</c> costs disk and nothing else, and the next stage removes
+    /// it.</para>
+    ///
+    /// <para>Returns false when the swap could not be completed, with the previous staged copy restored
+    /// where it can be — the caller then restarts onto the payload that was already working rather than
+    /// onto nothing.</para>
+    /// </summary>
+    internal static bool CommitStagedPayload(string incoming)
+    {
+        var staged = StagedPayloadDirectory();
+        if (SamePath(incoming, staged))
+        {
+            return true; // nothing was staged: the source already is the staged copy
+        }
+
+        if (!Directory.Exists(incoming))
+        {
+            return false;
+        }
+
+        var retired = RetiredPayloadDirectory();
+        var movedAside = false;
+        try
+        {
+            if (Directory.Exists(retired))
+            {
+                Directory.Delete(retired, recursive: true);
+            }
+
+            if (Directory.Exists(staged))
+            {
+                Directory.Move(staged, retired);
+                movedAside = true;
+            }
+
+            Directory.Move(incoming, staged);
+            TryDelete(retired);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            if (movedAside && !Directory.Exists(staged))
+            {
+                // Put the working copy back: a job pointed at a directory that no longer exists cannot
+                // start at all, which is strictly worse than an out-of-date daemon.
+                try { Directory.Move(retired, staged); } catch (Exception) { /* nothing left to try */ }
+            }
+
+            return false;
+        }
+    }
+
+    private static void TryDelete(string directory)
+    {
+        try
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Leftovers cost disk and nothing else; the next stage clears them.
         }
     }
 

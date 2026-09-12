@@ -37,11 +37,26 @@ public sealed class MacDaemonUpdater : IDaemonUpdater
             {
                 // Re-stage first: the job runs from the staged copy, never from the bundle (F63e), so a
                 // refresh that did not re-stage would restart onto the OLD assemblies.
-                MacDaemonLaunchAgent.StagePayload(payloadDirectory);
-                var code = await _launchAgent.KickstartAsync(ct).ConfigureAwait(false);
-                return code == 0
+                //
+                // B2: the copy lands BESIDE the live payload and its result is CHECKED. The previous
+                // version deleted the staged directory and copied into it while the job executed from it
+                // — the mixed-assembly window (e) exists to close — and then ran `kickstart -k` whatever
+                // the copy did, so a copy that failed halfway left the plist pointing at an incomplete
+                // payload, the daemon crashing on a missing assembly, and `Crashed:true` respawning it
+                // every 30 s forever. A refusal here leaves the daemon that is already running alone.
+                var incoming = MacDaemonLaunchAgent.StageIncomingPayload(payloadDirectory);
+                if (incoming is null)
+                {
+                    return new DaemonRefreshResult(
+                        false,
+                        "could not stage the daemon payload; the running daemon was left untouched.");
+                }
+
+                var restarted = await _launchAgent
+                    .RestartOntoStagedPayloadAsync(incoming, ct).ConfigureAwait(false);
+                return restarted
                     ? new DaemonRefreshResult(true, "launchd restarted mainguardd from the staged payload.")
-                    : new DaemonRefreshResult(false, $"launchctl kickstart failed (exit {code}).");
+                    : new DaemonRefreshResult(false, "launchd did not restart mainguardd from the staged payload.");
             }
 
             await _controller.StopAsync(payloadDirectory, ct).ConfigureAwait(false);
