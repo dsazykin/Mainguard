@@ -1285,7 +1285,9 @@
 - **`Mainguard.Server.Tests/AgentSessionReconcileTests.cs`** — the unit tier of the live session store's
   reconcile against Docker (ISSUES-LOG #18/#20): adoption with the jail's kind/role, the pause-axis-only
   correction (a `RateLimited` agent stays `RateLimited`), `Unresponsive` when the container is gone, the
-  `(repo, agent)` keying that keeps two repos' `pr-7` apart, idempotence, the ownership gate, and the one
+  `(repo, agent)` keying that keeps two repos' `pr-7` apart, idempotence, the ownership gate, **the
+  adoption mark the jail reaper's single idle-exemption reads** (set for the adopted jail, NOT for one the
+  store already knew about, and clearable), and the one
   that matters most — an unreachable container engine must change **nothing**, never read as "every jail
   vanished". Also pins the sibling half in the two older reconcilers: a *paused* container is `Live`, so
   a daemon restart during an engaged kill switch no longer declares the agent dead, force-removes its
@@ -1615,7 +1617,9 @@
   typed-pause-not-kill + `budget_exceeded` audit + snapshot + price table), `AdmissionControllerTests`
   (86% → reject with honest reason, cache TTL), `JailReapPolicyTests` (2026-09-04 — terminal entries reap
   even with a live CLI; a live CLI is otherwise never reaped; no CLI is kept until the allowance and reaped
-  at it), `SwarmReconcilerTests` (dead-prune/orphan-adopt/stop +
+  at it; **B1** — the in-flight exemption applies ONLY to an adopted jail that lost its terminal to a
+  daemon restart, and the same entry states on a jail this daemon started — AwaitingReview above all, the
+  end state of every finished worker — are still reaped at the allowance), `SwarmReconcilerTests` (dead-prune/orphan-adopt/stop +
   Docker-as-truth + RT-D1 ordering + `BootStep_RecordsWhatItPruned_RatherThanDiscardingTheReport`, since
   a boot pass that destroys agents must leave an audit entry and a log line naming them, and its
   counterpart that a pass changing nothing logs but does not audit), and the shared `GatewayTestDoubles` (`FakeAgentSupervisor`).
@@ -2527,12 +2531,20 @@
   leaves `daemon.token`, `daemon-server.cer` and `daemon-client.pfx` byte-for-byte unchanged, because
   the credentials are minted in memory and written only from `ApplicationStarted`; a second daemon on a
   DIFFERENT port against the same data root — which no bind error could ever have caught — is refused by
-  `DaemonInstanceLock`; the lock itself refuses a second acquire and releases on dispose; and the lock
-  file name is pinned equal across the `Mainguard.Server` / `Mainguard.Agents` assembly boundary, which
-  is the only place that duplication can be checked; and — the second leg — the loser leaves the live
+  `DaemonInstanceLock`; the lock itself refuses a second acquire and releases on dispose; **B3** — a
+  MOMENTARY exclusive hold of the lock file, exactly the shape of `MacDaemonController.IsInstanceLockHeld`
+  probing from the UI process, is waited out rather than mistaken for a running daemon; **N6** — a refused
+  start exits 0 under `MAINGUARD_SUPERVISOR` and keeps its named non-zero code otherwise; and the lock
+  file name AND the supervisor variable are pinned equal across the `Mainguard.Server` / `Mainguard.Agents`
+  assembly boundary, which is the only place those duplications can be checked; and — the second leg — the loser leaves the live
   daemon's `__EFMigrationsLock` row in place too, plus a focused test that the row is left alone while a
   daemon holds the data root AND still cleared once it is gone, since a fix that only ever skipped would
   trade the 2026-07-17 boot hang back in),
+  `ShutdownDetachTests` (**F59/B1** — `DetachAllForShutdown` leaves the CLI double's `Killed` false and
+  its `Released` true, `Release(key)` still kills, `BoundTerminalSession.Detach` vs `Dispose` differ at
+  that level too, and disposing the manager detaches rather than kills. The double mirrors `PtySession`'s
+  contract — **Dispose reaps, Release lets go** — because the claim first shipped as prose against doubles
+  that killed nothing on disposal, so nothing could tell that detach still ended in `Kill`),
   `ReadOnlyAttachTests` (**F64** — a locked attach cannot Resize the managed worker's terminal while an
   unlocked one still can; a lock applied MID-attach is honoured on the next frame, i.e. the lock is read
   live rather than snapshotted; `TryClaimInput` is exclusive and released on dispose; and concurrent
@@ -2547,9 +2559,13 @@
   `MacLaunchAgentPlistTests` (**F63** — the rendered plist parses as XML and round-trips a path
   containing `&` and `<`; `ProgramArguments[0]` is an absolute muxer, never a bare `dotnet`; `KeepAlive`
   is a conditional dict with a `ThrottleInterval`; `StandardOutPath`/`StandardErrorPath` are set; the job
-  PATH carries Homebrew and the muxer's own directory; the staged payload lives under the data root
-  rather than inside an `.app` bundle and is COPIED, never symlinked; and `InstallAsync` writes nothing
-  when the payload is absent).
+  PATH carries Homebrew and the muxer's own directory, plus `MAINGUARD_SUPERVISOR=launchd`; the staged
+  payload lives under the data root rather than inside an `.app` bundle and is COPIED, never symlinked;
+  and `InstallAsync` writes nothing when the payload is absent. **B2** — `StageIncomingPayload` copies
+  BESIDE the live payload and leaves it byte-for-byte intact until `CommitStagedPayload` rename-swaps,
+  the swap replaces wholesale (a file dropped between versions does not survive), a payload with no
+  `Mainguard.Server.dll` is refused with a null rather than staged, and staging the staged directory
+  itself is a no-op).
   **P2-14 daemon in-proc tests:** `InputLockGrpcTests` (a **raw** `TerminalService`
   client — not `DaemonClient` — attaching to a `TerminalLockRegistry`-locked agent reads the banner
   then gets `PermissionDenied` on an input frame; the unlocked control echoes), `RoleInterceptorTests`

@@ -1,7 +1,7 @@
 <!-- Extracted verbatim from the AGENTS.md Repository Map. Keep current: when you add, move, or delete a file, update its entry here. -->
 ### `Mainguard.Server/` (P2-02 daemon — ASP.NET Core gRPC host)
 
-- **`Program.cs`** — thin entry point: parses `DaemonOptions`, runs the `--local-dev --smoke` self-probe or the daemon (`app.Run()`), maps a bind failure to a typed `DaemonStartupException`. **F55:** a `DaemonAlreadyRunningException` (from the single-instance lock, which fires during `Build`) exits with `DaemonExitCodes.AlreadyRunning` (3) and one line on stderr rather than a stack trace — the guard working is not a crash, and the code is non-zero on purpose so launchd's `{ SuccessfulExit: false }` KeepAlive retries once the other daemon stops. `public partial class Program {}` so `WebApplicationFactory<Program>` can host it in-proc.
+- **`Program.cs`** — thin entry point: parses `DaemonOptions`, runs the `--local-dev --smoke` self-probe or the daemon (`app.Run()`), maps a bind failure to a typed `DaemonStartupException`. **F55:** a `DaemonAlreadyRunningException` (from the single-instance lock, which fires during `Build`) exits via `DaemonExitCodes.RefusedStart()` with one line on stderr rather than a stack trace — the guard working is not a crash. **N6:** that code is `AlreadyRunning` (3) when a human ran the daemon, and `AlreadyRunningUnderSupervisor` (0) when `MAINGUARD_SUPERVISOR` is set — the LaunchAgent sets it, and launchd's `{ SuccessfulExit: false }` KeepAlive restarts a job for as long as it exits non-zero, so a developer's own daemon on the data root used to make the login job exec-and-refuse every 30 seconds indefinitely. A script still gets the named non-zero code. `public partial class Program {}` so `WebApplicationFactory<Program>` can host it in-proc.
 - **`DaemonHost.cs`** — the shared host configuration (services, interceptors, gRPC service map,
   loopback-only Kestrel bind, silent logging) used by both the entry point and the in-proc tests;
   registers the durable `IKillJournal` (`JsonKillJournal` at `ResolveKillJournalPath`, beside the
@@ -110,7 +110,14 @@
     Windows), taken from the Kestrel options callback BEFORE a listener is configured and released by
     the kernel however the holder dies. Also `DaemonInstanceLockHolder` (the DI singleton that owns it
     for the host's lifetime — acquired late so the in-proc `TestServer` tier, where every fixture shares
-    one data root, never contends) and `DaemonAlreadyRunningException`. The lock is on the DATA ROOT,
+    one data root, never contends) and `DaemonAlreadyRunningException`. **B3:** `Acquire` RETRIES for
+    `AcquireRetryWindow` (1.5 s; `Acquire(dir, TimeSpan.Zero)` is the old single-shot form, for a test
+    that wants an immediate refusal). Single-shot, the guard could be tripped by the app itself:
+    `MacDaemonController.IsInstanceLockHeld` probes this file `FileShare.None` from the UI process and
+    the Pro head's connect diagnosis calls it while the daemon starts, so a daemon reaching the Kestrel
+    callback inside that probe's `using` exited "already running" — under launchd, a 30-second throttled
+    outage caused by the app merely checking. A probe holds the lock for microseconds and a daemon holds
+    it for its whole life, so retrying separates them without anyone coordinating. The lock is on the DATA ROOT,
     not the port: a second daemon on a *different* port damaged the same shared state and no bind error
     could ever have caught it. `daemon.lock.holder` beside it records the holder's pid for the refusal
     message only — nothing reads it to decide anything.
@@ -261,7 +268,12 @@
   on `AgentSession.Detail` so a new reason is told from a repeat. Comparing only the state word silently
   swallowed every update reporting progress WITHIN a state, which is the only shape a long step has: a
   coordinator sits in `Starting` for the minutes its toolchain image builds, so each progress line died
-  here and the client, hearing nothing, could only conclude the daemon had stopped responding. **P2-47 #8:** the `AgentSession` record carries a daemon-side-only
+  here and the client, hearing nothing, could only conclude the daemon had stopped responding. **B1:** an
+  ADOPTION axis alongside the pause axis — `MarkAdopted`/`ClearAdopted`/`WasAdoptedWithoutTerminal`,
+  written by `AgentSessionReconciler`'s adoption pass and cleared by `Stop` or the first sighting of a
+  bound CLI. Kept off the state word because adoption writes `Working` and so does an ordinary running
+  agent, while the jail reaper's question is not "is it working" but "is the missing terminal a fact
+  about the jail or about the daemon". **P2-47 #8:** the `AgentSession` record carries a daemon-side-only
   `ContainerId`/`RepoHash` (never serialized), and `AttachSandbox` binds a real jail to a spawned
   session (state → `Working`, `sandbox_attach` audit). **`Spawn` takes an optional explicit
   `agentId`** — it could previously only MINT GUIDs, so a session (and therefore a jail) named
@@ -369,8 +381,12 @@
     `SweepOnce()` is public for the wiring test; the on-demand `RefreshMirrorMain` RPC is the same call.
   - **`Runtime/JailReaperHostedService.cs`** (2026-09-04, owner decision) — the jail reaper: every
     `CoordinatorLimits.JailReapSweepSeconds` it walks `AgentSessionStore.List()`, asks `JailReapPolicy`
-    with the entry state, whether `TerminalSessionManager.TryGetBound` holds a live CLI, and how long it
-    has not, and stops what the policy names through the ordinary `AgentSpawnService.StopAsync` (harvest,
+    with the entry state, whether `TerminalSessionManager.TryGetBound` holds a live CLI, how long it
+    has not, and — **B1** — whether the session is an ADOPTED jail no CLI has bound to since
+    (`AgentSessionStore.WasAdoptedWithoutTerminal`, cleared here the first time a live CLI is seen). That
+    last flag is the entire scope of the in-flight exemption: a jail this daemon started itself, whose
+    worker finished and sits in AwaitingReview, still reaps at the allowance. It stops what the policy
+    names through the ordinary `AgentSpawnService.StopAsync` (harvest,
     publish, teardown — nothing committed is lost). Audits `jail_reaped`. `SweepOnceAsync(now)` is public
     and caller-clocked so the daemon-tier test drives the idle allowance without waiting it out.
   - **`Runtime/FrozenJailPolicy.cs`** — the frozen-jail predicate behind `send_worker_prompt`,
@@ -585,7 +601,10 @@
     startup and every 30 s. Adoption reads the parent off `mainguard.agent.parent` and hands each adopted
     session to an `onAdopted` hook, which the composition root binds to
     `AgentSpawnService.TryReattachEndpoint` so an adopted coordinator's tools and an adopted worker's plan
-    channel come back with it (before 2026-09-03 adoption rebuilt the record and nothing else). The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
+    channel come back with it (before 2026-09-03 adoption rebuilt the record and nothing else). Adoption
+    also calls `AgentSessionStore.MarkAdopted`, which is the jail reaper's ONE excuse for a jail with no
+    bound CLI — recorded here because this is the only pass that knows the CLI's PTY died with a previous
+    daemon rather than because the agent left. The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
     table, `LeaderReattachTask` → the PTY leader registry) never wrote to `AgentSessionStore`, which is
     what `ListAgents`/`StreamAgentEvents`/the resource monitor/the kill switch actually render — so a
     restarted daemon reported zero agents while their jails kept running, and a `docker pause`/`unpause`
@@ -742,7 +761,13 @@
   written-space vs positioned-gap distinction), first-class scroll/pop ops, cursor, modes, and the
   colour wire encoding (high byte 0=default/1=indexed/2=rgb) the client mirrors.
 - **`Runtime/BoundTerminalSession.cs`** (P2-03, extended by P2-18) — the long-lived agent-bound
-  session: raw replay ring + fan-out + `TailText` (unchanged), and with the libvterm engine also one
+  session. **F59:** `Detach()` (daemon shutdown) and `Dispose()` (StopAgent/teardown) share one
+  `TearDownDaemonSide(reapChild)`, and the flag is the whole difference — detach calls
+  `ITerminalSession.Release`, dispose calls `Kill`+`Dispose`. Both used to end in `Dispose`, which for
+  the production `PtySession` is a `Kill`, so "detach" killed exactly what "dispose" killed;
+  `ShutdownDetachTests` now asserts the two apart against a double with `PtySession`'s contract. The
+  write gate is deliberately not disposed (a keystroke racing teardown should fail on the torn-down
+  stream, not on `ObjectDisposedException`). Otherwise: raw replay ring + fan-out + `TailText`, and with the libvterm engine also one
   `VtermSession` fed the same 16 ms VT-safe frames under the session gate — `SubscribeGrid` (atomic
   full snapshot + live `GridUpdate`/`ClipboardCopy` frames), `Resize` (PTY + vterm in the same breath,
   then a fresh snapshot — preceded by a ring-only update carrying the reflow's scrollback pushes/pops

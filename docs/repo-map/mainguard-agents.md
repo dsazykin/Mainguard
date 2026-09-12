@@ -118,11 +118,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     verdict;
     timer-threaded — consumers marshal). Also `PtyProcessShim.cs` (P2-03): the real cross-platform PTY
     shim — `PtySession` (bidirectional `IO` stream, `Resize`/`Kill`/`ExitCode`, idempotent dispose that
-    reaps the child) + `PtyProcessShim.Spawn` (ConPTY on Windows / forkpty on Linux via the `Porta.Pty`
+    reaps the child, plus **`Release()` — F59's release-without-kill**: unhooks `ProcessExited`, completes
+    the exit waiter and disposes the streams, with no `Kill` and no `IPtyConnection.Dispose`, so daemon
+    shutdown can let go of a CLI instead of SIGKILLing it. Until it existed, every teardown path ended in
+    `Dispose`, i.e. in `Kill`, and "a restart no longer kills bound CLIs" was prose) + `PtyProcessShim.Spawn` (ConPTY on Windows / forkpty on Linux via the `Porta.Pty`
     package; execs `command`+`args` directly — never a shell wrapper) + the internal `PtyDuplexStream`
     adapter. `isatty()` is true inside; Ctrl+C (0x03) reaches the foreground process. **PR3:**
-  - `ITerminalSession.cs` — the engine-agnostic live-terminal seam (`IO`/`Resize`/`Kill`/`ExitCode`)
-    `PtySession` implements, so the daemon's CLI binding is testable with duplex-pipe fakes;
+  - `ITerminalSession.cs` — the engine-agnostic live-terminal seam (`IO`/`Resize`/`Kill`/`ExitCode`, plus
+    **`Release()`** — let go of the child without reaping it, defaulting to `Dispose` so only a session
+    type that actually kills needs to implement it) `PtySession` implements, so the daemon's CLI binding
+    is testable with duplex-pipe fakes;
   - `AgentRoles.cs` — the shared role-string contract (""/`coordinator`/`managed`) for
     `SpawnAgentRequest.role`; and `Agents/Ipc/` — the coordinator→daemon spawn channel's pure pieces:
     `AgentIpcProtocol.cs` (fixed in-jail layout `AgentIpcPaths` — `/opt/mainguard/ipc` read-only mount
@@ -564,10 +569,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       returns null; `DotnetMuxerPath()` keeps the bare-name fallback for interactive children only.)
     - `MacDaemonUpdater.cs` (the macos-host `IDaemonUpdater`: the daemon runs OFF the payload the
       app ships, so tier-1 refresh is stop + start from it — no staging copy, no systemd, no VM.
-      **F55/F63:** when the LaunchAgent is installed the refresh re-stages the payload and calls
-      `launchctl kickstart -k` instead, so launchd performs the one atomic restart. The old
-      unconditional stop+start fought the job: `KeepAlive` respawned the daemon the instant SIGTERM
-      landed, and the "start" then raced that respawn into two daemons contending for the port.)
+      **F55/F63:** when the LaunchAgent is installed, launchd performs the restart rather than this
+      updater. The old unconditional stop+start fought the job: `KeepAlive` respawned the daemon the
+      instant SIGTERM landed, and the "start" then raced that respawn into two daemons contending for the
+      port. **B2:** the refresh now stages into `daemon-payload.new` and CHECKS the result — a null is a
+      refusal that leaves the running daemon alone — then `RestartOntoStagedPayloadAsync` boots the job
+      out, renames the staged directory into place while nothing executes from it, and brings the job
+      back. Previously it re-staged in place (deleting the directory the daemon was running from) and
+      kickstarted whatever the copy did, so a half-copied payload produced a daemon crashing on a missing
+      assembly and `Crashed:true` respawning it every 30 s forever.)
     - `MacDaemonLaunchAgent.cs` (optional launchd integration — "keep the agent platform running
       at login": a per-user LaunchAgent installed/booted via `launchctl bootstrap gui/<uid>`, nothing
       elevated, plus `KickstartAsync` for the updater. **F63** fixed five defects in the plist:
@@ -579,11 +589,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       produced a plist `launchctl bootstrap` silently refused;
       (d) `StandardOutPath`/`StandardErrorPath` under `~/.mainguard/logs`, so a crash BEFORE the
       daemon's own logging pipeline exists leaves something behind, plus an `EnvironmentVariables` PATH
-      carrying Homebrew and the muxer's own directory;
-      (e) `StagePayload` copies the payload to `~/.mainguard/daemon-payload/` and the job runs from
-      there, never from inside the `.app` bundle — a bundle replaced in place gives a lazily-loading
-      daemon a mix of old and new assemblies. `RenderPlist`/`StagePayload` are internal so
-      `MacLaunchAgentPlistTests` can assert the document without touching launchd.)
+      carrying Homebrew and the muxer's own directory, and (**N6**) `MAINGUARD_SUPERVISOR=launchd` — the
+      variable `DaemonExitCodes.RefusedStart()` reads so a second instance refusing a data root another
+      daemon holds exits 0 under the job instead of asking `SuccessfulExit:false` to exec it again every
+      30 s (`SupervisorVariable` is mirrored across the assembly boundary and pinned by a test);
+      (e) the payload is STAGED to `~/.mainguard/daemon-payload/` and the job runs from there, never from
+      inside the `.app` bundle — a bundle replaced in place gives a lazily-loading daemon a mix of old
+      and new assemblies. **B2:** staging is two phases — `StageIncomingPayload` copies to
+      `daemon-payload.new` beside the live copy (returning null, a refusal, when the copy fails or has no
+      `Mainguard.Server.dll`) and `CommitStagedPayload` rename-swaps it into place, called only while the
+      job is booted out (`InstallAsync`, `RestartOntoStagedPayloadAsync`). The first version deleted and
+      rewrote the directory the running daemon was executing from, reintroducing (e)'s own defect at
+      every refresh. `RenderPlist`/`StageIncomingPayload`/`CommitStagedPayload` are internal so
+      `MacLaunchAgentPlistTests` can assert the document and the swap without touching launchd.)
     - `MacOobeState.cs` (the macos-host first-run marker — deliberately simpler than the WSL OOBE's
       staged machine: no reboot-resume, no elevation, no VM import, so "completed once" is the only
       stage worth persisting; deleting `macos-oobe.json` re-runs the flow.)
@@ -1883,17 +1901,21 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       a jail is stopped when its merge-queue entry is terminal (Merged/Rejected/Discarded — the work has
       left it) or when no CLI has been bound to it for `CoordinatorLimits.IdleJailReapMinutes`; a jail
       with a live CLI is never touched, whatever it is doing.
-      **F59 narrowed the second rule:** a jail whose entry is still IN FLIGHT (Working/Verifying/
-      Verified/StaleVerified/AwaitingReview/VerificationFailed) is no longer reaped for idleness alone.
-      "No CLI is bound" stopped meaning "nothing is happening" the moment a daemon restart stopped
-      killing the agents — an adopted jail has no bound CLI because its PTY belonged to the previous
-      daemon process and Docker cannot re-attach a running exec, so every one of them would have been
-      stopped mid-task half an hour after a restart. A jail left running costs memory the operator
-      reclaims with Stop; a jail reaped mid-task costs work nobody can get back. RESIDUAL, deliberate:
-      a jail whose CLI exited unobserved keeps an in-flight entry and is never reaped here — that is the
-      population the CLI re-bind-on-adoption work fixes, since re-binding is what restores the daemon's
-      ability to see the exit. `JailReapVerdict` carries the cause the
-      audit event records. Before this only a human pressing Stop ever removed a jail — the 26 GB of
+      **F59 narrowed the second rule, and the narrowing is SCOPED** (`terminalLostToRestart`): a jail
+      whose entry is still IN FLIGHT (Working/Verifying/Verified/StaleVerified/AwaitingReview/
+      VerificationFailed) is exempt from idle reaping **only when the reconciler adopted it** — i.e. it
+      outlived the daemon that started it, so its missing CLI is a fact about the daemon (the PTY died
+      with that process and Docker cannot re-attach a running exec) rather than about the jail. The
+      reaper reads that fact from `AgentSessionStore.WasAdoptedWithoutTerminal`, which adoption sets and
+      the first sighting of a bound CLI clears. Unscoped — the first cut — the exemption also covered the
+      ordinary worker that finished and sits in AwaitingReview until a human looks at it, i.e. every
+      worker's end state, which turned a fix for a mid-task kill into "no finished jail is ever
+      reclaimed": exactly the 26 GB population the reaper was written against. A jail left running costs
+      memory the operator reclaims with Stop; a jail reaped mid-task costs work nobody can get back.
+      RESIDUAL, deliberate: an ADOPTED jail whose CLI exited unobserved keeps an in-flight entry and is
+      never reaped here — that is the population the CLI re-bind-on-adoption work fixes, since re-binding
+      both restores the daemon's ability to see the exit and clears the adoption mark. `JailReapVerdict`
+      carries the cause the audit event records. Before this only a human pressing Stop ever removed a jail — the 26 GB of
       idle 2 GiB jails an owner measured.)
     - `CoordinatorLimits.cs` (**phase 2** — the daemon-side caps record, lifted out of `CoordinatorTools.cs`
       now that four call sites consume it: `MaxActiveWorkers` (6; **counts workers blocked on plan
