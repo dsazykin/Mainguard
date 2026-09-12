@@ -40,7 +40,20 @@ The three installer projects. `Mainguard.Installer.Elevated` is the ONLY elevate
   `comm` is exactly `mainguardd`, what P2-05 `pgrep -x mainguardd` matches); the `Dockerfile` `COPY`s
   it to `/opt/mainguard/` and ships **`mainguardd.service` (sets `Environment=HOME=/home/mainguard`
   explicitly as belt-and-braces; all per-user daemon state — token, SQLite, keyring, leader registry,
-  plan store — lands under `$HOME/.mainguard` via `MainguardPaths`)** enabled; `/etc/wsl.conf` sets
+  plan store — lands under `$HOME/.mainguard` via `MainguardPaths`)** enabled. **The unit also
+  supplies the key-ring passphrase (B1/F53),** without which the DataProtection key ring under
+  `$HOME/.mainguard/Keyring` has no at-rest protector on Linux and the daemon now refuses to boot
+  rather than fall back to an audit journal that forgets everything at shutdown: `ExecStartPre=+`
+  runs **`provision-keyring-passphrase.sh`** as root (the `+` prefix; the service itself is
+  `User=mainguard`), which mints ONE random passphrase per INSTALL — never per image, since the
+  tarball is byte-reproducible and a baked-in secret would be identical on every machine — into a
+  root-owned `0640` `/etc/mainguard/keyring.passphrase` and never regenerates it (a new passphrase
+  would make the existing ring unreadable). The unit passes the PATH via
+  `Environment=MAINGUARD_KEYRING_PASSPHRASE_FILE`, never the secret itself, because an `Environment=`
+  secret is readable through `systemctl show`, `/proc/<pid>/environ` and every child process the
+  daemon spawns; an operator with a stronger custody model points that variable at their own file
+  (e.g. a systemd `LoadCredential=` target) and drops the `ExecStartPre`. The script is in
+  `build.sh`'s `INPUT_SPECS`, so it is covered by `BUILD_INPUTS_HASH` like every other COPY'd input; `/etc/wsl.conf` sets
   `[boot] systemd=true` (+ the dockerd boot command + `mainguard` default user) so systemd starts the
   loopback-`127.0.0.1:5250` daemon on first boot alongside dockerd (WSL2 `localhostForwarding` reaches
   it from the Windows app). `packages.pinned.txt` gained `systemd`/`systemd-sysv`, and (P2-48)

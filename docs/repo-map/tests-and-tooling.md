@@ -129,7 +129,10 @@
     ("preparing db / stale migration lock cleared / migrate ok / watchdog fired") milestones (the
     watchdog fallback driven through `TryPrepareDatabase` directly). **F56** adds the owner-only
     permission tests (`[UnixOnlyFact]`: the logs dir is not group/world readable, the FIRST line lands
-    in an already-`0600` file, and a rolled file stays `0600`).
+    in an already-`0600` file, and a rolled file stays `0600`) — each also carrying
+    `[SupportedOSPlatform("linux")]`/`[SupportedOSPlatform("macos")]`, because `File.GetUnixFileMode`
+    inside a custom skip attribute is CA1416 to the analyzer and `dotnet format --verify-no-changes`
+    exited 2 on it.
   - `LoggingMaskTests` gains a non-`RpcException`-under-`Rpc` handler-fault test; **F56** reworks its
     assertions from "the field was masked" to "the body was never rendered", and adds
     `FreeTextRequestFields_AreNeverRendered_EvenThoughTheyAreNotMarkedSecret` — a `task_prompt`
@@ -139,12 +142,33 @@
     record count, registered `// SECRET` fields render nothing at all, nested messages recurse under
     the same rules, bytes render `<bytes:LEN>`, bounded scalars still render (an access log has to
     stay worth reading), and an allowlisted NAME with an un-handle-like VALUE still renders a length.
+  - **`Mainguard.Server.Tests/SecretFieldMaskProtoSweepTests.cs`** (F56) — the sweep the per-message
+    tests cannot be, and the one test that survives the contract changing: it enumerates EVERY
+    `MessageDescriptor` in the generated contract assembly (nested types included, ~150 of them),
+    fills every string/bytes field — singular, repeated, map value, nested — with a 96-character
+    sentinel, runs `Summarize`, and asserts neither the sentinel nor a 16-char prefix of it survives.
+    A second sweep covers the other half of the rule: a SHORT identifier sentinel in every singular
+    string field, with the set of field names that render it verbatim pinned against the allowlist
+    restated in the test — so widening `LoggableNames` (adding `reason` or `title` while debugging)
+    fails here and names the field, which is the leak-by-omission an allowlist exists to prevent.
   - **`Mainguard.Server.Tests/AuditRetentionLeaseTests.cs`** (F64b) — retention over a real
     SQLite-backed `ChainedAuditLog` with an injected clock: with no lease everything expired expires;
     an open `InMemoryMergeLeaseStore` lease holds back the records naming its agent or lease id while
     unrelated ones still expire; the held record expires on the sweep after the lease confirms;
     redaction events are never themselves redacted and the chain still verifies; plus the pure
-    `LeaseReferences` / `IsHeldByOpenLease` predicates (repo hash deliberately NOT a hold key).
+    `References` / `IsHeldByOpenLease` predicates (repo hash deliberately NOT a hold key; the two id
+    kinds never cross; and — the substring bug — an agent id of `a1` does not hold a record merely
+    because `a1` occurs inside a sha, a path or a free-text reason).
+  - **`Mainguard.Server.Tests/AuditPersistenceBootTests.cs`** (B1/B3) — the daemon must not come up
+    looking healthy while its audit trail goes nowhere. Drives `GatewayServiceRegistration.
+    RegisterAuditLog` directly over a real migrated SQLite DB: a key ring whose master key this
+    process cannot decrypt makes the boot THROW `AuditPersistenceUnavailableException` (message
+    naming the remedy, ERROR logged, and nothing registered — a half-wired fallback is the thing
+    being refused) while a protected ring registers the chained log and logs the posture line; a
+    missing daemon DB still falls back but reports at ERROR; the posture-vs-store classification is
+    pinned per exception type. Plus the read-only verify CLI: it creates no key ring on a box that
+    never ran the daemon (exit 0), exits 1 rather than "OK" when records exist but the master key is
+    gone, and still verifies a real chain.
   - **`Mainguard.Server.Tests/AuditReadBoundTests.cs`** (F64a) — `ReadAudit` over a stub chain of fat
     records: the page stops at the byte budget and fits under gRPC's 4 MB default, is a contiguous
     prefix so the walk resumes, still returns a single oversized record, and leaves small pages alone.
@@ -464,6 +488,21 @@
   `mainguardPassphraseEncryptedKey` in the key XML, a missing/wrong passphrase reading as `Unreadable`
   rather than absent, and the unprotected-write refusal matrix — end-to-end only where a protector can
   actually be absent, i.e. not Windows/macOS, via `RequiresUnprotectedPlatformFact`),
+  `SecureKeyringMigrationTests` (**B2**: what happens to a key ring that already EXISTS when the
+  protector arrives — a plaintext ring is re-wrapped in place when a passphrase appears, same key id,
+  and every secret still reads back; an already-protected ring is byte-for-byte untouched; an
+  unprotected one REPORTS its plaintext keys instead of passing silently; a still-plaintext ring
+  refuses the audit master key even under a configured protector; a passphrase-wrapped ring opened
+  without the passphrase refuses it too, rather than letting DataProtection mint a fresh unprotected
+  default key behind the operator's back; the `MAINGUARD_KEYRING_PASSPHRASE_FILE` source round-trips
+  with the env form, trailing newline and all; and `AuditCrypto.TryOpenExisting` writes nothing.
+  These run on every platform via `SecureKeyring`'s internal protection-override seam — the
+  unprotected posture is reachable end to end only on Linux/WSL, which is why its consequences went
+  unnoticed),
+  `KeyringTestPosture` (both test assemblies) — a `[ModuleInitializer]` that gives the test process a
+  key-ring passphrase when the machine would otherwise resolve to `KeyringProtection.None`, so the
+  suite exercises the same protected path everywhere it runs. Deliberately here and not in `ci.yml`:
+  an environment variable in CI would hide the product defect rather than state a posture,
   `CredentialResolverTests` (T-14 SSH-vs-token credential selection),
   `AccountsViewModelTests` (T-14 known-host catalog + PAT store/remove + add-custom-host),
   `SignatureStatusParserTests` (T-15 pure: the `%G?` code table + batched-log parse incl.

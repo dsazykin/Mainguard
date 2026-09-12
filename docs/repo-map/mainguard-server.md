@@ -1,7 +1,7 @@
 <!-- Extracted verbatim from the AGENTS.md Repository Map. Keep current: when you add, move, or delete a file, update its entry here. -->
 ### `Mainguard.Server/` (P2-02 daemon — ASP.NET Core gRPC host)
 
-- **`Program.cs`** — thin entry point: parses `DaemonOptions`, runs the `--local-dev --smoke` self-probe or the daemon (`app.Run()`), maps a bind failure to a typed `DaemonStartupException`. `public partial class Program {}` so `WebApplicationFactory<Program>` can host it in-proc.
+- **`Program.cs`** — thin entry point: parses `DaemonOptions`, runs the `--local-dev --smoke` self-probe or the daemon (`app.Run()`), maps a bind failure to a typed `DaemonStartupException`, and prints + exits 78 (`EX_CONFIG`) on `AuditPersistenceUnavailableException` (B1: the audit chain cannot be opened safely, so the daemon refuses to start rather than run with an in-memory journal that looks healthy). `public partial class Program {}` so `WebApplicationFactory<Program>` can host it in-proc.
 - **`DaemonHost.cs`** — the shared host configuration (services, interceptors, gRPC service map,
   loopback-only Kestrel bind, silent logging) used by both the entry point and the in-proc tests;
   registers the durable `IKillJournal` (`JsonKillJournal` at `ResolveKillJournalPath`, beside the
@@ -31,7 +31,20 @@
   `SecureKeyring` rooted beside it, constructed EAGERLY so a store problem lands in migration.log;
   `InMemoryAuditLog` fallback otherwise, with the will-not-survive-restart loss logged out loud
   (note: the in-proc test tier's hosts share one run-scoped daemon DB, so Server.Tests audit
-  assertions are repo/agent-scoped, and the chain itself re-reads its head per append); **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
+  assertions are repo/agent-scoped, and the chain itself re-reads its head per append).
+  **B1 — a key-ring posture failure is FATAL, not a fallback.** The catch-all used to swallow
+  `SecureKeyring`'s refusal to store the audit master key, so a fresh Linux/WSL box bound its port,
+  served every RPC, answered `VerifyAudit` with `persistent=false` and lost every audit event at
+  shutdown — the exact "carries on looking healthy" failure the fail-closed keyring was written to
+  remove, one layer up, and the reason the MainguardOS startup smoke passed. `IsKeyringPosture`
+  (`UnprotectedKeyringException` / `KeyringUnreadableException` /
+  `KeyringProtectorUnavailableException`) now rethrows as `AuditPersistenceUnavailableException` and
+  the daemon refuses to boot; `Program.cs` prints it and exits **78** (`EX_CONFIG`) rather than
+  crashing with a stack trace. The DB-unavailable fallback stays — there the alternative is no daemon
+  at all — but it is logged through a new `logError` delegate at ERROR, alongside the key-ring posture
+  line (`SecureKeyring.DescribeProtection()`) which is now logged at every boot. `RegisterAuditLog` and
+  `IsKeyringPosture` are `internal` so `AuditPersistenceBootTests` drives the whole decision without a
+  host; **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
   (`IPullRequestService`→`PullRequestService`, `IPrIntakeStore`→`DbPrIntakeStore`/in-memory fallback,
   `IPrHeadFetcher`→`PrHeadFetcher` over the substrate worktree path,
   **`IPrWorkerHost`→`Runtime/ExternalPrWorkerHost` (the spawn seam, sharing the merge queue's
@@ -68,7 +81,14 @@
     an open lease's `LeaseId` or `AgentId` (never its `RepoHash` — that would stop retention for a
     whole repository the moment one merge began). Held records are deferred, not exempt: the sweep
     after the lease confirms expires them, and the held count is logged so a lease stuck open is
-    visible. `Sweep`, `LeaseReferences` and `IsHeldByOpenLease` are `internal` so
+    visible. **The hold predicate matches PARSED identity fields, not envelope text:** it used to be
+    `payloadJson.Contains(reference)` over the whole envelope, which is a substring search rather than
+    a statement about leases — agent ids as short as `a1` or `pr-42` are valid and `a1` occurs in
+    roughly every other hex sha, so while one such lease was open nearly every expired record read as
+    "held" and retention quietly stopped. `IsHeldByOpenLease` now parses the payload and compares the
+    `agent`/`agent_id`/`worker`/`worker_id` fields against agent ids and `lease`/`lease_id` against
+    lease ids (both spellings because both are in the store), with the two id kinds kept apart in a
+    `LeaseReferences` record. `Sweep`, `References` and `IsHeldByOpenLease` are `internal` so
     `AuditRetentionLeaseTests` pins the behaviour without a 24 h wait.
   - **`Runtime/AuditAnchorService.cs`** (P2-15, F64c) — hourly best-effort RFC 3161 sweep: heads queue
     by the `AuditAnchorQueue` policy (1000 records / 24 h) regardless, but nothing is SENT unless
@@ -93,6 +113,13 @@
     is active" posture the merge-reconcile takes.
 - **`Gateway/GatewayBindPolicy.cs`** (**MG-13/MG-4**) — the pure bind-address rule for the model-gateway listener: loopback and private ranges are permitted; a wildcard bind and any public address are refused. `TryResolvePrivateHostAddress()` is the **default** bind since MG-4 turned the gateway on: a private, non-loopback IPv4 on an interface that is up, chosen deterministically so the address written into every confined jail is stable across restarts. Loopback is excluded as a default precisely because it binds cleanly and confines nothing — inside a container `127.0.0.1` is the container. It picks an address; whether a jail can REACH it is measured per spawn by `IEgressPolicy.CanProxyReachAsync`. The gateway fronts the user's provider key, so a listener that answers off-box is a credential-exposure surface rather than a convenience. Pure, so every case runs without a host.
 - **`Gateway/GatewayConfinementOptions.cs`** — `GatewayConfinementOptions` (the spawn path's answer to "is there a gateway to point this jail at, and where"; `Disabled` is the default and means the provider key goes into the jail exactly as before), `ModelHosts` (the model-API hosts, derived from `EgressAllowlist.DefaultEntries` so the allowlist and the gateway cannot drift), and `NullAgentPortMap` (Mainguard runs one gateway listener, so attribution comes from the agent token; this returns null rather than guessing an agent).
+- **`AuditPersistenceUnavailableException.cs`** (B1) — the typed boot refusal: the audit chain cannot
+  be opened without losing its tamper-evidence guarantees (no at-rest key-ring protector and no
+  explicit opt-in, a tampered/foreign ring, or a ring wrapped under a protector this process cannot
+  use). Its message carries the inner exception's named remedies, because the operator reading it is
+  looking at a daemon that did not start. Deliberately NOT survivable by the in-memory journal — see
+  the `RegisterAuditLog` note above for why that fallback is legitimate for a DB failure and not for
+  this one.
 - **`DaemonOptions.cs`** / **`DaemonStartupException.cs`** — parsed launch options (`--local-dev`/`--smoke`/`--port`, loopback-only by construction; `DataPath` overrides the P2-08 daemon SQLite path for test isolation; **`--gateway-bind`/`--gateway-port` control the model gateway, which is now ON BY DEFAULT (MG-4 item 3). It was previously settable only through `MAINGUARD_GATEWAY_BIND`, which nothing in the repo ever set, so in every supported deployment a BYOK jail received the raw provider key. `ResolveBindAddress` maps unset/`auto` → a private host address, `off` → disabled (the old posture), and an explicit address straight through to `GatewayBindPolicy`**) and the typed startup failure naming the port.
 - **`Auth/SessionTokenFile.cs`** — generates a 256-bit session token (`RandomNumberGenerator.GetBytes(32)`) written user-only-readable (Linux `~/.mainguard/daemon.token` mode 0600; Windows `%LocalAppData%\Mainguard\daemon.token` current-user ACL); prints nothing (G-13). Path via `Core.Daemon.DaemonPaths`.
 - **`Auth/SessionTransportCertificates.cs`** (MG-19) — the control plane's **peer-authentication**
@@ -846,7 +873,13 @@
     chain + mirror via `ChainedAuditLog` and validates stored RFC 3161 anchor tokens structurally
     (an anchor that no longer matches its recorded head hash exits 2 like chain tamper), prints
     head seq/hash; exit contract 0 intact (missing store / pre-chain DB = intact by definition) /
-    2 tampered with first-bad-seq printed / 64 usage / 1 cannot-verify.
+    2 tampered with first-bad-seq printed / 64 usage / 1 cannot-verify. **B3 — it is a READER again:**
+    it built an `AuditCrypto`, whose constructor mints and STORES a master key when there is none, so
+    on a box with no key-ring protector `audit verify` exited 1 with "Refusing to store
+    'audit-payload-key'…" where it previously reported an intact empty chain, and everywhere else it
+    left a key nobody asked for. It now uses `AuditCrypto.TryOpenExisting`, does not even create the
+    key-ring directory, and distinguishes "no key and no records" (0, intact by definition) from "no
+    key but records exist" (1, cannot verify — never reported as OK).
   - **`Runtime/SandboxKillTarget.cs`** (MG-8) — the `IKillTarget` that actually **stops work**, in
     three ordered steps: sever terminal input (`TerminalLockRegistry` + `SessionLeader.PauseInput` —
     in-proc and I/O-free, so they run BEFORE any Docker round-trip and an unreachable engine can never
