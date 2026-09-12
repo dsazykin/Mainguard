@@ -2276,7 +2276,11 @@
   **`JailReaperTests` (2026-09-04 — the reaper over the real composition root: a jail whose fake CLI is
   bound survives a day of sweeps; once the CLI is released the allowance runs and at 29 min it is kept, at
   31 min the session is gone, the engine was asked to remove the container, and `jail_reaped` is audited
-  with the cause. The policy's own table lives in `Mainguard.Tests/JailReapPolicyTests`),**
+  with the cause — scoped to that agent id, since the audit log is db-backed under the suite's shared data
+  root and every other reap in the assembly lands in the same table. **B1** adds the adoption plumbing at
+  this tier: an adopted jail with no queue entry is STILL reaped at the allowance (the mark is not a
+  blanket reprieve), and the mark is cleared by the first sweep that sees a bound CLI. The policy's own
+  table lives in `Mainguard.Tests/JailReapPolicyTests`),**
   **`StopAllAgentsOnExitTests` (2026-09-04 — the exit leg: `ControlCenterViewModel.StopAllAgentsAsync`
   ends every live mock agent and leaves the records (branches stay until teardown), honours an exhausted
   budget between agents, and the manifest's surface is the one `ProductionShutdownEnvironment` reaches —
