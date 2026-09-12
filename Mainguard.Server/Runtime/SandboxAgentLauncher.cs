@@ -911,7 +911,8 @@ public sealed class SandboxAgentLauncher
             }
 
             var carried = CarryCredentialContent(
-                file.HomeRelativePath, file.Content, "restore", adapter.Id, log);
+                file.HomeRelativePath, file.Content, "restore", adapter.Id, log,
+                reportWhatWasFiltered: false);
 
             if (carried is { Length: > 0 })
             {
@@ -951,8 +952,14 @@ public sealed class SandboxAgentLauncher
     /// AFTER the mount scrub, because the scrub is the one that can refuse the file outright.</para>
     /// </summary>
     /// <param name="leg">"harvest" or "restore" — log text only.</param>
+    /// <param name="reportWhatWasFiltered">Whether to log the two "this file changed" lines. True on the
+    /// harvest, where each one describes something a jail just did and fires once per stop. False on the
+    /// restore, where the same file is filtered again on EVERY spawn for as long as the stored blob keeps
+    /// its program definitions — one line per spawn, forever, saying what the harvest line already said.
+    /// A refusal is logged on both legs regardless: that one means a file did not travel.</param>
     private static byte[]? CarryCredentialContent(
-        string homeRelativePath, byte[] content, string leg, string agentKind, ILogger? log)
+        string homeRelativePath, byte[] content, string leg, string agentKind, ILogger? log,
+        bool reportWhatWasFiltered)
     {
         var carried = content;
 
@@ -972,7 +979,7 @@ public sealed class SandboxAgentLauncher
                 return null;
             }
 
-            if (!ReferenceEquals(scrubbed, carried))
+            if (reportWhatWasFiltered && !ReferenceEquals(scrubbed, carried))
             {
                 log?.LogInformation(
                     "cli credential {Leg} scrubbed a role-scoped grant for {Mount}: kind={Kind} path={Path}",
@@ -994,13 +1001,15 @@ public sealed class SandboxAgentLauncher
             return null;
         }
 
-        if (!ReferenceEquals(stripped, carried))
+        if (reportWhatWasFiltered && !ReferenceEquals(stripped, carried))
         {
             log?.LogInformation(
                 "cli credential {Leg} stripped executable configuration: kind={Kind} path={Path}",
                 leg, agentKind, homeRelativePath);
         }
 
+        // Reported on BOTH legs, deliberately: a vendor's new executable key can reach an install through
+        // a stored blob just as well as through a jail, and the file it arrives in is the same file.
         if (AdapterCredentialPolicy.ReportsUnreviewedKeys(homeRelativePath))
         {
             LogUnreviewedCredentialKeys(log, leg, homeRelativePath, unreviewed);
@@ -1547,7 +1556,8 @@ public sealed class SandboxAgentLauncher
                 // The same filter the restore leg runs, from the same function: the mount scrub where the
                 // file is settings-shaped, then the executable-config strip on everything. A rule applied
                 // on only one leg holds only for an install with no history.
-                var filtered = CarryCredentialContent(relative, content, "harvest", agentKind, _log);
+                var filtered = CarryCredentialContent(
+                    relative, content, "harvest", agentKind, _log, reportWhatWasFiltered: true);
                 if (filtered is null)
                 {
                     continue;

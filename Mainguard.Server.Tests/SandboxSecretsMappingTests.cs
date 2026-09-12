@@ -248,6 +248,46 @@ public sealed class SandboxSecretsMappingTests
         Assert.Empty(log.Lines);
     }
 
+    /// <summary>
+    /// <b>The line has to be worth reading.</b> opencode's <c>auth.json</c> is keyed by PROVIDER ID, so
+    /// every one of its top-level keys is "unreviewed" by construction — the daemon logged the owner's
+    /// perfectly ordinary provider list on every harvest AND every restore, which is how a security
+    /// signal becomes a line people scroll past. The file is filtered exactly as before; only the report
+    /// is quiet, and only for the files that have no inventory to be unreviewed against.
+    /// </summary>
+    [Fact]
+    public void FilterCliCredentials_SaysNothingAboutAProviderKeyedAuthFile()
+    {
+        const string Path = ".local/share/opencode/auth.json";
+        var log = new RecordingLogger();
+
+        var kept = SandboxAgentLauncher.FilterCliCredentials(
+            new[] { File(Path, """{"anthropic":{"type":"oauth","refresh":"rt"},"openai":{"type":"api"}}""") },
+            MarkerWithCredentialPaths(Path),
+            log);
+
+        Assert.Empty(log.Lines);
+        // The negative control: it is quiet because the report was not asked for, not because the file
+        // was dropped on the floor.
+        Assert.Contains("anthropic", Encoding.UTF8.GetString(Assert.Single(kept!).Content), StringComparison.Ordinal);
+    }
+
+    /// <summary>codex's <c>.codex/auth.json</c> shares the file NAME and not the shape: its keys are a
+    /// fixed schema that IS inventoried, so it keeps the report. A name-only match would have silenced
+    /// the file that most deserves it.</summary>
+    [Fact]
+    public void AnInventoriedAuthFile_StillReportsItsUnreviewedKeys()
+    {
+        var log = new RecordingLogger();
+
+        SandboxAgentLauncher.FilterCliCredentials(
+            new[] { File(".codex/auth.json", """{"someFutureVendorKey":1}""") },
+            MarkerWithCredentialPaths(".codex/auth.json"),
+            log);
+
+        Assert.Contains("someFutureVendorKey", Assert.Single(log.Lines), StringComparison.Ordinal);
+    }
+
     /// <summary>Captures the rendered log line, which is what a sink would actually write.</summary>
     private sealed class RecordingLogger : ILogger
     {

@@ -329,6 +329,76 @@ public sealed class CliSettingsBoundaryTests
         Assert.Contains("owner@example.com", carried, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// <b>The same clause, for the file the audit actually named.</b> <c>.gemini/settings.json</c> and
+    /// <c>.qwen/settings.json</c> are declared as CREDENTIAL paths, and they were routed to the mount
+    /// scrub alone — which removes strings naming Mainguard's own IPC mount and nothing else. But
+    /// <c>~/.gemini/settings.json</c> is exactly where gemini-cli defines <c>mcpServers</c>: an agent in
+    /// an attended gemini jail writes one, the harvest keeps it, and it is restored into every later
+    /// Managed worker of that repository — a jail whose terminal is daemon-locked, with nobody watching
+    /// the program it launches. The Critical this PR closes, still live for two of the three files.
+    ///
+    /// <para>The mirror of <see cref="StoppingAnAttendedJail_HarvestsTheLogin_WithoutTheProgramsTheJailNamed"/>,
+    /// on a settings-shaped path, and it asserts the reason the claude-shaped ALLOWLIST could not simply
+    /// be pointed at these files: <c>selectedAuthType</c> — the key that says which login the user chose —
+    /// survives. Closing the hole must not cost the sign-in.</para>
+    /// </summary>
+    [Fact]
+    public async Task StoppingAnAttendedJail_HarvestsASettingsShapedCredential_WithoutTheProgramsItNamed()
+    {
+        const string WithMcpServers = """
+            {
+              "selectedAuthType": "oauth-personal",
+              "theme": "Default",
+              "mcpServers": { "grabber": { "command": "/tmp/grab", "args": ["--all"] } }
+            }
+            """;
+        using var rig = SettingsRig.Create(inJailCredentials: new[]
+        {
+            (DeclaredSettingsShapedCredentialPath, Encoding.UTF8.GetBytes(WithMcpServers)),
+        });
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Coordinator, CancellationToken.None);
+
+        var result = await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        var file = Assert.Single(
+            result.CliCredentials, f => f.HomeRelativePath == DeclaredSettingsShapedCredentialPath);
+        var carried = Encoding.UTF8.GetString(file.Content);
+        Assert.DoesNotContain("mcpServers", carried, StringComparison.Ordinal);
+        Assert.DoesNotContain("/tmp/grab", carried, StringComparison.Ordinal);
+        // The negative control, and the reason CarryOnly is not used here: the login survives.
+        Assert.Contains("oauth-personal", carried, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the other leg, which is the half that needs no migration: a settings-shaped credential already
+    /// sitting in the owner's keychain from before this existed is filtered on its way INTO a jail, so an
+    /// install that has one is repaired by the next spawn rather than by the next attended stop.
+    /// </summary>
+    [Fact]
+    public async Task AStoredSettingsShapedCredentialNamingAProgram_NeverReachesAJail()
+    {
+        const string Stored = """
+            { "selectedAuthType": "oauth-personal", "mcpServers": { "grabber": { "command": "/tmp/grab" } } }
+            """;
+        using var rig = SettingsRig.Create();
+
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: string.Empty, CancellationToken.None,
+            cliCredentials: new[]
+            {
+                new SandboxCredentialFile(
+                    DeclaredSettingsShapedCredentialPath, Encoding.UTF8.GetBytes(Stored)),
+            });
+
+        var delivered = Assert.Single(rig.Engine.LastSpawn!.Secrets.CliCredentialFiles!);
+        var text = Encoding.UTF8.GetString(delivered.Content);
+        Assert.DoesNotContain("mcpServers", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("/tmp/grab", text, StringComparison.Ordinal);
+        Assert.Contains("oauth-personal", text, StringComparison.Ordinal);
+    }
+
     private static IReadOnlyList<(string Relative, byte[] Content)> OneLogin(string content) =>
         new[] { (DeclaredCredentialPath, Encoding.UTF8.GetBytes(content)) };
 
@@ -378,6 +448,61 @@ public sealed class CliSettingsBoundaryTests
 
         Assert.True(keys.HasAnythingFor(RepoHandle, AgentKind));
         Assert.Equal("sk-provider-key", keys.TryGet(RepoHandle, AgentKind));
+    }
+
+    /// <summary>
+    /// <b>The same non-eviction across KINDS, which the test above cannot see</b> — it runs a coordinator
+    /// and a worker of one and the same kind, and that is precisely the case where "no session of this
+    /// kind survives" and "nothing can spawn this kind again" coincide.
+    ///
+    /// <para>They come apart in the flow people actually run: a coordinator spawns workers of whatever
+    /// kind its shim names, so a live claude-code coordinator keeps spawning codex workers long after the
+    /// user's own codex session is gone — and the daemon's cache is the only place a shim-spawned worker
+    /// can get a key, because no client is in that loop. Dropping it here is dropping something still in
+    /// use. Asserted on the cache; <c>CoordinatorSpawnKindTests</c> carries the end-to-end half, where the
+    /// worker's jail really receives the key.</para>
+    /// </summary>
+    [Fact]
+    public async Task StoppingTheLastSessionOfOneKind_KeepsIt_WhileACoordinatorOfAnotherKindIsLive()
+    {
+        const string OtherKind = "other-cli";
+        using var rig = SettingsRig.Create();
+        var keys = rig.Host.Services.GetRequiredService<SessionKeyCache>();
+
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: "sk-coordinator",
+            role: AgentRoles.Coordinator, CancellationToken.None);
+        var otherKind = await rig.Spawns.SpawnAsync(
+            RepoHandle, OtherKind, modelApiKey: "sk-other-kind",
+            role: string.Empty, CancellationToken.None);
+
+        await rig.Spawns.StopAsync(otherKind, CancellationToken.None);
+
+        Assert.Equal("sk-other-kind", keys.TryGet(RepoHandle, OtherKind));
+    }
+
+    /// <summary>
+    /// And the per-kind eviction is still a real branch rather than one the guard above disabled: with no
+    /// coordinator in the repository, only a client spawn can ask for a kind again — and a client spawn
+    /// brings its own credentials from the host keychain — so the daemon's copy goes with that kind's last
+    /// session, while a sibling of a DIFFERENT kind keeps its own.
+    /// </summary>
+    [Fact]
+    public async Task WithNoCoordinatorLeft_StoppingTheLastSessionOfAKind_DropsOnlyThatKind()
+    {
+        const string OtherKind = "other-cli";
+        using var rig = SettingsRig.Create();
+        var keys = rig.Host.Services.GetRequiredService<SessionKeyCache>();
+
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: "sk-survivor", role: string.Empty, CancellationToken.None);
+        var otherKind = await rig.Spawns.SpawnAsync(
+            RepoHandle, OtherKind, modelApiKey: "sk-other-kind", role: string.Empty, CancellationToken.None);
+
+        await rig.Spawns.StopAsync(otherKind, CancellationToken.None);
+
+        Assert.False(keys.HasAnythingFor(RepoHandle, OtherKind));
+        Assert.Equal("sk-survivor", keys.TryGet(RepoHandle, AgentKind));
     }
 
     // ---- gate 3: ROLE — one role's tool grant never reaches another role's jail (D5b) ----------
