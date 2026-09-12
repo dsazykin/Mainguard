@@ -1978,7 +1978,16 @@
   `ContainerSpecBuilder.InspectPosture` (a jail the builder just made shows no drift; a raised ceiling
   is a RETIGHTEN not a recreate, so an operator moving a slider does not kill live sessions; a
   pre-MG-26 jail with no CPU cap is caught; every hardening control missing is a recreate; an
-  unreadable `HostConfig` reports no drift).
+  unreadable `HostConfig` reports no drift). The last block drives the **shipped Docker half** —
+  `DockerSandboxEngine.RetightenCeilingAsync` / `InspectPostureAsync` against a `MobyShapedContainers`
+  fake that models the one engine rule that matters: moby refuses a memory update whose new ceiling
+  exceeds the memory+swap total the request carries, and an absent `MemorySwap` means "the total the
+  container already has". That is what made a Memory-only RAISE a permanent 409 — the Settings page
+  reading 8 GiB while the jail stayed at 2 GiB — so the raise test fails outright if the pair is ever
+  broken up again, the lowering test catches the leftover swap headroom, and a separate test proves the
+  fake really refuses the broken shape rather than accepting anything. The two best-effort catches are
+  pinned as REPORTED, not swallowed: a refused ceiling update and an unanswerable posture inspect each
+  leave a line naming the jail.
   **`SandboxDefenceInDepthTests.cs`** — audit F33, the controls that had drifted into decoration. A
   bind source that symlinks OUT of a daemon-owned root is refused (docker binds what a path resolves
   to, not what it spells) while a source under a symlinked ROOT is still contained (the macOS

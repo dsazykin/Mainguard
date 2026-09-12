@@ -997,7 +997,23 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       filename: the union is `SandboxAgentLauncher.DeclaredWorkspaceIgnorePaths`. The instructions half
       was found in production — `git check-ignore CLAUDE.md` answered rc=1 in a live worker jail and the
       worker's own report flagged the stray `?? CLAUDE.md`. The exclude file lives in the per-agent repo
-      the daemon deletes at teardown, so nothing tracked is touched and no state outlives the agent) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
+      the daemon deletes at teardown, so nothing tracked is touched and no state outlives the agent.
+      **Audit F28 — `InspectPostureAsync` + `RetightenCeilingAsync`,** the two questions the reuse path
+      never asked: does this jail still carry today's hardening set, and today's ceiling?
+      `ContainerSpecBuilder.InspectPosture` splits the answer — hardening is fixed at create and joins
+      the recreate set, a ceiling is writable on a live cgroup and is re-applied in place, because an
+      operator moving a slider must not kill every running session. **The update sends `Memory` and
+      `MemorySwap` as the pair they are:** moby validates a memory update against the memory+swap total
+      the request carries and falls back to the container's existing one, so a Memory-only raise past
+      2x the created ceiling was rejected 409 on every reuse — the Settings page reading 8 GiB and the
+      jail sitting at 2 GiB indefinitely — while a lowering "worked" and left the old swap headroom
+      behind. `ContainerSpecBuilder` therefore states `MemorySwap` explicitly at create (the same
+      `Memory * 2` moby would have filled in, so no jail's posture moves) and `InspectPosture` compares
+      it. Both best-effort paths take the engine's `log` sink rather than swallowing: a refused ceiling
+      update, and an inspect that could not answer, each say so with the jail named — a tolerated
+      failure with no diagnostic is the "reads as applied while measuring nothing" shape this whole
+      lane is about. The daemon wires that sink from `DaemonHost` through
+      `AgentEnvironmentFactory`/`AgentEnvironmentComposition`) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
       the `mainguard-egress-proxy` container (image `DefaultImageRef` — the ref the v1 spawn preflight
       probes); renders + pushes the allowlist config; a `gatewayUpstream` ctor arg pushes the P2-08
       model-host fronting, and an `installedAdapterHosts` provider unions each installed CLI's declared
@@ -1042,9 +1058,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       ten-minute grace, since a spawn creates the segment before the jail. `SandboxSegmentReaper.SweepAsync`
       gathers the facts — networks, then ALL containers, then a per-candidate inspect because the network
       LIST does not populate `Containers` — fails closed if either list is unavailable, and swallows
-      per-network failures so one bad network never stops the sweep. **Not yet wired:** the daemon-side
-      caller belongs in `Mainguard.Server/Runtime/JailReaperHostedService` (one `SweepAsync` per sweep,
-      or once at boot); refusals are pinned in `Mainguard.Tests/SandboxResidueReapingTests.cs`.
+      per-network failures so one bad network never stops the sweep. **Not wired from this file's own
+      branch — `fix/audit-w3a-restart-survival` (PR #369) owns the wiring and the launcher's rollback
+      release**, and imports this file byte-identical: the daemon-side caller is one `SweepAsync` per
+      sweep in `Mainguard.Server/Runtime/JailReaperHostedService`, and the grant at
+      `SandboxAgentLauncher.cs:347` gets its matching `RemoveAgentSegmentAsync` on the rollback path
+      there. Splitting it that way keeps both branches off a three-way conflict in the launcher.
+      Refusals are pinned in `Mainguard.Tests/SandboxResidueReapingTests.cs`.
       **MG-27:** the proxy's image ref is resolved to
       its content digest and both compared and created against that).
     - `EgressBlockDetector.cs` (pure: a CLI's failure output → the egress host the default-deny proxy
