@@ -196,8 +196,12 @@ public sealed class GatewayForwarder
 
                 sniffer.Complete();
                 var (tokens, model) = sniffer.Result;
-                _gateway.Settle(lease, tokens ?? estimate, model);
+
+                // Flipped BEFORE the settle, not after: the discharge is one-shot. Now that the finally
+                // settles rather than abandons, a settle that threw half-way would otherwise be retried
+                // there and charge the agent twice for one request.
                 settled = true;
+                _gateway.Settle(lease, tokens ?? estimate, model);
                 _gateway.ClearRateLimit(agentId);                   // resumes PTY input, marks Running
                 return response;
             }
