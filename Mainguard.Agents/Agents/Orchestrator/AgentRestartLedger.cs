@@ -435,11 +435,13 @@ public static class AgentRestartLedger
     /// <summary>
     /// Replaces the process ledger. <b>For test isolation only</b> — the daemon never calls this.
     ///
-    /// <para>Both test assemblies install an <see cref="InMemoryAgentRestartLedger"/> from their module
+    /// <para>Both test assemblies install <see cref="NullAgentRestartLedger"/> from their module
     /// initializer, next to the data-root redirect and for the same reason: a single JSON file shared by
-    /// every test in an assembly running in parallel would couple them through agent ids, and a test that
-    /// wants durability constructs its own <see cref="JsonAgentRestartLedger"/> over its own temp file —
-    /// which is also the honest shape for a restart test, since it is two stores over one path.</para>
+    /// every test in an assembly running in parallel would couple them through agent ids. <b>Forgetting,
+    /// not remembering-in-memory</b> — see <see cref="NullAgentRestartLedger"/> for the difference, which
+    /// was measured rather than assumed. A test that wants durability constructs its own
+    /// <see cref="JsonAgentRestartLedger"/> over its own temp file, which is also the honest shape for a
+    /// restart test, since a restart is two stores over one path.</para>
     /// </summary>
     public static void UseForTests(IAgentRestartLedger ledger)
     {
