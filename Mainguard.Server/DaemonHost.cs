@@ -721,7 +721,23 @@ public static class DaemonHost
         var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger(DaemonLogCategories.Lifecycle);
         var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
         lifetime.ApplicationStarted.Register(() =>
-            logger.LogInformation("bound 127.0.0.1:{Port} — daemon ready", options.Port));
+        {
+            logger.LogInformation("bound 127.0.0.1:{Port} — daemon ready", options.Port);
+
+            // Audit B1: the gateway being absent is normally a posture. Absent because the bind
+            // AUTO-RESOLVED TO NOTHING is a defect that quietly downgrades every BYOK spawn to "raw
+            // provider key in the jail" — the exact way a resolver bug (docker0 excluded for being
+            // carrier-down on an idle bridge) shipped as a fleet-wide credential leak. Said once, at
+            // boot, so it is visible before the first agent is spawned rather than only per spawn.
+            if (options.GatewayDisabledUnintentionally)
+            {
+                logger.LogError(
+                    "model gateway DISABLED: no bind address could be resolved on this host and none was "
+                    + "configured. Every BYOK agent spawned here receives the raw provider API key inside "
+                    + "its jail and its model spend is not metered. Set MAINGUARD_GATEWAY_BIND (or "
+                    + "--gateway-bind) to the Docker bridge address, or to 'off' to accept this posture.");
+            }
+        });
         lifetime.ApplicationStopping.Register(() =>
             logger.LogInformation("shutdown requested — draining"));
         lifetime.ApplicationStopped.Register(() =>

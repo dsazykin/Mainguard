@@ -127,10 +127,183 @@ public class GatewayStreamingMeteringTests
         var (gateway, _) = BuildGateway();
 
         // Raising your own estimate is harmless and occasionally honest — that direction still works.
-        var result = await ForwardAsync(gateway, "{\"ok\":true}", "application/json", estimate: "5000");
+        var result = await ForwardAsync(gateway, "{\"ok\":true}", "application/json", estimate: "3000");
 
         Assert.Equal(200, result.StatusCode);
-        Assert.Equal(5000, gateway.GetSnapshot().Agents.Single().Tokens);
+        Assert.Equal(3000, gateway.GetSnapshot().Agents.Single().Tokens);
+    }
+
+    /// <summary>
+    /// Audit follow-up — the raise-only header is not harmless without a ceiling. The reservation is
+    /// taken from the SHARED per-minute token bucket and <c>TokenBucket.Clamp</c> clamps a request to the
+    /// whole capacity, so one jail sending <c>x-mainguard-token-estimate: 60000</c> drained the bucket
+    /// and stalled every other agent behind the FIFO queue — a denial of service costing one header.
+    /// </summary>
+    [Fact]
+    public async Task ClientEstimate_CannotRaiseWithoutLimit()
+    {
+        var (gateway, _) = BuildGateway();
+        var result = await ForwardAsync(gateway, "{\"ok\":true}", "application/json", estimate: "60000");
+
+        Assert.Equal(200, result.StatusCode);
+
+        // Capped at 4× the gateway's own default (1000), not the 60000 the jail asked for.
+        Assert.Equal(4000, gateway.GetSnapshot().Agents.Single().Tokens);
+        Assert.Equal(4000, GatewayForwarder.MaxEstimateRaiseFor(1000));
+    }
+
+    /// <summary>
+    /// Gemini's dialect: a top-level <c>usageMetadata</c> repeated per chunk as a running total, and
+    /// <c>modelVersion</c> instead of <c>model</c>. Unread, every confined gemini-cli agent settles at
+    /// the flat default estimate no matter what it spent.
+    /// </summary>
+    [Fact]
+    public void GeminiStream_UsageMetadata_IsParsed()
+    {
+        var body =
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}],\"modelVersion\":\"gemini-2.5-pro\","
+            + "\"usageMetadata\":{\"promptTokenCount\":900,\"candidatesTokenCount\":12,\"totalTokenCount\":912}}\n\n"
+            + "data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"modelVersion\":\"gemini-2.5-pro\","
+            + "\"usageMetadata\":{\"promptTokenCount\":900,\"candidatesTokenCount\":410,\"totalTokenCount\":1310}}\n\n";
+
+        var (tokens, model) = ModelUsageParser.Parse(body);
+
+        Assert.Equal(1310, tokens);
+        Assert.Equal("gemini-2.5-pro", model);
+    }
+
+    [Fact]
+    public void GeminiNonStreaming_UsageMetadata_IsParsed()
+    {
+        var (tokens, model) = ModelUsageParser.Parse(
+            "{\"modelVersion\":\"gemini-2.5-flash\",\"usageMetadata\":{\"promptTokenCount\":40,"
+            + "\"candidatesTokenCount\":60}}");
+
+        Assert.Equal(100, tokens);
+        Assert.Equal("gemini-2.5-flash", model);
+    }
+
+    // ---- Audit B2: an abort mid-stream is not a free completion ------------------------------------
+
+    /// <summary>
+    /// B2 — the zero-charge path. A jail runs <c>curl -N … | head -c 200</c>: the provider streams (and
+    /// bills) the completion, the jail closes its socket before <c>message_stop</c>, the copy to the
+    /// client throws on <c>RequestAborted</c> — and the old <c>finally</c> ABANDONED the lease, releasing
+    /// the reservation with no <c>SpendRecord</c> at all. Repeatable at will, and it also under-counted
+    /// every ordinary claude-code Esc. Once the upstream has committed, an exception must SETTLE.
+    /// </summary>
+    [Fact]
+    public async Task ClientAbortMidStream_SettlesWhatTheProviderAlreadyProduced()
+    {
+        var (gateway, ledger) = BuildGateway();
+        var forwarder = new GatewayForwarder(
+            gateway,
+            new HttpMessageInvoker(new ChunkedHandler(
+                new[]
+                {
+                    // Usage the provider has already reported when the client goes away.
+                    "event: message_start\n"
+                    + "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5\","
+                    + "\"usage\":{\"input_tokens\":1200,\"output_tokens\":1}}}\n\n",
+                    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n",
+                    // Never reaches the client — the socket is gone by now.
+                    "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":340}}\n\n",
+                },
+                "text/event-stream")),
+            delay: (_, _) => Task.CompletedTask);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://" + ModelHost + "/v1/messages")
+        {
+            Content = new StringContent("{}", Encoding.UTF8),
+        };
+
+        var aborting = new AbortingStream(throwOnWrite: 2);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => forwarder.ForwardAsync(
+            "agent-1", request, estimatedTokens: null,
+            relay: (_, _) => Task.FromResult<System.IO.Stream>(aborting),
+            CancellationToken.None));
+
+        // 1200 input + 1 output — what the stream had actually reported when the jail hung up. Not zero,
+        // and not the flat estimate either.
+        Assert.Equal(1201, ledger.GetTotals("agent-1").Tokens);
+    }
+
+    /// <summary>
+    /// The floor still applies to an abort: a stream cut before its first usage frame is charged the
+    /// reservation, never nothing.
+    /// </summary>
+    [Fact]
+    public async Task ClientAbortBeforeAnyUsageFrame_StillChargesTheReservation()
+    {
+        var (gateway, ledger) = BuildGateway();
+        var forwarder = new GatewayForwarder(
+            gateway,
+            new HttpMessageInvoker(new ChunkedHandler(
+                new[] { "event: ping\ndata: {\"type\":\"ping\"}\n\n", "event: ping\ndata: {}\n\n" },
+                "text/event-stream")),
+            delay: (_, _) => Task.CompletedTask);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://" + ModelHost + "/v1/messages")
+        {
+            Content = new StringContent("{}", Encoding.UTF8),
+        };
+
+        var aborting = new AbortingStream(throwOnWrite: 1);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => forwarder.ForwardAsync(
+            "agent-1", request, estimatedTokens: null,
+            relay: (_, _) => Task.FromResult<System.IO.Stream>(aborting),
+            CancellationToken.None));
+
+        Assert.Equal(1000, ledger.GetTotals("agent-1").Tokens);
+    }
+
+    /// <summary>
+    /// The carve-out, so "settle on the way out" does not become "charge for everything": a failure
+    /// BEFORE the upstream committed — the send itself throwing — produced nothing to bill, and still
+    /// refunds. Same for an abort while reading a 4xx/5xx, which providers do not bill.
+    /// </summary>
+    [Fact]
+    public async Task UpstreamFailure_BeforeAnyResponse_StillRefunds()
+    {
+        var (gateway, ledger) = BuildGateway();
+        var forwarder = new GatewayForwarder(
+            gateway, new HttpMessageInvoker(new ThrowingHandler()), delay: (_, _) => Task.CompletedTask);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://" + ModelHost + "/v1/messages")
+        {
+            Content = new StringContent("{}", Encoding.UTF8),
+        };
+
+        await Assert.ThrowsAsync<HttpRequestException>(() => forwarder.ForwardAsync(
+            "agent-1", request, estimatedTokens: null,
+            relay: (_, _) => Task.FromResult<System.IO.Stream>(new System.IO.MemoryStream()),
+            CancellationToken.None));
+
+        Assert.Equal(0, ledger.GetTotals("agent-1").Tokens);
+    }
+
+    [Fact]
+    public async Task AbortWhileReadingAnErrorResponse_Refunds()
+    {
+        var (gateway, ledger) = BuildGateway();
+        var forwarder = new GatewayForwarder(
+            gateway,
+            new HttpMessageInvoker(new ChunkedHandler(
+                new[] { "{\"error\":" , "\"overloaded\"}" }, "application/json", HttpStatusCode.InternalServerError)),
+            delay: (_, _) => Task.CompletedTask);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://" + ModelHost + "/v1/messages")
+        {
+            Content = new StringContent("{}", Encoding.UTF8),
+        };
+
+        var aborting = new AbortingStream(throwOnWrite: 1);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => forwarder.ForwardAsync(
+            "agent-1", request, estimatedTokens: null,
+            relay: (_, _) => Task.FromResult<System.IO.Stream>(aborting),
+            CancellationToken.None));
+
+        Assert.Equal(0, ledger.GetTotals("agent-1").Tokens);
     }
 
     [Fact]
@@ -261,5 +434,102 @@ public class GatewayStreamingMeteringTests
     private sealed class NoPortMap : IAgentPortMap
     {
         public string? AgentForPort(int port) => null;
+    }
+
+    /// <summary>An upstream that hands the body over one chunk per read, so a test can cut the client off
+    /// BETWEEN frames — the shape of the abort the forwarder has to charge for.</summary>
+    private sealed class ChunkedHandler : HttpMessageHandler
+    {
+        private readonly string[] _chunks;
+        private readonly string _contentType;
+        private readonly HttpStatusCode _status;
+
+        public ChunkedHandler(string[] chunks, string contentType, HttpStatusCode status = HttpStatusCode.OK)
+        {
+            _chunks = chunks;
+            _contentType = contentType;
+            _status = status;
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            var content = new StreamContent(new ChunkStream(_chunks));
+            content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(_contentType);
+            return Task.FromResult(new HttpResponseMessage(_status) { Content = content });
+        }
+    }
+
+    private sealed class ThrowingHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
+            Task.FromException<HttpResponseMessage>(new HttpRequestException("upstream is unreachable"));
+    }
+
+    /// <summary>A stream that yields exactly one scripted chunk per <c>Read</c>.</summary>
+    private sealed class ChunkStream : System.IO.Stream
+    {
+        private readonly Queue<byte[]> _chunks;
+
+        public ChunkStream(IEnumerable<string> chunks) =>
+            _chunks = new Queue<byte[]>(chunks.Select(c => Encoding.UTF8.GetBytes(c)));
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_chunks.Count == 0)
+            {
+                return 0;
+            }
+
+            var chunk = _chunks.Dequeue();
+            chunk.CopyTo(buffer, offset);
+            return chunk.Length;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long offset, System.IO.SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// The client's response body after the jail hangs up: Kestrel's stream throws on the write that
+    /// follows an aborted connection. <c>throwOnWrite</c> is 1-based — which write is the one that dies.
+    /// </summary>
+    private sealed class AbortingStream : System.IO.Stream
+    {
+        private readonly int _throwOnWrite;
+        private int _writes;
+
+        public AbortingStream(int throwOnWrite) => _throwOnWrite = throwOnWrite;
+
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (++_writes >= _throwOnWrite)
+            {
+                throw new OperationCanceledException("the client aborted the request");
+            }
+
+            return ValueTask.CompletedTask;
+        }
+
+        public override void Write(byte[] buffer, int offset, int count) =>
+            WriteAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, System.IO.SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
     }
 }

@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using System.Net;
 using Mainguard.Server.Gateway;
@@ -141,6 +142,122 @@ public sealed class GatewayBindPolicyTests
         Assert.Contains(resolved, bridges);
     }
 
+    // ---- Audit B1: an IDLE docker0 is still the bind address ---------------------------------------
+
+    /// <summary>
+    /// B1, the regression this suite failed to catch the first time: the resolver filtered interfaces to
+    /// <c>OperationalStatus == Up</c> before matching <c>docker0</c>.
+    ///
+    /// <para>A Linux bridge reports CARRIER, not admin state. With no port attached it is
+    /// <c>&lt;NO-CARRIER,BROADCAST,MULTICAST,UP&gt; state DOWN</c> — measured on this engine against a
+    /// freshly created, empty bridge — and .NET maps that to <c>Down</c>. Mainguard puts every container
+    /// on a user-defined network and never on the default bridge, so docker0 is idle on exactly the hosts
+    /// this resolver exists for: the filter excluded it, the resolver returned null, the gateway was
+    /// disabled, and every BYOK spawn handed the raw provider key to its jail.</para>
+    ///
+    /// <para>The status is now absent from the selector's input shape entirely, so this asserts the
+    /// property rather than a particular filter: a docker0 that holds a private IPv4 IS the answer,
+    /// whatever its carrier is doing.</para>
+    /// </summary>
+    [Fact]
+    public void IdleDockerBridge_IsStillTheBindAddress()
+    {
+        var resolved = GatewayBindPolicy.SelectDockerBridgeAddress(new[]
+        {
+            Nic("eth0", "192.168.1.20"),
+            // The idle default bridge: addressed, admin-up, carrier-down.
+            Nic("docker0", "172.17.0.1"),
+        });
+
+        Assert.Equal("172.17.0.1", resolved);
+    }
+
+    /// <summary>Only <c>docker0</c>. A per-agent segment's own <c>br-*</c> bridge is on-link from inside
+    /// that segment, so binding there would let a jail dial the gateway past its proxy.</summary>
+    [Fact]
+    public void SegmentBridges_AreNeverChosen()
+    {
+        var resolved = GatewayBindPolicy.SelectDockerBridgeAddress(new[]
+        {
+            Nic("br-1f9ce2f2f6d2", "192.168.166.1"),
+            Nic("mainguard-agent", "10.202.0.1"),
+            Nic("eth0", "10.0.5.7"),
+        });
+
+        Assert.Null(resolved);
+    }
+
+    /// <summary>A LAN address on a non-bridge interface is never the answer — F25's whole point.</summary>
+    [Fact]
+    public void WifiAddress_IsNeverChosen_EvenWhenItIsTheOnlyPrivateOne()
+    {
+        Assert.Null(GatewayBindPolicy.SelectDockerBridgeAddress(new[] { Nic("en0", "192.168.1.42") }));
+    }
+
+    /// <summary>Loopback, link-local and IPv6 on docker0 are not bindable gateway addresses; the IPv4
+    /// unicast is, and it is chosen deterministically when there are several.</summary>
+    [Fact]
+    public void DockerBridge_PicksItsPrivateIPv4_Deterministically()
+    {
+        var resolved = GatewayBindPolicy.SelectDockerBridgeAddress(new[]
+        {
+            new GatewayBindPolicy.HostInterface("docker0", new[]
+            {
+                IPAddress.Parse("fe80::1c4c:38ff:fe9a:ae18"),
+                IPAddress.Parse("169.254.7.7"),
+                IPAddress.Parse("172.18.0.1"),
+                IPAddress.Parse("172.17.0.1"),
+            }),
+        });
+
+        Assert.Equal("172.17.0.1", resolved);
+    }
+
+    /// <summary>A host with no default bridge at all still resolves to null — disabled is the correct
+    /// answer there, and it is the only case that may produce one.</summary>
+    [Fact]
+    public void NoDockerBridge_ResolvesToNull() =>
+        Assert.Null(GatewayBindPolicy.SelectDockerBridgeAddress(Array.Empty<GatewayBindPolicy.HostInterface>()));
+
+    /// <summary>
+    /// The host-level half of B1, and the one that fails on the Linux CI runner if the resolver ever
+    /// regresses: on a Linux host that HAS a docker0 holding a private IPv4, the resolver must return
+    /// that address. The two existing default-bind tests both pass when the resolver returns null, which
+    /// is exactly why the regression shipped.
+    /// </summary>
+    [Fact]
+    public void OnLinux_WithADockerBridge_TheResolverMustReturnIt()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return; // docker0 lives in the VM on Docker Desktop/OrbStack hosts; there is nothing to assert.
+        }
+
+        var bridge = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+            .Where(n => n.Name == "docker0")
+            .SelectMany(n => n.GetIPProperties().UnicastAddresses)
+            .Select(u => u.Address)
+            .Where(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            .Select(a => a.ToString())
+            .FirstOrDefault();
+
+        if (bridge is null)
+        {
+            return; // no default bridge on this host (rootless Docker, `bridge: none`) — nothing to bind.
+        }
+
+        var resolved = GatewayBindPolicy.TryResolvePrivateHostAddress();
+
+        Assert.True(
+            resolved is not null,
+            $"this host has docker0 at {bridge} and the gateway bind resolved to NOTHING. The daemon would "
+            + "disable the gateway and every BYOK spawn would inject the raw provider key into its jail.");
+        Assert.Equal(bridge, resolved);
+    }
+
+    private static GatewayBindPolicy.HostInterface Nic(string name, string address) =>
+        new(name, new[] { IPAddress.Parse(address) });
+
     /// <summary>
     /// F25 — the bind address and the address a CONTAINER dials are the same string except for
     /// loopback, and loopback is the case that matters: a jail's <c>NO_PROXY</c> covers
@@ -198,6 +315,32 @@ public sealed class GatewayBindPolicyTests
         => Assert.Equal(
             GatewayBindPolicy.TryResolvePrivateHostAddress(),
             DaemonOptions.ResolveBindAddress(configured));
+
+    /// <summary>
+    /// B1's second half: "no gateway" has two causes with the same consequence (the raw provider key in
+    /// every BYOK jail) and very different meanings. An operator who wrote <c>off</c> chose it; a bind
+    /// that auto-resolved to nothing is a defect, and the daemon says so at error level at boot and per
+    /// spawn. They must not be conflated.
+    /// </summary>
+    [Fact]
+    public void GatewayOff_IsDistinguishedFromABindThatResolvedToNothing()
+    {
+        var chosen = new DaemonOptions
+        {
+            GatewayBindConfigured = "off",
+            GatewayBindAddress = DaemonOptions.ResolveBindAddress("off"),
+        };
+        Assert.Null(chosen.GatewayBindAddress);
+        Assert.False(chosen.GatewayDisabledUnintentionally);
+
+        // Nobody asked for this one — it is what a resolver that finds nothing produces.
+        var unresolved = new DaemonOptions { GatewayBindConfigured = null, GatewayBindAddress = null };
+        Assert.True(unresolved.GatewayDisabledUnintentionally);
+
+        // And a daemon that DID bind one is never "unintentionally disabled".
+        var bound = new DaemonOptions { GatewayBindConfigured = null, GatewayBindAddress = "172.17.0.1" };
+        Assert.False(bound.GatewayDisabledUnintentionally);
+    }
 
     /// <summary>
     /// An impermissible EXPLICIT address must still reach the policy and fail startup loudly — the

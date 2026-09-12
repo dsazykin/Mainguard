@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 
@@ -176,11 +177,9 @@ internal static class GatewayBindPolicy
     {
         try
         {
-            var nics = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
-                .Where(n => n.OperationalStatus == System.Net.NetworkInformation.OperationalStatus.Up)
-                .ToArray();
-
-            return AddressOn(nics, n => string.Equals(n.Name, "docker0", StringComparison.Ordinal));
+            return SelectDockerBridgeAddress(
+                System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+                    .Select(n => new HostInterface(n.Name, Addresses(n))));
         }
         catch (System.Net.NetworkInformation.NetworkInformationException)
         {
@@ -190,13 +189,59 @@ internal static class GatewayBindPolicy
         }
     }
 
-    private static string? AddressOn(
-        System.Net.NetworkInformation.NetworkInterface[] nics,
-        Func<System.Net.NetworkInformation.NetworkInterface, bool> match) =>
-        (from nic in nics
-         where match(nic)
-         from unicast in nic.GetIPProperties().UnicastAddresses
-         let address = unicast.Address
+    /// <summary>
+    /// One host interface reduced to the only two things the bridge choice may depend on: its NAME and
+    /// the addresses it holds. The operational status is deliberately absent — see
+    /// <see cref="SelectDockerBridgeAddress"/>.
+    /// </summary>
+    internal readonly record struct HostInterface(string Name, IReadOnlyList<IPAddress> Addresses);
+
+    private static IReadOnlyList<IPAddress> Addresses(System.Net.NetworkInformation.NetworkInterface nic)
+    {
+        try
+        {
+            return nic.GetIPProperties().UnicastAddresses.Select(u => u.Address).ToArray();
+        }
+        catch (System.Net.NetworkInformation.NetworkInformationException)
+        {
+            // One unreadable interface (a tunnel device that vanished mid-enumeration) must not cost the
+            // host its gateway — every other interface still answers.
+            return Array.Empty<IPAddress>();
+        }
+    }
+
+    /// <summary>
+    /// Picks <c>docker0</c>'s private IPv4 out of the host's interfaces — the whole of the Linux/WSL2
+    /// bind decision, as a pure function so it can be asserted without a host to stand it up on.
+    ///
+    /// <para><b>The operational status is not an input, and that is the fix for a shipped regression.</b>
+    /// This used to filter the interface list to <c>OperationalStatus == Up</c> before matching the name.
+    /// A Linux bridge reports CARRIER rather than admin state: with no port attached it is
+    /// <c>&lt;NO-CARRIER,BROADCAST,MULTICAST,UP&gt; state DOWN</c>,
+    /// <c>/sys/class/net/&lt;name&gt;/operstate</c> reads <c>down</c>, and .NET maps that to
+    /// <c>OperationalStatus.Down</c> — measured on this engine against a freshly created bridge with
+    /// nothing attached. Mainguard puts every container on a user-defined network
+    /// (<c>mainguard-agent</c>, the per-agent <c>br-*</c> segments) and never on the default bridge, so
+    /// <b>docker0 is idle on precisely the hosts this resolver exists for</b>. The filter excluded it,
+    /// the resolver returned null, <c>DaemonOptions.GatewayBindAddress</c> was therefore "disabled", and
+    /// every BYOK spawn fell through to "confinement skipped" — the raw provider key into the jail,
+    /// strictly worse than the LAN bind the narrowing was written to fix. On Windows the Pro daemon runs
+    /// inside the WSL2 VM, so that was the production Windows path too.</para>
+    ///
+    /// <para><b>Why the interface and not Docker.</b> <c>docker network inspect bridge</c> (or
+    /// <c>bip</c> in <c>daemon.json</c>) would also yield the address, but it makes resolving a bind
+    /// address depend on an engine round-trip — inside a property initialiser that runs before anything
+    /// has connected to Docker, on a machine where the engine may not be up yet — or on parsing a file
+    /// that is usually absent. It also answers a subtly different question (what Docker INTENDS) where
+    /// binding needs what the host actually holds. The interface is the same source Kestrel binds from.
+    /// Carrier is irrelevant to bindability: an address configured on an admin-up bridge is bindable with
+    /// or without a port attached, which is why the status is absent from <see cref="HostInterface"/>
+    /// entirely rather than filtered on more leniently — a shape that cannot express the bug.</para>
+    /// </summary>
+    internal static string? SelectDockerBridgeAddress(IEnumerable<HostInterface> interfaces) =>
+        (from nic in interfaces
+         where string.Equals(nic.Name, "docker0", StringComparison.Ordinal)
+         from address in nic.Addresses
          where address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
                && !IPAddress.IsLoopback(address)
                && IsPrivate(address)

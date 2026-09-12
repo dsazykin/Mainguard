@@ -36,7 +36,15 @@ public static class ModelHosts
 /// </summary>
 /// <param name="BaseUrl">The gateway URL a confined CLI's base-URL variable is set to, or null.</param>
 /// <param name="Enabled">Whether the daemon actually bound a gateway listener.</param>
-public sealed record GatewayConfinementOptions(string? BaseUrl, bool Enabled)
+/// <param name="DisabledUnintentionally">
+/// True when the gateway is absent because the bind AUTO-RESOLVED TO NOTHING rather than because the
+/// operator turned it off. Both postures hand a BYOK jail the raw provider key, but only one of them was
+/// asked for: the audit's B1 finding was a resolver that returned null on every normal Linux/WSL2 host,
+/// which disabled the gateway fleet-wide and was indistinguishable in the log from a deliberate
+/// <c>--gateway-bind off</c>. The launcher logs this variant as an error.
+/// </param>
+public sealed record GatewayConfinementOptions(
+    string? BaseUrl, bool Enabled, bool DisabledUnintentionally = false)
 {
     /// <summary>The posture of a daemon with no model gateway — the default everywhere.</summary>
     public static readonly GatewayConfinementOptions Disabled = new(null, false);

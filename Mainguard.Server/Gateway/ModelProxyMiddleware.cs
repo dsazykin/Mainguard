@@ -42,6 +42,18 @@ public sealed class GatewayForwarder
     /// </summary>
     public const int DefaultMaxRequestBodyBytes = 8 * 1024 * 1024;
 
+    /// <summary>
+    /// How far above the gateway's own default a jail's <c>x-mainguard-token-estimate</c> may raise its
+    /// reservation. The header can only ever RAISE the charge (F23), which reads as harmless — but the
+    /// reservation comes out of the SHARED per-minute token bucket, so an unbounded raise is a denial of
+    /// service against every other agent rather than an act of honesty about this one.
+    /// </summary>
+    internal const int MaxEstimateMultiple = 4;
+
+    /// <summary>The ceiling that multiple implies, saturating rather than overflowing.</summary>
+    internal static int MaxEstimateRaiseFor(int defaultEstimate) =>
+        (int)Math.Min(int.MaxValue, (long)Math.Max(0, defaultEstimate) * MaxEstimateMultiple);
+
     private readonly AiGateway _gateway;
     private readonly HttpMessageInvoker _upstream;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
@@ -111,8 +123,15 @@ public sealed class GatewayForwarder
         // taken verbatim, so a confined agent could send `x-mainguard-token-estimate: 0`, reserve
         // nothing, and — with streaming usage unparseable — settle nothing either: the per-agent budget
         // and the shared token bucket were both bypassed by two header bytes. Raising your own
-        // reservation is harmless and occasionally honest, so that direction still works.
-        var estimate = Math.Max(_defaultEstimate, estimatedTokens ?? 0);
+        // reservation is harmless and occasionally honest, so that direction still works — but only up
+        // to MaxEstimateMultiple × the default (audit follow-up): the raise is NOT free, because
+        // AcquireAsync reserves it out of the SHARED per-minute token bucket, and TokenBucket.Clamp
+        // clamps a request to the whole capacity. One jail sending 60000 therefore drained the bucket
+        // for a minute and stalled every other agent behind the FIFO queue — a denial of service costing
+        // one header. A real request above 4× the default is settled at its real usage anyway; all the
+        // ceiling costs an honest client is a slightly optimistic reservation.
+        var estimate = Math.Clamp(
+            estimatedTokens ?? 0, _defaultEstimate, MaxEstimateRaiseFor(_defaultEstimate));
 
         // Buffer the request body once so the request can be replayed across retries — bounded, so a
         // jail cannot use the retry buffer as a memory pump (F29).
@@ -129,6 +148,16 @@ public sealed class GatewayForwarder
         // being cancelled. A lease dropped on the floor would charge the agent for a request that never
         // happened, permanently, which is a worse failure than the overshoot the reservation prevents.
         var settled = false;
+
+        // Audit B2 — set the moment a terminal, non-error upstream response is in hand, which is the
+        // moment the provider has committed to producing (and billing) a completion. Everything after
+        // that point must SETTLE on the way out, never abandon: a jail running
+        // `curl -N … | head -c 200` closes its socket mid-stream, the copy throws on RequestAborted, and
+        // the old `finally` released the reservation with no SpendRecord at all — a complete, billed
+        // completion charged at zero, repeatable at will. The same path under-counted every ordinary
+        // claude-code Esc.
+        var upstreamCommitted = false;
+        ModelUsageSniffer? sniffer = null;
         try
         {
             for (var attempt = 1; ; attempt++)
@@ -145,7 +174,12 @@ public sealed class GatewayForwarder
                     continue;                                       // retry — the CLI still waits on one call
                 }
 
-                var sniffer = new ModelUsageSniffer(ContentTypeOf(response));
+                sniffer = new ModelUsageSniffer(ContentTypeOf(response));
+
+                // A 4xx/5xx is not billed by the provider, so an abort while reading one stays a
+                // refund; anything the provider answers normally is work it has already done.
+                upstreamCommitted = (int)response.StatusCode < 400;
+
                 if (relay is null)
                 {
                     // Terminal response: buffer it so we can read usage AND still hand it to the caller
@@ -172,8 +206,45 @@ public sealed class GatewayForwarder
         {
             if (!settled)
             {
-                _gateway.Abandon(lease);
+                SettleOrAbandonAfterFailure(lease, upstreamCommitted, sniffer, estimate);
             }
+        }
+    }
+
+    /// <summary>
+    /// Audit B2 — discharges a lease whose request did not finish normally.
+    ///
+    /// <para>Before the upstream committed (the send threw, the retry loop was cancelled, the client went
+    /// away during backoff) nothing was produced and nothing is owed: <c>Abandon</c> refunds the bucket
+    /// and drops the provisional debit, as before. After it committed — headers in hand, bytes flowing —
+    /// the provider has generated and billed a completion whatever the jail then did with the socket, so
+    /// the lease must SETTLE. It settles at <c>max(usage seen so far, the reservation)</c>: the sniffer's
+    /// result is live per <c>data:</c> frame, so a stream cut at 80% still charges the 80% the provider
+    /// actually emitted, and the floor keeps the old "no usage parsed ⇒ charge the estimate" behaviour
+    /// for a stream cut before its first usage frame.</para>
+    ///
+    /// <para>Nothing in here may throw: this runs in a <c>finally</c> while another exception — usually
+    /// the client's own cancellation — is in flight, and replacing it would turn a billing detail into a
+    /// confusing 500. A settle that fails therefore falls back to the refund.</para>
+    /// </summary>
+    private void SettleOrAbandonAfterFailure(
+        GatewayLease lease, bool upstreamCommitted, ModelUsageSniffer? sniffer, int estimate)
+    {
+        if (!upstreamCommitted)
+        {
+            _gateway.Abandon(lease);
+            return;
+        }
+
+        try
+        {
+            sniffer?.Complete();
+            var (tokens, model) = sniffer?.Result ?? (null, string.Empty);
+            _gateway.Settle(lease, Math.Max(tokens ?? 0, estimate), model);
+        }
+        catch (Exception)
+        {
+            _gateway.Abandon(lease);
         }
     }
 
@@ -427,8 +498,14 @@ internal sealed class UsageAccumulator
 
     private void MergeModel(JsonElement element)
     {
-        if (_model.Length == 0
-            && element.TryGetProperty("model", out var m)
+        if (_model.Length != 0)
+        {
+            return;
+        }
+
+        // Anthropic/OpenAI say `model`; Gemini answers with `modelVersion` and no `model` at all, and a
+        // spend row priced against an empty model id is a spend row nobody can audit.
+        if ((element.TryGetProperty("model", out var m) || element.TryGetProperty("modelVersion", out m))
             && m.ValueKind == JsonValueKind.String
             && m.GetString() is { Length: > 0 } name)
         {
@@ -438,6 +515,8 @@ internal sealed class UsageAccumulator
 
     private void MergeUsage(JsonElement element)
     {
+        MergeGeminiUsage(element);
+
         if (!element.TryGetProperty("usage", out var usage) || usage.ValueKind != JsonValueKind.Object)
         {
             return;
@@ -449,6 +528,27 @@ internal sealed class UsageAccumulator
         // zero than as an exception.
         _input = Math.Max(_input, Math.Max(Read(usage, "input_tokens"), Read(usage, "prompt_tokens")));
         _output = Math.Max(_output, Math.Max(Read(usage, "output_tokens"), Read(usage, "completion_tokens")));
+    }
+
+    /// <summary>
+    /// Gemini's third dialect: a top-level <c>usageMetadata</c> object with its own field names, repeated
+    /// on every streamed chunk as a running total (so the max-merge rule above is right for it too).
+    ///
+    /// <para>Read here rather than "when gemini-cli lands" because the confinement of gemini-cli and this
+    /// parser are separate PRs: without it every confined Gemini agent settles at the flat default
+    /// estimate no matter what it actually spent, which is the same silent under-metering F23 fixed for
+    /// SSE.</para>
+    /// </summary>
+    private void MergeGeminiUsage(JsonElement element)
+    {
+        if (!element.TryGetProperty("usageMetadata", out var meta) || meta.ValueKind != JsonValueKind.Object)
+        {
+            return;
+        }
+
+        _total = Math.Max(_total, Read(meta, "totalTokenCount"));
+        _input = Math.Max(_input, Read(meta, "promptTokenCount"));
+        _output = Math.Max(_output, Read(meta, "candidatesTokenCount"));
     }
 
     private static int Read(JsonElement usage, string name) =>

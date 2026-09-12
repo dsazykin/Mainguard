@@ -45,8 +45,16 @@ public class GatewayReachAndSegmentIsolationDockerTests
     /// why the daemon must translate the bind address before telling anything about it — inside a
     /// container <c>127.0.0.1</c> is the container, and a jail's <c>NO_PROXY</c> covers it, so a jail
     /// pointed at loopback dials itself.</para>
+    ///
+    /// <para><b>Docker Desktop only, and that is the claim, not a convenience.</b> The loopback bind is
+    /// chosen on macOS/Windows precisely because <c>host-gateway</c> routes to the host's loopback stack
+    /// there. On Linux Docker Engine it maps to the docker0 address, where a <c>127.0.0.1</c> listener is
+    /// genuinely unreachable from a container — so run unconditionally this asserted something false and
+    /// failed the Linux CI leg by design. The Linux half of the contract is
+    /// <see cref="Proxy_CanReachTheResolvedBridgeBoundGateway"/>, which asserts the address the resolver
+    /// actually picks there.</para>
     /// </summary>
-    [RequiresDockerFact]
+    [RequiresDockerDesktopFact]
     public async Task Proxy_CanReachALoopbackBoundGateway_ViaTheHostAlias()
     {
         await using var fx = new SandboxFixture();
@@ -71,6 +79,55 @@ public class GatewayReachAndSegmentIsolationDockerTests
                 await fx.Egress.CanProxyReachAsync($"127.0.0.1:{port}"),
                 "127.0.0.1 inside the proxy is the proxy — if this ever succeeds the probe is measuring "
                 + "something other than the daemon host.");
+        }
+        finally
+        {
+            listener.Stop();
+            await accepting;
+        }
+    }
+
+    /// <summary>
+    /// Audit B1/B3 — the Linux half, and the one the PR-blocking CI leg runs: on native Docker Engine the
+    /// daemon binds the address <c>GatewayBindPolicy</c> resolves (docker0), and a listener there must be
+    /// reachable from the egress proxy through the EXACT string <c>ProxyReachableHostFor</c> hands the
+    /// jail and the proxy allowlist.
+    ///
+    /// <para>It also pins the resolver itself against the real host: a null here would mean the daemon
+    /// disables the gateway on a machine that plainly has a docker bridge, which is how "confinement
+    /// skipped, raw provider key into every BYOK jail" shipped. The bridge being idle — carrier-down
+    /// because Mainguard puts every container on a user-defined network — is the normal state, not an
+    /// edge case, so this is the condition that matters.</para>
+    /// </summary>
+    [RequiresLinuxDockerEngineFact]
+    public async Task Proxy_CanReachTheResolvedBridgeBoundGateway()
+    {
+        var bind = Mainguard.Server.Gateway.GatewayBindPolicy.TryResolvePrivateHostAddress();
+        Assert.True(
+            bind is not null,
+            "the gateway bind resolved to NOTHING on a Linux host running the Docker test tier. The "
+            + "daemon would disable the gateway and every BYOK spawn would put the raw provider key in "
+            + "its jail.");
+
+        await using var fx = new SandboxFixture();
+        await fx.EnsureEgressReadyAsync();
+
+        using var listener = new System.Net.Sockets.TcpListener(IPAddress.Parse(bind!), 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var accepting = AcceptQuietlyAsync(listener);
+
+        try
+        {
+            // The same translation the daemon applies before writing the base URL into a jail and the
+            // allowlist entry into the proxy — asserted through it, not around it.
+            var reachable = Mainguard.Server.Gateway.GatewayBindPolicy.ProxyReachableHostFor(bind);
+            Assert.Equal(bind, reachable); // a bridge address is dialled by its literal value
+
+            Assert.True(
+                await fx.Egress.CanProxyReachAsync($"{reachable}:{port}"),
+                $"the egress proxy could not reach a gateway bound at {reachable}:{port}. Confinement "
+                + "would be skipped on every BYOK spawn, i.e. the raw provider key would go into the jail.");
         }
         finally
         {

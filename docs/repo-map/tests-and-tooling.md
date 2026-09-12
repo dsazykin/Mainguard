@@ -2499,7 +2499,25 @@
   `stream:true` plus `x-mainguard-token-estimate: 0` — is charged the floor rather than nothing, while
   an estimate ABOVE the floor still raises the reservation; an oversized request body is 413 with
   nothing charged; and `BudgetLedger` charges the reserved amount for a zero settle against a live
-  reservation while a settle with no reservation keeps its old meaning),
+  reservation while a settle with no reservation keeps its old meaning. **Audit B2**: a client that
+  aborts MID-STREAM is charged what the provider had already reported (the stream is fed chunk by chunk
+  through a sink that throws on the second write, so the assertion is 1201 — the usage in the frames that
+  got out — and not zero, which is what the old `Abandon`-on-any-exception produced for a completion the
+  provider generated and billed in full); an abort before any usage frame still charges the reservation;
+  a failure BEFORE the upstream committed, and an abort while reading a 5xx, still refund; the estimate
+  raise is capped at 4× the default so one jail cannot drain the shared per-minute bucket; and Gemini's
+  `usageMetadata`/`modelVersion` shape parses in both streaming and whole-document form),
+  `GatewayBindPolicyTests` (**MG-13/F25/audit B1** — the bind rule and the default-bind resolver:
+  loopback and RFC-1918 permitted, wildcard and public refused (including the 172.16/12 off-by-ones);
+  the default IS whatever the resolver found and is never a LAN-facing address; `ProxyReachableHostFor`
+  translates loopback and nothing else; `off`/`auto`/explicit resolve as documented and an impermissible
+  explicit address passes through so startup can refuse it loudly. **B1's regression tests**: an IDLE
+  `docker0` — carrier-down, which is its normal state on a Mainguard host — is still selected, a `br-*`
+  segment bridge and a Wi-Fi address never are, and on a LINUX host that HAS a docker0 the resolver must
+  return that address rather than null. The pre-existing default-bind tests both PASS when the resolver
+  returns null, which is exactly how the gateway-disabled-fleet-wide regression shipped; these fail.
+  Also that a deliberate `--gateway-bind off` stays distinguishable from a bind that resolved to
+  nothing),
   `AgentGatewayTokenRotationTests` (**F25** — the `mg_sess_` token rotates on a schedule: replaced after
   the interval, the superseded one still resolving through the overlap so a request already in flight
   finishes and failing after it, custody of the real key surviving the swap, one agent's rotation not
@@ -2736,8 +2754,11 @@
   extracted from `ToolchainProvisioningDockerTests`, which now shares it), `Fixtures/RequiresDockerFact.cs`
   (`[RequiresDockerFact]` skips unless Docker is reachable AND the CI-built agent-base image is
   present; the sibling `[RequiresDockerDaemonFact]` gates on Docker-daemon presence only — for P2-08's
-  reconciler test that stands up its own trivial image; class-level
-  `[Trait("Category","RequiresDocker")]` carries the CI filter),
+  reconciler test that stands up its own trivial image; **`[RequiresDockerDesktopFact]` and
+  `[RequiresLinuxDockerEngineFact]`** split the claims that differ by engine, because `host-gateway`
+  means the host's loopback stack on Docker Desktop and the docker0 address on native Linux — a test
+  asserting one of those unconditionally fails the other platform's CI leg by design (audit B3);
+  class-level `[Trait("Category","RequiresDocker")]` carries the CI filter),
   `Fixtures/RequiresAccessDeniedFact.cs` (`[RequiresAccessDeniedFact]` — skips unless this process can
   actually be DENIED access to a directory it owns, which root, Windows and any metadata-less mount
   quietly are not; the probe performs the real deny-then-read rather than trusting `chmod`, because a
@@ -2962,7 +2983,13 @@
   unreachable", the other bridge's gateway included) but its OWN bridge's gateway answers ping in
   0.05 ms — which is why `GatewayBindPolicy` binds `docker0` and never a `br-*` segment bridge, since a
   gateway on a segment's own address would be dialable by every jail on it without going through
-  tinyproxy. Both halves are asserted, with a non-internal control so a pass cannot be an inert probe),
+  tinyproxy. Both halves are asserted, with a non-internal control so a pass cannot be an inert probe.
+  **Audit B3 — the reach claim is per engine.** The loopback-via-alias test is `[RequiresDockerDesktopFact]`
+  (on Linux Docker Engine `host-gateway` IS docker0, so a `127.0.0.1` listener is genuinely unreachable
+  from a container and asserting otherwise failed the Linux runner by design), and its Linux counterpart
+  `Proxy_CanReachTheResolvedBridgeBoundGateway` binds a listener at the address `GatewayBindPolicy`
+  actually resolves and requires the proxy to reach it through the exact string `ProxyReachableHostFor`
+  hands the jail — which also fails loudly if that resolver ever returns null on a host with a bridge),
   `Agents/SandboxEgressDockerTests.cs` (the egress matrix — allowlisted API via proxy, non-allowlisted
   fails **fast**, direct-IP dropped despite proxy-env unset, DNS exfil NXDOMAIN, **in-jail DNS that
   depends on no public resolver** (`AllowlistedName_ShouldStillResolve_WithoutAnyPublicResolver` —

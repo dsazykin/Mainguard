@@ -425,7 +425,11 @@ public static class GatewayServiceRegistration
         // MAINGUARD_GATEWAY_BIND=off), or a host with no private address, still yields the old posture.
         services.AddSingleton(new GatewayConfinementOptions(
             BaseUrl: BuildGatewayBaseUrl(options),
-            Enabled: options is not null && !string.IsNullOrWhiteSpace(options.GatewayBindAddress)));
+            Enabled: options is not null && !string.IsNullOrWhiteSpace(options.GatewayBindAddress),
+            // Audit B1: a gateway that is absent because the bind auto-resolved to NOTHING is a defect,
+            // not a posture, and every BYOK spawn on such a daemon leaks the raw key into its jail. The
+            // launcher says so at error level rather than with the same warning a deliberate `off` gets.
+            DisabledUnintentionally: options is not null && options.GatewayDisabledUnintentionally));
 
         // Phase 2's automatic verification trigger. Until now the ONLY production callers of
         // MergeQueue.RunVerificationAsync were the human Verify button, the restart resume and the stale
