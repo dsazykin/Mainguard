@@ -1007,8 +1007,13 @@
   `AnOAuthSpawn_MintsNothing…` is the negative control (a daemon that minted unconditionally would pass
   the first test while breaking the OAuth path), and the revoke test also asserts `ResolveAgent(token)`
   is null, so a revoke that orphaned the reverse map would not pass. Docker-free: a fake substrate whose
-  sandbox engine RECORDS every `SandboxSpawnRequest`. The real-jail leg is
-  `Agents/GatewayConfinementDockerTests.cs`.
+  sandbox engine RECORDS every `SandboxSpawnRequest`. It also owns the three ways a BYOK key reaches a
+  jail UNCONFINED, each of which must read differently in the log because each has a different remedy:
+  a CLI that declares no base-URL/model-host pair ("IMPOSSIBLE", a vendor fact), a deliberate
+  `--gateway-bind off` ("OFF", an operator setting), and — audit B1 — a bind that AUTO-RESOLVED TO
+  NOTHING ("UNAVAILABLE", an error, because nobody asked for it and it is how a resolver bug became a
+  fleet-wide credential leak). Every one of them asserts the message does NOT quote the key. The
+  real-jail leg is `Agents/GatewayConfinementDockerTests.cs`.
 - **`Mainguard.Server.Tests/EgressRefusalLogLevelTests.cs`** — an egress **refusal** reaches the daemon
   log at `Warning`. `LoggingTransparencyLog` picked the level with
   `string.Equals(line.Verdict, "Denied", …)` against a free-form string field whose only daemon producer
