@@ -116,9 +116,15 @@ public sealed class MacDaemonLaunchAgent
         File.WriteAllText(plist, RenderPlist(dotnet, dll, staged, logs));
 
         await LaunchctlAsync(ct, "bootout", GuiDomain() + "/" + Label).ConfigureAwait(false); // tolerate "not loaded"
-        if (!CommitStagedPayload(incoming)) return false;
-        var loaded = await LaunchctlAsync(ct, "bootstrap", GuiDomain(), plist).ConfigureAwait(false);
-        return loaded == 0;
+        var committed = CommitStagedPayload(incoming);
+
+        // A failed swap leaves the PREVIOUS staged copy in place (CommitStagedPayload restores it), so the
+        // job is still worth loading — on the payload that was already working. What must never be loaded
+        // is a job whose dll is not there: that is the respawn loop, thirty seconds apart, forever.
+        var loaded = File.Exists(dll)
+            ? await LaunchctlAsync(ct, "bootstrap", GuiDomain(), plist).ConfigureAwait(false)
+            : -1;
+        return committed && loaded == 0;
     }
 
     /// <summary>
@@ -140,6 +146,14 @@ public sealed class MacDaemonLaunchAgent
     {
         await LaunchctlAsync(ct, "bootout", GuiDomain() + "/" + Label).ConfigureAwait(false);
         var committed = CommitStagedPayload(incoming);
+
+        // The job comes back either way: a failed swap leaves the previous staged copy in place, and an
+        // out-of-date daemon beats none at all. The one thing not worth loading is a job whose dll is
+        // missing — that is the 30-second respawn loop this change exists to prevent.
+        if (!File.Exists(Path.Combine(StagedPayloadDirectory(), "Mainguard.Server.dll")))
+        {
+            return false;
+        }
 
         // Bootstrap brings the (RunAtLoad) job back. Kickstart is the fallback for the case where the
         // bootout did not actually unload it — then the job is still registered and bootstrap says so.
