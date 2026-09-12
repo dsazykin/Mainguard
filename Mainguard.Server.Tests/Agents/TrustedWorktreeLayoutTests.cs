@@ -58,6 +58,111 @@ public sealed class TrustedWorktreeLayoutTests : IDisposable
         Assert.Contains("shared mirror", ex.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// W1-A rework, blocker 2 — the bypass, verbatim, and the ONE assertion that proves it closed: the
+    /// shared mirror's <c>main</c> does not move.
+    ///
+    /// <para>Everything the agent needs is in its own repository, which its jail mounts read-write; only
+    /// the worktree's <c>.git</c> pointer was made read-only. So: write
+    /// <c>&lt;agentRepo&gt;/worktrees/&lt;n&gt;/commondir</c> = the mirror (mounted at the same path in the
+    /// jail), point <c>…/HEAD</c> at <c>refs/heads/&lt;main&gt;</c>, and BLANK <c>…/gitdir</c>. The pointer
+    /// is untouched, so the daemon derived the right common directory and the mirror check passed — and
+    /// then the round-trip failed, <c>TryResolve</c> returned null, and null meant "run unpinned with the
+    /// worktree as cwd". git then walked <c>.git</c> → gitdir → <c>commondir</c> → the mirror and the wip
+    /// commit advanced the MIRROR's <c>refs/heads/main</c> with agent content, past the ref mediator and
+    /// past the merge queue. Breaking one file was the whole exploit.</para>
+    /// </summary>
+    [Fact]
+    public async Task RewrittenCommondir_IsRefused_AndTheMirrorsMainNeverMoves()
+    {
+        var env = new Fixture(_root);
+        var mirrorMainBefore = Rev(env.Mirror, env.MainBranch);
+        Assert.NotEqual(string.Empty, mirrorMainBefore);
+
+        PlantCommondirBypass(env);
+
+        var ex = Assert.Throws<RepoProvisioningException>(
+            () => TrustedWorktreeLayout.TryResolve(env.Worktree, env.AgentRepo, env.Mirror));
+        Assert.Contains("shared mirror", ex.Message, StringComparison.Ordinal);
+
+        // …and the cycle that would have made the commit ends as a skip, before it yields anything.
+        var rebaser = new KeepAliveRebaser(
+            new ExplodingYieldProtocol(),
+            _ => new AgentWorktreeLocation(env.Worktree, env.Mirror, env.MainBranch, env.AgentRepo));
+        var result = await rebaser.RunCycleAsync("a1");
+
+        Assert.Equal(RebaseCycleKind.Skipped, result.Kind);
+        Assert.Equal(mirrorMainBefore, Rev(env.Mirror, env.MainBranch));
+    }
+
+    /// <summary>
+    /// The measurement that says why blocker 2's fix could not just be "pin <c>GIT_COMMON_DIR</c>", and
+    /// the one this suite would have wanted before the branch claimed the Critical closed.
+    ///
+    /// <para>git's files ref backend builds its common directory with <c>get_common_dir_noenv()</c>, so
+    /// <c>GIT_COMMON_DIR</c> does not reach it — the <c>commondir</c> FILE does. With every pin correct
+    /// and that one file rewritten, a daemon <c>commit</c> advances the MIRROR's branch. The test drives
+    /// the layout by hand (bypassing the refusal above) to show the mechanism is real, so that a future
+    /// change that drops <c>AssertCommondirFileAgrees</c> because "GIT_COMMON_DIR covers it" fails here
+    /// with the reason.</para>
+    /// </summary>
+    [Fact]
+    public void GitCommonDirEnv_DoesNotGovernRefWrites_WhichIsWhyCommondirIsValidated()
+    {
+        var env = new Fixture(_root);
+
+        // The honest layout, captured BEFORE the payload — this is what the pin would have produced.
+        var layout = TrustedWorktreeLayout.TryResolve(env.Worktree, env.AgentRepo, env.Mirror);
+        Assert.NotNull(layout);
+
+        var mirrorMainBefore = Rev(env.Mirror, env.MainBranch);
+        PlantCommondirBypass(env);
+
+        File.WriteAllText(Path.Combine(env.Worktree, "agent-work.txt"), "content the agent chose\n");
+        AgentGitCommand.RunWithEnv(layout!.WorkTree, layout.Env, "add", "-A");
+        AgentGitCommand.RunWithEnv(
+            layout.WorkTree, layout.Env,
+            "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "wip: sync");
+
+        // The pin did NOT hold the refs: this is the vector, demonstrated.
+        Assert.NotEqual(mirrorMainBefore, Rev(env.Mirror, env.MainBranch));
+    }
+
+    /// <summary>
+    /// The same bypass against the weaker caller shape — no <c>agentRepoPath</c>, so the pointer is what
+    /// selects the repository. A broken round-trip used to mean null, i.e. "run unpinned", i.e. follow the
+    /// very chain this type exists not to follow. It is a refusal now: once <c>.git</c> is a FILE there is
+    /// no null left in this method.
+    /// </summary>
+    [Fact]
+    public void BlankedRegistration_IsRefused_RatherThanRunUnpinned()
+    {
+        var env = new Fixture(_root);
+        PlantCommondirBypass(env);
+
+        var ex = Assert.Throws<RepoProvisioningException>(
+            () => TrustedWorktreeLayout.TryResolve(env.Worktree, agentRepoPath: null, forbiddenCommonDir: env.Mirror));
+        Assert.Contains("does not register", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>A `.git` FILE is a linked worktree, and a linked worktree either resolves or throws.
+    /// Null on any of these was the fail-open channel the bypass was steered into.</summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("gitdir:")]
+    [InlineData("not a pointer at all")]
+    [InlineData("gitdir: /nowhere/in/particular")]
+    public void AnyUnusablePointer_IsARefusal_NeverNull(string pointer)
+    {
+        var env = new Fixture(_root);
+        File.WriteAllText(Path.Combine(env.Worktree, ".git"), pointer + "\n");
+
+        Assert.Throws<RepoProvisioningException>(
+            () => TrustedWorktreeLayout.TryResolve(env.Worktree, agentRepoPath: null, forbiddenCommonDir: env.Mirror));
+        Assert.Throws<RepoProvisioningException>(
+            () => TrustedWorktreeLayout.TryResolve(env.Worktree, env.AgentRepo, env.Mirror));
+    }
+
     /// <summary>With the daemon-computed repository supplied, the pointer can no longer decide WHOSE
     /// repository the daemon operates on — not the mirror, not a co-tenant's, not one the agent made.</summary>
     [Fact]
@@ -129,6 +234,27 @@ public sealed class TrustedWorktreeLayoutTests : IDisposable
     /// workspace can.</summary>
     private static void Redirect(string worktree, string target)
         => File.WriteAllText(Path.Combine(worktree, ".git"), "gitdir: " + target + "\n");
+
+    /// <summary>
+    /// The blocker-2 payload, written entirely inside the per-agent repository — the tree the jail mounts
+    /// READ-WRITE — with the worktree's own <c>.git</c> pointer left exactly as git wrote it.
+    /// </summary>
+    private static void PlantCommondirBypass(Fixture env)
+    {
+        var registration = Path.Combine(
+            env.AgentRepo, "worktrees", Path.GetFileName(env.Worktree));
+        Assert.True(Directory.Exists(registration), registration);
+
+        File.WriteAllText(Path.Combine(registration, "commondir"), env.Mirror + "\n");
+        File.WriteAllText(Path.Combine(registration, "HEAD"), "ref: refs/heads/" + env.MainBranch + "\n");
+        File.WriteAllText(Path.Combine(registration, "gitdir"), string.Empty);
+    }
+
+    private static string Rev(string gitDir, string reference)
+    {
+        var (code, output, _) = AgentTestGit.Run(gitDir, "rev-parse", "--verify", "--quiet", reference);
+        return code == 0 ? output.Trim() : string.Empty;
+    }
 
     /// <summary>A source repo → a bare shared MIRROR → a per-agent repository cloned from it → a real
     /// linked worktree off the agent repository. The production MG-3 shape.</summary>

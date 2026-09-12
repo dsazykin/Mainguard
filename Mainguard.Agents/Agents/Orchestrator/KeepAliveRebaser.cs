@@ -192,6 +192,22 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
         var conflicted = false;
         try
         {
+            // W1-A rework — RE-resolve now that the agent is quiescent. The resolution above happens
+            // before the yield on purpose (a refusal must not cost a pause), but that makes it a SNAPSHOT
+            // taken while the agent was still running, and what it validates — the worktree's `.git`
+            // pointer and its per-worktree `commondir` — is exactly what the agent would rewrite. Only the
+            // answer taken after the yield is the one the mutations below run under. It is the same
+            // re-read-at-the-moment-of-action rule K6 applied to the mutation guard, for the same reason.
+            try
+            {
+                layout = TrustedWorktreeLayout.TryResolve(loc.WorktreePath, loc.AgentRepoPath, loc.BarePath);
+            }
+            catch (RepoProvisioningException ex)
+            {
+                _setState(agentId, AgentRunState.Working);
+                return new RebaseCycleResult(RebaseCycleKind.Skipped, ex.Message, WipCommitCreated: false);
+            }
+
             var verdict = GitMutationGuard.CanMutate(GitMutationGuard.Inspect(loc.WorktreePath));
             if (!verdict.CanMutate)
             {

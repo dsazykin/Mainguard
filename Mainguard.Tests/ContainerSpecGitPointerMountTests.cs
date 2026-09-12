@@ -40,6 +40,49 @@ public class ContainerSpecGitPointerMountTests
         Assert.False(workspace.ReadOnly);
     }
 
+    /// <summary>
+    /// W1-A rework — the pointer was only the first link of the chain, and the two files it leads to are
+    /// in the tree the jail mounts READ-WRITE.
+    ///
+    /// <para><c>&lt;agentRepo&gt;/worktrees/&lt;n&gt;/commondir</c> names where refs, objects and config
+    /// come from, and <c>…/gitdir</c> names the worktree back. <c>commondir</c> is the one that matters
+    /// most: git's files ref backend resolves it with <c>get_common_dir_noenv()</c>, so it follows this
+    /// FILE even when the daemon has pinned <c>GIT_COMMON_DIR</c> elsewhere — rewriting one line here put
+    /// the daemon's ref writes into the shared mirror with every pin correct.</para>
+    /// </summary>
+    [Fact]
+    public void AgentRepoJail_MountsTheWorktreeRegistrationFilesReadOnly()
+    {
+        var mounts = ContainerSpecBuilder.Build(Request()).HostConfig.Mounts;
+        var registration = AgentRepo + "/worktrees/agent-1";
+
+        foreach (var file in new[] { registration + "/commondir", registration + "/gitdir" })
+        {
+            var mount = Assert.Single(mounts, m => m.Target == file);
+            Assert.Equal("bind", mount.Type);
+            Assert.Equal(file, mount.Source);
+            Assert.True(mount.ReadOnly, file + " is writable from inside the jail");
+        }
+
+        // …nested inside the per-agent repository, which stays read-write: the agent still writes HEAD,
+        // the index, its logs and its own refs.
+        Assert.False(Assert.Single(mounts, m => m.Target == AgentRepo).ReadOnly);
+    }
+
+    /// <summary>The naming rule, pinned on its own: the registration directory is the worktree path's own
+    /// last component, which is what the daemon handed <c>git worktree add</c>.</summary>
+    [Fact]
+    public void RegistrationFiles_AreNamedFromTheWorktreesOwnDirectoryName()
+    {
+        Assert.Equal(
+            new[]
+            {
+                AgentRepo + "/worktrees/agent-1/commondir",
+                AgentRepo + "/worktrees/agent-1/gitdir",
+            },
+            ContainerSpecBuilder.WorktreeRegistrationFiles(AgentRepo, Worktree + "/"));
+    }
+
     /// <summary>The pointer file only EXISTS in the MG-3 layout, where the worktree is linked off a
     /// per-agent repository. Without one, <c>.git</c> is an ordinary directory and mounting a file over it
     /// would fail the container create outright — so the mount travels with `AgentRepoPath`, never alone.</summary>
@@ -49,6 +92,7 @@ public class ContainerSpecGitPointerMountTests
         var mounts = ContainerSpecBuilder.Build(Request(agentRepo: null)).HostConfig.Mounts;
 
         Assert.DoesNotContain(mounts, m => m.Target == "/workspace/.git");
+        Assert.DoesNotContain(mounts, m => m.Target.Contains("/worktrees/agent-1/", System.StringComparison.Ordinal));
         Assert.Single(mounts, m => m.Target == "/workspace");
     }
 

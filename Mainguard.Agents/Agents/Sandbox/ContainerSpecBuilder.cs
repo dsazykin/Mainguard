@@ -251,6 +251,24 @@ public static class ContainerSpecBuilder
     public static string WorktreeGitPointer(string worktreePath)
         => worktreePath.TrimEnd('/') + "/.git";
 
+    /// <summary>W1-A — the per-worktree registration files inside the per-agent repository that decide
+    /// where git resolves refs and which worktree this is:
+    /// <c>&lt;agentRepo&gt;/worktrees/&lt;name&gt;/{commondir,gitdir}</c>. Hand-joined with forward
+    /// slashes for the same reason <see cref="WorktreeGitPointer"/> is — these are VM-side Linux paths and
+    /// a Windows-hosted daemon build must not spell them with backslashes.</summary>
+    public static IReadOnlyList<string> WorktreeRegistrationFiles(string agentRepoPath, string worktreePath)
+    {
+        var name = worktreePath.TrimEnd('/');
+        var slash = name.LastIndexOf('/');
+        if (slash >= 0)
+        {
+            name = name[(slash + 1)..];
+        }
+
+        var registration = agentRepoPath.TrimEnd('/') + "/worktrees/" + name;
+        return new[] { registration + "/commondir", registration + "/gitdir" };
+    }
+
     /// <summary>
     /// MG-3 — whether the shared mirror's bind mount denies writes from inside the jail.
     ///
@@ -377,6 +395,35 @@ public static class ContainerSpecBuilder
                 Target = WorkspaceGitPointerTarget,
                 ReadOnly = true,
             });
+
+            // W1-A rework — the OTHER two files that decide where daemon-side git writes, re-mounted
+            // read-only on top of the read-write per-agent repository.
+            //
+            // The `.git` pointer above was only the first link of the chain. It names
+            // `<agentRepo>/worktrees/<n>`, and inside that directory `commondir` names where refs,
+            // objects and config come from while `gitdir` names the worktree back. Both live in the ONE
+            // git directory the agent may write, so making only the pointer read-only left the redirect
+            // intact one level down — and `commondir` is the level that matters most, because git's files
+            // ref backend resolves it with `get_common_dir_noenv()` and therefore follows this FILE even
+            // when the daemon has pinned GIT_COMMON_DIR to something else. Measured: with every pin
+            // correct, rewriting this one line makes a daemon commit advance the shared mirror's branches.
+            //
+            // Both are written exactly once, by `git worktree add`, and never again — not by the agent's
+            // git, not by the daemon's. A file that is never legitimately written does not need to be
+            // writable. Everything beside them (HEAD, index, logs, refs the agent's own git moves) stays
+            // read-write, so this removes nothing an agent does.
+            foreach (var metadata in WorktreeRegistrationFiles(request.AgentRepoPath, request.WorktreePath))
+            {
+                mounts.Add(new Mount
+                {
+                    Type = "bind",
+                    // Target == Source for the same reason the agent repo's own mount is: these paths are
+                    // named by absolute VM path from inside the repository.
+                    Source = metadata,
+                    Target = metadata,
+                    ReadOnly = true,
+                });
+            }
         }
 
         if (!string.IsNullOrEmpty(request.AdaptersRootPath))

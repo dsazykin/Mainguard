@@ -635,9 +635,18 @@ internal static class GitConfigExecutionSurface
 /// <para><b>What is trusted.</b> The working tree path (the daemon computed it), and — when supplied —
 /// the agent repository root (the daemon computed that too, from
 /// <see cref="AgentRepoLayout.AgentRepoPath"/>). Nothing else. The resolved layout is pinned into the
-/// child process with <c>GIT_DIR</c>, <c>GIT_COMMON_DIR</c> and <c>GIT_WORK_TREE</c>, which outrank
-/// every on-disk pointer — <c>setup_git_env()</c> reads the <c>commondir</c> FILE only when
-/// <c>GIT_COMMON_DIR</c> is unset.</para>
+/// child process with <c>GIT_DIR</c>, <c>GIT_COMMON_DIR</c> and <c>GIT_WORK_TREE</c>, and both on-disk
+/// pointers — the worktree's <c>.git</c> and the per-worktree <c>commondir</c> — are then read back and
+/// required to AGREE with that layout. They are never used to choose it.</para>
+///
+/// <para><b>Why agreement and not just the pin.</b> The pin is not sufficient, and the branch's first
+/// draft said it was. <c>GIT_COMMON_DIR</c> governs objects, config and <c>git rev-parse
+/// --git-common-dir</c> — but git's files ref backend computes its own common directory with
+/// <c>get_common_dir_noenv()</c>, which reads the <c>commondir</c> FILE and by construction ignores the
+/// environment. Measured: with all three variables pinned at the agent repository, a <c>git commit</c>
+/// still advanced <c>refs/heads/main</c> in the repository that file named. So <c>commondir</c> is read
+/// here — only ever to refuse — and <see cref="Sandbox.ContainerSpecBuilder"/> re-mounts it read-only
+/// inside the jail so the write being refused cannot be made.</para>
 ///
 /// <para><b>Rework: this used to fail OPEN, and that made the docstring above false.</b> Every
 /// validation failure returned null, and both callers read null as "run unpinned, exactly as before" —
@@ -682,9 +691,8 @@ internal sealed class TrustedWorktreeLayout
     internal string GitDir { get; }
 
     /// <summary>The common git directory — refs, objects, config. Either the daemon-computed agent
-    /// repository verbatim, or derived from the pointer's own <c>…/worktrees/&lt;name&gt;</c> shape. Never
-    /// read from the <c>commondir</c> file, and <c>GIT_COMMON_DIR</c> is what stops git reading it
-    /// either.</summary>
+    /// repository verbatim, or derived from the pointer's own <c>…/worktrees/&lt;name&gt;</c> shape; never
+    /// taken from the <c>commondir</c> file, which is only read back and required to agree.</summary>
     internal string CommonDir { get; }
 
     /// <summary>The pin, as environment. Passed to <see cref="AgentGitCommand.RunWithEnv"/>.</summary>
@@ -790,8 +798,73 @@ internal sealed class TrustedWorktreeLayout
         // mounted read-only into the jail, so in production this should be unreachable — which is the
         // reason to fail loudly if it ever fires rather than to carry on.)
         AssertPointerDoesNotRedirect(workTree, dotGit, commonDir, forbiddenCommonDir);
+        AssertCommondirFileAgrees(RealPath(gitDir), commonDir, forbiddenCommonDir);
 
         return new TrustedWorktreeLayout(workTree, RealPath(gitDir), commonDir);
+    }
+
+    /// <summary>
+    /// W1-A rework — the check that <c>GIT_COMMON_DIR</c> turned out NOT to make redundant, and the
+    /// reason the pin alone was not the fix.
+    ///
+    /// <para><b>Measured:</b> with <c>GIT_DIR</c>, <c>GIT_COMMON_DIR</c> and <c>GIT_WORK_TREE</c> all
+    /// pinned at the agent repository, <c>git rev-parse --git-common-dir</c> correctly answers the agent
+    /// repository — and a <c>git commit</c> still advances <c>refs/heads/&lt;main&gt;</c> in whatever
+    /// repository the <c>commondir</c> FILE names. git's files ref backend builds its own common directory
+    /// with <c>get_common_dir_noenv()</c> (<c>files_ref_store_init()</c>), which by construction does not
+    /// consult <c>GIT_COMMON_DIR</c>: the environment variable governs objects, config and paths, and the
+    /// <b>ref store follows the file</b>. So an agent that rewrites one line of
+    /// <c>&lt;agentRepo&gt;/worktrees/&lt;n&gt;/commondir</c> — a file in the tree its jail mounts
+    /// read-write — moves the daemon's ref writes into the shared mirror even when every pin is correct.
+    /// </para>
+    ///
+    /// <para>Hence this file IS read now, and the type's old "commondir is never read" claim was both
+    /// false and, worse, load-bearing. It is read for exactly one purpose: to REFUSE. It never selects a
+    /// directory. The structural half is that <c>ContainerSpecBuilder</c> re-mounts this file (and
+    /// <c>gitdir</c> beside it) read-only inside the jail, so the write this refuses should be impossible
+    /// to make in the first place.</para>
+    /// </summary>
+    private static void AssertCommondirFileAgrees(string gitDir, string commonDir, string? forbiddenCommonDir)
+    {
+        var commondirFile = Path.Combine(gitDir, "commondir");
+        string contents;
+        try
+        {
+            if (!File.Exists(commondirFile))
+            {
+                throw new RepoProvisioningException(
+                    $"W1-A: '{commondirFile}' is missing, so git's ref store would take '{gitDir}' itself as "
+                    + "the common directory and the daemon's ref writes would land somewhere the merge queue "
+                    + "never reads. Refusing to run daemon-side git against it.");
+            }
+
+            contents = File.ReadAllText(commondirFile).Trim();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new RepoProvisioningException(
+                $"W1-A: '{commondirFile}' could not be read ({ex.Message}), so the repository git's ref "
+                + "store would write to cannot be established. Refusing to run daemon-side git against it.");
+        }
+
+        // Resolved exactly the way get_common_dir_noenv() resolves it: relative to the per-worktree gitdir.
+        var named = RealPath(Path.IsPathRooted(contents) ? contents : Path.Combine(gitDir, contents));
+
+        if (forbiddenCommonDir is { Length: > 0 } && PathsEqual(named, RealPath(forbiddenCommonDir)))
+        {
+            throw new RepoProvisioningException(
+                $"W1-A: '{commondirFile}' names the shared mirror '{named}'. git's ref store follows that "
+                + "file rather than GIT_COMMON_DIR, so a commit made here would advance the MIRROR's "
+                + "branches — past the ref mediator and past the merge queue. Refusing.");
+        }
+
+        if (!PathsEqual(named, commonDir))
+        {
+            throw new RepoProvisioningException(
+                $"W1-A: '{commondirFile}' names '{named}', but the daemon provisioned this worktree under "
+                + $"'{commonDir}'. git's ref store follows that file rather than GIT_COMMON_DIR, so the "
+                + "daemon's ref writes would land in a repository the agent chose. Refusing.");
+        }
     }
 
     /// <summary>Refuses when the agent-writable <c>gitdir:</c> pointer names a common directory other
@@ -912,6 +985,8 @@ internal sealed class TrustedWorktreeLayout
                 $"W1-A: '{registration}' could not be read ({ex.Message}), so the worktree's registration "
                 + "cannot be confirmed. Refusing to run daemon-side git against it.");
         }
+
+        AssertCommondirFileAgrees(gitDir, commonDir, forbiddenCommonDir);
 
         return new TrustedWorktreeLayout(workTree, gitDir, commonDir);
     }
