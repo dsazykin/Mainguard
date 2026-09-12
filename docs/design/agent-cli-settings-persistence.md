@@ -254,8 +254,12 @@ The external-PR jails escaped only by accident: kind `external-pr` has no adapte
    qwen-code declare `.gemini/settings.json` / `.qwen/settings.json` as credentials; the manifest is
    explicit that this predates `settingsPaths` and that moving them would migrate live data out of the
    keychain. So they were not moved. They are matched by file name
-   (`AdapterCredentialPolicy.IsSettingsShaped`), scrubbed by `CliSettingsGrantScrub` and held to the
-   settings ceiling, in both directions.
+   (`AdapterCredentialPolicy.IsSettingsShaped`), put through the mount scrub AND the program-naming
+   strip (below), and held to the settings ceiling, in both directions. The scrub alone was not enough
+   and the first cut of this change shipped only that: `~/.gemini/settings.json` is where gemini-cli
+   defines `mcpServers`, so the mount scrub removed strings naming Mainguard's own IPC directory and
+   carried the program definitions straight through — the Critical, still live for two of the three
+   named files.
 
 ## The settings scrub is now an allowlist (F45)
 
@@ -273,18 +277,28 @@ CLI release in the direction of "carried".
 
 ## What was NOT done, and why
 
-- **`.claude.json` content allowlist — attempted and dropped.** That file is declared as a credential
-  but is really claude-code's whole application state (~75 KB on a real machine: caches, tip counters,
-  and a `projects` map holding per-directory prompt history, approved tool lists and `mcpServers`
-  entries). Reducing it to its login fields was implemented, then dropped, because the reduction could
-  not be *proven* safe: demonstrating that a jail still authenticates afterwards requires a real logged
-  in state, and the only one available was the owner's own live credentials. What was established in a
-  real container running the pinned CLI is that an allowlist-shaped file is structurally accepted — it
-  starts normally, no onboarding, no parse error, failing only on the absent token — but that is not
-  the same claim, and the failure mode that matters (a good token rejected because the account record
-  was reduced) is exactly what it cannot see. Shipping it would have risked every jail prompting for a
-  fresh login, which is the complaint this whole round trip exists to fix. It needs a deliberate test
-  login the verifier is allowed to use.
+- **`.claude.json` content allowlist — attempted, dropped, and replaced by a targeted strip.** That
+  file is declared as a credential but is really claude-code's whole application state (~75 KB on a real
+  machine: caches, tip counters, and a `projects` map holding per-directory prompt history, approved tool
+  lists and `mcpServers` entries). Reducing it to its login fields was implemented, then dropped, because
+  the reduction could not be *proven* safe: demonstrating that a jail still authenticates afterwards
+  requires a real logged-in state, and the only one available was the owner's own live credentials. What
+  was established in a real container running the pinned CLI is that an allowlist-shaped file is
+  structurally accepted — it starts normally, no onboarding, no parse error, failing only on the absent
+  token — but that is not the same claim, and the failure mode that matters (a good token rejected
+  because the account record was reduced) is exactly what it cannot see.
+
+  What shipped instead is the INVERSE, and it is not a residual: `CliSettingsGrantScrub.StripExecutableConfig`
+  removes only the keys that name a program (`ExecutableConfigKeys`, at any depth — claude-code keeps a
+  project's servers under `projects.<dir>.mcpServers`) and carries every other key untouched,
+  byte-identical when nothing matched. A program name is not a credential, so "this cannot break
+  authentication" is provable by unit test rather than by account. `ExecutableConfigKeys` is the one list
+  this codebase keeps of them: `CarriedTopLevelKeys` is its complement and the two are asserted disjoint.
+  `projects.<dir>.allowedTools` is the one value the filter edits rather than keeps or drops — the owner's
+  bounded "don't ask again" answers survive, the whole-tool grants do not, by the same `IsUnbounded` rule
+  the settings leg applies to `permissions.allow`. **Known residual:** `hasTrustDialogAccepted` is carried
+  deliberately — it names no program, and dropping it would hang every Managed worker on a trust dialog
+  its read-only terminal cannot answer.
 - **Scheduled gateway-token rotation — the delivery hook is still unwired, and that is a finding.**
   `AgentGatewayCredentials.RotateStale` refuses to rotate unless a `TokenDelivery` hook confirms the
   jail received the replacement. There is no channel that can: the token reaches the jail in
