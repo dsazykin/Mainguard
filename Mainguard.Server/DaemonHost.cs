@@ -72,16 +72,29 @@ public static class DaemonHost
             "options parsed: port={Port} localDev={LocalDev} smoke={Smoke} logsDir={LogsDir}",
             options.Port, options.LocalDev, options.Smoke, logsDir);
 
-        var tokenFile = SessionTokenFile.Create(tokenPath);
+        // F55: the process-wide single-instance guard. Registered here so container disposal releases it,
+        // but ACQUIRED from the Kestrel options callback in Build — the one hook that runs on a real
+        // listening daemon and never under the in-proc TestServer tier (where every fixture deliberately
+        // shares one data root). See DaemonInstanceLock for the full argument.
+        builder.Services.AddSingleton<Runtime.DaemonInstanceLockHolder>();
+
+        // F55: MINTED, NOT WRITTEN. Both the session token and the mTLS material used to be written to
+        // disk right here — long before Kestrel binds — so a second daemon started against the same data
+        // root rotated the LIVE daemon's credentials and only afterwards discovered the port was taken.
+        // Every client then held a token the survivor had never issued and presented a client certificate
+        // it does not pin, and the handshake failed before the bearer layer was even reached. The write
+        // now happens from ApplicationStarted (PersistSessionCredentials), i.e. only once the port has
+        // actually been won.
+        var tokenFile = SessionTokenFile.Mint(tokenPath);
         builder.Services.AddSingleton(tokenFile);
-        lifecycle.LogInformation("session token ready");
+        lifecycle.LogInformation("session token minted (written once the port is bound)");
 
         // MG-19: the peer-authentication layer. Fresh per-session mTLS material is written beside the
         // token with the same user-only permissions, so the bearer token is no longer the sole gate on
         // the control plane. Returned to Build so the Kestrel listener can present/pin it.
-        var transportCertificates = SessionTransportCertificates.Create(tokenFile.Path);
+        var transportCertificates = SessionTransportCertificates.MintSession(tokenFile.Path);
         builder.Services.AddSingleton(transportCertificates);
-        lifecycle.LogInformation("session transport credentials ready (mutual TLS, pinned)");
+        lifecycle.LogInformation("session transport credentials minted (mutual TLS, pinned)");
 
         // P2-15: IAuditLog is registered by GatewayServiceRegistration.Register below — the audit
         // chain rides the same daemon-DB posture decision as the gateway stores (ChainedAuditLog
@@ -312,7 +325,12 @@ public static class DaemonHost
         // (AgentCliBinder → docker exec under a real PTY) that Attach streams with replay across
         // re-attaches. The per-attach factory ctor remains the TI-P2-03 wiring-test shape; with
         // neither, the attach falls back to the P2-02 echo.
-        builder.Services.AddSingleton<TerminalSessionManager>();
+        // Constructed through a factory rather than by type so the logger constructor is chosen
+        // explicitly: DetachAllForShutdown has to be able to NAME the agents a restart left running
+        // (F59), and "which constructor did DI pick" is not a thing that should decide whether an
+        // operator-facing line gets written.
+        builder.Services.AddSingleton(sp => new TerminalSessionManager(
+            sp.GetRequiredService<ILoggerFactory>()));
 
         // P2-09: the session leader owns the per-agent PTY fds and the durable, leader-owned registry
         // the daemon reattaches through on boot (no daemon-side pidfiles). The registry lives next to
@@ -330,7 +348,11 @@ public static class DaemonHost
             builder,
             ResolveDataPath(options, builder.Configuration, tokenPath),
             log: message => migration.LogInformation("{Milestone}", message),
-            options: options);
+            options: options,
+            // F55, second leg: the data root whose instance lock guards ClearStaleMigrationLock. Named
+            // here rather than derived from the DB path because --data-path can separate the two, and
+            // this is the ONE place that knows both.
+            lockDirectory: transportCertificates.Directory);
 
         // P2-15 retention: 90-day expiry as chained redactions (once at boot + daily). No-op on the
         // in-memory fallback journal.
@@ -357,6 +379,12 @@ public static class DaemonHost
 
         builder.Services.AddGrpc(o =>
         {
+            // Explicit message ceilings (fix/audit-w1d-logging-and-secrets). gRPC's 4 MB receive default
+            // is below what this control plane legitimately carries — a merge diff or a scrollback page —
+            // and the send side is UNBOUNDED by default, which is the direction that matters: a single
+            // oversized reply would otherwise be assembled in full in the daemon's heap.
+            o.MaxReceiveMessageSize = 16 * 1024 * 1024;
+            o.MaxSendMessageSize = 16 * 1024 * 1024;
             // EVERY RPC is authenticated (no public-method allowlist), then role/terminal-lock enforced
             // (P2-14 — coordinator denied merge/approval RPCs, locked-worker input severed), then
             // access-logged through the secret field mask. Order: authenticate, authorize, log.
@@ -612,6 +640,35 @@ public static class DaemonHost
 
         builder.WebHost.ConfigureKestrel(kestrel =>
         {
+            // F55: take the single-instance lock HERE — before a listener is configured, and therefore
+            // before anything binds or is written. This callback is the seam that separates a real
+            // daemon from the in-proc test tier: Kestrel's options are materialized only when Kestrel
+            // is actually the server, so a WebApplicationFactory host (TestServer) never reaches it and
+            // the tier's deliberately-shared data root stays workable.
+            //
+            // A second daemon against the same data root fails here, having minted its credentials in
+            // memory and written NOTHING. That is the whole point of the finding: the loser used to
+            // rotate the winner's token and mTLS material on its way to discovering it had lost.
+            kestrel.ApplicationServices.GetRequiredService<Runtime.DaemonInstanceLockHolder>()
+                .Acquire(certificates.Directory);
+
+            // F60: HTTP/2 keepalive on the SERVER side. Attach, StreamQueue and StreamAgentEvents are
+            // long-lived streams that can sit idle for many minutes; without pings a half-open TCP
+            // connection (laptop lid, VM suspend, NAT rebind) is invisible to both ends until the OS
+            // gives up — the client's reconnect never fires because no fault ever surfaces. Kestrel now
+            // pings an idle connection and tears it down when the ping is not answered, which is what
+            // turns a silent half-open socket into the RpcException the client already knows how to
+            // reconnect from.
+            kestrel.Limits.Http2.KeepAlivePingDelay = TimeSpan.FromSeconds(20);
+            kestrel.Limits.Http2.KeepAlivePingTimeout = TimeSpan.FromSeconds(20);
+
+            // ...and the corollary: a long-lived gRPC stream must not be killed for being quiet. The
+            // default minimum request-body data rate (240 B/s after a 5 s grace) is a slow-loris defence
+            // written for request bodies that are meant to end. An Attach stream where the operator is
+            // reading rather than typing sends nothing for minutes and is a legitimate client; the
+            // keepalive pings above are the liveness check that replaces the rate floor.
+            kestrel.Limits.MinRequestBodyDataRate = null;
+
             // Loopback only, and MUTUALLY AUTHENTICATED (MG-19). "Loopback" is not an isolation
             // boundary here: under WSL2 localhostForwarding this in-VM listener is reachable from any
             // process in the Windows user's session (measured — docs/security-architecture.md), so the
@@ -652,7 +709,65 @@ public static class DaemonHost
         UseModelGateway(app, options);
         MapServices(app);
         RegisterLifecycleLogging(app, options);
+        RegisterCredentialPersistence(app);
+        RegisterTerminalDetachOnShutdown(app);
         return app;
+    }
+
+    /// <summary>
+    /// F55, the second half: the session token and mTLS material are written to disk from
+    /// <c>ApplicationStarted</c> — after every listener has bound — and never before.
+    ///
+    /// <para><c>ApplicationStarted</c> fires inside <c>IHost.StartAsync</c>, before it returns, so
+    /// <see cref="RunSmokeAsync"/> and every client that waits for the daemon to be up still finds the
+    /// files where it always did. A daemon that fails to bind never gets here, which is exactly the
+    /// behaviour the finding asks for: the loser of a port race leaves the winner's credentials alone.</para>
+    ///
+    /// <para>A write that fails STOPS the daemon rather than serving on. A listening control plane whose
+    /// clients cannot read its credentials is worse than one that is plainly down: the operator sees
+    /// handshake failures against a daemon that reports itself healthy.</para>
+    /// </summary>
+    private static void RegisterCredentialPersistence(WebApplication app)
+    {
+        var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+        var logger = app.Services.GetRequiredService<ILoggerFactory>()
+            .CreateLogger(DaemonLogCategories.Lifecycle);
+
+        lifetime.ApplicationStarted.Register(() =>
+        {
+            try
+            {
+                app.Services.GetRequiredService<SessionTokenFile>().Persist();
+                app.Services.GetRequiredService<SessionTransportCertificates>().Persist();
+                logger.LogInformation("session credentials written (port won first)");
+            }
+            catch (Exception ex)
+            {
+                logger.LogCritical(ex,
+                    "could not write the session credentials — stopping: {Message}", ex.Message);
+                lifetime.StopApplication();
+            }
+        });
+    }
+
+    /// <summary>
+    /// F59: a daemon shutdown DETACHES the bound CLI terminals instead of killing them.
+    ///
+    /// <para>Container disposal used to reach <see cref="TerminalSessionManager.Dispose"/>, which called
+    /// <c>Release</c> on every bound session, which killed each CLI. A restart for an unrelated reason —
+    /// an upgrade, a launchd respawn, an operator restarting the app — therefore terminated every agent
+    /// mid-task, with no prompt and no record beyond the jail sitting idle until the reaper took it half
+    /// an hour later. The jail and its worktree survive a daemon restart by design; the CLI's PTY does
+    /// not, but that is a reattach problem, not a reason to SIGKILL the process.</para>
+    ///
+    /// <para>Registered on <c>ApplicationStopping</c> so it runs while the host is still up and the log
+    /// still has sinks — the point is that the operator can see which agents were left running.</para>
+    /// </summary>
+    private static void RegisterTerminalDetachOnShutdown(WebApplication app)
+    {
+        var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+        lifetime.ApplicationStopping.Register(() =>
+            app.Services.GetRequiredService<TerminalSessionManager>().DetachAllForShutdown());
     }
 
     /// <summary>
@@ -746,12 +861,41 @@ public static class DaemonHost
         catch (IOException ex)
         {
             await app.DisposeAsync();
-            throw new DaemonStartupException(options.Port,
-                $"Mainguard daemon could not bind loopback port {options.Port} (already in use?).", ex);
+            throw new DaemonStartupException(options.Port, BindFailureMessage(options.Port), ex);
+        }
+        catch (Exception)
+        {
+            // F55 added a second way for startup to fail (the instance lock refusing a second daemon),
+            // and a host that failed to start must be disposed on EVERY path — a leaked one holds the
+            // container, its hosted services and, on a partial start, a listener.
+            await app.DisposeAsync();
+            throw;
         }
 
         return app;
     }
+
+    /// <summary>
+    /// The operator-facing text for a failed control-plane bind.
+    ///
+    /// <para><b>Why this is more than "address in use" (F55, observed 2026-09-08).</b> The realistic cause
+    /// on a development machine is a second daemon started from another build or worktree, and the thing
+    /// the operator most needs to know is what did NOT happen: the daemon already on the port is fine, it
+    /// keeps running, and this instance wrote nothing. Before the credential writes moved behind the bind
+    /// that was not true — the loser rewrote the shared <c>daemon.token</c> and <c>daemon-client.pfx</c>
+    /// on its way to this exception, which orphaned an eight-day-old session that was still holding the
+    /// port and still healthy, and left the bare bind error as the only clue. A message that says only
+    /// "address already in use" gives the accidental victim nothing to act on.</para>
+    /// </summary>
+    internal static string BindFailureMessage(int port) =>
+        $"Mainguard daemon could not bind loopback port {port} — something is already listening there, "
+        + "which on a development machine is almost always another mainguardd (a second build, a second "
+        + "worktree, or a login LaunchAgent). THIS instance has stopped and written nothing: the daemon "
+        + "that holds the port keeps running, and its session token and mTLS material are untouched, so "
+        + "any client already talking to it is unaffected. To take the port over, stop that daemon first "
+        + $"(`lsof -nP -iTCP:{port} -sTCP:LISTEN`); to run a second one deliberately, give it its own "
+        + "--port AND its own data root (MAINGUARD_DATA_ROOT) — two daemons sharing one data root is the "
+        + "condition the single-instance lock refuses.";
 
     /// <summary>
     /// The <c>--local-dev --smoke</c> path: start, self-probe an authenticated

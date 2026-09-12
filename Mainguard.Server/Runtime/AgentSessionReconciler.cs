@@ -208,6 +208,12 @@ public sealed class AgentSessionReconciler
                     _store.MarkState(key, WorkingState, AdoptedReason);
                 }
 
+                // The jail reaper's exemption is scoped to exactly this: a jail that outlived the daemon
+                // which started it, whose CLI's PTY died with that process and cannot be re-attached. The
+                // state word cannot carry the fact (adoption writes "Working", and so does an ordinary
+                // running agent), and without it the reaper either destroys mid-task work or keeps every
+                // finished-awaiting-review jail forever. The mark clears as soon as a CLI binds again.
+                _store.MarkAdopted(key);
                 adopted.Add(container.AgentId);
             }
             catch (Exception ex)

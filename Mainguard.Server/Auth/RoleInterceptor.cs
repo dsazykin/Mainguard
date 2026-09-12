@@ -12,10 +12,14 @@ namespace Mainguard.Server.Auth;
 /// P2-14 role + terminal-lock enforcement, <b>daemon-side, at the gRPC layer</b> (never UI-only —
 /// convention is not enforcement, plan §7 rejection trigger).
 ///
-/// <para><b>Role (test 6):</b> a connection whose bearer token is a <see cref="ConnectionRole.Coordinator"/>
-/// credential is denied the merge RPCs (<c>BeginMerge</c>/<c>ConfirmMerge</c>) and the human-only
-/// plan-approval RPCs (<c>ApprovePlan</c>/<c>RejectPlan</c>) with <see cref="StatusCode.PermissionDenied"/>.
-/// The coordinator has no merge power and cannot approve its own plans.</para>
+/// <para><b>Role (test 6, F11):</b> a connection whose bearer token is a
+/// <see cref="ConnectionRole.Coordinator"/> credential may call only the RPCs on
+/// <see cref="CoordinatorAllowedMethods"/> — fleet and policy READS, plus its own conversation. Every
+/// other method, including one added after this file was last read, is refused with
+/// <see cref="StatusCode.PermissionDenied"/>. This is default-deny by construction; it replaced a deny
+/// list that was correct about each entry it had and wrong about its shape, since the ~20 methods it
+/// never mentioned included spawn, stop, terminal attach, credential harvest, the kill switch,
+/// verification, the merge diff, the queue stream, egress policy, budgets and repo provisioning.</para>
 ///
 /// <para><b>Terminal input lock (test 5):</b> for <c>TerminalService.Attach</c> the request (INPUT) stream
 /// is wrapped so a <c>data</c> frame toward a <see cref="TerminalLockRegistry"/>-locked agent is rejected
@@ -27,8 +31,71 @@ public sealed class RoleInterceptor : Interceptor
     private const string HeaderKey = "authorization";
     private const string Scheme = "bearer ";
 
-    // The RPCs a coordinator credential may never call (interceptor-enforced role, not convention).
-    private static readonly HashSet<string> CoordinatorDeniedMethods = new(StringComparer.Ordinal)
+    /// <summary>
+    /// <b>F11 — the coordinator's ALLOWLIST.</b> A coordinator credential may call these RPCs and no
+    /// others. Everything absent from this set is denied, including RPCs that do not exist yet.
+    ///
+    /// <para><b>Why this replaced a deny list.</b> The deny list was correct about every entry it had and
+    /// wrong about its shape: it enumerated ~30 dangerous methods out of ~50, and the residue — the
+    /// methods a coordinator was silently allowed — included <c>SpawnAgent</c> (a manual agent with a full
+    /// worktree, undoing the role lock in one RPC), <c>StopAgent</c> (stop a co-tenant),
+    /// <c>TerminalService/Attach</c> (the live stream <c>GetScrollback</c> was explicitly denied for),
+    /// <c>HarvestAgentCredentials</c>, the kill switch, <c>RunVerification</c> /
+    /// <c>GetVerificationLog</c> / <c>GetMergeDiff</c> / <c>StreamQueue</c> (F43),
+    /// <c>EgressService/AddAllowlistHost</c> (widen every jail's egress), <c>GatewayService/SetBudgets</c>
+    /// and the <c>RepoSyncService</c> mutations. Three auditors found different subsets of that residue
+    /// independently, which is the diagnostic: a deny list fails open, and it fails open <em>quietly</em>
+    /// — every new RPC is allowed to the coordinator by default, and nothing in the build says so.</para>
+    ///
+    /// <para><b>What is on it, and why each one.</b> Reads that the coordinator surface is built out of,
+    /// plus its own conversation. Nothing here mutates queue, plan, jail, egress, budget or repo state,
+    /// and nothing here carries another agent's terminal output or transcript. <c>GetJailLimits</c> is
+    /// the read half of a pair whose write half was already denied; <c>CanMerge</c> is a predicate the
+    /// coordinator uses to decide whether to bother a human, not an act.</para>
+    ///
+    /// <para><b>The cost, stated.</b> A new RPC that a coordinator legitimately needs must be added here
+    /// or it is refused — loudly, with a message naming the method. That is the trade: a missing entry
+    /// breaks a coordinator feature in development, where a deny list's missing entry shipped a hole. In
+    /// this codebase the coordinator's production channel is the in-jail Unix socket
+    /// (<see cref="Runtime.AgentIpcServer"/>), not gRPC, so the surface being small is not an accident of
+    /// this list — it is what the coordinator actually uses.</para>
+    /// </summary>
+    private static readonly HashSet<string> CoordinatorAllowedMethods = new(StringComparer.Ordinal)
+    {
+        // Fleet reads: what agents exist, what they are doing, what this daemon is.
+        "/mainguard.v1.AgentService/ListAgents",
+        "/mainguard.v1.AgentService/StreamAgentEvents",
+        "/mainguard.v1.AgentService/StreamAgentResources",
+        "/mainguard.v1.AgentService/ListInstalledAdapters",
+        "/mainguard.v1.AgentService/GetDaemonInfo",
+        // The read half of the jail ceiling; SetJailLimits stays denied (it is the operator's lever over
+        // the machine's memory).
+        "/mainguard.v1.AgentService/GetJailLimits",
+        // A predicate, not an act: "would this branch merge cleanly". Every RPC that actually moves the
+        // queue is absent from this list.
+        "/mainguard.v1.MergeQueueService/CanMerge",
+        // Read-only policy/settings surfaces the coordinator renders. Their write siblings
+        // (SetPlanMode, UpdatePrIntakeSettings, SetBudgets, Add/RemoveAllowlistHost) are absent.
+        "/mainguard.v1.PlanApprovalService/GetPlanMode",
+        "/mainguard.v1.PrIntakeService/GetPrIntakeSettings",
+        "/mainguard.v1.GatewayService/GetBudgets",
+        "/mainguard.v1.GatewayService/StreamSpend",
+        "/mainguard.v1.EgressService/ListAllowlist",
+        "/mainguard.v1.RepoSyncService/ListWorktrees",
+        // The coordinator's OWN conversation — the one surface that is its own, both directions.
+        "/mainguard.v1.CoordinatorService/StreamConversation",
+        "/mainguard.v1.CoordinatorService/SendMessage",
+    };
+
+    /// <summary>
+    /// The former deny list, kept as the annotated record of WHY each of these is refused — the reasoning
+    /// is not reconstructable from the allowlist's absences, and it is the reasoning a reviewer needs when
+    /// somebody proposes moving one of them across. It is no longer the control: membership here is
+    /// implied by absence from <see cref="CoordinatorAllowedMethods"/>. The
+    /// <c>CoordinatorAllowlistCoverageTests</c> pin that every entry below is still denied, so this list
+    /// cannot rot into a lie.
+    /// </summary>
+    internal static readonly HashSet<string> CoordinatorDeniedMethods = new(StringComparer.Ordinal)
     {
         "/mainguard.v1.MergeQueueService/BeginMerge",
         "/mainguard.v1.MergeQueueService/ConfirmMerge",
@@ -130,6 +197,55 @@ public sealed class RoleInterceptor : Interceptor
         // It is unreachable today (the in-jail coordinator has no gRPC route), which is precisely the
         // condition under which a control quietly stops being true (MG-12).
         "/mainguard.v1.PlanApprovalService/StreamPlans",
+
+        // ---- F11: the residue the deny list left allowed. Each of these was reachable with a
+        // ---- coordinator credential until the allowlist above became the control.
+        //
+        // SpawnAgent undoes the role lock in a single call: the coordinator's workers are managed
+        // (input-locked, plan-gated) because the SPAWN made them so, and the RPC takes the role as an
+        // argument. A coordinator that could call it would give itself a manual agent with a full,
+        // writable worktree and no plan gate — every restriction below, bypassed by not being subject
+        // to them in the first place.
+        "/mainguard.v1.AgentService/SpawnAgent",
+        // Stopping is the destructive twin of PauseAgent, which was already denied. It tears down a
+        // co-tenant's jail and its unmerged work.
+        "/mainguard.v1.AgentService/StopAgent",
+        // Harvesting lifts an agent's CLI login material out of its jail. The whole point of the
+        // per-agent credential tmpfs is that one agent's keys are not another's.
+        "/mainguard.v1.AgentService/HarvestAgentCredentials",
+        // MG-30 denied GetScrollback because it serves any agent's session history. Attach serves the
+        // same content LIVE, and bidirectionally — the read the coordinator is denied, plus the input
+        // stream the terminal lock exists to sever. Denying the page-at-a-time read while leaving the
+        // stream open was the gap in its own right.
+        "/mainguard.v1.TerminalService/Attach",
+        // The emergency stop and its release. Freezing the whole fleet (or unfreezing one somebody
+        // froze deliberately) is the operator's act by definition — it is the control that exists for
+        // when the agents are the problem.
+        "/mainguard.v1.KillSwitchService/Engage",
+        "/mainguard.v1.KillSwitchService/Resume",
+        // F43. Verification is the gate a branch passes before a human is asked to merge it. A
+        // coordinator that could trigger it could re-run a failing branch until a flake let it
+        // through; one that could read the log or the diff holds the review material for work it
+        // competes with, which is the GetScrollback boundary again by another door.
+        "/mainguard.v1.MergeQueueService/RunVerification",
+        "/mainguard.v1.MergeQueueService/GetVerificationLog",
+        "/mainguard.v1.MergeQueueService/GetMergeDiff",
+        // StreamQueue is the whole queue for every repo and every agent — states, branches, verification
+        // outcomes and the human's decisions. Same read boundary as StreamPlans directly above.
+        "/mainguard.v1.MergeQueueService/StreamQueue",
+        // Egress policy is machine-wide: an added allowlist host widens what EVERY jail may reach, and
+        // a removed one can break a co-tenant's build. Reading the allowlist stays allowed.
+        "/mainguard.v1.EgressService/AddAllowlistHost",
+        "/mainguard.v1.EgressService/RemoveAllowlistHost",
+        // The spend ceiling is the operator's lever over the bill, exactly like SetJailLimits is the
+        // lever over memory. Reading budgets and the spend stream stays allowed.
+        "/mainguard.v1.GatewayService/SetBudgets",
+        // Repo provisioning and worktree lifecycle are the substrate's own state. RemoveWorktree in
+        // particular can delete a co-tenant's working tree; ProvisionRepo/CreateWorktree manufacture
+        // daemon-owned state on the user's machine. ListWorktrees stays allowed.
+        "/mainguard.v1.RepoSyncService/ProvisionRepo",
+        "/mainguard.v1.RepoSyncService/CreateWorktree",
+        "/mainguard.v1.RepoSyncService/RemoveWorktree",
     };
 
     private const string AttachMethod = "/mainguard.v1.TerminalService/Attach";
@@ -185,9 +301,15 @@ public sealed class RoleInterceptor : Interceptor
         return continuation(requestStream, responseStream, context);
     }
 
+    /// <summary>
+    /// F11: default-deny. A coordinator credential proceeds only for a method on
+    /// <see cref="CoordinatorAllowedMethods"/>; anything else — including an RPC added tomorrow — is
+    /// refused, and the refusal names the method so a legitimately-missing entry is a one-line diagnosis
+    /// rather than a mystery.
+    /// </summary>
     private void DenyIfCoordinatorForbidden(ServerCallContext context)
     {
-        if (!CoordinatorDeniedMethods.Contains(context.Method))
+        if (CoordinatorAllowedMethods.Contains(context.Method))
         {
             return;
         }
@@ -196,8 +318,11 @@ public sealed class RoleInterceptor : Interceptor
         if (_roles.Resolve(token, _tokenFile.Token) == ConnectionRole.Coordinator)
         {
             throw new RpcException(new Status(StatusCode.PermissionDenied,
-                "The coordinator role cannot invoke merge, entry-lifecycle or plan-approval RPCs "
-                + "— chat + capped tools only."));
+                $"The coordinator role cannot invoke '{context.Method}'. A coordinator credential is "
+                + "limited to an explicit allowlist — fleet/policy READS and its own conversation. Merge, "
+                + "entry-lifecycle, plan-approval, spawn/stop, terminal, kill-switch, egress, budget and "
+                + "repo-provisioning RPCs are the operator's, and every RPC not on the allowlist is "
+                + "refused by default."));
         }
     }
 

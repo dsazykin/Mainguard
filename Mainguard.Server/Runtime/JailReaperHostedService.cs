@@ -80,13 +80,25 @@ public sealed class JailReaperHostedService : IHostedService, IDisposable
             if (hasLiveCli)
             {
                 _idleSince.TryRemove(key, out _);
+
+                // A CLI is bound again, so the daemon can see this jail's terminal: whatever adoption
+                // recorded about it is spent. Cleared HERE — where a live CLI is actually observed —
+                // rather than at the bind, so it holds for a re-bind on adoption and for a plain
+                // re-spawn into the same jail alike.
+                _sessions.ClearAdopted(key);
             }
             else
             {
                 idleSince = _idleSince.GetOrAdd(key, now);
             }
 
-            var verdict = JailReapPolicy.Decide(entry, hasLiveCli, idleSince, now, allowance);
+            // The in-flight exemption applies to ONE population: a jail adopted from a dead daemon whose
+            // terminal cannot be re-attached. An ordinary worker that finished and is waiting for a human
+            // still reaps at the allowance — exempting that was how the fix for a mid-task kill became a
+            // "every finished jail lives forever" memory regression.
+            var verdict = JailReapPolicy.Decide(
+                entry, hasLiveCli, idleSince, now, allowance,
+                terminalLostToRestart: _sessions.WasAdoptedWithoutTerminal(key));
             if (!verdict.Reap)
             {
                 continue;
