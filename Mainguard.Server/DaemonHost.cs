@@ -213,9 +213,17 @@ public static class DaemonHost
         // PERMITS it. Without that entry a confined jail is pointed at an endpoint Mainguard's own
         // default-deny filter refuses — the confinement would break the agent instead of metering it.
         builder.Services.AddSingleton<IAgentEnvironment>(sp =>
-            AgentEnvironmentFactory.CreateForHost(
+        {
+            // F28: the sandbox engine's non-fatal reuse paths get a real log sink. A jail that refuses
+            // the in-place ceiling update keeps the ceiling it was created with — tolerable, but only
+            // if somebody can find out; without this the Settings page reports a ceiling no jail is
+            // running under and nothing anywhere says so.
+            var sandboxLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("Mainguard.Sandbox");
+            return AgentEnvironmentFactory.CreateForHost(
                 sp.GetRequiredService<IAuditLog>(),
-                Gateway.GatewayServiceRegistration.BuildGatewayUpstream(options)));
+                Gateway.GatewayServiceRegistration.BuildGatewayUpstream(options),
+                log: message => sandboxLog.LogWarning("{Message}", message));
+        });
 
         // P2-47 #8: the real sandboxed-spawn chain behind AgentService.SpawnAgent (provision worktree →
         // ensure default-deny egress → start hardened jail). Kept out of the gRPC class (validation+dispatch

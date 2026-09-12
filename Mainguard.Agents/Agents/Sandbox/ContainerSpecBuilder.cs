@@ -738,6 +738,16 @@ public static class ContainerSpecBuilder
             UsernsMode = request.UsernsMode,
 
             Memory = request.Limits.MemoryBytes,
+
+            // F28 follow-up: stated EXPLICITLY rather than left to dockerd's implicit default, because
+            // the update endpoint cannot be given one without the other. moby's adaptContainerSettings
+            // fills an unset MemorySwap with Memory*2 and persists THAT, so a container created without
+            // this line still reports 2x — but `UpdateContainerAsync` validates the new Memory against
+            // the swap total it is being sent, and a Memory-only update raising the ceiling above the
+            // OLD swap total is rejected (409). Recording the value here is what lets RetightenCeiling
+            // send the matching pair; the created posture itself is byte-for-byte what it always was.
+            MemorySwap = MemorySwapFor(request.Limits.MemoryBytes),
+
             PidsLimit = request.Limits.Pids,
 
             // MG-26: a CPU ceiling (cgroup cpu.max) — without it one `while :; do :; done` per pid
@@ -1044,6 +1054,14 @@ public static class ContainerSpecBuilder
     internal static long NanoCpus(double cpus) => (long)Math.Round(cpus * 1_000_000_000d, MidpointRounding.AwayFromZero);
 
     /// <summary>
+    /// Docker's <c>MemorySwap</c> for a memory ceiling: the memory+swap TOTAL, not the swap allowance.
+    /// <c>Memory * 2</c> is exactly the value moby's <c>adaptContainerSettings</c> writes when the field
+    /// is left unset with a memory limit present, so naming it changes no jail's posture — it makes the
+    /// number available to the update endpoint, which needs the pair or it rejects the raise.
+    /// </summary>
+    internal static long MemorySwapFor(long memoryBytes) => memoryBytes * 2;
+
+    /// <summary>
     /// What a jail we are about to REUSE is missing, relative to the posture this builder would create
     /// it with today (audit F28).
     /// </summary>
@@ -1142,6 +1160,15 @@ public static class ContainerSpecBuilder
         if (actual.Memory != expected.MemoryBytes)
             ceiling.Add($"memory is {actual.Memory}, expected {expected.MemoryBytes}");
 
+        // The memory+swap TOTAL, and it is not decoration: an update that raises Memory past the swap
+        // total the container currently carries is REFUSED by the engine, so a ceiling raise that did
+        // not also move this one could never apply. Drift here is by definition drift in memory too
+        // (both are a pure function of MemoryBytes), so it costs no extra recreate — it is listed so the
+        // retighten is told what to send and the reason names the axis that would otherwise 409.
+        var wantMemorySwap = MemorySwapFor(expected.MemoryBytes);
+        if (actual.MemorySwap != wantMemorySwap)
+            ceiling.Add($"memory+swap total is {actual.MemorySwap}, expected {wantMemorySwap}");
+
         var wantNanoCpus = NanoCpus(expected.Cpus);
         if (actual.NanoCPUs != wantNanoCpus)
         {
@@ -1164,6 +1191,14 @@ public static class ContainerSpecBuilder
         var host = create.HostConfig;
         if (host.Memory <= 0)
             throw new SandboxSpecException("MG-26: the agent jail must carry a memory ceiling.");
+        // A memory ceiling with unbounded swap (MemorySwap = -1) is not a memory ceiling: the jail
+        // simply spills past it onto disk. Asserted rather than assumed, because the field is now set
+        // explicitly and an explicit field is one a future edit can get wrong.
+        if (host.MemorySwap < host.Memory)
+            throw new SandboxSpecException(
+                "MG-26: the agent jail's memory+swap total must be at least its memory ceiling; "
+                + $"got MemorySwap={host.MemorySwap} for Memory={host.Memory} "
+                + "(-1 or 0 would leave swap unbounded, which defeats the ceiling).");
         if (host.PidsLimit is null or <= 0)
             throw new SandboxSpecException("MG-26: the agent jail must carry a pids ceiling.");
         if (host.NanoCPUs <= 0)

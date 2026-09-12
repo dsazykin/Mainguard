@@ -50,7 +50,10 @@ internal static class AgentEnvironmentComposition
         // The other half of the finding — that the containment test itself was textual — IS fixed:
         // ContainerSpecBuilder.IsUnderAnyRoot now compares resolved real paths, so a symlink out of a
         // daemon-owned root no longer passes a check the bind then ignores.
-        Func<string, IReadOnlyList<string>>? allowedMountRoots = null)
+        Func<string, IReadOnlyList<string>>? allowedMountRoots = null,
+        // Where the substrate's best-effort paths report what they could not do. Null in the harnesses
+        // that build a substrate for one call; the daemon passes its own logger.
+        Action<string>? log = null)
     {
         // The root, resolved HERE rather than left to each collaborator's own default, because the
         // allowlist store below needs the same directory the mirrors and worktrees live in. Identical to
@@ -114,8 +117,13 @@ internal static class AgentEnvironmentComposition
         // UsernsRemapPolicy.InheritDaemonRemap), but it now names the daemon-level remap it inherits, and
         // ContainerSpecBuilder refuses the "host" opt-out on the way out.
         var sandboxes = new DockerSandboxEngine(docker, new SandboxEngineOptions(
-            egress.NetworkName, egress.ProxyUrl, UsernsRemapPolicy.InheritDaemonRemap,
-            AllowedMountRoots: allowedMountRoots?.Invoke(root)));
+                egress.NetworkName, egress.ProxyUrl, UsernsRemapPolicy.InheritDaemonRemap,
+                AllowedMountRoots: allowedMountRoots?.Invoke(root)),
+            // The engine's two best-effort reuse paths (posture inspect, in-place ceiling update) are
+            // non-fatal by design and were therefore silent. They are the operator-visible ones — a
+            // ceiling the Settings page reports as applied — so they get the daemon's log, not just a
+            // comment saying the failure is tolerated.
+            log: log);
 
         // The per-repo toolchain layer is built through the SAME Docker client, on the VM's network —
         // deliberately not through the jail's default-deny segment, and touching no allowlist.

@@ -281,7 +281,11 @@ public sealed class DockerToolchainImageBuilder : IToolchainImageBuilder
             }
 
             return new ToolchainImageCandidate(
-                i.ID, tags, new DateTimeOffset(DateTime.SpecifyKind(i.Created, DateTimeKind.Utc)), used);
+                // .ToUniversalTime(), never SpecifyKind(..., Utc) — Docker.DotNet parses RFC3339 with
+                // RoundtripKind, so an offset-suffixed Created (a non-UTC dockerd host) comes back
+                // Kind=Local and stamping it Utc shifts the age by that offset. Here that would age a
+                // just-built layer past the six-hour grace and delete the image the next jail needs.
+                i.ID, tags, new DateTimeOffset(i.Created.ToUniversalTime()), used);
         }).ToArray();
 
         var removed = new List<string>();
