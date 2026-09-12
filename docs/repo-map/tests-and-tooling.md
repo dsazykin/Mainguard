@@ -1312,6 +1312,16 @@
   its epoch surviving, including recovery of the epoch from `IKillJournal.ReadAll`; the pause axis coming
   back at adoption and being dropped by a stop (`pr-<n>` ids are reused); the parked conflict and its
   hand-back permit surviving; and an unreadable ledger rehydrating as nothing remembered.
+  **The CRASH WINDOWS** (rework) are the harder half and have their own section: a restart BETWEEN
+  operations is easy, while each of these operations is two durable writes with an engine round-trip
+  between them, and the write order decides what a daemon that dies in the middle leaves behind. Modelled
+  the only honest way — a crash is the process ceasing to exist, so nothing runs afterwards: the fake
+  engine's `OnPause`/`OnUnpause` hook photographs the ledger FILE as the engine call begins, the next
+  daemon is built over that photograph, and the jail is left in the state a killed daemon leaves it (still
+  paused, because the call in flight never landed). Covers human Unpause killed mid-loop, the two orderings
+  asserted directly on the file, a human-claimed freeze with no surviving flag still being resumable, the
+  kill switch's Resume killed mid-fan-out, and a RUNNING jail not inheriting a rehydrated freeze at
+  adoption while `DeadlineLapsedReason` does survive.
 - **`Mainguard.Server.Tests/AdoptionReattachTests.cs`** — adoption's second half and the stop race, at the
   unit tier: the re-attach hook fires for an adopted RUNNING jail and **again when a jail adopted paused
   thaws** (a `docker exec` into a SIGSTOPped container blocks, so the frozen adoption cannot re-bind and
@@ -2076,7 +2086,13 @@
   its own jail socket); `AgentSession.ParentAgentId` records the spawning coordinator;** the
   Unix-socket legs — coordinator IPC endpoint + locked managed-worker spawn via the socket, and the
   REAL python3 `mainguard-agent` shim round-trip — are `LinuxOnly`, authoritative in the Linux CI
-  leg),**
+  leg; **the adoption re-bind driven through the SHIPPED hook** — `AgentSpawnService.TryReattachAdoptedAgent`
+  over an adoption-shaped record, asserting the adapter lookup, the marker argv, the declared `resumeArg`
+  ahead of the variadic `--allowedTools`, the role instructions and the one shim grant re-applied, the
+  kickoff turn deliberately absent, and the `cli_reattached` audit; plus the guards the hook owns — a
+  frozen jail is skipped (`docker exec` into a SIGSTOPped container blocks) and a session that already has
+  a live CLI is left alone. Driving `TryBind` with a hand-written argv instead passes with the entire hook
+  deleted, which is why the entry point is the one under test),**
   **`PlanModeToggleDaemonTests`** (the plan-mode toggle AT THE DAEMON, on its own `PlanGateRig` so the
   switch it flips is its own host's: with the toggle off the worker's `task` op answers at once and the
   coordinator is told "Working"; with it on the same op is refused and then answers after an approval,
@@ -2316,7 +2332,11 @@
   Stop still clears it. Plus audit F27's wiring: the host's `SweepSegmentsOnceAsync` runs the segment
   reaper and audits `jail_segment_reaped` by segment name — a network that no longer exists cannot be
   inspected afterwards — and a segment sweep that throws is swallowed rather than taking the load-bearing
-  jail sweep with it. The policy's own table lives in `Mainguard.Tests/JailReapPolicyTests`),**
+  jail sweep with it — including the throw that actually happens and was NOT swallowed before the rework:
+  a Docker.DotNet timeout arrives as `TaskCanceledException`, an `OperationCanceledException` on a token
+  nobody cancelled, which the type-only filter let out into a faulted reaper loop that never ran again;
+  a genuinely cancelled token still propagates, because that one means the host is stopping.
+  The policy's own table lives in `Mainguard.Tests/JailReapPolicyTests`),**
   **`StopAllAgentsOnExitTests` (2026-09-04 — the exit leg: `ControlCenterViewModel.StopAllAgentsAsync`
   ends every live mock agent and leaves the records (branches stay until teardown), honours an exhausted
   budget between agents, and the manifest's surface is the one `ProductionShutdownEnvironment` reaches —

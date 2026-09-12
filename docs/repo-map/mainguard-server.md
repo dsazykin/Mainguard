@@ -331,7 +331,12 @@
     grace is already ten minutes): `SandboxSegmentReaper.SweepAsync` reclaims per-agent networks whose jail
     no longer exists, audited as `jail_segment_reaped` by segment name, and a sweep that throws is
     swallowed so the load-bearing jail half is never lost with it (audit F27 — the reaper was complete and
-    tested and reached nothing). **A different axis from the jail sweep, deliberately not sharing its
+    tested and reached nothing). **"Throws" includes an `OperationCanceledException` on a token nobody
+    cancelled** (W3A rework): a Docker.DotNet call past its 100-second default surfaces as
+    `TaskCanceledException`, which the type-only filter let through — out of the sweep, out of the loop
+    lambda that had no catch around it, into a faulted `Task.Run` whose `while` never ran again, leaving
+    the jail sweep dead until the next daemon restart with nothing reporting it. A cancellation is only an
+    instruction when the caller's token is actually cancelled, and that one still propagates. **A different axis from the jail sweep, deliberately not sharing its
     rules:** the jail sweep asks "idle too long", and PR #366 exempted a jail with an in-flight merge entry
     from that; a segment is reaped on whether ANY container (running or stopped) exists for it, so a
     live-but-idle jail's network is saved by the jail's existence whatever the queue thinks, and borrowing
@@ -537,7 +542,15 @@
     call FAILS, so a retry is a retry rather than needing the undocumented "pause again, then unpause"
     (F17), and (b) accepts a jail whose pause axis carries only the engine's own reading — a freeze nobody
     inside the app claims — which is F3's last exit; a freeze an in-app owner DOES claim is still refused,
-    because its owner's release does more than call unpause. Pinned by
+    because its owner's release does more than call unpause. **The two writes are ordered around the engine
+    call, and that order is the fix for the crash window the durable ledger opened** (W3A rework): Pause
+    persists the CLAIM before the freeze it explains, and Unpause drops the flag from MEMORY before the
+    engine call (`ForgetHumanPause`, for the machine-hold race) and from the FILE only after it
+    (`PersistHumanPauseCleared`). The other order left `{HumanPaused:false, Frozen:["a human paused it"]}`
+    for a daemon that died mid-loop — the audit's own wedge, made durable. `IsReleasableFreeze` closes the
+    same window from the reading side: this service's own axis reason (`HumanPausedFrozenReason`) with no
+    surviving flag is still a human's freeze, and a session that is not frozen at all does not veto the
+    others. Pinned by
     `Mainguard.Server.Tests/AgentPauseTests` (incl. a real docker pause→inspect→unpause leg),
     `RestartSurvivalTests`, `RestartSurvivalDockerTests`, and the arbiter legs of
     `Mainguard.Tests/YieldProtocolTests`.
@@ -554,7 +567,14 @@
     adoption is SKIPPED while `AgentSessionStore.IsTearingDown` says a stop is mid-teardown (audit F14 —
     the stop removes the record seconds before the container goes, and a pass landing in that window
     resurrected a ghost session that then refused the entry's Resume for half an hour), and the engine's
-    own freeze reason never overwrites a more specific one already on the pause axis. The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
+    own freeze reason never overwrites a more specific one already on the pause axis. The rework adds the
+    converse of that last rule — `ClearFreezeOnAnAdoptedRunningJail`: a jail Docker lists as RUNNING does
+    not inherit a rehydrated freeze, because every release is two writes (wake the container, clear the
+    axis) and a daemon that died between them left a running jail whose axis said frozen, which the drift
+    pass never cleared (it only clears when the state WORD is Paused, and adoption had just written
+    `Working`). Safe only at adoption, where the key had no record a line earlier so no live owner can be
+    mid-pause on it; `SandboxKillTarget.DeadlineLapsedReason` is exempt, because it says containment could
+    not be READ and a listing is not the confirmation it is waiting for. The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
     table, `LeaderReattachTask` → the PTY leader registry) never wrote to `AgentSessionStore`, which is
     what `ListAgents`/`StreamAgentEvents`/the resource monitor/the kill switch actually render — so a
     restarted daemon reported zero agents while their jails kept running, and a `docker pause`/`unpause`
@@ -902,7 +922,14 @@
     (a role property) survives the cycle — that was the concern behind the original "Resume deliberately
     does NOT un-contain", honoured precisely instead of by refusing to recover at all. A container that
     no longer exists is released by definition (logged, skipped); an unpause the engine refuses marks the
-    session `Unresponsive` with "the jail is STILL paused" and keeps it in the retry ledger.
+    session `Unresponsive` with "the jail is STILL paused" and keeps it in the retry ledger. **The durable
+    entry is narrowed as the release proceeds and dropped once, at the very end** (W3A rework): dropping it
+    up front — before a single container had been woken — meant a daemon dying inside the fan-out left
+    `KillContained=false` with every jail still paused and the axis still reading "Kill switch engaged", so
+    the next daemon's Resume released nothing, Unpause refused (a claimed reason) and the CLI re-bind
+    skipped (the jail is frozen): a raw `docker unpause` was the only exit, which is the audit's Critical 3
+    written into the code added to close it. Each container leaves the entry only once it has been
+    witnessed awake, so a lost daemon rehydrates exactly what nobody woke.
   - `DaemonHost.cs` registers one `IAgentEnvironment` (`Wsl2AgentEnvironment`) as a singleton, the P2-14
     governance singletons (`ConnectionRoleRegistry`, `TerminalLockRegistry`,
     `IApproverIdentityResolver`, `CoordinatorLimits`, `PlanApprovalService` over a restart-safe

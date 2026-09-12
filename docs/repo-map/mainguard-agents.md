@@ -316,6 +316,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     so the obvious spelling of this fix ships the fix and keeps the bug. Gated on `ipcDirPath` like the
     pre-approval beside it, and an unreadable style is REFUSED at parse (`BadInitialPrompt`) rather than
     defaulted, because degrading to "no first turn" is the deadlock).
+    **The fourth per-adapter field, `resumeArg`** (claude-code: `--continue`, measured against the CLI's own
+    `--help`), is the mirror image and is used on exactly ONE path — `BuildReattachLaunchArgv`, the adoption
+    re-bind after a daemon restart. The daemon's PTY dies with the daemon so the adopted agent's CLI is a
+    new `docker exec`, but its jail is not new: `/workspace`, the `agent/<id>` branch and the in-jail `$HOME`
+    all survive, and a CLI that keeps a per-directory session store keeps it under that `$HOME` — so the
+    transcript is still on disk and the flag is what opens it. Without it the re-bind restored a *process*,
+    not a loop: a steerable CLI at an empty input box with no idea what it was doing. Never on the spawn
+    line (a fresh jail has no conversation to continue), placed before the variadic `--allowedTools` for the
+    same reason the first turn is, and subject to the same rule as `preApprovedCommandArg` — verify the flag
+    against the PINNED binary, because a flag a CLI does not know makes it exit on its own launch line, and
+    on the re-bind path that is an adopted agent that had a jail and now has nothing. An adapter that
+    declares none re-binds exactly as it did before the field existed.
   - **`Agents/` (P2-06 repo provisioner — daemon-side, no UI).**
     - `RepoPathHasher.cs` (pure: a normalized Windows repo path → a stable lowercase-hex SHA-256;
       case-folds + unifies slashes + strips the trailing separator so `C:\Repo\` and `c:/repo` map to one
@@ -2216,8 +2228,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the argv the daemon execs in the jail. This is the `agentKind`→CLI wiring `SandboxAgentLauncher`
       used to ignore. The marker also carries `credentialPaths` and `settingsPaths` across the host/VM
       boundary — the ONLY declarations of what the daemon may restore into / harvest from a jail — plus
-      `instructionsFile`/`systemPromptArg` and (defect C2) `preApprovedCommandArg`/
-      `preApprovedCommandFormat`. **Defect D5a — the marker is no longer a second source of truth.**
+      `instructionsFile`/`systemPromptArg`, (defect C2) `preApprovedCommandArg`/
+      `preApprovedCommandFormat`, and the adoption re-bind's `resumeArg`. **Defect D5a — the marker is no
+      longer a second source of truth.**
       Those fields being null on an older marker was documented as "re-install to backfill", and on a real
       install nobody does: `~/mainguard/adapters/registry/claude-code.json` carried none of
       `preApprovedCommandArg`, `preApprovedCommandFormat` or `initialPromptStyle`, so two shipped fixes

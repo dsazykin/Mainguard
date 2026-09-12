@@ -302,7 +302,13 @@ public sealed class SandboxSegmentReaper
         return SandboxSegmentReapPolicy.Decide(
             inspected.Name ?? listed.Name,
             role,
-            new DateTimeOffset(DateTime.SpecifyKind(inspected.Created, DateTimeKind.Utc)),
+            // .ToUniversalTime(), never SpecifyKind(..., Utc). Docker.DotNet parses the engine's RFC3339
+            // timestamp with RoundtripKind, so a `+02:00` suffix — what a native Linux/WSL dockerd on a
+            // non-UTC host emits — yields Kind=Local. STAMPING that Utc keeps the wall-clock digits and
+            // throws the offset away, shifting the age by the host's offset: in UTC-7 a segment created
+            // one minute ago reads seven hours old and the grace that exists to protect an in-flight
+            // spawn is defeated. Same call the engine already makes for container.Created.
+            new DateTimeOffset(inspected.Created.ToUniversalTime()),
             now,
             _grace,
             jailNames,
