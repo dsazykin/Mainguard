@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
@@ -49,11 +50,25 @@ public interface IPrHeadPeek
 /// <see cref="IPrHeadPeek"/> lets the caller decide "changed?" without touching the worktree, and the
 /// destructive leg now waits out the worker's <c>index.lock</c> on the shared
 /// <see cref="GitMutationGuard"/> backoff and refuses (typed) rather than colliding with it.</para>
+///
+/// <para><b>NOT closed on this path: the config-snapshot race.</b>
+/// <see cref="AgentGitCommand"/>'s neutralization is a snapshot taken microseconds before the spawn. On
+/// the keep-alive path that window is shut by construction — the agent is yielded, its jail paused, for
+/// the whole cycle. <b>Here it is not.</b> This fetcher is a peer of the worker, not its arbiter: it
+/// holds no yield token (see <see cref="WaitForWorktreeLock"/>), so the worker's jail is LIVE while the
+/// fetch and the <c>reset --hard</c> run, and <c>reset --hard</c> runs smudge filters. Worse, the
+/// trigger is the attacker's: the PR author pushes, the poll fetches, so an external author can drive
+/// this leg on demand while flipping <c>filter.*.smudge</c> in a loop from their own jail, and win the
+/// race on some iteration. Closing it means giving the intake a yield relationship with the worker
+/// (pause the jail for the reset), which is a change to who arbitrates a worker and is deliberately not
+/// made here. Until it is, treat the external-PR worker path as HARDENED BUT NOT CLOSED against a
+/// repo-local driver: the ordinary case is neutralized, a determined racer is not.</para>
 /// </summary>
 public sealed class PrHeadFetcher : IPrHeadFetcher, IPrHeadPeek
 {
     private readonly Func<string, string, string> _resolveWorktreePath;
     private readonly Func<string, string, string?>? _resolveAgentRepoPath;
+    private readonly Func<string, string?>? _resolveMirrorPath;
     private readonly Func<ExternalPrSource, string> _hostUrl;
 
     /// <param name="resolveWorktreePath">Maps (repoHash, agentId) → the agent's worktree path
@@ -72,14 +87,22 @@ public sealed class PrHeadFetcher : IPrHeadFetcher, IPrHeadPeek
     /// <c>…/worktrees/&lt;name&gt;</c> shape and round-trip-checked, which is strictly better than
     /// following it blindly but does not pin identity.
     /// </param>
+    /// <param name="resolveMirrorPath">
+    /// W1-A rework — maps repoHash → the daemon-owned shared mirror, used as the working directory of the
+    /// non-destructive <see cref="PeekRemoteHeadAsync"/>. See that method for why the worker's own
+    /// worktree was the wrong place to ask a question about a remote. Optional: without it the peek falls
+    /// back to the worktree's PARENT directory, which is daemon-owned and is not a repository.
+    /// </param>
     public PrHeadFetcher(
         Func<string, string, string> resolveWorktreePath,
         Func<ExternalPrSource, string>? hostUrl = null,
-        Func<string, string, string?>? resolveAgentRepoPath = null)
+        Func<string, string, string?>? resolveAgentRepoPath = null,
+        Func<string, string?>? resolveMirrorPath = null)
     {
         _resolveWorktreePath = resolveWorktreePath ?? throw new ArgumentNullException(nameof(resolveWorktreePath));
         _hostUrl = hostUrl ?? HttpsCloneUrl;
         _resolveAgentRepoPath = resolveAgentRepoPath;
+        _resolveMirrorPath = resolveMirrorPath;
     }
 
     public Task<string?> PeekRemoteHeadAsync(
@@ -91,10 +114,17 @@ public sealed class PrHeadFetcher : IPrHeadFetcher, IPrHeadPeek
         return Task.Run<string?>(() =>
         {
             // ls-remote is a pure remote query: it opens no repository object store, writes no ref, takes
-            // no lock. The working directory is deliberately the worktree so a relative/file:// fixture URL
-            // resolves the same way the fetch below will — but nothing in the worktree is read or written.
+            // no lock. It also needs no repository at all — which is the W1-A rework here.
+            //
+            // This used to run with the WORKER'S WORKTREE as its working directory, and that quietly made
+            // the answer agent-controlled. The worker on an external PR is a third party's code, its
+            // repository config is writable from its jail, and `url.<x>.insteadOf` rewrites the URL git
+            // actually contacts. So one config key redirected "has the PR head moved?" to a remote of the
+            // agent's choosing, which could answer "the same SHA as last time" forever — pinning the
+            // intake at unchanged and stopping the daemon from ever noticing a real force-push. A question
+            // about a REMOTE has no business being asked from inside the thing it is asked about.
             var worktreePath = _resolveWorktreePath(repoHash, agentId);
-            if (AgentGitCommand.TryRun(worktreePath, out var output, "ls-remote", fetchUrl, headRef) != 0)
+            if (AgentGitCommand.TryRun(PeekDirectory(repoHash, worktreePath), out var output, "ls-remote", fetchUrl, headRef) != 0)
             {
                 return null;
             }
@@ -175,6 +205,27 @@ public sealed class PrHeadFetcher : IPrHeadFetcher, IPrHeadPeek
                 + $"{delays.Count} attempts; refusing to hard-reset its worktree underneath it. The next "
                 + "poll retries.");
         }
+    }
+
+    /// <summary>
+    /// Where the peek's <c>ls-remote</c> runs: never a directory the agent can write.
+    ///
+    /// <para>First choice is the shared MIRROR — daemon-owned, mounted read-only into every jail since
+    /// MG-3, so its config cannot be rewritten from inside one. Failing that, the worktree's PARENT
+    /// (<c>&lt;vmRoot&gt;/worktrees/&lt;repoHash&gt;</c>), which is daemon-owned, is not mounted into any
+    /// jail, and is not a repository — <c>ls-remote</c> does not need one. A relative fixture URL still
+    /// resolves, because every URL this is given is absolute (an <c>https://</c> clone URL, or the E2E
+    /// suite's absolute fixture path).</para>
+    /// </summary>
+    private string PeekDirectory(string repoHash, string worktreePath)
+    {
+        if (_resolveMirrorPath?.Invoke(repoHash) is { Length: > 0 } mirror && Directory.Exists(mirror))
+        {
+            return mirror;
+        }
+
+        var parent = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(worktreePath));
+        return parent is { Length: > 0 } && Directory.Exists(parent) ? parent : worktreePath;
     }
 
     private static string HttpsCloneUrl(ExternalPrSource source) =>

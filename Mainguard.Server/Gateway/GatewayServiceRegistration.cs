@@ -600,7 +600,14 @@ public static class GatewayServiceRegistration
                 // pointer's own shape and only round-trip-checked.
                 resolveAgentRepoPath: (repoHash, agentId) =>
                     (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
-                        ?.AgentRepoPathFor(repoHash, agentId)));
+                        ?.AgentRepoPathFor(repoHash, agentId),
+                // W1-A rework — where the non-destructive "has the head moved?" peek runs. The daemon-owned
+                // mirror, never the worker's own worktree: on an external PR that worktree belongs to a
+                // third party whose jail can write its repository config, and one `url.<x>.insteadOf` there
+                // redirects the peek's `ls-remote` to a remote of their choosing — an answer of "unchanged"
+                // the intake would then believe forever.
+                resolveMirrorPath: repoHash =>
+                    sp.GetRequiredService<IAgentEnvironment>().Repos.BareRepoPathFor(repoHash)));
 
         services.AddSingleton<IExternalPrIntake>(sp =>
         {
