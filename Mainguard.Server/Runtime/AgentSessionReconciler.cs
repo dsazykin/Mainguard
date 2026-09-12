@@ -220,6 +220,7 @@ public sealed class AgentSessionReconciler
                 else
                 {
                     _store.MarkState(key, WorkingState, AdoptedReason);
+                    ClearFreezeOnAnAdoptedRunningJail(key);
                 }
 
                 adopted.Add(container.AgentId);
@@ -440,6 +441,38 @@ public sealed class AgentSessionReconciler
         if (_store.FrozenReason(key) is null)
         {
             _store.MarkFrozen(key, DockerPausedFrozenReason);
+        }
+    }
+
+    /// <summary>
+    /// Drops a rehydrated pause-axis mark from a jail Docker says is <b>running</b>. Adoption only, and
+    /// that scope is what makes it safe: the (repo, id) had no record a line ago, so no live owner inside
+    /// this daemon can be mid-pause on it — the mark can only have come from the restart ledger, and the
+    /// ledger is describing a jail that is demonstrably not frozen any more.
+    ///
+    /// <para><b>The window it closes.</b> Every release path is two writes — wake the container, then
+    /// clear the axis. A daemon that dies between them leaves a RUNNING jail whose axis still names a
+    /// freeze, and the adoption path applied that mark verbatim while the drift pass only clears when the
+    /// state WORD says Paused — which it does not, because adoption just wrote <c>Working</c>. The result
+    /// was permanent: <c>FrozenJailPolicy</c> refuses prompts and verification, the CLI re-bind skips
+    /// ("the jail is frozen"), readiness defers, and the reaper stops the agent 30 minutes later as idle.
+    /// Docker is the truth about whether a container is frozen; the axis only ever recorded WHO.</para>
+    ///
+    /// <para>The one reason that legitimately survives a running jail is
+    /// <see cref="SandboxKillTarget.DeadlineLapsedReason"/> — it says containment could not be READ, so
+    /// "the container is running" is the very claim it declines to make, and a listing that shows it
+    /// running is not the confirmation that mark is waiting for.</para>
+    /// </summary>
+    private void ClearFreezeOnAnAdoptedRunningJail(AgentSessionKey key)
+    {
+        if (_store.FrozenReason(key) is { Length: > 0 } reason
+            && !string.Equals(reason, SandboxKillTarget.DeadlineLapsedReason, StringComparison.Ordinal))
+        {
+            _log.LogInformation(
+                "agent-session reconcile: {Agent} was adopted RUNNING but carried a rehydrated freeze "
+                + "({Reason}) — cleared; the engine is the authority on whether a jail is frozen",
+                key.AgentId, reason);
+            _store.MarkFrozen(key, null);
         }
     }
 

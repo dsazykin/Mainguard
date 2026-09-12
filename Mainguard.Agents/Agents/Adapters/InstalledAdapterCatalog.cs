@@ -70,7 +70,14 @@ public sealed record InstalledAdapterMarker(
     /// worker jail launching with no first turn, which is the deadlock this field exists to close. Null
     /// on markers written before this field existed; re-install the CLI to backfill it, and until then
     /// those jails behave exactly as they did before.</summary>
-    [property: JsonPropertyName("initialPromptStyle")] string? InitialPromptStyle = null)
+    [property: JsonPropertyName("initialPromptStyle")] string? InitialPromptStyle = null,
+    /// <summary>The launch flag this CLI takes to CONTINUE its previous conversation (see
+    /// <see cref="AdapterSpec.ResumeArg"/>). Carried across the host/VM boundary because the daemon reads
+    /// the MARKER, not the manifest — a field that stopped at the manifest would leave every adopted jail
+    /// re-bound to a blank CLI, which is the half of "the loop survives a restart" that a process re-bind
+    /// alone does not deliver. Null on markers written before this field existed; re-install the CLI to
+    /// backfill it, and until then those jails re-bind exactly as they did before.</summary>
+    [property: JsonPropertyName("resumeArg")] string? ResumeArg = null)
 {
     /// <summary>The parsed <see cref="InitialPromptStyle"/>; <see cref="AdapterInitialPromptStyle.None"/>
     /// for an older marker or an unreadable spelling. Unlike the manifest, a marker cannot refuse — it is
@@ -106,7 +113,8 @@ public sealed record InstalledAdapterMarker(
         spec.SystemPromptArg,
         spec.PreApprovedCommandArg,
         spec.PreApprovedCommandFormat,
-        spec.InitialPromptStyle);
+        spec.InitialPromptStyle,
+        spec.ResumeArg);
 
     /// <summary>
     /// This marker with every <b>manifest-declared</b> field taken from <paramref name="spec"/>, keeping

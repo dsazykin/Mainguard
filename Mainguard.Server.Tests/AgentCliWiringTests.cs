@@ -179,6 +179,110 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         Assert.NotNull(rig.Terminals.TryGetBound(spawn.AgentId));
     }
 
+    // ---- adoption: the CLI re-bind, driven through the shipped hook ---------------------------------
+
+    /// <summary>
+    /// <b>Audit F6, end to end through the SHIPPED entry point.</b> A daemon restart leaves a live jail
+    /// with no bound CLI — the exec'd process was a child of the dead daemon's PTY. The reconciler hands
+    /// that session to <c>AgentSpawnService.TryReattachAdoptedAgent</c>, and this drives exactly that hook
+    /// rather than the binder underneath it, because everything the re-bind decides lives in between:
+    /// which adapter, which instructions, the shim pre-approval, the resume flag, and the guards that say
+    /// when not to exec at all. A test that calls <c>TryBind</c> with a hand-written argv passes with the
+    /// whole hook deleted.
+    /// </summary>
+    [Fact]
+    public async Task AnAdoptedJail_IsReBoundThroughTheSpawnServiceHook_WithResume_AndWithoutTheKickoff()
+    {
+        using var rig = WiringRig.Create(_daemon);
+
+        // The adoption shape: a record with a container and no bound CLI, exactly what the reconciler
+        // writes for a jail that outlived its daemon.
+        var store = rig.Host.Services.GetRequiredService<AgentSessionStore>();
+        var spawns = rig.Host.Services.GetRequiredService<AgentSpawnService>();
+        const string agentId = "adopted-coord";
+        var key = new AgentSessionKey(RepoHandle, agentId);
+        store.Spawn("claude-code", role: AgentRoles.Coordinator, agentId: agentId, repoHash: RepoHandle);
+        store.AttachSandbox(key, "ctr-adopted");
+
+        Assert.True(spawns.TryReattachAdoptedAgent(store.Find(key)!));
+
+        // A real bind against the surviving container, through the same binder the spawn path uses.
+        var spec = rig.LastSpec;
+        Assert.NotNull(spec);
+        Assert.Equal(agentId, spec!.AgentId);
+        Assert.Equal("ctr-adopted", spec.ContainerId);
+        Assert.NotNull(rig.Terminals.TryGetBound(key));
+
+        var launch = spec.Launch.ToArray();
+
+        // The installed marker's own argv, first.
+        Assert.Equal(new[] { "claude", "--permission-mode", "plan" }, launch.Take(3).ToArray());
+
+        // The resume flag — the difference between re-binding a process and re-binding an agent. Declared
+        // by the adapter, never hardcoded, and it must come before the variadic --allowedTools.
+        Assert.Contains("--continue", launch);
+        Assert.True(
+            Array.IndexOf(launch, "--continue") < Array.IndexOf(launch, "--allowedTools"),
+            "--allowedTools is variadic and swallows what follows it");
+
+        // The role's operating instructions and the ONE shim grant are re-applied: both are properties of
+        // the process being started, and this is a brand-new process.
+        Assert.Contains("--append-system-prompt", launch);
+        Assert.Contains("--allowedTools", launch);
+        Assert.Contains(launch, a => a.Contains("mainguard-agent", StringComparison.Ordinal));
+
+        // The first user turn is NOT. An adopted coordinator has already had it, possibly days ago.
+        Assert.DoesNotContain(
+            launch,
+            a => a.StartsWith("Begin now", StringComparison.Ordinal)
+                 || a.Contains("this is your first turn", StringComparison.Ordinal));
+
+        var audit = rig.Host.Services.GetRequiredService<Mainguard.Git.Audit.IAuditLog>();
+        await WaitForAsync(() => audit.Read().Any(
+            ev => ev.Type == AgentSpawnService.CliReattachedEvent && ev.Fields["agent_id"] == agentId));
+    }
+
+    /// <summary>
+    /// The guards the hook owns, and each one is a reason the shipped path differs from calling the binder
+    /// directly: a frozen jail is skipped (<c>docker exec</c> into a SIGSTOPped container blocks, so the
+    /// re-bind waits for the pass that thaws it), and a session that already has a live CLI is skipped
+    /// (two execs would race for one workspace and one branch).
+    /// </summary>
+    [Fact]
+    public async Task AFrozenJail_IsNotReExecInto_AndAnAlreadyBoundOneIsLeftAlone()
+    {
+        using var rig = WiringRig.Create(_daemon);
+
+        var store = rig.Host.Services.GetRequiredService<AgentSessionStore>();
+        var spawns = rig.Host.Services.GetRequiredService<AgentSpawnService>();
+
+        var frozen = new AgentSessionKey(RepoHandle, "adopted-frozen");
+        store.Spawn("claude-code", agentId: "adopted-frozen", repoHash: RepoHandle);
+        store.AttachSandbox(frozen, "ctr-frozen");
+        store.MarkFrozen(frozen, "a human paused it");
+
+        Assert.False(spawns.TryReattachAdoptedAgent(store.Find(frozen)!));
+        Assert.Null(rig.LastSpec);
+        Assert.Null(rig.Terminals.TryGetBound(frozen));
+
+        var audit = rig.Host.Services.GetRequiredService<Mainguard.Git.Audit.IAuditLog>();
+        await WaitForAsync(() => audit.Read().Any(
+            ev => ev.Type == AgentSpawnService.CliReattachSkippedEvent
+                  && ev.Fields["agent_id"] == "adopted-frozen"));
+
+        // Now a jail that DOES get a CLI, and a second pass over the same session.
+        var live = new AgentSessionKey(RepoHandle, "adopted-live");
+        store.Spawn("claude-code", agentId: "adopted-live", repoHash: RepoHandle);
+        store.AttachSandbox(live, "ctr-live");
+        Assert.True(spawns.TryReattachAdoptedAgent(store.Find(live)!));
+        var first = rig.LastSpec;
+        Assert.NotNull(first);
+
+        rig.LastSpec = null;
+        Assert.False(spawns.TryReattachAdoptedAgent(store.Find(live)!));
+        Assert.Null(rig.LastSpec); // no second exec into a jail that already has one
+    }
+
     [Fact]
     public async Task CliExit_InkCursorColumnLayout_TailKeepsWordBoundaries_AndDetectorNamesTheRealHost()
     {

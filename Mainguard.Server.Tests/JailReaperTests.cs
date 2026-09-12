@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -167,6 +168,55 @@ public sealed class JailReaperTests : IDisposable
             sweepSegments: _ => throw new InvalidOperationException("the engine did not answer"));
 
         Assert.Empty(await host.SweepSegmentsOnceAsync(DateTimeOffset.UtcNow));
+    }
+
+    /// <summary>
+    /// <b>The throw that was NOT swallowed, and it is the one that actually happens.</b> A Docker.DotNet
+    /// HTTP call that outruns its 100-second default — the engine paused, restarting, or simply slow —
+    /// surfaces as <see cref="TaskCanceledException"/>, which IS an
+    /// <see cref="OperationCanceledException"/>, on a token nobody cancelled. The old filter excluded
+    /// every OCE by type, so that one escaped the sweep, escaped the loop lambda that had no catch around
+    /// it, faulted the host's <c>Task.Run</c>, and the <c>while</c> never ran again: the jail sweep this
+    /// host exists for was dead until the next daemon restart, with nothing anywhere reporting it. A
+    /// cancellation is only an instruction when somebody actually cancelled something.
+    /// </summary>
+    [Fact]
+    public async Task AnEngineTimeoutDressedAsACancellation_IsSwallowedToo()
+    {
+        var host = new JailReaperHostedService(
+            _host.Services.GetRequiredService<AgentSessionStore>(),
+            _host.Services.GetRequiredService<TerminalSessionManager>(),
+            _host.Services.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry>(),
+            _host.Services.GetRequiredService<AgentSpawnService>(),
+            _host.Services.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits>(),
+            _host.Services.GetRequiredService<IAuditLog>(),
+            _host.Services.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>(),
+            sweepSegments: _ => throw new TaskCanceledException(
+                "The request was canceled due to the configured HttpClient.Timeout of 100 seconds elapsing."));
+
+        // Nothing was cancelled: the host is running and the token is live — only the engine went away.
+        Assert.Empty(await host.SweepSegmentsOnceAsync(DateTimeOffset.UtcNow, CancellationToken.None));
+    }
+
+    /// <summary>The other direction, which must NOT change: a real cancellation is the host stopping, and
+    /// swallowing that would make shutdown look like an engine fault.</summary>
+    [Fact]
+    public async Task ARealCancellation_StillPropagates()
+    {
+        using var cancelled = new CancellationTokenSource();
+        await cancelled.CancelAsync();
+        var host = new JailReaperHostedService(
+            _host.Services.GetRequiredService<AgentSessionStore>(),
+            _host.Services.GetRequiredService<TerminalSessionManager>(),
+            _host.Services.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry>(),
+            _host.Services.GetRequiredService<AgentSpawnService>(),
+            _host.Services.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits>(),
+            _host.Services.GetRequiredService<IAuditLog>(),
+            _host.Services.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>(),
+            sweepSegments: ct => Task.FromCanceled<IReadOnlyList<string>>(ct));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => host.SweepSegmentsOnceAsync(DateTimeOffset.UtcNow, cancelled.Token));
     }
 
     public void Dispose()

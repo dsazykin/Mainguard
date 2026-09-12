@@ -1221,11 +1221,14 @@ public sealed class SandboxAgentLauncher
     /// both are properties of the process being started rather than of the conversation: this is a new
     /// <c>docker exec</c>, so it has neither until it is given them.</para>
     ///
-    /// <para><b>What it cannot restore is the CLI's conversation.</b> The exec'd CLI died with the daemon's
-    /// PTY; this starts a new one in the same jail, against the same workspace, the same
-    /// <c>agent/&lt;id&gt;</c> branch and the same in-jail <c>$HOME</c> — so the work is intact and
-    /// whatever the vendor CLI persists for itself is where it left it, but the daemon does not claim to
-    /// have resumed a session it never owned. The agent is steerable again; that is the claim.</para>
+    /// <para><b>What it asks the CLI to restore is the conversation</b>, when that CLI declares a way to
+    /// (<see cref="InstalledAdapterMarker.ResumeArg"/> — <c>--continue</c> for claude-code). The exec'd
+    /// CLI died with the daemon's PTY, but the jail did not: the same workspace, the same
+    /// <c>agent/&lt;id&gt;</c> branch and the same in-jail <c>$HOME</c> are all still there, and a vendor
+    /// CLI that keeps a per-directory session store keeps it under that <c>$HOME</c>. So the transcript is
+    /// on disk in the jail and the flag is what opens it. The daemon still does not own that session and
+    /// makes no claim about what came back — a CLI that declares no resume flag, or whose store was
+    /// pruned, is re-bound blank, which is the pre-existing behaviour and is still steerable.</para>
     /// </summary>
     /// <param name="agentKind">The CLI kind, off the adopted jail's own <c>mainguard.kind</c> label.</param>
     /// <param name="role">The IPC endpoint role the re-bound endpoint was given.</param>
@@ -1244,6 +1247,15 @@ public sealed class SandboxAgentLauncher
         if (launchCommand is not { Count: > 0 })
         {
             return null;
+        }
+
+        // The RESUME flag, and it is the difference between re-binding a process and re-binding an agent.
+        // Placed immediately after the binary and before everything the daemon appends, for the reason
+        // BuildLaunchArgv places the first turn there: `--allowedTools` is variadic and swallows what
+        // follows it, so anything that must be read as its own argument goes ahead of it.
+        if (adapter?.ResumeArg is { Length: > 0 } resumeArg)
+        {
+            launchCommand = launchCommand.Append(resumeArg).ToList();
         }
 
         if (adapter?.SystemPromptArg is { Length: > 0 } promptArg)

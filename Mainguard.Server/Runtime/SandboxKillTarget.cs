@@ -326,11 +326,20 @@ public sealed class SandboxKillTarget : IKillTarget
             return;
         }
 
-        // Off the durable ledger as soon as it is off the in-memory one. A release that succeeded and then
-        // lost the daemon would otherwise rehydrate the entry and re-release an already-running jail on
-        // the next Resume — harmless, but it would report containment that no longer exists.
-        Persist(agentId, null);
-
+        // The durable entry is NOT dropped here, and that is the whole correction. Dropping it up front —
+        // before a single container had been woken — meant a daemon that died inside the fan-out below
+        // left `KillContained=false` with every jail still `docker pause`d and the axis still reading
+        // "Kill switch engaged". The next daemon rehydrated nothing, so Resume released nothing, Unpause
+        // refused (a claimed reason), and the CLI re-bind skipped (the jail is frozen): a raw
+        // `docker unpause` from a terminal was the only exit left. That is the audit's Critical 3, written
+        // into the file that was added to close it.
+        //
+        // Instead the entry SHRINKS as the release proceeds (see ReleasedOne below) and is dropped once —
+        // at the end, after the terminal lock and the input gate have been reversed too. The cost is the
+        // shape the old comment was avoiding: a crash between the last unpause and the final write leaves
+        // an entry whose containers are already running, so the next Resume unpauses nothing and reports a
+        // release. That is idempotent and observable; the wedge it replaces was neither.
+        //
         // A human pause is sticky through a kill-switch cycle. It outranks the ledger because the two can
         // race: if a human pause landed while the kill's own pause call was in flight, the kill switch may
         // hold the ledger entry for a jail the human now considers theirs. The terminal sever is still
@@ -338,6 +347,20 @@ public sealed class SandboxKillTarget : IKillTarget
         var humanPaused = _arbiter.IsHumanPaused(agentId);
 
         System.Runtime.ExceptionServices.ExceptionDispatchInfo? failure = null;
+
+        // What is still held. Every container that leaves this list has been WITNESSED awake — unpaused,
+        // already running, or gone — so the durable entry can be narrowed to it the moment that is true.
+        // A daemon lost mid-fan-out then rehydrates exactly the containers nobody has woken yet.
+        var remaining = contained.PausedContainers.ToList();
+
+        void ReleasedOne(string containerId)
+        {
+            if (remaining.Remove(containerId))
+            {
+                Persist(agentId, contained with { PausedContainers = remaining.ToList() });
+            }
+        }
+
         if (!humanPaused)
         {
             var sessions = _store.FindAll(agentId);
@@ -354,6 +377,7 @@ public sealed class SandboxKillTarget : IKillTarget
                     // abandon the remaining containers behind this id.
                     _log.LogWarning("resume: agent={Agent} container={Container} no longer exists — nothing to unpause",
                         agentId, containerId);
+                    ReleasedOne(containerId);
                     continue;
                 }
 
@@ -361,6 +385,7 @@ public sealed class SandboxKillTarget : IKillTarget
                 {
                     // Somebody already woke it (a raw docker unpause during the freeze). Nothing to do.
                     MarkResumed(session);
+                    ReleasedOne(containerId);
                     continue;
                 }
 
@@ -373,6 +398,7 @@ public sealed class SandboxKillTarget : IKillTarget
                 catch (Docker.DotNet.DockerContainerNotFoundException)
                 {
                     _log.LogWarning("resume: agent={Agent} container={Container} disappeared mid-release", agentId, containerId);
+                    ReleasedOne(containerId);
                     continue;
                 }
                 catch (Exception ex)
@@ -391,6 +417,7 @@ public sealed class SandboxKillTarget : IKillTarget
                 }
 
                 MarkResumed(session);
+                ReleasedOne(containerId);
                 _log.LogWarning("resume: agent={Agent} container={Container} unpaused (kill switch released)",
                     agentId, containerId);
             }
@@ -420,12 +447,24 @@ public sealed class SandboxKillTarget : IKillTarget
         {
             // Put the entry back so pressing Resume again retries this agent rather than reporting
             // "nothing to release" for a jail that is demonstrably still frozen — durably, so the retry
-            // survives the restart an operator may well reach for next.
-            var retained = contained with { TookTerminalLock = false, ClosedInputGate = false };
+            // survives the restart an operator may well reach for next. Only the containers still held:
+            // a retry that re-probed the ones already awake would report a release it did not perform.
+            var retained = contained with
+            {
+                PausedContainers = remaining.ToList(),
+                TookTerminalLock = false,
+                ClosedInputGate = false,
+            };
             _contained[agentId] = retained;
             Persist(agentId, retained);
             failure.Throw();
         }
+
+        // The release is complete — every jail awake, the lock and the gate reversed — so the durable
+        // entry goes now and not a line earlier. A human-paused agent lands here too: its jail stays
+        // frozen by the HUMAN's ledger, which is a different owner with a different release, and this
+        // kill switch is done with it.
+        Persist(agentId, null);
     }
 
     /// <summary>The axis reason for a session-only record the kill switch could only sever input for.</summary>

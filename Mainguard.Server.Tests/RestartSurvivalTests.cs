@@ -284,6 +284,243 @@ public sealed class RestartSurvivalTests : IDisposable
         Assert.DoesNotContain("jail-e", engine.Paused);
     }
 
+    // ================= The CRASH WINDOWS: a daemon that dies DURING the operation ===================
+    //
+    // The tests above restart a daemon BETWEEN operations, which is the easy half. Each operation here
+    // is two durable writes with an engine round-trip between them, and the order of those two writes
+    // decides what a daemon that dies in the middle leaves behind. Written the wrong way round, the fix
+    // for audit F3 re-creates the exact wedge it removes — durably, so the restart an operator reaches
+    // for next cannot clear it either.
+    //
+    // A crash is not an exception. It is the process ceasing to exist, so nothing runs afterwards: no
+    // catch, no finally, no compensating write. These tests model it the only way that is honest —
+    // photograph the ledger FILE at the instant the engine call begins, then build the next daemon over
+    // that photograph.
+
+    /// <summary>
+    /// <b>Human Unpause, killed mid-loop.</b> The flag clear has to reach memory before the engine call
+    /// (a machine hold starting mid-loop must see the intent already withdrawn) and the FILE only after
+    /// it. Clearing the file first left <c>{HumanPaused:false, Frozen:["a human paused it"]}</c>: the next
+    /// daemon rehydrates the axis, finds no owner, and Unpause answers "this agent isn't human-paused"
+    /// about a jail it is itself still holding frozen.
+    /// </summary>
+    [Fact]
+    public async Task ADaemonKilledMidUnpause_LeavesAJailTheNextDaemonCanStillResume()
+    {
+        const string agentId = "midway-1";
+        var engine = new FakePausableEngine();
+        var key = new AgentSessionKey(Repo, agentId);
+
+        string? atTheMomentOfDeath = null;
+        {
+            var d1 = NewDaemon(engine);
+            d1.Store.Spawn("claude-code", agentId: agentId, repoHash: Repo);
+            d1.Store.AttachSandbox(key, "jail-m");
+            Assert.True((await d1.Pause.PauseAsync(agentId, CancellationToken.None)).Done);
+
+            // The daemon dies here — inside UnpauseAsync, with the unpause call in flight.
+            engine.OnUnpause = _ => atTheMomentOfDeath ??= File.ReadAllText(_ledgerPath);
+            await d1.Pause.UnpauseAsync(agentId, CancellationToken.None);
+            engine.OnUnpause = null;
+        }
+
+        Assert.NotNull(atTheMomentOfDeath);
+        File.WriteAllText(_ledgerPath, atTheMomentOfDeath!);
+
+        // The jail is what a killed daemon leaves: still `docker pause`d, because the unpause that was in
+        // flight never completed.
+        var engine2 = new FakePausableEngine();
+        engine2.Paused.Add("jail-m");
+
+        var d2 = NewDaemon(engine2);
+        await new AgentSessionReconciler(
+            d2.Store,
+            listContainers: _ => Task.FromResult<IReadOnlyList<AgentContainerState>>(new[]
+            {
+                new AgentContainerState(agentId, Repo, "jail-m", Running: false, Paused: true),
+            })).ReconcileAsync();
+
+        var resumed = await d2.Pause.UnpauseAsync(agentId, CancellationToken.None);
+
+        Assert.True(resumed.Done, resumed.Reason);
+        Assert.DoesNotContain("jail-m", engine2.Paused);
+    }
+
+    /// <summary>The write ordering itself, asserted directly on the file rather than through a recovery —
+    /// so a regression names the cause instead of a symptom two daemons later.</summary>
+    [Fact]
+    public async Task TheHumanPauseFlag_IsStillOnFile_WhileTheUnpauseIsInFlight()
+    {
+        const string agentId = "order-1";
+        var engine = new FakePausableEngine();
+        var d = NewDaemon(engine);
+        d.Store.Spawn("claude-code", agentId: agentId, repoHash: Repo);
+        d.Store.AttachSandbox(new AgentSessionKey(Repo, agentId), "jail-o");
+        Assert.True((await d.Pause.PauseAsync(agentId, CancellationToken.None)).Done);
+
+        AgentRestartRecord? duringTheCall = null;
+        engine.OnUnpause = _ => duringTheCall = NewLedger().Find(agentId);
+
+        Assert.True((await d.Pause.UnpauseAsync(agentId, CancellationToken.None)).Done);
+
+        Assert.NotNull(duringTheCall);
+        Assert.True(
+            duringTheCall!.HumanPaused,
+            "the durable claim was dropped before the jail was thawed — a daemon dying here leaves a "
+            + "frozen jail with no owner, which is the wedge the ledger exists to end");
+        Assert.False(d.Ledger.IsHumanPaused(agentId)); // and in memory it went early, for the machine hold
+        Assert.False(NewLedger().Find(agentId).HumanPaused); // …and durably, once the engine confirmed
+    }
+
+    /// <summary>The reverse ordering, on the way in: the CLAIM is written before the freeze it explains,
+    /// so a crash mid-Pause can only leave a claim with a running jail — which self-heals — and never a
+    /// freeze with no claim, which does not.</summary>
+    [Fact]
+    public async Task TheHumanPauseFlag_IsOnFileBeforeTheJailIsEverFrozen()
+    {
+        const string agentId = "order-2";
+        var engine = new FakePausableEngine();
+        var d = NewDaemon(engine);
+        d.Store.Spawn("claude-code", agentId: agentId, repoHash: Repo);
+        d.Store.AttachSandbox(new AgentSessionKey(Repo, agentId), "jail-p");
+
+        AgentRestartRecord? duringTheCall = null;
+        engine.OnPause = _ => duringTheCall = NewLedger().Find(agentId);
+
+        Assert.True((await d.Pause.PauseAsync(agentId, CancellationToken.None)).Done);
+
+        Assert.NotNull(duringTheCall);
+        Assert.True(duringTheCall!.HumanPaused);
+        Assert.Empty(duringTheCall.Frozen);
+    }
+
+    /// <summary>
+    /// The same wedge closed from the READING side, which is what makes it unreachable rather than merely
+    /// narrow. A row that says a jail is frozen because a human froze it, with no surviving
+    /// <c>HumanPaused</c> flag — a torn write, or a file from a daemon that predates the ordering above —
+    /// is still a HUMAN's freeze. Refusing it is the audit's original "frozen, refuses every exit".
+    /// </summary>
+    [Fact]
+    public async Task AHumanClaimedFreezeWithNoSurvivingFlag_IsStillResumable()
+    {
+        const string agentId = "torn-1";
+        var engine = new FakePausableEngine();
+        engine.Paused.Add("jail-t");
+        var key = new AgentSessionKey(Repo, agentId);
+
+        var d = NewDaemon(engine);
+        d.Store.Spawn("claude-code", agentId: agentId, repoHash: Repo);
+        d.Store.AttachSandbox(key, "jail-t");
+        d.Store.MarkState(key, "Paused", "Paused by you.");
+        d.Store.MarkFrozen(key, AgentPauseService.HumanPausedFrozenReason);
+        Assert.False(d.Ledger.IsHumanPaused(agentId)); // the flag did not survive
+
+        var resumed = await d.Pause.UnpauseAsync(agentId, CancellationToken.None);
+
+        Assert.True(resumed.Done, resumed.Reason);
+        Assert.DoesNotContain("jail-t", engine.Paused);
+        Assert.Null(d.Store.FrozenReason(key));
+    }
+
+    /// <summary>
+    /// <b>Kill-switch Resume, killed mid-fan-out.</b> The causation ledger is what a release reverses, so
+    /// dropping it before a single container had been woken meant a daemon that died in the loop left
+    /// <c>KillContained=false</c> with every jail still paused and the axis still reading "Kill switch
+    /// engaged". The next daemon rehydrated nothing: Resume released nothing, Unpause refused (a claimed
+    /// reason), the CLI re-bind skipped (the jail is frozen) — a raw <c>docker unpause</c> was the only
+    /// exit left, which is audit Critical 3 written into the file added to close it.
+    /// </summary>
+    [Fact]
+    public async Task ADaemonKilledMidKillSwitchResume_LeavesAJailTheNextDaemonCanStillRelease()
+    {
+        const string agentId = "contained-1";
+        var engine = new FakePausableEngine();
+
+        string? atTheMomentOfDeath = null;
+        {
+            var d1 = NewKillDaemon(engine);
+            d1.Store.Spawn("claude-code", agentId: agentId, repoHash: Repo);
+            d1.Store.AttachSandbox(new AgentSessionKey(Repo, agentId), "jail-k");
+            await d1.KillSwitch.EngageAsync();
+            Assert.Contains("jail-k", engine.Paused);
+
+            engine.OnUnpause = _ => atTheMomentOfDeath ??= File.ReadAllText(_ledgerPath);
+            await d1.KillSwitch.ResumeAsync();
+            engine.OnUnpause = null;
+        }
+
+        Assert.NotNull(atTheMomentOfDeath);
+        File.WriteAllText(_ledgerPath, atTheMomentOfDeath!);
+
+        var engine2 = new FakePausableEngine();
+        engine2.Paused.Add("jail-k"); // the unpause that was in flight never landed
+
+        var d2 = NewKillDaemon(engine2);
+        d2.Store.Spawn("claude-code", agentId: agentId, repoHash: Repo);
+        d2.Store.AttachSandbox(new AgentSessionKey(Repo, agentId), "jail-k");
+
+        await d2.KillSwitch.ResumeAsync();
+
+        Assert.DoesNotContain("jail-k", engine2.Paused);
+    }
+
+    /// <summary>
+    /// <b>Adoption of a RUNNING jail must not inherit a freeze.</b> Every release is two writes — wake the
+    /// container, then clear the axis — so a daemon that dies between them leaves a running jail whose
+    /// axis still names a freeze. Adoption applied that mark verbatim and the drift pass only clears when
+    /// the state WORD says Paused, which it never does after an adoption wrote <c>Working</c>. The result
+    /// was permanent: prompts and verification refused, the CLI re-bind skipped, readiness deferred, and
+    /// the reaper stopping the agent half an hour later as idle. Docker is the authority on frozen.
+    /// </summary>
+    [Fact]
+    public async Task ARunningJailAdoptedWithARehydratedFreeze_DoesNotStayFrozen()
+    {
+        const string agentId = "thawed-1";
+        var key = new AgentSessionKey(Repo, agentId);
+
+        var s1 = new AgentSessionStore(new InMemoryAuditLog(), NewLedger());
+        s1.Spawn("claude-code", agentId: agentId, repoHash: Repo);
+        s1.AttachSandbox(key, "jail-r");
+        s1.MarkFrozen(key, AgentPauseService.HumanPausedFrozenReason);
+
+        // The daemon died after `docker unpause` succeeded and before MarkFrozen(null). The jail is up.
+        var s2 = new AgentSessionStore(new InMemoryAuditLog(), NewLedger());
+        await new AgentSessionReconciler(
+            s2,
+            listContainers: _ => Task.FromResult<IReadOnlyList<AgentContainerState>>(new[]
+            {
+                new AgentContainerState(agentId, Repo, "jail-r", Running: true, Paused: false),
+            })).ReconcileAsync();
+
+        Assert.Equal(AgentSessionReconciler.WorkingState, s2.Find(key)!.State);
+        Assert.Null(s2.FrozenReason(key));
+    }
+
+    /// <summary>The one reason that legitimately outlives a running jail: it says containment could not be
+    /// READ, so "Docker lists it as running" is precisely the claim it declines to make. Clearing it on a
+    /// listing would convert an unconfirmed emergency stop into a confirmed non-event.</summary>
+    [Fact]
+    public async Task AnUnconfirmedContainmentMark_SurvivesAdoptionOfARunningJail()
+    {
+        const string agentId = "unconfirmed-1";
+        var key = new AgentSessionKey(Repo, agentId);
+
+        var s1 = new AgentSessionStore(new InMemoryAuditLog(), NewLedger());
+        s1.Spawn("claude-code", agentId: agentId, repoHash: Repo);
+        s1.AttachSandbox(key, "jail-u");
+        s1.MarkFrozen(key, SandboxKillTarget.DeadlineLapsedReason);
+
+        var s2 = new AgentSessionStore(new InMemoryAuditLog(), NewLedger());
+        await new AgentSessionReconciler(
+            s2,
+            listContainers: _ => Task.FromResult<IReadOnlyList<AgentContainerState>>(new[]
+            {
+                new AgentContainerState(agentId, Repo, "jail-u", Running: true, Paused: false),
+            })).ReconcileAsync();
+
+        Assert.Equal(SandboxKillTarget.DeadlineLapsedReason, s2.FrozenReason(key));
+    }
+
     // ================= The pause axis, the parking and the hand-back permit =========================
 
     /// <summary>
@@ -476,6 +713,15 @@ public sealed class RestartSurvivalTests : IDisposable
         /// <summary>Makes <c>docker unpause</c> fail, for the F17 retry test.</summary>
         public bool FailUnpause { get; set; }
 
+        /// <summary>Called as the engine call begins, before it has had any effect. The crash-window
+        /// tests use it to photograph the durable ledger at the instant a daemon would have died
+        /// MID-operation — the only honest way to test an ordering, because a crash is the process
+        /// disappearing and not an exception the code gets a chance to handle.</summary>
+        public Action<string>? OnPause { get; set; }
+
+        /// <summary>The same, for the release direction.</summary>
+        public Action<string>? OnUnpause { get; set; }
+
         public Task<SandboxHandle> SpawnAsync(SandboxSpawnRequest request, CancellationToken ct = default)
             => throw new NotSupportedException();
 
@@ -485,12 +731,14 @@ public sealed class RestartSurvivalTests : IDisposable
 
         public Task PauseAsync(string containerId, CancellationToken ct = default)
         {
+            OnPause?.Invoke(containerId);
             Paused.Add(containerId);
             return Task.CompletedTask;
         }
 
         public Task UnpauseAsync(string containerId, CancellationToken ct = default)
         {
+            OnUnpause?.Invoke(containerId);
             if (FailUnpause)
             {
                 throw new InvalidOperationException("the container engine is not answering");

@@ -108,10 +108,18 @@ public sealed class JailReaperHostedService : IHostedService, IDisposable
         {
             reaped = await _sweepSegments(ct).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
             // A reaper that throws is a reaper someone disables. The jail sweep is the load-bearing half
             // of this host and must not be lost to an engine that would not answer a network listing.
+            //
+            // <b>The token check is the whole point of the filter.</b> `ex is not OperationCanceledException`
+            // alone let a Docker.DotNet HTTP timeout through — those surface as `TaskCanceledException`,
+            // which IS an OCE, on a token nobody cancelled (the engine paused, restarting, or just slow
+            // past the 100 s default). It escaped this method, escaped the loop lambda below, faulted the
+            // `Task.Run`, and the `while` never re-entered: the load-bearing jail sweep was dead until the
+            // next daemon restart, observed by nothing. A REAL cancellation — the caller's token, i.e. the
+            // host stopping — still propagates, because that one is an instruction rather than a failure.
             _log.LogWarning(ex, "jail reaper: the network-segment sweep threw");
             return Array.Empty<string>();
         }
@@ -251,7 +259,23 @@ public sealed class JailReaperHostedService : IHostedService, IDisposable
                 // the segment sweep is never asked about a network the same pass is still using.
                 if (now - _lastSegmentSweep >= SegmentSweepInterval)
                 {
-                    await SweepSegmentsOnceAsync(now, _stop.Token).ConfigureAwait(false);
+                    // The same guard the jail sweep above has, and for the same reason: an escaping
+                    // exception here faults this Task and the `while` never runs again. Belt to
+                    // SweepSegmentsOnceAsync's braces — that method swallows what it can, this catches
+                    // anything a future edit stops swallowing.
+                    try
+                    {
+                        await SweepSegmentsOnceAsync(now, _stop.Token).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (_stop.IsCancellationRequested)
+                        {
+                            return; // the host is stopping — the only cancellation that means "stop"
+                        }
+
+                        _log.LogWarning(ex, "jail reaper: the network-segment sweep threw");
+                    }
                 }
             }
         });
