@@ -49,8 +49,16 @@ public static class SandboxImageVersions
     public const string AgentBase = "5b56114f0d002798d3e1b2e6344d8db463a509664f94099d28244d4a9cbcd4fe";
 
     /// <summary>Source hash of <c>images/mainguard-egress-proxy/</c> (curated inputs: Dockerfile,
-    /// entrypoint.sh, reload.sh).</summary>
-    public const string EgressProxy = "79fb6e5b1bd5eb321ffe8b873f73d98a1cd7d0e33f585f14956dd928f64e69f1";
+    /// entrypoint.sh, reload.sh).
+    ///
+    /// <para>Moved by F26's comment in <c>reload.sh</c>, which records that <c>ConnectPort</c> and the
+    /// hostname <c>Filter</c> cannot bound the gateway allowlist to a single PORT, so that bound is
+    /// enforced by the daemon-rendered iptables OUTPUT rules instead. The script's RUNTIME behaviour is
+    /// unchanged — the comment sits after the heredoc's <c>EOF</c>, so the generated tinyproxy config is
+    /// byte-identical. The hash covers the file's bytes and deliberately cannot tell a comment from
+    /// code: a hash you could smuggle a change past would be worth nothing, so a doc-only edit paying a
+    /// rebuild is the correct trade rather than a reason to route the comment elsewhere.</para></summary>
+    public const string EgressProxy = "3c85f8a00d15edc022fd36a050fb81d1ba37fabbb79b325ce168b9ddbbcda77b";
 
     private static readonly IReadOnlyDictionary<string, string> ByName =
         new Dictionary<string, string>(StringComparer.Ordinal)

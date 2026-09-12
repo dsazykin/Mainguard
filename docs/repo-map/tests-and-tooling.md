@@ -866,7 +866,19 @@
     every ACCEPT destination-constrained, and still terminates in DROP), `SandboxImageDigestTests`
     (**MG-27, pure** — see the jail-image note above), `EgressAllowlistTests` (defaults carry **no
     git-host entry**, add/remove round-trips + `allowlist_changed` audit events, a git-host entry
-    flagged `DefeatsA6`, JSON persistence round-trip), `GatewayReachabilityPolicyTests` (**MG-4, pure:
+    flagged `DefeatsA6`, JSON persistence round-trip),
+    `EgressHostPatternTests` (**F31, pure**: the three exploits the finding named are each pinned as a
+    refusal — `a|.*` (an alternation allowing every host, defeating default-deny while the UI still
+    shows one innocuous entry), `(` (an uncompilable filter, i.e. a fleet-wide egress outage), and a
+    `/` or newline (dnsmasq directive injection re-opening DNS exfil) — plus the legitimate shapes that
+    must keep working (wildcards, IPv4 literals, `host.docker.internal`), `Add` throwing, and the
+    DROP-not-throw behaviour of the persisted-form and render paths so one bad entry never costs the
+    user the valid ones),
+    `EgressGatewayPortBoundTests` (**F26/F25, pure**: the backstop admits the gateway port and drops
+    everything else to that host, renders nothing at all for a hostile or portless endpoint — the line
+    runs as root inside the proxy — and the rendered script is handed to a real `sh -n`, because a
+    syntax error there is a silent whole-fleet egress failure; plus the proxy's
+    `host.docker.internal:host-gateway` mapping), `GatewayReachabilityPolicyTests` (**MG-4, pure:
     the rendered egress policy that lets a CONFINED jail reach the model gateway, and the two things it
     must not disturb. The gateway's own host must appear in the tinyproxy filter as a bare host (a
     `host:port` pattern can never match, the same silent-no-op class as a wrong base-URL variable);
@@ -995,8 +1007,13 @@
   `AnOAuthSpawn_MintsNothing…` is the negative control (a daemon that minted unconditionally would pass
   the first test while breaking the OAuth path), and the revoke test also asserts `ResolveAgent(token)`
   is null, so a revoke that orphaned the reverse map would not pass. Docker-free: a fake substrate whose
-  sandbox engine RECORDS every `SandboxSpawnRequest`. The real-jail leg is
-  `Agents/GatewayConfinementDockerTests.cs`.
+  sandbox engine RECORDS every `SandboxSpawnRequest`. It also owns the three ways a BYOK key reaches a
+  jail UNCONFINED, each of which must read differently in the log because each has a different remedy:
+  a CLI that declares no base-URL/model-host pair ("IMPOSSIBLE", a vendor fact), a deliberate
+  `--gateway-bind off` ("OFF", an operator setting), and — audit B1 — a bind that AUTO-RESOLVED TO
+  NOTHING ("UNAVAILABLE", an error, because nobody asked for it and it is how a resolver bug became a
+  fleet-wide credential leak). Every one of them asserts the message does NOT quote the key. The
+  real-jail leg is `Agents/GatewayConfinementDockerTests.cs`.
 - **`Mainguard.Server.Tests/EgressRefusalLogLevelTests.cs`** — an egress **refusal** reaches the daemon
   log at `Warning`. `LoggingTransparencyLog` picked the level with
   `string.Equals(line.Verdict, "Denied", …)` against a free-form string field whose only daemon producer
@@ -2481,6 +2498,36 @@
   authenticated token instead of the spoofable `x-mainguard-agent` header, injects the daemon-held key
   at the network hop so the agent's own credential never survives it, refuses an unauthenticated
   caller with 401, and filters credential/Mainguard/hop-by-hop headers both directions),
+  `GatewayStreamingMeteringTests` (**F23/F29** — an SSE stream settles its REAL usage and still reaches
+  the agent byte for byte; the Anthropic dialect (input in `message_start`, a running output count per
+  `message_delta`) and the OpenAI one (one `usage` chunk, `[DONE]`) both parse; the exact bypass —
+  `stream:true` plus `x-mainguard-token-estimate: 0` — is charged the floor rather than nothing, while
+  an estimate ABOVE the floor still raises the reservation; an oversized request body is 413 with
+  nothing charged; and `BudgetLedger` charges the reserved amount for a zero settle against a live
+  reservation while a settle with no reservation keeps its old meaning. **Audit B2**: a client that
+  aborts MID-STREAM is charged what the provider had already reported (the stream is fed chunk by chunk
+  through a sink that throws on the second write, so the assertion is 1201 — the usage in the frames that
+  got out — and not zero, which is what the old `Abandon`-on-any-exception produced for a completion the
+  provider generated and billed in full); an abort before any usage frame still charges the reservation;
+  a failure BEFORE the upstream committed, and an abort while reading a 5xx, still refund; the estimate
+  raise is capped at 4× the default so one jail cannot drain the shared per-minute bucket; and Gemini's
+  `usageMetadata`/`modelVersion` shape parses in both streaming and whole-document form),
+  `GatewayBindPolicyTests` (**MG-13/F25/audit B1** — the bind rule and the default-bind resolver:
+  loopback and RFC-1918 permitted, wildcard and public refused (including the 172.16/12 off-by-ones);
+  the default IS whatever the resolver found and is never a LAN-facing address; `ProxyReachableHostFor`
+  translates loopback and nothing else; `off`/`auto`/explicit resolve as documented and an impermissible
+  explicit address passes through so startup can refuse it loudly. **B1's regression tests**: an IDLE
+  `docker0` — carrier-down, which is its normal state on a Mainguard host — is still selected, a `br-*`
+  segment bridge and a Wi-Fi address never are, and on a LINUX host that HAS a docker0 the resolver must
+  return that address rather than null. The pre-existing default-bind tests both PASS when the resolver
+  returns null, which is exactly how the gateway-disabled-fleet-wide regression shipped; these fail.
+  Also that a deliberate `--gateway-bind off` stays distinguishable from a bind that resolved to
+  nothing),
+  `AgentGatewayTokenRotationTests` (**F25** — the `mg_sess_` token rotates on a schedule: replaced after
+  the interval, the superseded one still resolving through the overlap so a request already in flight
+  finishes and failing after it, custody of the real key surviving the swap, one agent's rotation not
+  touching another, `Revoke` giving no grace, and — the safety property — NOTHING rotating when the new
+  token cannot be delivered to the jail, including when the delivery hook throws),
   `GatewayUpstreamBindingTests` (**the per-agent upstream binding — every request built the way a
   confined jail actually sends it, i.e. `Host` = the GATEWAY rather than the provider. The custody
   tests above all use `Host = api.anthropic.com`, a shape production cannot produce once a CLI is
@@ -2712,8 +2759,11 @@
   extracted from `ToolchainProvisioningDockerTests`, which now shares it), `Fixtures/RequiresDockerFact.cs`
   (`[RequiresDockerFact]` skips unless Docker is reachable AND the CI-built agent-base image is
   present; the sibling `[RequiresDockerDaemonFact]` gates on Docker-daemon presence only — for P2-08's
-  reconciler test that stands up its own trivial image; class-level
-  `[Trait("Category","RequiresDocker")]` carries the CI filter),
+  reconciler test that stands up its own trivial image; **`[RequiresDockerDesktopFact]` and
+  `[RequiresLinuxDockerEngineFact]`** split the claims that differ by engine, because `host-gateway`
+  means the host's loopback stack on Docker Desktop and the docker0 address on native Linux — a test
+  asserting one of those unconditionally fails the other platform's CI leg by design (audit B3);
+  class-level `[Trait("Category","RequiresDocker")]` carries the CI filter),
   `Fixtures/RequiresAccessDeniedFact.cs` (`[RequiresAccessDeniedFact]` — skips unless this process can
   actually be DENIED access to a directory it owns, which root, Windows and any metadata-less mount
   quietly are not; the probe performs the real deny-then-read rather than trusting `chmod`, because a
@@ -2927,6 +2977,24 @@
   CI and passed locally the deciding difference was that store's `RepoDigests` behaviour and **the
   runner's Docker version appears nowhere in the workflow logs**, so the question had to be answered
   by reasoning from an error string instead of by reading a fact),
+  `Agents/GatewayReachAndSegmentIsolationDockerTests.cs` (**F25/F26/F30** — the three claims in that
+  batch only a real engine can settle. The egress proxy reaches a LOOPBACK-bound gateway through
+  `host.docker.internal` and does NOT reach it at `127.0.0.1` (inside the proxy that is the proxy), so
+  the narrowed bind is usable and the daemon's loopback→alias translation is load-bearing rather than
+  decorative; the proxy really carries the `host-gateway` mapping and the name resolves inside it; the
+  F26 `OUTPUT` rules are asserted against `iptables -S OUTPUT` in the LIVE proxy, not against the
+  rendered text, because the finding is about what the proxy enforces. **The F30 measurement changed the
+  design**: an internal segment has no default route (everything off its subnet is "Network is
+  unreachable", the other bridge's gateway included) but its OWN bridge's gateway answers ping in
+  0.05 ms — which is why `GatewayBindPolicy` binds `docker0` and never a `br-*` segment bridge, since a
+  gateway on a segment's own address would be dialable by every jail on it without going through
+  tinyproxy. Both halves are asserted, with a non-internal control so a pass cannot be an inert probe.
+  **Audit B3 — the reach claim is per engine.** The loopback-via-alias test is `[RequiresDockerDesktopFact]`
+  (on Linux Docker Engine `host-gateway` IS docker0, so a `127.0.0.1` listener is genuinely unreachable
+  from a container and asserting otherwise failed the Linux runner by design), and its Linux counterpart
+  `Proxy_CanReachTheResolvedBridgeBoundGateway` binds a listener at the address `GatewayBindPolicy`
+  actually resolves and requires the proxy to reach it through the exact string `ProxyReachableHostFor`
+  hands the jail — which also fails loudly if that resolver ever returns null on a host with a bridge),
   `Agents/SandboxEgressDockerTests.cs` (the egress matrix — allowlisted API via proxy, non-allowlisted
   fails **fast**, direct-IP dropped despite proxy-env unset, DNS exfil NXDOMAIN, **in-jail DNS that
   depends on no public resolver** (`AllowlistedName_ShouldStillResolve_WithoutAnyPublicResolver` —

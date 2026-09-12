@@ -843,6 +843,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `EgressAllowlist.cs` (model + JSON persistence + `allowlist_changed` audit events; `DefaultEntries`
       = model APIs + package registries with **no git host** (A6);
       `EgressAllowlistEntry.DefeatsA6`/`LooksLikeGitHost` flag a git-host entry).
+      **F31 — `EgressHostPattern` lives here and nothing stores an unvalidated pattern any more.** The
+      grammar is the one a resolvable hostname already satisfies (an optional `*.` prefix, then
+      dot-separated LDH labels, ≤253 chars; IPv4 literals pass, which matters because the gateway's own
+      address is allowlisted as one). Nothing validated these before, and they are rendered into a
+      tinyproxy extended regex that escapes only the dot, and into a line-and-slash-delimited dnsmasq
+      config: `a|.*` became `^a|.*$`, an alternation matching every hostname there is (default-deny
+      turned allow-all while the UI still listed one innocuous entry); `(` made the filter uncompilable,
+      i.e. a fleet-wide egress outage; a `/` or a newline injected dnsmasq directives that can restore
+      the default upstream `no-resolv` exists to remove, re-opening DNS exfiltration. `Add` now throws
+      on an invalid pattern (the LAST gate — `EgressGrpcService` refuses one first), while
+      `FromPersistedForm` and `CombinedWith` DROP one instead of throwing: a corrupt file, or one
+      malformed adapter-declared host, must not cost the user every valid entry or take the fleet's
+      egress down.
       **Edits are now DURABLE.** `ToPersistedForm`/`FromPersistedForm` had no production callers on
       either side: `Wsl2AgentEnvironment` built `WithDefaults(audit)` on every daemon start, so an
       `EgressGrpcService` add/remove mutated an in-memory list that was audited, re-rendered onto the
@@ -857,7 +870,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       render-time union with installed CLIs' auto-permitted hosts, not a user edit. Pinned by
       `Mainguard.Tests/EgressAllowlistPersistenceTests.cs`.
     - `EgressProxyConfig.cs` (pure renderer: tinyproxy allow-filter + dnsmasq pinned-DNS + iptables
-      backstop from the allowlist. The backstop is rendered as a complete `*filter` table piped to
+      backstop from the allowlist. **F31: every render path filters through `EgressHostPattern.IsValid`**
+      — the last line of defence, since this is the function whose output becomes a regex and a config
+      directive. **F26: `RenderIptablesScript` now takes the gateway's `host:port` and emits `OUTPUT`
+      rules bounding the daemon host to the GATEWAY PORT alone** (plus DNS), dropping everything else to
+      that address. tinyproxy's `Filter` matches a hostname and has no notion of a port (`ConnectPort`
+      bounds only CONNECT), so the MG-4 allowlist entry that makes the gateway reachable also handed
+      every jail a plain-HTTP proxy to *any* TCP port on the daemon host — a local Ollama, a dev server,
+      Docker's TCP API. The address is resolved by `getent` inside the script at apply time (the gateway
+      is a name Docker put in `/etc/hosts`), and `RenderGatewayOutputPrelude` refuses to interpolate
+      anything that is not a validated host plus a 1-65535 port, because that line runs as root in the
+      proxy. Still ONE `iptables-restore`, so the atomicity argument below is intact.
+      The backstop is rendered as a complete `*filter` table piped to
       **`iptables-restore`**, i.e. applied in ONE netlink transaction: it used to be `iptables -F` plus
       ~13 `iptables -A` processes, and measured on a live proxy the chain immediately after the flush is
       `-P INPUT DROP` with **zero rules** — a total blackhole including ESTABLISHED traffic — for the 131
@@ -1007,7 +1031,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       load-bearing. It adds the gateway's own host to the rendered filter as a direct-route entry
       (`CombineGatewayHost`/`GatewayHostOf`, port stripped — tinyproxy filters on hostname) and emits no
       `upstream` directive, so a confined jail can reach the daemon while every existing host keeps the
-      route it had. `gatewayUpstream` would instead front the model hosts for EVERY agent, dragging OAuth
+      route it had. **F25/F26: `gatewayReachableAt` is now also passed to
+      `EgressProxyConfig.RenderIptablesScript`**, so the backstop bounds that host to the gateway port
+      alone, and `ProxyHostConfig` sets `ExtraHosts = ["host.docker.internal:host-gateway"]`
+      (`GatewayHostAlias`) — the one name that reaches the daemon from inside this container, and the
+      reason a loopback-bound gateway is usable at all. A proxy created before that mapping existed is
+      REPLACED (`HasGatewayHostAliasAsync`, same policy as an image upgrade): an `/etc/hosts` entry can
+      only be set at create time, and without it every BYOK spawn would silently skip confinement — i.e.
+      hand the jail the raw provider key — for the life of that container. Only the proxy gets the
+      mapping; the jails sit on Internal segments with no route anywhere. `gatewayUpstream` would instead front the model hosts for EVERY agent, dragging OAuth
       traffic through the gateway to be 401'd, which is why production passes only the former.
       `CanProxyReachAsync` performs the real connect from inside the proxy (bash `/dev/tcp`; the proxy
       image has no HTTP client), cached on success only.
@@ -1334,7 +1366,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `TokenBucket.cs` (pure, injected-clock: two coupled requests/min + tokens/min buckets seeded from
       P2-01 `KeyHealth`; continuous fractional refill; FIFO waiter queue granted in order via `Pump`;
       `Release(lease, actual)` reconciles estimate→actual conserving tokens — the burst/refill/fairness
-      property target).
+      property target). **F52: the 60 RPM / 60k TPM fallbacks are configurable.**
+      `DefaultRequestsPerMinute`/`DefaultTokensPerMinute` read `MAINGUARD_GATEWAY_RPM` /
+      `MAINGUARD_GATEWAY_TPM` once per process (absent, unparseable or non-positive keeps the
+      conservative `Fallback*` constant — the failure direction for a rate limit is "too slow", never
+      "unbounded"), and `FromKeyHealth` takes optional explicit ceilings for a caller with its own
+      configuration source. One bucket is shared by the whole daemon, so those two numbers were a
+      fleet-wide ceiling with no way to change them: a Tier-4 key was throttled to a free-tier shape and
+      the only symptom was agents queueing.
     - `AiGateway.cs` (`IAiGateway` = `AcquireAsync`/`Report429`/`GetSnapshot` + records
       `GatewayLease`/`GatewaySnapshot`/`AgentSpendSnapshot`, the `IAgentSupervisor`
       pause/resume/mark-state seam + `NullAgentSupervisor`, and the pure `GatewayBackoff` —
@@ -1342,7 +1381,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       typed reason + `budget_exceeded` audit, never kills).
     - `BudgetLedger.cs` (per-agent + per-day token + cost caps `BudgetCaps`, the static `ModelPriceTable`,
       `ISpendStore`/`InMemorySpendStore`, `Record`/`IsExhausted`/`GetSpendSince` cost-per-merged-change
-      hook + `SpendRecorded` stream event).
+      hook + `SpendRecorded` stream event). **F23: `SettleReservation` REFUSES A ZERO SETTLE against a
+      live reservation** and charges the reserved amount instead. A reservation exists because a request
+      was admitted, so usage was expected; the gateway settled with whatever the response parser
+      returned, and for every SSE stream that was nothing — which, combined with a jail-supplied
+      estimate of zero, made both the per-agent caps and the shared bucket free to bypass. A settle with
+      no reservation behind it (id 0, the direct `Record` path) keeps its old meaning.
     - `AdmissionController.cs` (`CanSpawn(out reason)` — injectable `/proc/meminfo` sampler
       `MemorySample`, ≤5 s cache, 85%-used default, honest "N GB supports X–Y" message).
     - `SwarmReconciler.cs` (Docker-as-truth reconcile: expected-but-dead → `RemoveAgentWorktree(force)` +

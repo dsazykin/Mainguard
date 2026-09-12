@@ -219,17 +219,40 @@ public sealed class BudgetLedger
     /// </summary>
     public SpendRecord SettleReservation(long reservationId, string agentId, string model, long actualTokens)
     {
-        var record = new SpendRecord
-        {
-            AgentId = agentId,
-            Model = model ?? string.Empty,
-            Tokens = actualTokens,
-            UsdMicros = ModelPriceTable.CostMicros(model ?? string.Empty, actualTokens),
-            WhenUtc = _clock().UtcDateTime,
-        };
+        SpendRecord record;
 
         lock (_gate)
         {
+            // F23 — A ZERO SETTLE AGAINST A LIVE RESERVATION IS REFUSED.
+            //
+            // A reservation exists because a request was admitted, so usage was expected. Settling it at
+            // zero says "that request cost nothing", and the ledger used to believe it: the gateway
+            // settles with whatever the response parser returned, and the parser returned nothing for
+            // every SSE stream (claude-code's default). Combined with a jail-supplied estimate of zero
+            // that made the per-agent budget and the shared bucket free to bypass — send `stream:true`
+            // with `x-mainguard-token-estimate: 0` and spend the operator's key without ever being
+            // charged. Falling back to the amount RESERVED is the conservative direction: it is the
+            // number the caps were already enforced against, so an agent can never come out of a request
+            // owing less than it was admitted for.
+            //
+            // A settle with no reservation behind it (id 0, the direct Record path) keeps its old
+            // meaning — there was no admission, so there is nothing to fall back to.
+            var charged = actualTokens;
+            if (charged <= 0 && _reservations.TryGetValue(reservationId, out var held))
+            {
+                charged = held.Tokens;
+            }
+
+            charged = Math.Max(0, charged);
+            record = new SpendRecord
+            {
+                AgentId = agentId,
+                Model = model ?? string.Empty,
+                Tokens = charged,
+                UsdMicros = ModelPriceTable.CostMicros(model ?? string.Empty, charged),
+                WhenUtc = _clock().UtcDateTime,
+            };
+
             _reservations.Remove(reservationId);
             _store.Append(record);
         }
