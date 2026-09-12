@@ -370,8 +370,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       shell with no exec bit to check. `AgentBranchGuard.Probe` + `AgentBranchAlignment` are the
       backstop — measured `symbolic-ref`/`rev-parse`/`merge-base --is-ancestor`, never a guess, with
       `Unknown` deliberately distinct from "aligned"; `Describe` is the operator report naming the actual
-      branch, the expected branch and a recovery that was actually computed. Auto-recovery is
-      **rejected** — see `docs/design/agent-branch-confinement.md` §4).
+      branch, the expected branch and a recovery that was actually computed. **W1-A rework**: `Probe` runs
+      those three commands under a `TrustedWorktreeLayout` pinned from `agentRepoPath`, because it decides
+      whether an agent's work is on the branch the merge queue reads and it runs in a live agent's
+      worktree; a refused layout is `Unknown`, which every caller already treats as "not evidence of
+      alignment". Auto-recovery is **rejected** — see `docs/design/agent-branch-confinement.md` §4).
     - `AgentRefMediator.cs` (**MG-3 stage 2** — the ONE path by which anything an agent produced reaches
       the shared mirror, and the reason the design chose daemon-FETCH over push-to-daemon: with a push
       model the agent proposes `old new refname` triples the daemon must validate forever and correctly,
@@ -448,7 +451,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       distinct from `Committed` so a clean tree is never reported as recorded work, and pointedly NOT
       publishing —
       `AgentRefWatcher` raises `Advanced` only on `Published`, so an eager publish here would disarm
-      `WorkerReadinessTrigger` for the very commit it exists to react to);
+      `WorkerReadinessTrigger` for the very commit it exists to react to. **W1-A rework**: those git calls
+      — and `RemoveAgentWorktree`'s dirty check — run under a `TrustedWorktreeLayout` from the private
+      `PinFor(repoHash, agentId, worktreePath)`; the CREATION-time `remote remove`/`remote add` in
+      `FinishWorktreeLocked` deliberately do not, because they run between `worktree add` and the jail's
+      first existence, when there is no agent yet to have written the pointers they would validate);
       `RemoveAgentWorktree(force)` (dirty non-force → typed refusal; force → `remove --force`, then
       `ReapBranch` — `branch -D` **only when `AgentRefMediator.MayReap` proves the delete destroys
       nothing**, i.e. the tip is already contained in the mirror's integration branch — then delete the
@@ -552,18 +559,39 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `CleanRepository_StillProducesARealDiff_ThroughTheDaemonPath`). "Empty means disabled" is a per-key
       fact, not a rule, so it is only relied on where the enumerator has seen the key actually declared —
       there the worst case is a loud failure on a repository that planted an executable value.
+      **W1-A rework — the enumeration reads ONE repository and git does not stay in one.** `status`/`diff`
+      call `is_submodule_modified()` for every POPULATED gitlink (mode 160000 whose `<path>/.git` exists —
+      no `.gitmodules` needed), which spawns `git status --porcelain=2` inside a repository whose
+      `filter.<d>.clean` was never enumerated and whose `GIT_DIR` pin `prepare_submodule_repo_env()` drops;
+      `fetch` defaults to `fetch.recurseSubmodules=on-demand`. So recursion is now pinned off at the source
+      (`-c diff.ignoreSubmodules=all -c submodule.recurse=false -c fetch.recurseSubmodules=false
+      -c status.submoduleSummary=false`), with `--ignore-submodules=all` injected AFTER the subcommand for
+      `status`/`diff` — not redundant: the config pin is a default that
+      `set_diffopt_flags_from_submodule_config()` clears for a repo declaring `submodule.<n>.ignore`, and
+      only the CLI option also sets `override_submodule_config`. `git add` has no such option and
+      `builtin/add.c` never loads `git_diff_ui_config`, so `GitlinkExclusions` reads the index
+      (`ls-files --stage -z` — no child git, no filter) and appends `:(exclude,literal)<path>` for every
+      populated gitlink. Measured cost, tested: daemon-side git stops SEEING submodule pointer moves (the
+      agent's own in-jail git still records them). `gpg.ssh.defaultKeyCommand` joined the classifier —
+      `commit.gpgsign=true` + `gpg.format=ssh` + no `user.signingkey` runs it through a shell on every
+      commit the daemon makes and every one a rebase replays.
     - `GitConfigExecutionSurface` (same file) — the **pure** classifier for "config keys git will spawn a
       command from", unit-pinned family by family so the list is a tested artifact. Deliberately excludes
       `alias.*` (a git alias cannot shadow a built-in and the daemon invokes nothing else).
     - `TrustedWorktreeLayout` (same file) — W1-A layer 2. Resolves an agent worktree's git layout from
       DAEMON-computed roots and validates it, instead of letting git discover it from the agent-writable
-      `.git` pointer file and `commondir`: the common dir is derived from the gitdir's own
-      `…/worktrees/<name>` shape (never read from `commondir`), asserted equal to the daemon's
-      `AgentRepoLayout.AgentRepoPath` when the caller knows it, refused when it is the shared mirror
-      (the audit's "second vector"), round-trip-checked against the repository's own `worktrees/<n>/gitdir`
-      registration, and then pinned into the child through `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE`,
-      which outrank every on-disk pointer. Returns null (= run unpinned, exactly as before) for a main
-      working tree or a substrate-less test double, which have no indirection to subvert.
+      `.git` pointer file and `commondir`. When the caller knows `AgentRepoLayout.AgentRepoPath` the layout
+      is COMPUTED (`GIT_DIR = <agentRepo>/worktrees/<the daemon's own worktree directory name>`) and the
+      pointer is read back only as a tamper alarm; without it the pointer selects the repository and is
+      shape-checked, mirror-checked and round-trip-checked. **Rework: it fails CLOSED.** Null now means
+      only "there is no linked-worktree indirection here" (a real `.git` DIRECTORY, or none at all) — once
+      `.git` is a FILE every exit is a validated layout or a typed refusal. It used to return null on any
+      validation failure and both callers read null as "run unpinned", so blanking
+      `worktrees/<n>/gitdir` was the whole exploit. **And the pin alone is not sufficient**: git's files
+      ref backend builds its common dir with `get_common_dir_noenv()`, so `GIT_COMMON_DIR` does not reach
+      it and the `commondir` FILE does — measured, a commit with every pin correct still advanced the
+      MIRROR's `refs/heads/main`. `AssertCommondirFileAgrees` therefore reads that file, only ever to
+      refuse, and `ContainerSpecBuilder` re-mounts it (and `gitdir`) read-only in the jail.
   - **`Agents/Bootstrap/`** (P2-05 MainguardOS bootstrapper — client-side; gets a WSL2-enabled
     Windows machine to a health-checked `mainguardd`).
     - `WslConfigMerger.cs` (the **pure**, IO-free INI merge for `%UserProfile%\.wslconfig`: adds only
@@ -832,6 +860,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       again, but it lives in the agent's workspace and it is the first thing any git run there reads —
       including the daemon's, outside the jail; aiming it at the read-only shared mirror was the audit's
       "plausible second vector". Travels with `AgentRepoPath`, which is what makes `.git` a file at all.
+      **W1-A rework**: `WorktreeRegistrationFiles(agentRepoPath, worktreePath)` re-mounts the two files the
+      pointer LEADS to — `<agentRepo>/worktrees/<name>/{commondir,gitdir}` — read-only on top of the
+      read-write per-agent repo, for the same reason and with the same "written once by `worktree add`"
+      justification. `commondir` is the one that matters most: git's files ref backend resolves it with
+      `get_common_dir_noenv()`, so it follows that FILE even when the daemon pinned `GIT_COMMON_DIR`
+      elsewhere — rewriting one line there put daemon ref writes into the shared mirror with every pin
+      correct. Everything else in the registration (HEAD, index, logs, refs) stays writable.
       **macOS agent-IPC fix**: `IpcOutboxPath` adds a READ-WRITE mount at
       `/opt/mainguard/ipc/outbox`, **nested inside** the read-only IPC mount so the shim and the operating
       instructions stay the daemon's files. It is the coordinator jail's only writable bind mount, so the
@@ -1447,8 +1482,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `commondir`. A worktree aimed at the shared mirror (or, when `AgentWorktreeLocation.AgentRepoPath`
       is supplied, at any repository other than the provisioned one) ends the cycle as `Skipped` with the
       measured reason, before any yield/pause/mutation. `AgentWorktreeLocation` gained the optional
-      `AgentRepoPath` for that; **it is not yet populated by `MergeQueueProvisioner`, so production runs
-      the derive-and-validate path rather than the strict pin** — see the W1-A PR body.
+      `AgentRepoPath` for that, and `MergeQueueProvisioner`/`GatewayServiceRegistration` populate it in
+      production, so the cycle runs the strict pin. **Rework**: the layout is RE-resolved after the yield
+      and that second answer is the one the mutations run under — the pre-yield resolution is a snapshot
+      taken while the agent was still running, and what it validates (`.git`, `commondir`) is exactly what
+      the agent would rewrite. Same re-read-at-the-moment-of-action rule K6 applied to the mutation guard.
       `ConflictActionResult` — refusal-as-result, like `AgentResumeResult`. Not persisted, deliberately: it
       is a measurement of one worktree at one instant, and the durable record of the handoff is the audit
       event. Since 2026-09-04 it also holds the **hand-back mark** (`MarkHandedBack`/`IsHandedBack`/
@@ -1871,8 +1909,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       destructive leg additionally waits the worker's `index.lock` out on `GitMutationGuard`'s shared
       backoff and refuses (typed) rather than colliding — deliberately not `RunGuarded`, which requires a
       yield token the intake has no standing to claim. **W1-A**: the fetch/reset run under a pinned
-      `TrustedWorktreeLayout`, with an optional `resolveAgentRepoPath` ctor arg that turns the derive-and-
-      validate path into a strict pin (**not yet supplied by `GatewayServiceRegistration`** — see the PR).
+      `TrustedWorktreeLayout`, with a `resolveAgentRepoPath` ctor arg — supplied by
+      `GatewayServiceRegistration` — that turns the derive-and-validate path into a strict pin.
+      **W1-A rework**: `resolveMirrorPath` moves the PEEK's working directory off the worker's worktree.
+      `ls-remote` needs no repository, and asking it from inside the worker's made the answer
+      agent-controlled — `url.<x>.insteadOf` in a third party's PR worktree redirects the query and can
+      pin the intake at "unchanged" forever. It now runs in the daemon-owned mirror (fallback: the
+      worktree's parent, which is not a repository). **Still NOT closed on this path**: the config
+      snapshot/spawn race. The intake holds no yield token, so the worker's jail is live while
+      `reset --hard` runs smudge filters, and the external PR author controls the trigger (every push
+      causes a fetch) — see the type docs. Closing it means giving the intake a yield relationship with
+      the worker, which is a change of arbitration and is deliberately not made here.
       **`PrWorkerHost.cs` (the intake's spawn seam —
       `IPrWorkerHost`/`PrWorkerOutcome`/`PrWorkerResult` + `ExternalPrIntake.WorkerAgentKind` =
       `external-pr`).** The intake used to create a worktree and an entry and **spawn nothing**, so an
