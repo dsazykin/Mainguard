@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using Mainguard.Agents.Agents.Ipc;
+using Mainguard.Tests.TestTools;
 using Xunit;
 
 namespace Mainguard.Tests;
@@ -182,7 +183,10 @@ public class AgentIpcProtocolTests
     /// simply never called. Compiled with the real interpreter; skipped where there is none, because a
     /// missing python3 on a dev box is not evidence about the script.
     /// </summary>
-    [Fact]
+    // The "where there is none" half used to be two silent `return;`s inside the loop, which xunit
+    // reports as Passed: a box without python3 got a green result for a check that compiled nothing.
+    // Same condition, now expressed as a skip, so the absence is visible in the run.
+    [RequiresPython3Fact("both shims are python living inside a C# string literal")]
     public void BothShims_AreValidPython()
     {
         foreach (var (name, source) in new[]
@@ -205,19 +209,14 @@ public class AgentIpcProtocolTests
                 start.ArgumentList.Add("py_compile");
                 start.ArgumentList.Add(path);
 
+                // The attribute already proved python3 launches on this box, so a null process or a
+                // Win32Exception here is an anomaly worth failing on — not a reason to report green.
                 using var process = System.Diagnostics.Process.Start(start);
-                if (process is null)
-                {
-                    return; // no python3 on this box — nothing measured, nothing claimed
-                }
+                Assert.NotNull(process);
 
-                var stderr = process.StandardError.ReadToEnd();
+                var stderr = process!.StandardError.ReadToEnd();
                 process.WaitForExit();
                 Assert.True(process.ExitCode == 0, $"{name} is not valid python: {stderr}");
-            }
-            catch (System.ComponentModel.Win32Exception)
-            {
-                return; // python3 is not installed here
             }
             finally
             {
@@ -237,7 +236,7 @@ public class AgentIpcProtocolTests
     /// <para>The real-jail leg of the same claim is <c>AgentIpcJailDockerTests.TheRealShimsSpawn_*</c>;
     /// this one is in the everyday tier so a regression is caught on a box with no Docker.</para>
     /// </summary>
-    [Theory]
+    [RequiresPython3Theory("the shim's own main() is driven under the real interpreter")]
     // The taught form: an unquoted, multi-word task tail is fine — it is the argument that is hard to
     // quote, so it is the one that does not have to be.
     [InlineData(
@@ -257,13 +256,11 @@ public class AgentIpcProtocolTests
     public void TheShimsSpawnParser_AcceptsTheTaughtForm_AndDiagnosesEverySlip(
         string[] args, string? expectedTitle, string? expectedTask, string? expectedRefusal)
     {
+        // The attribute already proved python3 launches here, so a null result is an anomaly to fail on.
         var parsed = RunSpawnParser(args);
-        if (parsed is null)
-        {
-            return; // no python3 on this box — nothing measured, nothing claimed
-        }
+        Assert.NotNull(parsed);
 
-        var (title, task, refusal, reported) = parsed.Value;
+        var (title, task, refusal, reported) = parsed!.Value;
         if (expectedRefusal is null)
         {
             Assert.Null(refusal);
@@ -301,18 +298,28 @@ public class AgentIpcProtocolTests
     /// <c>bash -c</c> never reaches the parser: <c>syntax error near unexpected token '('</c>, exit 2,
     /// and — because nothing ran — nothing in the daemon's log either.</para>
     /// </summary>
-    [Fact]
+    // <b>This guard was the wrong guard, and the way it was wrong is worth recording.</b> It read
+    // `if (quoted is null) return; // no python3/bash on this box`, and it only ever fired for a missing
+    // BASH. With bash present and python3 absent — the shape of a plain .NET SDK container —
+    // `bash -c "python3 …"` exits 127 with empty stdout, which RunSpawnParserThroughBash maps to a real
+    // result whose Refusal is "bash: python3: command not found". Non-null, so the guard was skipped, and
+    // the test then failed on `Assert.Null(quoted.Value.Refusal)` — an assertion that reads like a shim
+    // defect and is not one, in the one file where every sibling test reported a silent green for the
+    // same missing interpreter. Measured: driving this exact bash/driver/shim pipeline with the
+    // interpreter renamed reproduces it. The composite attribute states both halves of the real
+    // precondition up front, so the run says which one is missing instead of failing sideways.
+    //
+    // What is NOT here: a product fix. The shim was run through a real bash on macOS (bash 3.2 / python
+    // 3.9.6) and on Linux (bash 5.2 / python 3.12) with the two command lines below, and it behaves
+    // exactly as this test asserts. The defect was the guard.
+    [RequiresPython3AndBashFact("the taught command line is measured through a real shell")]
     public void TheTaughtSpawnForm_SurvivesAShell_AndTheOldUnquotedOneDoesNot()
     {
         const string Task = "rewrite add() and multiply() so they reject non-numbers";
 
         var quoted = RunSpawnParserThroughBash($"spawn claude-code --title 'Validate inputs' --task \"{Task}\"");
-        if (quoted is null)
-        {
-            return; // no python3/bash on this box — nothing measured, nothing claimed
-        }
-
-        Assert.Null(quoted.Value.Refusal);
+        Assert.NotNull(quoted);
+        Assert.Null(quoted!.Value.Refusal);
         Assert.Equal("Validate inputs", quoted.Value.Title);
         Assert.Equal(Task, quoted.Value.Task);
 
@@ -332,7 +339,7 @@ public class AgentIpcProtocolTests
     /// is now per op, and a deadline that lapses is reported as what it is: accepted but slow, look
     /// before repeating. Driven through the real <c>main()</c>, because the dispatch is what picks it.
     /// </summary>
-    [Theory]
+    [RequiresPython3Theory("the deadline is picked by the shim's own dispatch, run under python3")]
     [InlineData(new[] { "spawn", "claude-code", "--title", "Fix the clock", "--task", "work" }, 600)]
     [InlineData(new[] { "status" }, 60)]
     [InlineData(new[] { "prompt", "w-1", "go" }, 120)]
@@ -340,24 +347,17 @@ public class AgentIpcProtocolTests
     public void EveryCoordinatorOp_RunsUnderItsOwnDeadline(string[] args, int expectedTimeout)
     {
         var timeout = RunAndReadTimeout(args);
-        if (timeout is null)
-        {
-            return; // no python3 on this box — nothing measured, nothing claimed
-        }
-
-        Assert.Equal(expectedTimeout, timeout.Value.Timeout);
+        Assert.NotNull(timeout);
+        Assert.Equal(expectedTimeout, timeout!.Value.Timeout);
     }
 
-    [Fact]
+    [RequiresPython3Fact("the lapsed-deadline message is produced by the shim, run under python3")]
     public void ADeadlineThatLapses_IsNotReportedAsAnUnreachableDaemon()
     {
         var run = RunAndReadTimeout(new[] { "verify", "slow" });
-        if (run is null)
-        {
-            return; // no python3 on this box — nothing measured, nothing claimed
-        }
+        Assert.NotNull(run);
 
-        Assert.DoesNotContain("cannot reach", run.Value.Stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("cannot reach", run!.Value.Stderr, StringComparison.Ordinal);
         Assert.Contains("may still be working", run.Value.Stderr, StringComparison.Ordinal);
         Assert.Contains("status", run.Value.Stderr, StringComparison.Ordinal);
     }
@@ -550,7 +550,7 @@ public class AgentIpcProtocolTests
     /// <para>Run through the real <c>main()</c> under python3, because the property being asserted is
     /// that the DISPATCH refuses, not that some helper would have.</para>
     /// </summary>
-    [Theory]
+    [RequiresPython3Theory("the commit dispatch is driven through the shim's own main()")]
     // The taught form: one argument, newlines and all, passed through untouched.
     [InlineData(new[] { "commit", "feat: a subject\n\nA body paragraph." }, "feat: a subject\n\nA body paragraph.", null)]
     // An empty message is still allowed — the daemon defaults it, and refusing would lose the work.
@@ -561,12 +561,9 @@ public class AgentIpcProtocolTests
         string[] args, string? expectedMessage, string? expectedRefusal)
     {
         var run = RunPlanShim(args);
-        if (run is null)
-        {
-            return; // no python3 on this box — nothing measured, nothing claimed
-        }
+        Assert.NotNull(run);
 
-        var (message, refusal) = run.Value;
+        var (message, refusal) = run!.Value;
         if (expectedRefusal is null)
         {
             Assert.Null(refusal);
@@ -592,7 +589,7 @@ public class AgentIpcProtocolTests
     /// the daemon then refused" are different facts and only the second leaves a card behind.</item>
     /// </list>
     /// </summary>
-    [Theory]
+    [RequiresPython3Theory("the re-scope verb is driven through the shim's own main()")]
     [InlineData(new[] { "rescope", "plan-7", "PLAN_FILE" }, null)]
     [InlineData(new[] { "rescope" }, "rescope <approved-plan-id> <plan.json>")]
     [InlineData(new[] { "rescope", "plan-7" }, "rescope <approved-plan-id> <plan.json>")]
@@ -600,16 +597,16 @@ public class AgentIpcProtocolTests
         string[] args, string? expectedRefusal)
     {
         var run = RunPlanShimRequest(args);
-        if (run is null)
-        {
-            return; // no python3 on this box — nothing measured, nothing claimed
-        }
+        Assert.NotNull(run);
 
-        var (requestJson, refusal) = run.Value;
+        var (requestJson, refusal) = run!.Value;
         if (expectedRefusal is not null)
         {
             Assert.Null(requestJson);
             Assert.Contains(expectedRefusal, refusal!, StringComparison.Ordinal);
+            // Not a skip guard: the refusal cases have no request to inspect, so this is the end of the
+            // assertion for them. Left as an early return deliberately — it reports Passed because it
+            // PASSED, having checked both of the things a refusal case has.
             return;
         }
 
@@ -635,21 +632,19 @@ public class AgentIpcProtocolTests
     /// <para>Both directions, because either alone passes on the defect: the refusal must name
     /// <c>brief</c>, and <c>brief</c> must print the id.</para>
     /// </summary>
-    [Fact]
+    [RequiresPython3Fact("both halves are read off the shim's own stdout, run under python3")]
     public void TheShimsBrief_PrintsTheLivePlanId_BecauseTheRescopeRefusalSendsTheWorkerThere()
     {
         var refusal = RunPlanShimIo(new[] { "rescope" });
         var brief = RunPlanShimIo(new[] { "brief" });
-        if (refusal is null || brief is null)
-        {
-            return; // no python3 on this box — nothing measured, nothing claimed
-        }
+        Assert.NotNull(refusal);
+        Assert.NotNull(brief);
 
-        Assert.Contains("brief", refusal.Value.Refusal!, StringComparison.Ordinal);
+        Assert.Contains("brief", refusal!.Value.Refusal!, StringComparison.Ordinal);
 
         // …and what that command prints: the headline AND the id the refusal promised, with its state,
         // because "which plan" and "is it approved yet" are the two facts a re-scope needs.
-        Assert.Contains("Fix the token clock", brief.Value.Stdout, StringComparison.Ordinal);
+        Assert.Contains("Fix the token clock", brief!.Value.Stdout, StringComparison.Ordinal);
         Assert.Contains("p1", brief.Value.Stdout, StringComparison.Ordinal);
         Assert.Contains("Approved", brief.Value.Stdout, StringComparison.Ordinal);
     }

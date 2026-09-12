@@ -89,16 +89,25 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     private readonly SandboxEngineOptions _options;
     private readonly TimeSpan _secretWriteTimeout;
     private readonly IExecStdinTransport _stdin;
+    private readonly Action<string>? _log;
 
     /// <param name="stdin">How secret bytes reach a jail. Defaults to
     /// <see cref="DockerSocketExecStdinTransport"/> — Docker.DotNet's own stdin path is NOT usable (it
     /// delivers neither the bytes nor the half-close against modern engines; see that class for the
     /// measurements). Injectable so the unit suite can drive the failure paths without a daemon.</param>
-    public DockerSandboxEngine(IDockerClient docker, SandboxEngineOptions options, IExecStdinTransport? stdin = null)
+    /// <param name="log">Where the engine's best-effort paths report what they could not do. The two
+    /// that need it are the posture inspect and the in-place ceiling update: both are deliberately
+    /// non-fatal, and a non-fatal failure with no diagnostic is precisely the "reads as applied while
+    /// measuring nothing" shape this file keeps closing — an operator would see the new ceiling in
+    /// Settings and the old one on the jail, forever, with nothing anywhere saying why.</param>
+    public DockerSandboxEngine(
+        IDockerClient docker, SandboxEngineOptions options, IExecStdinTransport? stdin = null,
+        Action<string>? log = null)
     {
         _docker = docker ?? throw new ArgumentNullException(nameof(docker));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _secretWriteTimeout = options.SecretWriteTimeout ?? DefaultSecretWriteTimeout;
+        _log = log;
         // Constructed eagerly but RESOLVED lazily: DockerSocketExecStdinTransport.For only captures a
         // callback, so building an engine still needs no live daemon.
         _stdin = stdin ?? DockerSocketExecStdinTransport.For(docker);
@@ -180,13 +189,19 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // so the host's arithmetic and the jail itself are asked instead.
             var staleWorkspace =
                 !await WorkspaceMountAliveAsync(existing, request, ct).ConfigureAwait(false);
+            // F28: the two questions this reuse path never asked — the hardening set, and the ceiling.
+            // Every check above is "was this container created by a build that knows about X?"; these two
+            // are "does it still match what we would create TODAY?", which is what an operator lowering
+            // the per-jail ceiling, and a Mainguard upgrade tightening the jail, both change. A jail
+            // created before MG-26 was otherwise reused forever with no CPU cap at all.
+            var posture = await InspectPostureAsync(existing.ID, request.Limits, ct).ConfigureAwait(false);
             // MG-27: the ref is now a content digest, and Docker's container LIST reports a short image
             // id — compare through the matcher, never with `!=`, or every reuse would look like an
             // upgrade and recreate a perfectly good jail on every spawn.
             if (staleSecretLayout || staleWorkspace
                 || !SandboxImageDigest.SameImage(existing.Image, request.ImageRef)
                 || missingBareMount || missingAgentRepoMount || writableMirror || stalePin || wrongNetwork
-                || missingCacheMount)
+                || missingCacheMount || posture.MustRecreate)
             {
                 await _docker.Containers.RemoveContainerAsync(existing.ID,
                     new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
@@ -195,6 +210,16 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             {
                 try
                 {
+                    // F28: re-apply the ceiling BEFORE the jail is started. Memory, CPU and pids are all
+                    // writable on a live cgroup, so an operator who lowered the per-jail ceiling reaches
+                    // this jail without it being destroyed and its session lost — which is why this is an
+                    // update rather than another entry in the recreate set above.
+                    // The result is deliberately not acted on: a refused update is reported (see
+                    // RetightenCeilingAsync) and the jail keeps the ceiling it has, rather than the
+                    // operator's slider being able to make every reuse fail.
+                    if (posture.MustRetighten)
+                        _ = await RetightenCeilingAsync(existing.ID, request.Limits, ct).ConfigureAwait(false);
+
                     if (!string.Equals(existing.State, "running", StringComparison.OrdinalIgnoreCase))
                         await _docker.Containers.StartContainerAsync(existing.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
                     // A restarted jail's tmpfs $HOME came back empty — restore the CLI's saved login
@@ -438,6 +463,98 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         }
     }
 
+    /// <summary>
+    /// F28 — the reuse-time posture check: how the existing jail differs from what
+    /// <see cref="ContainerSpecBuilder"/> would create for <paramref name="expected"/> today.
+    ///
+    /// <para>Read from the container's own <c>HostConfig</c>, which is what it was CREATED with. A
+    /// container that vanished under us, or an inspect that fails, reports no drift — same convention as
+    /// every sibling probe here: an unanswerable question is not a reason to destroy a jail, and the
+    /// recreate path the caller already has will deal with a container that is really gone.</para>
+    /// </summary>
+    internal async Task<ContainerSpecBuilder.JailPostureVerdict> InspectPostureAsync(
+        string containerId, SandboxLimits expected, CancellationToken ct)
+    {
+        try
+        {
+            var inspect = await RunBoundedAsync(
+                token => _docker.Containers.InspectContainerAsync(containerId, token),
+                ControlPlaneTimeout, "inspect (posture)", containerId, ct).ConfigureAwait(false);
+            return ContainerSpecBuilder.InspectPosture(inspect.HostConfig, expected);
+        }
+        catch (DockerContainerNotFoundException)
+        {
+            // Not a failure at all: the container is gone, so there is no posture to have an opinion
+            // about, and the caller's own recreate path deals with it.
+            return ContainerSpecBuilder.JailPostureVerdict.Clean;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Still "no drift" — an unanswerable question is not a reason to destroy a jail — but NOT
+            // silent. "Clean" here means "we could not look", and the difference matters: a persistently
+            // failing inspect means every hardening and ceiling check on the reuse path has been
+            // answering no-drift without reading anything.
+            _log?.Invoke(
+                $"sandbox: could not read the posture of jail '{containerId}' "
+                + $"({ex.GetType().Name}: {ex.Message}); reusing it WITHOUT a hardening or ceiling check.");
+            return ContainerSpecBuilder.JailPostureVerdict.Clean;
+        }
+    }
+
+    /// <summary>
+    /// F28 — writes the current ceiling onto a jail that already exists, through Docker's container
+    /// update endpoint (cgroup <c>memory.max</c> / <c>cpu.max</c> / <c>pids.max</c>).
+    ///
+    /// <para><b><c>MemorySwap</c> travels with <c>Memory</c>, and leaving it out made every RAISE a
+    /// no-op.</b> Docker's <c>MemorySwap</c> is the memory+swap TOTAL, and the engine validates a memory
+    /// update against the swap total it is being sent — a request carrying only <c>Memory</c> is
+    /// validated against the total the container already has, which for a jail created at the default
+    /// 2 GiB is 4 GiB. So an operator raising the ceiling to 8 GiB got a 409 on every single reuse: the
+    /// Settings page said 8 GiB and the jail stayed at 2 GiB, indefinitely, until some unrelated
+    /// recreate. (Lowering "worked", and left the jail with the old, much larger swap headroom.) Both
+    /// numbers are a pure function of the ceiling, so they are sent as the pair they are.</para>
+    ///
+    /// <para>Best effort by contract, but <b>never silent</b>. The failure mode that remains is an
+    /// engine that refuses the update — an old API, or a memory ceiling below the jail's current
+    /// working set, which the engine rejects rather than OOM-killing on the spot. Failing the spawn
+    /// there would mean an operator's slider could make every reuse fail; the jail keeps the ceiling it
+    /// has, and the next recreate (an image upgrade, a mount change, a teardown) picks up the new one
+    /// anyway. What is NOT acceptable is what this used to do about it, which was nothing: the whole
+    /// audit finding behind this file is controls that read as applied while measuring nothing, and a
+    /// swallowed update is that shape exactly. The refusal now reaches the log with the ceiling it
+    /// failed to write.</para>
+    /// </summary>
+    /// <returns>True when the engine accepted the update; false when it refused it (already logged).</returns>
+    internal async Task<bool> RetightenCeilingAsync(string containerId, SandboxLimits expected, CancellationToken ct)
+    {
+        try
+        {
+            await RunBoundedAsync(
+                token => _docker.Containers.UpdateContainerAsync(containerId, new ContainerUpdateParameters
+                {
+                    Memory = expected.MemoryBytes,
+                    // The pair, not the half — see the summary. Omitting this is what made a raise 409.
+                    MemorySwap = ContainerSpecBuilder.MemorySwapFor(expected.MemoryBytes),
+                    NanoCPUs = ContainerSpecBuilder.NanoCpus(expected.Cpus),
+                    PidsLimit = expected.Pids,
+                }, token),
+                ControlPlaneTimeout, "update (ceiling)", containerId, ct).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The jail keeps the ceiling it already had — and somebody is told so, because the operator
+            // who moved the slider is otherwise looking at a setting that reads applied and is not.
+            var cpus = expected.Cpus.ToString(CultureInfo.InvariantCulture);
+            _log?.Invoke(
+                $"sandbox: jail '{containerId}' REFUSED the ceiling update (memory {expected.MemoryBytes} B, "
+                + $"memory+swap {ContainerSpecBuilder.MemorySwapFor(expected.MemoryBytes)} B, cpus {cpus}, "
+                + $"pids {expected.Pids}) — {ex.GetType().Name}: {ex.Message}. It keeps the ceiling it was "
+                + "created with until it is recreated.");
+            return false;
+        }
+    }
+
     /// <summary>MG-36 — true when a reusable jail already sits on <paramref name="networkName"/>. A
     /// container that vanished under us counts as matching so the caller's own recreate path — not this
     /// probe — decides what to do about it (same convention as <see cref="PinnedDnsMatchesAsync"/>).</summary>
@@ -510,7 +627,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 // A small tolerance, because the container's clock is the engine's and the directory's is
                 // the host's; the resume shape is separated by seconds to minutes, a fresh spawn by the
                 // other sign.
-                if (born > created.AddSeconds(2))
+                if (BirthTimeIsUsable(born) && born > created.AddSeconds(2))
                 {
                     return false;
                 }
@@ -531,6 +648,33 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// <b>Audit F33 — whether the host really told us when this directory was born.</b>
+    ///
+    /// <para>A birth time is not a portable fact. <c>statx</c> answers it on ext4, APFS and btrfs; on a
+    /// filesystem or kernel without it .NET has no birth time to report and hands back a sentinel near
+    /// the epoch instead. Compared naively, that sentinel is always OLDER than the container, so the
+    /// heuristic silently answers "not recreated" for every directory on such a substrate — the check
+    /// looks applied and measures nothing, which is exactly the defect class this file keeps closing. A
+    /// future timestamp is the other unusable shape (a clock skew between host and engine), and it fails
+    /// in the expensive direction: it would recreate a perfectly good jail.</para>
+    ///
+    /// <para>So an unusable birth time is treated as "cannot tell" and the decision falls through to the
+    /// jail's own <c>cd /workspace</c> probe, which needs no timestamps at all. <b>Not closed by this:</b>
+    /// on a birth-time-less filesystem the resume shape — a bind pinned to a deleted inode that still
+    /// resolves inside the container — remains invisible to both checks. Closing it properly wants an
+    /// identity written INTO the worktree at creation and read back from inside the jail, which belongs
+    /// beside worktree creation rather than here.</para>
+    /// </summary>
+    internal static bool BirthTimeIsUsable(DateTime born)
+    {
+        var utc = born.Kind == DateTimeKind.Utc ? born : born.ToUniversalTime();
+        // 1980 is comfortably after every "no birth time" sentinel (the Unix epoch, and Windows'
+        // 1601 file-time zero) and comfortably before any real directory on a machine running this.
+        return utc > new DateTime(1980, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+            && utc < DateTime.UtcNow.AddDays(1);
     }
 
     /// <summary>

@@ -885,7 +885,21 @@
     `MacOnlyFact` skip-with-reason attributes. `UnixOnlyFact` (Linux + macOS) is for any-Unix
     behavior — forkpty, unix file modes — now that the macos-host substrate means "not Windows"
     no longer implies Linux; `LinuxOnlyFact` stays for genuinely Linux-bound dependencies
-    (cgroups, /proc, the in-VM daemon).
+    (cgroups, /proc, the in-VM daemon). It also holds `RequiresNetworkFact` and the shim-suite gates
+    `RequiresPython3Fact` / `RequiresPython3Theory` / `RequiresPython3AndBashFact`, over the cached
+    `Python3Availability` and `BashAvailability` probes — which LAUNCH the interpreter rather than
+    scanning `PATH`, because a name that exists but will not execute is exactly what the guards they
+    replaced were catching. **Why they exist:** `AgentIpcProtocolTests` opened every shim test with
+    `if (…) return;`, which xunit reports as **Passed** — a box with no python3 got a green result for
+    a check that ran nothing, and a permanently-green test that measures nothing is worse than no test
+    because the green is read as evidence. The condition is unchanged; only its expression moves, to a
+    `Skip` xunit reports with the reason attached. (Skip is set from the constructor, never thrown:
+    this repo is on xunit 2.9.3, where `Assert.Skip` reports as a FAILURE.) The `AndBash` composite is
+    a correction, not a convenience: the guard it replaced was commented "no python3/bash" and only
+    ever fired for a missing bash — with bash present and python3 absent, `bash -c "python3 …"` exits
+    127 with empty stdout, which the helper maps to a real result carrying a "command not found"
+    refusal, so the guard was skipped and the test failed on an assertion that reads like a shim
+    defect. Reproduced by driving the same bash/driver/shim pipeline with the interpreter renamed.
   - `TestTools/SelfInvocation.cs` — the quoted command prefix tests hand to
     `GitService.SelfInvocationOverride` to spawn the COPIED Mainguard.Client.App head. On macOS it
     always takes the `dotnet <dll>` form: current macOS pins an executable name to the location it
@@ -1953,6 +1967,44 @@
   `AllowedMountRoots` on the spec, a bind source outside every declared substrate root (a user
   repo, a prefix-sibling like `<root>-evil`) is a typed refusal at construction; with no roots
   declared (WSL2 today) behavior is pinned unchanged.
+  **`SandboxResidueReapingTests.cs`** — audit F27/F32/F28, and every test in it is about a REFUSAL,
+  because a collector that takes too little wastes disk while one that takes too much destroys a live
+  agent's network or the image its jail is running on. Pins `SandboxSegmentReapPolicy` (the shared
+  `mainguard-agents` network is never a candidate; an unstamped network, an occupied one, one whose
+  jail still exists **stopped**, and one inside the grace are each kept), `ToolchainImageGcPolicy`
+  (an image any container references is never removed — asserted while old, unwanted and past
+  retention, so "in use" wins alone; plus wanted-by-tag-or-id, too-young, foreign-tagged, and that
+  retention spends its slots only on layers that would otherwise go), and
+  `ContainerSpecBuilder.InspectPosture` (a jail the builder just made shows no drift; a raised ceiling
+  is a RETIGHTEN not a recreate, so an operator moving a slider does not kill live sessions; a
+  pre-MG-26 jail with no CPU cap is caught; every hardening control missing is a recreate; an
+  unreadable `HostConfig` reports no drift). The last block drives the **shipped Docker half** —
+  `DockerSandboxEngine.RetightenCeilingAsync` / `InspectPostureAsync` against a `MobyShapedContainers`
+  fake that models the one engine rule that matters: moby refuses a memory update whose new ceiling
+  exceeds the memory+swap total the request carries, and an absent `MemorySwap` means "the total the
+  container already has". That is what made a Memory-only RAISE a permanent 409 — the Settings page
+  reading 8 GiB while the jail stayed at 2 GiB — so the raise test fails outright if the pair is ever
+  broken up again, the lowering test catches the leftover swap headroom, and a separate test proves the
+  fake really refuses the broken shape rather than accepting anything. The two best-effort catches are
+  pinned as REPORTED, not swallowed: a refused ceiling update and an unanswerable posture inspect each
+  leave a line naming the jail.
+  **`SandboxDefenceInDepthTests.cs`** — audit F33, the controls that had drifted into decoration. A
+  bind source that symlinks OUT of a daemon-owned root is refused (docker binds what a path resolves
+  to, not what it spells) while a source under a symlinked ROOT is still contained (the macOS
+  `/var` → `/private/var` shape, which resolving only one side would start refusing);
+  `ContainerSpecBuilder.RealPath` resolves through symlinked parents to a leaf that does not exist
+  yet. An innocuously-named env var carrying a real credential is refused by VALUE via the shared
+  `Mainguard.Git.Safety.SecretPatterns` catalog, and the refusal names the variable and the rule and
+  **never** the value. `NO_PROXY` exempts loopback only — the unroutable `git.mainguard.internal` is
+  gone. `DockerSandboxEngine.BirthTimeIsUsable` rejects the sentinels a filesystem without `statx`
+  produces. The world-writable package-cache leaf carries the sticky bit; the group-shared rung is not
+  world-writable and must not acquire one.
+  **`HandBackPermitTests.cs`** — audit F44 residual, the store half: a conflict hand-back permits the
+  rewrite while fresh, right up to `RebaseConflictParkingStore.HandBackLifetime`, and stops permitting
+  it after; expiry is not a latch (deciding again re-arms); consuming disarms; the key is the
+  (repo, agent) PAIR, so one repository's `pr-7` authorisation never excuses another's. The mediator
+  half — that the permit is spent by the next publish that MOVES the ref, fast-forward or not — is in
+  `Mainguard.Server.Tests/Agents/AgentRefMediationTests.cs` against real git.
   **`SandboxSecretWriteTimeoutTests.cs`** — the spawn path's secret delivery is TIME-BOUNDED: it
   drives the real `DockerSandboxEngine.WriteSecretFileAsync` against a fake `IDockerClient` whose exec
   create never completes and never observes its cancellation token (the shape of a Docker endpoint

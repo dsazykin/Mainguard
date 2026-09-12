@@ -91,15 +91,61 @@ public sealed class RebaseConflictParkingStore
     // so without this mark the handed-back branch was refused on every sweep, forever, and the card's
     // promise of automatic re-verification was false. The mark is the human's authorisation for ONE such
     // rewrite: set by the hand-back, consumed by the first publish it lets through, keyed like the parking.
-    private readonly ConcurrentDictionary<(string Repo, string Agent), byte> _handedBack = new();
+    //
+    // AUDIT F44 (residual): the mark used to be a bare presence flag, and both halves of "ONE rewrite"
+    // were untrue of it. It had no expiry, so an authorisation granted on Monday still permitted a
+    // rewrite on Friday against a mirror the human had never seen; and it was consumed only by a publish
+    // that took the REWRITE path, so an ordinary fast-forward publish of the same branch left it armed
+    // for whatever came next. Both are fixed here, beside the grant, because the mediator cannot know
+    // when the grant was made and the fix belongs where the fact is.
+    private readonly ConcurrentDictionary<(string Repo, string Agent), DateTimeOffset> _handedBack = new();
+
+    private readonly Func<DateTimeOffset> _clock;
+
+    /// <param name="clock">Injected so the expiry is testable without waiting a day out.</param>
+    public RebaseConflictParkingStore(Func<DateTimeOffset>? clock = null) =>
+        _clock = clock ?? (() => DateTimeOffset.UtcNow);
+
+    /// <summary>
+    /// How long a hand-back authorisation stays valid.
+    ///
+    /// <para>The grant describes a decision a human took about a conflict they were looking at, so it has
+    /// to outlive the work it authorises and not much else. A worker finishing a rebase takes minutes to
+    /// hours, and a person who steps away mid-afternoon should not have to click again; a person who
+    /// comes back the next morning is looking at a different mirror, and re-deciding is the correct cost.
+    /// Expiring is safe in the direction that matters: the branch is refused with rule 2's own message
+    /// and the card offers the hand-back again, which is a visible no rather than a silent yes.</para>
+    /// </summary>
+    public static readonly TimeSpan HandBackLifetime = TimeSpan.FromHours(24);
 
     /// <summary>Records that a human handed this entry's conflict back to its agent to finish the rebase.</summary>
     public void MarkHandedBack(string repoHandle, string agentId) =>
-        _handedBack[(repoHandle ?? string.Empty, agentId ?? string.Empty)] = 0;
+        _handedBack[(repoHandle ?? string.Empty, agentId ?? string.Empty)] = _clock();
 
-    /// <summary>True while a hand-back is outstanding — the mediator may accept one rewrite of this branch.</summary>
-    public bool IsHandedBack(string repoHandle, string agentId) =>
-        _handedBack.ContainsKey((repoHandle ?? string.Empty, agentId ?? string.Empty));
+    /// <summary>
+    /// True while a hand-back is outstanding AND still inside <see cref="HandBackLifetime"/> — the
+    /// mediator may accept one rewrite of this branch.
+    ///
+    /// <para>An expired mark is removed on the way past rather than left to accumulate: this is the only
+    /// read path, so it is the only place that can notice, and a permit that has expired should stop
+    /// existing rather than keep answering "no" forever.</para>
+    /// </summary>
+    public bool IsHandedBack(string repoHandle, string agentId)
+    {
+        var key = (repoHandle ?? string.Empty, agentId ?? string.Empty);
+        if (!_handedBack.TryGetValue(key, out var granted))
+        {
+            return false;
+        }
+
+        if (_clock() - granted < HandBackLifetime)
+        {
+            return true;
+        }
+
+        _handedBack.TryRemove(key, out _);
+        return false;
+    }
 
     /// <summary>Consumes the mark: the rewrite it authorised has reached the mirror (or the entry is gone).</summary>
     public bool ClearHandedBack(string repoHandle, string agentId) =>
