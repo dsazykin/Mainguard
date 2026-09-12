@@ -882,13 +882,13 @@ public sealed class SandboxAgentLauncher
     /// migration. The size ceiling is re-applied here for the same reason it exists at all — the store
     /// this reads from was written by a jail.</para>
     ///
-    /// <para><b>F2, the last clause: <c>.claude.json</c>.</b> A credential path that is not
-    /// settings-shaped used to be carried byte-identical in both directions, and that file carries
-    /// <c>mcpServers</c> command definitions — a jail naming the programs the NEXT jail's CLI will
-    /// launch. It now goes through <see cref="CliSettingsGrantScrub.StripExecutableConfig"/>, which
-    /// removes exactly the keys that name a program and leaves every other key alone. A blob already
-    /// sitting in the owner's keychain from before that existed is filtered HERE, on its way into a
-    /// jail — which is the half that needs no migration.</para>
+    /// <para><b>F2, the last clause.</b> Every credential file — settings-shaped or not — goes through
+    /// <see cref="CarryCredentialContent"/>, which removes the keys that name a program. These files
+    /// used to be carried byte-identical in both directions, and <c>.claude.json</c> /
+    /// <c>.gemini/settings.json</c> both carry <c>mcpServers</c> command definitions: a jail naming the
+    /// programs the NEXT jail's CLI will launch. A blob already sitting in the owner's keychain from
+    /// before that existed is filtered HERE, on its way into a jail — the half that needs no
+    /// migration.</para>
     /// </summary>
     internal static IReadOnlyList<SandboxCredentialFile>? FilterCliCredentials(
         IReadOnlyList<SandboxCredentialFile>? supplied, InstalledAdapterMarker? adapter, ILogger? log = null)
@@ -910,16 +910,8 @@ public sealed class SandboxAgentLauncher
                 continue;
             }
 
-            byte[]? carried;
-            if (AdapterCredentialPolicy.IsSettingsShaped(file.HomeRelativePath))
-            {
-                carried = CliSettingsGrantScrub.Scrub(file.Content);
-            }
-            else
-            {
-                carried = CliSettingsGrantScrub.StripExecutableConfig(file.Content, out var unreviewed);
-                LogUnreviewedCredentialKeys(log, "restore", file.HomeRelativePath, unreviewed);
-            }
+            var carried = CarryCredentialContent(
+                file.HomeRelativePath, file.Content, "restore", adapter.Id, log);
 
             if (carried is { Length: > 0 })
             {
@@ -931,6 +923,93 @@ public sealed class SandboxAgentLauncher
     }
 
     /// <summary>
+    /// <b>The one filter every credential file passes through, on BOTH legs</b> — out of a jail on an
+    /// attended stop, and back into the next jail of that repository. Returns the bytes to carry, or
+    /// null when the file must not cross at all.
+    ///
+    /// <para><b>Why one function and not a branch per leg.</b> The two legs must agree exactly: harvest
+    /// stops the vault ACQUIRING something, restore stops an already-stored copy DELIVERING it, and a
+    /// rule applied on only one of them is a rule that holds only for installs that have no history.
+    /// They were two copies of the same branch and they had already drifted — which is how the
+    /// settings-shaped files ended up with half the filter.</para>
+    ///
+    /// <para><b>Both filters, composed, for the settings-shaped files.</b>
+    /// <c>.gemini/settings.json</c> and <c>.qwen/settings.json</c> are declared as credential paths (see
+    /// <see cref="AdapterCredentialPolicy.IsSettingsShaped"/>) and got only
+    /// <see cref="CliSettingsGrantScrub.Scrub"/> — the daemon-owned IPC mount removed and nothing else.
+    /// But <c>~/.gemini/settings.json</c> is exactly where gemini-cli defines <c>mcpServers</c> (and, in
+    /// recent releases, <c>hooks</c>): an agent in an attended gemini jail could write
+    /// <c>mcpServers: { x: { command: … } }</c>, the harvest kept it, and it was restored into every
+    /// later Managed worker of that repository — a jail launched with a terminal nobody is watching.
+    /// That is the original finding, still live for two of the three named files.</para>
+    ///
+    /// <para><b>Why not <see cref="CliSettingsGrantScrub.CarryOnly"/> there.</b> That allowlist is shaped
+    /// for claude-code's settings file and would drop <c>selectedAuthType</c> — the key that says which
+    /// login the user chose — so it would cost a real sign-in to close a program-definition hole.
+    /// <see cref="CliSettingsGrantScrub.StripExecutableConfig"/> exists for precisely this case: a
+    /// different vendor's schema, from which only the keys that name a program are removed. Composed
+    /// AFTER the mount scrub, because the scrub is the one that can refuse the file outright.</para>
+    /// </summary>
+    /// <param name="leg">"harvest" or "restore" — log text only.</param>
+    private static byte[]? CarryCredentialContent(
+        string homeRelativePath, byte[] content, string leg, string agentKind, ILogger? log)
+    {
+        var carried = content;
+
+        // D5b, applied where the file actually sits. A settings file declared under credentialPaths is
+        // still a settings file: it can carry a rule naming the daemon-owned IPC mount, and it is
+        // restored into every later jail of this repo just like the real ones. An unparseable one that
+        // names the mount does not travel at all.
+        if (AdapterCredentialPolicy.IsSettingsShaped(homeRelativePath))
+        {
+            var scrubbed = CliSettingsGrantScrub.Scrub(carried);
+            if (scrubbed is null)
+            {
+                log?.LogWarning(
+                    "cli credential {Leg} refused (settings-shaped, names {Mount} and could not be "
+                    + "scrubbed): kind={Kind} path={Path}",
+                    leg, CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind, homeRelativePath);
+                return null;
+            }
+
+            if (!ReferenceEquals(scrubbed, carried))
+            {
+                log?.LogInformation(
+                    "cli credential {Leg} scrubbed a role-scoped grant for {Mount}: kind={Kind} path={Path}",
+                    leg, CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind, homeRelativePath);
+            }
+
+            carried = scrubbed;
+        }
+
+        // The strip is targeted rather than an allowlist because these are the files that say the user is
+        // logged in, and the keys removed are by definition not credentials.
+        var stripped = CliSettingsGrantScrub.StripExecutableConfig(carried, out var unreviewed);
+        if (stripped is null)
+        {
+            log?.LogWarning(
+                "cli credential {Leg} refused (names an executable-config key and could not be read, or "
+                + "held nothing but program definitions): kind={Kind} path={Path}",
+                leg, agentKind, homeRelativePath);
+            return null;
+        }
+
+        if (!ReferenceEquals(stripped, carried))
+        {
+            log?.LogInformation(
+                "cli credential {Leg} stripped executable configuration: kind={Kind} path={Path}",
+                leg, agentKind, homeRelativePath);
+        }
+
+        if (AdapterCredentialPolicy.ReportsUnreviewedKeys(homeRelativePath))
+        {
+            LogUnreviewedCredentialKeys(log, leg, homeRelativePath, unreviewed);
+        }
+
+        return stripped.Length > 0 ? stripped : null;
+    }
+
+    /// <summary>
     /// Reports the top-level keys of a credential file that nobody has reviewed — the standing answer to
     /// "a denylist rots as the vendor adds keys". A new executable key surfaces in the daemon log instead
     /// of passing silently, on both legs, which is what makes
@@ -939,6 +1018,11 @@ public sealed class SandboxAgentLauncher
     /// <para><b>Names only.</b> The list arrives already reduced to plain identifiers by the filter, and
     /// nothing here adds a value, a length or a prefix of one. The path is the adapter's own DECLARED
     /// home-relative path, so it is vendor text rather than anything the jail chose.</para>
+    ///
+    /// <para><b>Not asked for every file</b> — see <see cref="AdapterCredentialPolicy.ReportsUnreviewedKeys"/>.
+    /// A file whose top-level keys are provider ids or a whole vendor preference schema has no inventory to
+    /// be unreviewed against, so it reported its every ordinary key on every harvest and every restore.
+    /// That is a line people learn to skip, which costs more than the two files buy.</para>
     /// </summary>
     private static void LogUnreviewedCredentialKeys(
         ILogger? log, string leg, string path, IReadOnlyList<string> keys)
@@ -1397,11 +1481,12 @@ public sealed class SandboxAgentLauncher
     /// <see cref="CliSettingsGrantScrub"/> and held to the settings cap where it sits, so those two
     /// files stop being the hole in the middle of both.</para>
     ///
-    /// <para><b>F2's last clause — the credential files that are NOT settings-shaped.</b>
-    /// <c>.claude.json</c> was carried byte-identical in both directions, and it holds <c>mcpServers</c>
-    /// command definitions: one jail naming the programs the next jail's CLI will launch. Every such file
-    /// now goes through <see cref="CliSettingsGrantScrub.StripExecutableConfig"/> — a targeted removal of
-    /// the keys that name a program, with every other key untouched, which is the one shape of this filter
+    /// <para><b>F2's last clause — the programs a jail names.</b> <c>.claude.json</c> AND the
+    /// settings-shaped <c>settings.json</c> files all hold <c>mcpServers</c> command definitions: one jail
+    /// naming the programs the next jail's CLI will launch. Every declared credential file, of either
+    /// shape, now goes through <see cref="CarryCredentialContent"/> — the same function the restore leg
+    /// calls — ending in <see cref="CliSettingsGrantScrub.StripExecutableConfig"/>, a targeted removal of
+    /// the keys that name a program with every other key untouched, which is the one shape of this filter
     /// that cannot break a login.</para>
     /// </summary>
     public async Task<IReadOnlyList<SandboxCredentialFile>> HarvestCliCredentialsAsync(
@@ -1459,58 +1544,16 @@ public sealed class SandboxAgentLauncher
                 var content = Convert.FromBase64String(
                     string.Concat(result.Stdout.Where(c => !char.IsWhiteSpace(c))));
 
-                // D5b, applied where the file actually sits. A settings file declared under
-                // credentialPaths is still a settings file: it can carry a rule naming the daemon-owned
-                // IPC mount, and it is restored into every later jail of this repo just like the real
-                // ones. An unparseable one that names the mount does not travel at all.
-                if (AdapterCredentialPolicy.IsSettingsShaped(relative))
+                // The same filter the restore leg runs, from the same function: the mount scrub where the
+                // file is settings-shaped, then the executable-config strip on everything. A rule applied
+                // on only one leg holds only for an install with no history.
+                var filtered = CarryCredentialContent(relative, content, "harvest", agentKind, _log);
+                if (filtered is null)
                 {
-                    var scrubbed = CliSettingsGrantScrub.Scrub(content);
-                    if (scrubbed is null)
-                    {
-                        _log.LogWarning(
-                            "cli credential harvest refused (settings-shaped, names {Mount} and could not "
-                            + "be scrubbed): kind={Kind} path={Path}",
-                            CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind, relative);
-                        continue;
-                    }
-
-                    if (scrubbed.Length != content.Length)
-                    {
-                        _log.LogInformation(
-                            "cli credential harvest scrubbed a role-scoped grant for {Mount}: kind={Kind} path={Path}",
-                            CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind, relative);
-                    }
-
-                    content = scrubbed;
+                    continue;
                 }
-                else
-                {
-                    // F2's last clause. Everything that is not settings-shaped — .claude.json above all —
-                    // left the jail byte-identical, and .claude.json carries mcpServers command
-                    // definitions: the programs the NEXT jail's CLI would launch, named by this one. The
-                    // strip is targeted rather than an allowlist because this is the file that says the
-                    // user is logged in, and the keys removed are by definition not credentials.
-                    var filtered = CliSettingsGrantScrub.StripExecutableConfig(content, out var unreviewed);
-                    if (filtered is null)
-                    {
-                        _log.LogWarning(
-                            "cli credential harvest refused (names an executable-config key and could not "
-                            + "be read, or held nothing but program definitions): kind={Kind} path={Path}",
-                            agentKind, relative);
-                        continue;
-                    }
 
-                    if (!ReferenceEquals(filtered, content))
-                    {
-                        _log.LogInformation(
-                            "cli credential harvest stripped executable configuration: kind={Kind} path={Path}",
-                            agentKind, relative);
-                    }
-
-                    LogUnreviewedCredentialKeys(_log, "harvest", relative, unreviewed);
-                    content = filtered;
-                }
+                content = filtered;
 
                 if (content.Length is > 0 && content.Length <= maxBytes)
                 {

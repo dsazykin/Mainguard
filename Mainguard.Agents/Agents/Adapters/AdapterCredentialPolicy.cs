@@ -70,4 +70,55 @@ public static class AdapterCredentialPolicy
     /// diagnostics and tests that want to name them.</summary>
     public static IReadOnlyList<string> SettingsShapedIn(IEnumerable<string>? credentialPaths) =>
         credentialPaths?.Where(IsSettingsShaped).ToArray() ?? Array.Empty<string>();
+
+    /// <summary>
+    /// Whether the daemon should REPORT this file's unreviewed top-level key names
+    /// (<c>SandboxAgentLauncher.LogUnreviewedCredentialKeys</c> — the standing answer to "a denylist rots
+    /// as the vendor adds keys"). True by default, including for any credential path a future adapter
+    /// declares: a file nobody has looked at is exactly the one worth a line.
+    ///
+    /// <para><b>Why two kinds of file are excluded.</b> The report is a diff against
+    /// <c>CliSettingsGrantScrub.ReviewedCredentialKeys</c>, an inventory of the key names the declared
+    /// login files actually hold. Two declared paths have no such inventory and cannot be given one
+    /// honestly:</para>
+    ///
+    /// <list type="bullet">
+    ///   <item><b>opencode's <c>auth.json</c></b> is keyed by PROVIDER ID — the names are chosen at
+    ///   runtime by whichever providers the user signed into, so every key is "unreviewed" by
+    ///   construction and the line fired on every harvest and every restore of a perfectly ordinary
+    ///   login. A line that fires every time is a line nobody reads, which costs more than it
+    ///   buys.</item>
+    ///   <item><b>The settings-shaped credential files</b> (<see cref="IsSettingsShaped"/>) hold a
+    ///   vendor's entire preference schema — dozens of keys, versioned by the vendor. Enumerating them
+    ///   would be guesswork restated as an inventory, and getting it wrong reads as a security signal.</item>
+    /// </list>
+    ///
+    /// <para><b>What is NOT given up.</b> Only the log line. Both kinds of file still go through the full
+    /// strip — every key naming a program is removed from them, at any depth — so the protection is
+    /// identical; what is missing is the early warning that a NEW vendor key ought to be looked at. For
+    /// the settings-shaped files that warning has a cheaper source anyway: the vendor's own release notes
+    /// are read when the pinned adapter version in the manifest is bumped, which is the moment a new key
+    /// can first appear in a jail.</para>
+    /// </summary>
+    public static bool ReportsUnreviewedKeys(string? homeRelativePath) =>
+        homeRelativePath is { Length: > 0 }
+        && !IsSettingsShaped(homeRelativePath)
+        && !IsProviderKeyed(homeRelativePath);
+
+    /// <summary>
+    /// True when a declared credential path's top-level keys are PROVIDER IDS rather than a fixed vendor
+    /// schema — opencode's <c>.local/share/opencode/auth.json</c>, whose contents are
+    /// <c>{ "anthropic": {…}, "openai": {…} }</c>.
+    ///
+    /// <para>Matched on the directory the file sits in, not on the file name: codex declares
+    /// <c>.codex/auth.json</c>, whose keys ARE a fixed schema and ARE inventoried, so a name-only match
+    /// would silence the file that most deserves the line.</para>
+    /// </summary>
+    private static bool IsProviderKeyed(string homeRelativePath)
+    {
+        var segments = homeRelativePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return segments.Length >= 2
+            && segments[^1].Equals("auth.json", StringComparison.OrdinalIgnoreCase)
+            && segments[^2].Equals("opencode", StringComparison.OrdinalIgnoreCase);
+    }
 }

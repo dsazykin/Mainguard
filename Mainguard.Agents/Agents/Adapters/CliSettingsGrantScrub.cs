@@ -161,14 +161,46 @@ public static class CliSettingsGrantScrub
     /// sets the environment the agent's own tools inherit. Every one of them is executable configuration
     /// that used to travel byte-identical out of one jail and into the next.</para>
     ///
+    /// <para><b><c>enabledMcpjsonServers</c> names programs it does not spell.</b> It switches ON the
+    /// servers defined in the repository's own committed <c>.mcp.json</c>, by name, so the definition
+    /// never appears in the file this strip can see. It does not have to: the checkout is the agent's own
+    /// writable workspace, so a jail that writes a server into <c>.mcp.json</c> and its name into this key
+    /// has named a program the next jail's CLI will launch just as surely as an inline <c>mcpServers</c>
+    /// block — the same finding, one indirection deep. Removing it costs an approval the user gives once;
+    /// keeping it costs the claim this filter makes.</para>
+    ///
     /// <para><b>None of them is a credential</b>, which is the whole reason the credential leg can strip
     /// them without a live account to test against: removing a key that names a program cannot change the
     /// answer to "is this user logged in".</para>
+    ///
+    /// <para><b>What is deliberately NOT here.</b> <c>hasTrustDialogAccepted</c> names no program: it
+    /// records that the owner answered claude-code's "do you trust the files in this folder" prompt. A
+    /// Managed worker's terminal is daemon-locked read-only (P2-14), so nobody can answer that prompt in
+    /// one — dropping the key would hang every unattended worker on a dialog with no human behind it. It
+    /// is therefore carried, knowingly, and named here as a residual rather than left to be re-discovered:
+    /// a jail can set it, and what it grants is "this CLI will read this checkout without asking", which
+    /// is what the jail is for.</para>
     /// </summary>
     public static readonly IReadOnlyList<string> ExecutableConfigKeys = new[]
     {
-        "mcpServers", "enableAllProjectMcpServers", "hooks", "apiKeyHelper", "statusLine", "env",
+        "mcpServers", "enableAllProjectMcpServers", "enabledMcpjsonServers", "hooks", "apiKeyHelper",
+        "statusLine", "env",
     };
+
+    /// <summary>
+    /// The keys whose value is a PERMISSION RULE LIST rather than a program definition. They survive —
+    /// the user's own bounded approvals are what the round-trip exists to preserve — with the rules that
+    /// grant a whole tool taken out, exactly as <see cref="CarryPermissions"/> does on the settings leg.
+    ///
+    /// <para><b>Why <c>allowedTools</c> is not simply stripped.</b> <c>projects.&lt;dir&gt;.allowedTools</c>
+    /// is where claude-code records the "yes, don't ask again" answers for a project, so removing it would
+    /// re-prompt the owner for every command they already approved. But the file is agent-writable inside
+    /// the jail, so the same list is where a jail can write <c>Bash(*)</c>: one line that turns the
+    /// allowlist into an open door for every later jail of the repository. The settings leg has dropped
+    /// exactly that line since F45 (<see cref="IsUnbounded"/>) while this leg carried it — one fact with
+    /// two answers, which is the MG-12 shape this file exists to avoid.</para>
+    /// </summary>
+    private static readonly string[] BoundedRuleListKeys = { "allowedTools" };
 
     /// <summary>
     /// The keys carried from inside <c>permissions</c>. The rule lists themselves, and nothing else.
@@ -539,6 +571,16 @@ public static class CliSettingsGrantScrub
                             continue;
                         }
 
+                        if (value is JsonArray rules && BoundedRuleListKeys.Contains(name, StringComparer.Ordinal))
+                        {
+                            // The list survives with the whole-tool grants taken out of it. An emptied
+                            // list stays an empty list rather than disappearing: "nothing is
+                            // pre-approved" is the safe reading, and a key the vendor's parser expects
+                            // to find is not something to remove as a side effect of filtering it.
+                            result[name] = BoundedRulesOnly(rules);
+                            continue;
+                        }
+
                         result[name] = value is null ? null : WithoutExecutableKeys(value.DeepClone());
                     }
 
@@ -559,6 +601,32 @@ public static class CliSettingsGrantScrub
             default:
                 return node?.DeepClone();
         }
+    }
+
+    /// <summary>One rule list with every whole-tool grant removed — the credential leg applying the same
+    /// <see cref="IsUnbounded"/> rule the settings leg applies to <c>permissions.allow</c>, so a jail
+    /// cannot write <c>Bash(*)</c> into one file and have it honoured because it came through the other.
+    /// A non-string entry is carried (filtered for executable keys like anything else): the rule that can
+    /// be read is the one this can judge.</summary>
+    private static JsonArray BoundedRulesOnly(JsonArray rules)
+    {
+        var bounded = new JsonArray();
+        foreach (var rule in rules.ToArray())
+        {
+            if (rule is null)
+            {
+                continue;
+            }
+
+            if (rule is JsonValue v && v.TryGetValue<string>(out var text) && IsUnbounded(text))
+            {
+                continue;
+            }
+
+            bounded.Add(WithoutExecutableKeys(rule.DeepClone()));
+        }
+
+        return bounded;
     }
 
     /// <summary>True when these bytes name the daemon-owned IPC mount anywhere at all.</summary>

@@ -769,25 +769,40 @@ public sealed class AgentSpawnService
             await _launcher.TeardownAsync(session.RepoHash, agentId, containerId, ct).ConfigureAwait(false);
         }
 
-        // F50: the daemon's custody of this repo + kind ends when its last session does. Evaluated
-        // AFTER the harvest above, because that harvest is the thing that legitimately refreshes the
-        // cache — dropping first would throw away the login the user just performed, then re-add it.
+        // F50: the daemon's custody of this repo ends when its last session does. Evaluated AFTER the
+        // harvest above, because that harvest is the thing that legitimately refreshes the cache —
+        // dropping first would throw away the login the user just performed, then re-add it.
         //
-        // Two scopes, because the cache has two: the per-(repo, kind) entries go when no session of that
-        // kind survives in the repo, and the repo-level custom env entries go when the repo is empty.
-        // Both are read from the store AFTER the Stop above removed this one, so "no sessions left"
-        // means exactly that.
+        // Two scopes, because the cache has two, and the WIDE one is the unconditional rule: when the
+        // repository has no sessions left at all, everything held for it goes — every kind's credentials
+        // plus the repo-level custom env entries, which are not per kind. That is the gesture F50 is
+        // about ("stop all agents" should mean the machine is holding nothing), and it needs no
+        // reasoning about roles: with nothing running, nothing can spawn.
+        //
+        // The narrow per-(repo, kind) eviction is the one that has to be argued for, and the argument is
+        // narrower than it first looked. The cache exists so a COORDINATOR-initiated worker (no client in
+        // the loop) inherits the repo's credentials — and `SpawnWorkerAsync` takes the kind from the
+        // shim, so a coordinator may spawn a worker of ANY installed kind, not only its own. "No session
+        // of this kind survives, therefore nobody can ask for this kind again" is true only when the
+        // coordinator's kind equals the worker's kind. Without the coordinator guard below, a user who
+        // ran one codex session in a repo and stopped it would leave the live claude-code coordinator's
+        // every later codex worker booting with no provider key and no login — a flow that worked, for
+        // the daemon's lifetime, before F50 existed.
+        //
+        // So: drop a kind only when no session of that kind survives AND no coordinator survives in the
+        // repo to spawn one. A surviving coordinator is precisely the thing that can still legitimately
+        // consume this entry.
         if (session?.RepoHash is { Length: > 0 } stoppedRepo)
         {
             var live = _store.List().Where(s => string.Equals(s.RepoHash, stoppedRepo, StringComparison.Ordinal)).ToArray();
-            if (!live.Any(s => string.Equals(s.Kind, session.Kind, StringComparison.Ordinal)))
-            {
-                _keys.Forget(stoppedRepo, session.Kind);
-            }
-
             if (live.Length == 0)
             {
                 _keys.ForgetRepo(stoppedRepo);
+            }
+            else if (!live.Any(s => string.Equals(s.Kind, session.Kind, StringComparison.Ordinal))
+                     && !live.Any(s => string.Equals(s.Role, AgentRoles.Coordinator, StringComparison.Ordinal)))
+            {
+                _keys.Forget(stoppedRepo, session.Kind);
             }
         }
 

@@ -114,12 +114,16 @@ public sealed class SessionKeyCache
     /// the user restarts. "Stop all agents" is the gesture a person makes when they want the machine to
     /// be holding nothing; it should mean that.</para>
     ///
-    /// <para>What eviction costs: nothing a user notices. The cache exists so a COORDINATOR-initiated
-    /// worker (no client in the loop) inherits the credentials of the repo it belongs to. Once no
-    /// session of that kind survives in the repo there is no coordinator left to spawn one, and the next
-    /// client spawn supplies the credentials again from the host keychain, which is the durable store.
-    /// A miss was always a supported outcome — it spawns unauthenticated rather than substituting
-    /// something else.</para>
+    /// <para>What eviction costs: nothing a user notices, PROVIDED the caller asks the right question.
+    /// The cache exists so a COORDINATOR-initiated worker (no client in the loop) inherits the
+    /// credentials of the repo it belongs to, and a coordinator spawns workers of whatever kind its shim
+    /// names — not only its own. So "no session of this kind survives" does NOT by itself mean nobody
+    /// can ask for this kind again; only "no session of this kind AND no coordinator survives in the
+    /// repo" does. That is the condition <c>AgentSpawnService.StopAsync</c> evaluates before calling
+    /// this, and the reason it is stated there rather than here is that this type cannot see the session
+    /// store. Once the entry is gone the next client spawn supplies the credentials again from the host
+    /// keychain, which is the durable store; a miss was always a supported outcome — it spawns
+    /// unauthenticated rather than substituting something else.</para>
     /// </summary>
     public void Forget(string? repoHandle, string? agentKind)
     {
