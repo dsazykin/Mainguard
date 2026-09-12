@@ -193,7 +193,17 @@ public sealed class AuditRetentionService : BackgroundService
                 return false;
             }
 
-            foreach (var property in document.RootElement.EnumerateObject())
+            // What a record surfaces is the canonical ENVELOPE
+            // `{identity, payload, seq, timestamp, type}` — the caller's fields are the `payload`
+            // object, not the root. (A bare field object is accepted too, which is the shape the
+            // pure-predicate tests use.) `identity` is deliberately not searched: it is the OS user
+            // who acted, never an agent or lease id.
+            var fields = document.RootElement.TryGetProperty("payload", out var payload)
+                         && payload.ValueKind == JsonValueKind.Object
+                ? payload
+                : document.RootElement;
+
+            foreach (var property in fields.EnumerateObject())
             {
                 if (property.Value.ValueKind != JsonValueKind.String)
                 {

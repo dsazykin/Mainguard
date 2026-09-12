@@ -230,6 +230,31 @@ public sealed class AuditRetentionLeaseTests : IDisposable
         Assert.True(AuditRetentionService.IsHeldByOpenLease("{\"agent\":\"a1\"}", references));
     }
 
+    /// <summary>The shape the sweep actually sees: a record surfaces as the canonical ENVELOPE, so
+    /// the identity fields are one level down under <c>payload</c>. The old substring match worked on
+    /// the envelope for the wrong reason — it never looked at the structure at all.</summary>
+    [Fact]
+    public void IsHeldByOpenLease_ReadsTheIdentityFields_OutOfTheCanonicalEnvelope()
+    {
+        var references = Refs(agents: new[] { "agent-held" }, leases: new[] { "lease-9" });
+
+        const string envelope =
+            "{\"identity\":\"tester\",\"payload\":{\"agent\":\"agent-held\",\"repo\":\"r1\"},"
+            + "\"seq\":1,\"timestamp\":\"2026-01-01T00:00:00.0000000+00:00\",\"type\":\"merge_started\"}";
+        Assert.True(AuditRetentionService.IsHeldByOpenLease(envelope, references));
+
+        const string other =
+            "{\"identity\":\"tester\",\"payload\":{\"agent\":\"agent-unrelated\"},"
+            + "\"seq\":2,\"timestamp\":\"2026-01-01T00:00:00.0000000+00:00\",\"type\":\"merge_started\"}";
+        Assert.False(AuditRetentionService.IsHeldByOpenLease(other, references));
+
+        // The envelope's own fields are not identity fields — `identity` is the OS user who acted.
+        const string identityCollision =
+            "{\"identity\":\"agent-held\",\"payload\":{\"agent\":\"agent-unrelated\"},"
+            + "\"seq\":3,\"timestamp\":\"2026-01-01T00:00:00.0000000+00:00\",\"type\":\"merge_started\"}";
+        Assert.False(AuditRetentionService.IsHeldByOpenLease(identityCollision, references));
+    }
+
     /// <summary>A lease id must not hold a record because some AGENT happens to be called that, and
     /// vice versa: the two id spaces are independent.</summary>
     [Fact]
