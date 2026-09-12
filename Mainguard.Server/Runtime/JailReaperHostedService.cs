@@ -137,13 +137,37 @@ public sealed class JailReaperHostedService : IHostedService, IDisposable
         return reaped;
     }
 
+    /// <summary>
+    /// How long one whole segment sweep may take before it is abandoned. A ceiling, not an expectation:
+    /// the sweep is a network listing, a container listing and one inspect per candidate, which is
+    /// milliseconds against a healthy engine.
+    ///
+    /// <para><b>It exists because this sweep is the reaper loop's only unbounded call.</b> Docker.DotNet's
+    /// own 100-second HTTP default covers one request, and a sweep is many; an engine that is up but
+    /// wedged answers each of them slowly rather than not at all, and the loop that owns the load-bearing
+    /// jail sweep would be inside this for as long as that lasted. Abandoning the sweep costs one pass of
+    /// a five-minute cadence, which is nothing — the jail it would have found is still there next time.</para>
+    /// </summary>
+    public static readonly TimeSpan SegmentSweepBudget = TimeSpan.FromMinutes(2);
+
     private static async Task<IReadOnlyList<string>> SweepSegmentsWithDockerAsync(CancellationToken ct)
     {
         // A client per sweep, like the session reconciler's own lister: this runs every few minutes and a
         // long-lived connection to an engine that may be restarted underneath it buys nothing.
         using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
-        return await new Mainguard.Agents.Agents.Sandbox.SandboxSegmentReaper(docker)
-            .SweepAsync(ct).ConfigureAwait(false);
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        budget.CancelAfter(SegmentSweepBudget);
+        try
+        {
+            return await new Mainguard.Agents.Agents.Sandbox.SandboxSegmentReaper(docker)
+                .SweepAsync(budget.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // The budget lapsed, not the caller. Answer "nothing swept" rather than let a cancellation the
+            // CALLER did not ask for travel up as though the host were stopping.
+            return Array.Empty<string>();
+        }
     }
 
     /// <summary>One pass at <paramref name="now"/>. Public, and clocked by the caller, so a test drives the

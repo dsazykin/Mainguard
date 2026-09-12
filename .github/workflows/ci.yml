@@ -52,11 +52,20 @@ jobs:
       - name: Build pinned libvterm (P2-18 engine)
         run: bash build/libvterm/build.sh
 
+      # --blame-hang names the test instead of the job. On 2026-09-08 this step was CANCELLED at the
+      # 6-hour limit with `Mainguard.Server.Tests` silent after its 583rd result and ~40 classes never
+      # reported: a hang produces no failure, no output and no dump, so the only evidence a reviewer had
+      # was a six-hour job and a missing total. The timeout is per TEST and the slowest one in this suite
+      # is single-digit seconds, so 15 minutes cannot fire on a slow runner — it fires on a test that has
+      # stopped. When it does, the collector writes a hang dump and the sequence file naming the test that
+      # was running, which is the whole difference between "CI timed out" and "this test deadlocks".
       - name: Test
         env:
           MAINGUARD_LIBVTERM: ${{ github.workspace }}/build/libvterm/out/libvterm.so
           MAINGUARD_REQUIRE_LIBVTERM: "1"
-        run: dotnet test --no-build --configuration Release --verbosity normal
+        run: >
+          dotnet test --no-build --configuration Release --verbosity normal
+          --blame-hang --blame-hang-timeout 15m
 
   format:
     name: Format check
