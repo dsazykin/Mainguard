@@ -87,6 +87,30 @@ internal static class AgentGitCommand
     /// <para>The wildcard families (<c>filter.*</c>, <c>diff.*.command</c>/<c>textconv</c>,
     /// <c>merge.*.driver</c>, …) cannot be expressed here at all; they are handled by
     /// <see cref="NeutralizingArgs"/> too.</para>
+    ///
+    /// <para><b>W1-A rework — the four submodule pins, which are what make the enumeration complete.</b>
+    /// <see cref="NeutralizingArgs"/> reads the config of the repository at <c>workingDir</c> and nothing
+    /// else, so it is only sound while git stays inside that repository. git does not:
+    /// <c>status</c>/<c>diff</c> call <c>is_submodule_modified()</c> for every <i>populated</i> gitlink —
+    /// a path staged as mode 160000 whose <c>&lt;path&gt;/.git</c> exists, <b>no <c>.gitmodules</c>
+    /// required</b> — which spawns <c>git status --porcelain=2</c> inside it, and <c>fetch</c> defaults to
+    /// <c>fetch.recurseSubmodules=on-demand</c>. <c>prepare_submodule_repo_env</c> keeps
+    /// <c>GIT_CONFIG_PARAMETERS</c> (so these pins are inherited) but drops <c>GIT_DIR</c>,
+    /// <c>GIT_COMMON_DIR</c> and <c>GIT_WORK_TREE</c> (so <see cref="TrustedWorktreeLayout"/>'s pin is
+    /// lost), and the CHILD repository's <c>filter.&lt;d&gt;.clean</c> was never enumerated because the
+    /// probe never looked at it. An agent that runs <c>git init sub</c>, gives it a hostile clean filter
+    /// and one <c>.gitattributes</c> line, stages <c>sub</c> and dirties it, gets that command executed by
+    /// the daemon on the next keep-alive <c>status --porcelain</c>. So recursion is turned off at the
+    /// source: no child git is spawned, and there is no un-enumerated config to be run by one.
+    /// <c>diff.ignoreSubmodules=all</c> is an enum, not a command, so — unlike <c>diff.external=</c> — an
+    /// empty-means-run trap does not apply, and it is safe as an always-on pin.</para>
+    ///
+    /// <para><b>What that costs.</b> Daemon-side git stops SEEING submodule pointer moves: a keep-alive
+    /// <c>IsDirty</c> whose only change is a submodule bump reads clean, and
+    /// <c>WorktreeManager.CommitAgentWork</c> reports "nothing to commit" for one. The agent's own in-jail
+    /// git is unhardened and commits such a change normally, so what is lost is a daemon-side wip
+    /// SNAPSHOT of a submodule bump — the price of not executing arbitrary commands from a repository the
+    /// agent writes.</para>
     /// </summary>
     private static readonly string[] HardeningArgs =
     {
@@ -94,7 +118,53 @@ internal static class AgentGitCommand
         "-c", "core.fsmonitor=",
         "-c", "protocol.ext.allow=never",
         "-c", "safe.directory=",
+        "-c", "diff.ignoreSubmodules=all",
+        "-c", "submodule.recurse=false",
+        "-c", "fetch.recurseSubmodules=false",
+        "-c", "status.submoduleSummary=false",
     };
+
+    /// <summary>
+    /// W1-A rework — the belt that config alone cannot provide, injected after the subcommand.
+    ///
+    /// <para>The <c>-c diff.ignoreSubmodules=all</c> pin above is a DEFAULT, and
+    /// <c>set_diffopt_flags_from_submodule_config()</c> overwrites defaults: a repository that declares
+    /// <c>submodule.&lt;name&gt;.ignore=none</c> (in its config, or in a <c>.gitmodules</c> the agent
+    /// wrote) calls <c>handle_ignore_submodules_arg()</c>, which CLEARS <c>ignore_submodules</c> before
+    /// applying its own value — re-arming the probe the pin just disarmed. The command-line
+    /// <c>--ignore-submodules</c> option is the one form that also sets
+    /// <c>override_submodule_config</c>, which makes that function a no-op. So the two are not redundant:
+    /// the config pin covers every subcommand, and this covers the two subcommands that can be talked out
+    /// of it.</para>
+    ///
+    /// <para>Only <c>status</c> and <c>diff</c> accept the option, and they are also the only two the
+    /// audit's path reaches: <c>add</c> sets <c>ignore_submodules</c> AND <c>override_submodule_config</c>
+    /// itself (<c>add_files_to_cache()</c>), <c>rebase</c> passes <c>ignore_submodules=1</c> into
+    /// <c>require_clean_work_tree()</c>, and <c>commit</c> only reaches a working-tree status on the
+    /// "nothing to commit" arm — which both daemon callers gate behind a <c>status</c>/<c>diff</c> that
+    /// already carries this flag.</para>
+    /// </summary>
+    private static readonly Dictionary<string, string> SubcommandHardeningFlag = new(StringComparer.Ordinal)
+    {
+        ["status"] = "--ignore-submodules=all",
+        ["diff"] = "--ignore-submodules=all",
+    };
+
+    /// <summary>
+    /// The one subcommand that recurses into a nested repository and has NO option to stop it.
+    ///
+    /// <para>Measured, not assumed: with <c>diff.ignoreSubmodules=all</c> pinned and the nested payload
+    /// planted, <c>status</c> and <c>diff</c> go quiet and <c>git add -A</c> still runs the nested
+    /// <c>filter.&lt;d&gt;.clean</c>. <c>builtin/add.c</c>'s config callback never reaches
+    /// <c>git_diff_ui_config()</c>, so <c>default_diff_options</c> is zeroed for it and
+    /// <c>match_stat_with_submodule()</c> calls <c>is_submodule_modified()</c> for every populated
+    /// gitlink; and <c>git add</c> has no <c>--ignore-submodules</c>.</para>
+    ///
+    /// <para>So the gitlinks are removed from the <i>pathspec</i> instead, which is the same decision the
+    /// pins already took — daemon-side git does not look inside submodules — expressed in the one
+    /// vocabulary <c>add</c> understands. See <see cref="GitlinkExclusions"/>.</para>
+    /// </summary>
+    private const string GitlinkExcludingSubcommand = "add";
 
     /// <summary>
     /// Environment forced on every daemon-side git: drop system config (<c>/etc/gitconfig</c>) and
@@ -180,15 +250,136 @@ internal static class AgentGitCommand
     }
 
     // Prepend the MG-1 hardening -c overrides plus the W1-A per-repository neutralizations. They must
-    // precede the subcommand, so they lead the arg list.
+    // precede the subcommand, so they lead the arg list — and the per-subcommand flag must FOLLOW it, so
+    // the caller's own args are split around the subcommand rather than simply appended to.
     private static string[] Hardened(string workingDir, IReadOnlyDictionary<string, string> env, string[] args)
     {
         var neutralize = NeutralizingArgs(workingDir, env);
-        var combined = new string[HardeningArgs.Length + neutralize.Length + args.Length];
-        Array.Copy(HardeningArgs, combined, HardeningArgs.Length);
-        Array.Copy(neutralize, 0, combined, HardeningArgs.Length, neutralize.Length);
-        Array.Copy(args, 0, combined, HardeningArgs.Length + neutralize.Length, args.Length);
-        return combined;
+        var combined = new List<string>(HardeningArgs.Length + neutralize.Length + args.Length + 1);
+        combined.AddRange(HardeningArgs);
+        combined.AddRange(neutralize);
+
+        var subcommandIndex = SubcommandIndex(args);
+        for (var i = 0; i < args.Length; i++)
+        {
+            combined.Add(args[i]);
+            if (i == subcommandIndex && SubcommandHardeningFlag.TryGetValue(args[i], out var flag))
+            {
+                combined.Add(flag);
+            }
+        }
+
+        if (subcommandIndex >= 0 && args[subcommandIndex] == GitlinkExcludingSubcommand)
+        {
+            combined.AddRange(GitlinkExclusions(workingDir, env));
+        }
+
+        return combined.ToArray();
+    }
+
+    /// <summary>
+    /// Negative pathspecs that take every POPULATED gitlink out of a daemon-side <c>git add</c>.
+    ///
+    /// <para><c>ls-files --stage</c> is an index read: it spawns no child git and runs no filter, so it is
+    /// safe to ask before the <c>add</c> it is protecting. Mode <c>160000</c> is a gitlink; a gitlink whose
+    /// <c>&lt;path&gt;/.git</c> exists is a POPULATED one, and only a populated one makes
+    /// <c>is_submodule_modified()</c> spawn <c>git status --porcelain=2</c> inside it. The exclusion is
+    /// <c>:(exclude,literal)</c> — <c>literal</c> because the path is agent-chosen and must not be read as
+    /// a glob.</para>
+    ///
+    /// <para>An empty result adds nothing, so the overwhelmingly common case (no gitlinks at all) leaves
+    /// the command byte-identical to what it was.</para>
+    /// </summary>
+    private static string[] GitlinkExclusions(string workingDir, IReadOnlyDictionary<string, string> env)
+    {
+        if (string.IsNullOrEmpty(workingDir))
+        {
+            return Array.Empty<string>();
+        }
+
+        int code;
+        string listing;
+        try
+        {
+            // No -c overrides on the probe: it must not recurse into Hardened.
+            (code, listing, _) = GitService.RunGit(
+                workingDir, env, CancellationToken.None, "ls-files", "--stage", "-z");
+        }
+        catch (GitOperationException)
+        {
+            return Array.Empty<string>();
+        }
+
+        if (code != 0 || listing.Length == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        List<string>? excludes = null;
+        foreach (var entry in listing.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+        {
+            // "<mode> <sha> <stage>\t<path>"
+            if (!entry.StartsWith("160000 ", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var tab = entry.IndexOf('\t');
+            if (tab < 0 || tab == entry.Length - 1)
+            {
+                continue;
+            }
+
+            var path = entry[(tab + 1)..];
+            if (!Directory.Exists(Path.Combine(workingDir, path)) && !File.Exists(Path.Combine(workingDir, path, ".git")))
+            {
+                // An UNPOPULATED gitlink has nothing for git to recurse into, and excluding it would
+                // needlessly stop the daemon recording a legitimate pointer change.
+                continue;
+            }
+
+            excludes ??= new List<string>();
+            if (excludes.Count >= MaxNeutralizedKeys)
+            {
+                throw new RepoProvisioningException(
+                    "W1-A: the worktree at '" + workingDir + "' stages more than " + MaxNeutralizedKeys
+                    + " populated nested repositories. Refusing to run daemon-side git against it.");
+            }
+
+            excludes.Add(":(exclude,literal)" + path);
+        }
+
+        return excludes is null ? Array.Empty<string>() : excludes.ToArray();
+    }
+
+    /// <summary>
+    /// The index of the git SUBCOMMAND in a caller's arg list, or -1.
+    ///
+    /// <para>It is not always <c>args[0]</c>: two callers prepend their own <c>-c user.name=…</c> pairs
+    /// (the keep-alive rebaser's wip commit and <c>WorktreeManager.IdentityFor</c>), so the first element
+    /// can be a global option. Global options are skipped — <c>-c</c> and <c>--config-env</c> together
+    /// with their value, anything else beginning with <c>-</c> on its own — and the first bare word is the
+    /// subcommand.</para>
+    /// </summary>
+    private static int SubcommandIndex(string[] args)
+    {
+        for (var i = 0; i < args.Length; i++)
+        {
+            if (args[i] is "-c" or "--config-env")
+            {
+                i++;
+                continue;
+            }
+
+            if (args[i].StartsWith('-'))
+            {
+                continue;
+            }
+
+            return i;
+        }
+
+        return -1;
     }
 
     /// <summary>
@@ -307,8 +498,9 @@ internal static class AgentGitCommand
         return args is null ? Array.Empty<string>() : args.ToArray();
     }
 
-    // The caller's subcommand name for error text (args[0]), skipping the injected -c pairs.
-    private static string Subcommand(string[] args) => args.Length > 0 ? args[0] : "git";
+    // The caller's subcommand name for error text, skipping any leading global options the caller passed.
+    private static string Subcommand(string[] args)
+        => SubcommandIndex(args) is var i && i >= 0 ? args[i] : "git";
 }
 
 /// <summary>
@@ -333,7 +525,8 @@ internal static class GitConfigExecutionSurface
     /// <c>.cmd|.path</c>; the fixed-name <c>core.*</c>/<c>sequence.editor</c> knobs;
     /// <c>credential.[&lt;url&gt;.]helper</c>; <c>remote.&lt;r&gt;.uploadpack|receivepack|proxy</c>
     /// (fetch/push); <c>uploadpack.packObjectsHook</c>; <c>init.templateDir</c> (hooks by another
-    /// name); <c>gpg[.&lt;fmt&gt;].program</c>; <c>trailer.&lt;t&gt;.command|cmd</c>;
+    /// name); <c>gpg[.&lt;fmt&gt;].program</c> and <c>gpg.ssh.defaultKeyCommand</c> (a shell command run by
+    /// EVERY signed commit when <c>user.signingkey</c> is unset); <c>trailer.&lt;t&gt;.command|cmd</c>;
     /// <c>submodule.&lt;s&gt;.update</c> (a <c>!command</c> form); and any <c>pager.&lt;cmd&gt;</c>.</para>
     ///
     /// <para>Deliberately NOT here: <c>alias.*</c> — a git alias cannot shadow a built-in subcommand and
@@ -376,7 +569,13 @@ internal static class GitConfigExecutionSurface
             "remote" => hasSubsection && variable is "uploadpack" or "receivepack" or "proxy",
             "uploadpack" => variable is "packobjectshook",
             "init" => variable is "templatedir",
-            "gpg" => variable is "program",
+            // gpg.<format>.program is the obvious one; gpg.ssh.defaultKeyCommand is the one W1-A's first
+            // pass missed, and it is strictly easier to reach. With `commit.gpgsign=true`, `gpg.format=ssh`
+            // and NO `user.signingkey`, git runs `gpg.ssh.defaultKeyCommand` THROUGH A SHELL to discover a
+            // key — on every commit. The daemon makes commits in an agent-writable repository on two paths
+            // (the keep-alive wip snapshot and WorktreeManager.CommitAgentWork) and replays more of them on
+            // every rebase, so the whole of that config lives where the agent can write it.
+            "gpg" => variable is "program" or "defaultkeycommand",
             "trailer" => hasSubsection && variable is "command" or "cmd",
             "submodule" => hasSubsection && variable is "update",
             "browser" => variable is "cmd" or "path",
@@ -435,10 +634,31 @@ internal static class GitConfigExecutionSurface
 ///
 /// <para><b>What is trusted.</b> The working tree path (the daemon computed it), and — when supplied —
 /// the agent repository root (the daemon computed that too, from
-/// <see cref="AgentRepoLayout.AgentRepoPath"/>). Nothing else. <c>commondir</c> is never read: the
-/// common directory is derived from the gitdir's own <c>…/worktrees/&lt;name&gt;</c> shape, and the
-/// resolved layout is pinned into the child process with <c>GIT_DIR</c>, <c>GIT_COMMON_DIR</c> and
-/// <c>GIT_WORK_TREE</c>, which outrank every on-disk pointer.</para>
+/// <see cref="AgentRepoLayout.AgentRepoPath"/>). Nothing else. The resolved layout is pinned into the
+/// child process with <c>GIT_DIR</c>, <c>GIT_COMMON_DIR</c> and <c>GIT_WORK_TREE</c>, which outrank
+/// every on-disk pointer — <c>setup_git_env()</c> reads the <c>commondir</c> FILE only when
+/// <c>GIT_COMMON_DIR</c> is unset.</para>
+///
+/// <para><b>Rework: this used to fail OPEN, and that made the docstring above false.</b> Every
+/// validation failure returned null, and both callers read null as "run unpinned, exactly as before" —
+/// so the one thing an agent had to achieve was to make validation FAIL. The per-worktree gitdir lives
+/// in the per-agent repository, which the jail mounts read-write, and only the worktree's <c>.git</c>
+/// pointer was made read-only. Writing <c>&lt;agentRepo&gt;/worktrees/&lt;n&gt;/commondir</c> = the
+/// shared mirror's path and then blanking <c>…/worktrees/&lt;n&gt;/gitdir</c> left the pointer intact,
+/// the derived common dir equal to the agent repo, the mirror check satisfied (it tests the DERIVED
+/// directory, never the file) and the round-trip broken — i.e. null, i.e. unpinned. The daemon's
+/// <c>add -A</c>/<c>commit</c>/<c>rebase</c> then ran with the worktree as cwd, git followed
+/// <c>.git</c> → gitdir → <c>commondir</c> → the mirror, and the wip commit advanced the MIRROR's
+/// <c>refs/heads/main</c> with agent content — past the ref mediator and past the merge queue.</para>
+///
+/// <para><b>So the rule is now one sentence: a linked worktree either resolves or throws.</b> Null
+/// survives for exactly two shapes, and neither has an indirection to subvert — a real <c>.git</c>
+/// DIRECTORY (a main working tree; git would find the same layout we would pin) and a directory with no
+/// <c>.git</c> at all (the substrate-less test doubles). The moment <c>.git</c> is a FILE, every path out
+/// of <see cref="TryResolve"/> is either a validated layout or a typed
+/// <see cref="RepoProvisioningException"/>. And when the caller knows the agent repository, the pointer
+/// is not consulted at all: <c>GIT_DIR</c> is computed as
+/// <c>&lt;agentRepo&gt;/worktrees/&lt;the daemon's own worktree directory name&gt;</c>.</para>
 /// </summary>
 internal sealed class TrustedWorktreeLayout
 {
@@ -461,25 +681,28 @@ internal sealed class TrustedWorktreeLayout
     /// <summary>The per-worktree git directory (<c>&lt;repo&gt;/worktrees/&lt;name&gt;</c>).</summary>
     internal string GitDir { get; }
 
-    /// <summary>The common git directory — refs, objects, config. Derived, never read from
-    /// <c>commondir</c>.</summary>
+    /// <summary>The common git directory — refs, objects, config. Either the daemon-computed agent
+    /// repository verbatim, or derived from the pointer's own <c>…/worktrees/&lt;name&gt;</c> shape. Never
+    /// read from the <c>commondir</c> file, and <c>GIT_COMMON_DIR</c> is what stops git reading it
+    /// either.</summary>
     internal string CommonDir { get; }
 
     /// <summary>The pin, as environment. Passed to <see cref="AgentGitCommand.RunWithEnv"/>.</summary>
     internal IReadOnlyDictionary<string, string> Env { get; }
 
     /// <summary>
-    /// Resolves and validates the layout for <paramref name="worktreePath"/>, or returns null when it
-    /// cannot be established. <b>Null is "run unpinned, exactly as before"</b>, not "unsafe": the
-    /// substrate-less test doubles and the pre-MG-3 shapes (a plain <c>.git</c> directory) have no
-    /// linked-worktree indirection to be redirected through in the first place.
+    /// Resolves and validates the layout for <paramref name="worktreePath"/>.
+    ///
+    /// <para><b>Null means "there is no linked-worktree indirection here"</b> and nothing else — a real
+    /// <c>.git</c> directory, or no <c>.git</c> at all. It is NOT a failure channel: once <c>.git</c> is a
+    /// file, this either returns a validated layout or throws
+    /// <see cref="RepoProvisioningException"/>. See the type remarks for the bypass that rule closes.</para>
     /// </summary>
     /// <param name="worktreePath">The daemon-computed working tree.</param>
     /// <param name="agentRepoPath">The daemon-computed per-agent repository, when the caller knows it.
-    /// Supplied ⇒ the common directory is asserted to be exactly this, so the <c>gitdir:</c> pointer is
-    /// only ever used to select <i>which</i> registered worktree we are, never <i>whose</i> repository.
-    /// Null ⇒ the common directory is derived from the pointer's own shape and checked against
-    /// <paramref name="forbiddenCommonDir"/>.</param>
+    /// Supplied ⇒ the layout is COMPUTED from it and the worktree's own directory name; the agent's
+    /// <c>gitdir:</c> pointer is not read at all. Null ⇒ the common directory is derived from the
+    /// pointer's own shape, checked against <paramref name="forbiddenCommonDir"/>, and round-tripped.</param>
     /// <param name="forbiddenCommonDir">A path the common directory must not be — the shared mirror.
     /// This is the exact redirect the audit called out as "a plausible second vector".</param>
     internal static TrustedWorktreeLayout? TryResolve(
@@ -500,36 +723,133 @@ internal sealed class TrustedWorktreeLayout
         var dotGit = Path.Combine(workTree, ".git");
 
         // A real .git directory is the main working tree: there is no pointer to subvert, and pinning
-        // GIT_DIR would only restate what git would find. Leave it unpinned.
+        // GIT_DIR would only restate what git would find. Leave it unpinned. Likewise no .git at all —
+        // there is no repository here for anything to be redirected through.
         if (Directory.Exists(dotGit) || !File.Exists(dotGit))
         {
             return null;
         }
 
+        // ---- From here `.git` is a FILE. Every exit is a layout or a refusal; never null. -------------
+        return agentRepoPath is { Length: > 0 }
+            ? FromDaemonRoots(worktreePath, workTree, dotGit, agentRepoPath, forbiddenCommonDir)
+            : FromPointer(workTree, dotGit, forbiddenCommonDir);
+    }
+
+    /// <summary>
+    /// The pinned form: <c>GIT_DIR</c> is <c>&lt;agentRepo&gt;/worktrees/&lt;name&gt;</c>, where
+    /// <paramref name="agentRepoPath"/> and <paramref name="worktreePath"/> are both daemon-computed, and
+    /// nothing the agent can write is consulted on the way.
+    ///
+    /// <para>The worktree NAME is the last component of the daemon's own worktree path, because that is
+    /// what the daemon handed <c>git worktree add</c> and what git therefore registered
+    /// (<c>worktree_basename()</c>). It is taken from the path AS GIVEN rather than from its
+    /// symlink-resolved form: resolving can rename the final component, and the registration was made
+    /// under the name git was given. The agent id charset (<see cref="AgentRepoLayout.RequireAgentId"/>)
+    /// is a strict subset of what git accepts verbatim, so no de-duplication suffix can have been
+    /// appended — one agent repository holds exactly one worktree.</para>
+    /// </summary>
+    private static TrustedWorktreeLayout FromDaemonRoots(
+        string worktreePath, string workTree, string dotGit, string agentRepoPath, string? forbiddenCommonDir)
+    {
+        var commonDir = RealPath(agentRepoPath);
+
+        // Defensive, and cheap: a caller that handed us the mirror AS the agent repository would pin the
+        // daemon onto the mirror with the daemon's own blessing. That is a wiring bug rather than an
+        // agent's doing, and it is exactly as unacceptable.
+        if (forbiddenCommonDir is { Length: > 0 } && PathsEqual(commonDir, RealPath(forbiddenCommonDir)))
+        {
+            throw new RepoProvisioningException(
+                $"W1-A: the per-agent repository for '{workTree}' resolves to the shared mirror "
+                + $"'{commonDir}'. The mirror is read-only to every jail precisely so no agent can reach "
+                + "it; refusing to reach it on the agent's behalf.");
+        }
+
+        var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(worktreePath));
+        if (string.IsNullOrEmpty(name))
+        {
+            throw new RepoProvisioningException(
+                $"W1-A: '{worktreePath}' has no final path component, so the registered worktree name it "
+                + "was added under cannot be named. Refusing to run daemon-side git against it.");
+        }
+
+        var gitDir = Path.Combine(commonDir, "worktrees", name);
+        if (!Directory.Exists(gitDir))
+        {
+            throw new RepoProvisioningException(
+                $"W1-A: the daemon provisioned '{worktreePath}' as a linked worktree of '{agentRepoPath}', "
+                + $"but that repository has no '{gitDir}' registration directory. The worktree's own "
+                + "`.git` pointer is deliberately not consulted as a fallback — following it is the vector "
+                + "this pin exists to remove. Refusing to run daemon-side git against it.");
+        }
+
+        // The pointer is read ONLY here, ONLY to raise an alarm, and its answer can only make this method
+        // refuse — never choose. The distinction is the whole point: deriving the layout from it is what
+        // let an agent pick the repository; comparing the layout we already computed against it is how an
+        // agent that TRIED to gets reported instead of silently ignored. (Since W1-A the pointer is also
+        // mounted read-only into the jail, so in production this should be unreachable — which is the
+        // reason to fail loudly if it ever fires rather than to carry on.)
+        AssertPointerDoesNotRedirect(workTree, dotGit, commonDir, forbiddenCommonDir);
+
+        return new TrustedWorktreeLayout(workTree, RealPath(gitDir), commonDir);
+    }
+
+    /// <summary>Refuses when the agent-writable <c>gitdir:</c> pointer names a common directory other
+    /// than the daemon-computed one. Never used to DERIVE anything.</summary>
+    private static void AssertPointerDoesNotRedirect(
+        string workTree, string dotGit, string commonDir, string? forbiddenCommonDir)
+    {
+        var (_, pointedCommonDir) = DerivePointerTargets(workTree, dotGit);
+
+        if (forbiddenCommonDir is { Length: > 0 } && PathsEqual(pointedCommonDir, RealPath(forbiddenCommonDir)))
+        {
+            throw new RepoProvisioningException(
+                $"W1-A: the worktree at '{workTree}' points its git directory at the shared mirror "
+                + $"'{pointedCommonDir}'. That mirror is read-only to every jail precisely so no agent can "
+                + "reach it; refusing to reach it on the agent's behalf.");
+        }
+
+        if (!PathsEqual(pointedCommonDir, commonDir))
+        {
+            throw new RepoProvisioningException(
+                $"W1-A: the worktree at '{workTree}' claims to belong to '{pointedCommonDir}', but the "
+                + $"daemon provisioned it under '{commonDir}'. Refusing to run daemon-side "
+                + "git against a repository the agent chose.");
+        }
+    }
+
+    /// <summary>
+    /// Parses the worktree's <c>gitdir:</c> pointer into <c>(gitDir, commonDir)</c>, refusing anything
+    /// that is not the <c>&lt;common&gt;/worktrees/&lt;name&gt;</c> shape git itself writes.
+    /// </summary>
+    private static (string GitDir, string CommonDir) DerivePointerTargets(string workTree, string dotGit)
+    {
         string pointer;
         try
         {
             pointer = File.ReadAllText(dotGit).Trim();
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return null;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return null;
+            throw new RepoProvisioningException(
+                $"W1-A: the worktree at '{workTree}' has a `.git` file that could not be read ({ex.Message}), "
+                + "so its git layout cannot be established. Refusing to run daemon-side git against it.");
         }
 
         const string prefix = "gitdir:";
         if (!pointer.StartsWith(prefix, StringComparison.Ordinal))
         {
-            return null;
+            throw new RepoProvisioningException(
+                $"W1-A: the worktree at '{workTree}' has a `.git` file that is not a `gitdir:` pointer. "
+                + "Refusing to run daemon-side git against it.");
         }
 
         var target = pointer[prefix.Length..].Trim();
         if (target.Length == 0)
         {
-            return null;
+            throw new RepoProvisioningException(
+                $"W1-A: the worktree at '{workTree}' has an empty `gitdir:` pointer. Refusing to run "
+                + "daemon-side git against it.");
         }
 
         var gitDir = RealPath(Path.IsPathRooted(target) ? target : Path.Combine(workTree, target));
@@ -546,9 +866,21 @@ internal sealed class TrustedWorktreeLayout
                 + "worktree directory of any repository. Refusing to run daemon-side git against it.");
         }
 
-        // The mirror is checked FIRST, ahead of the identity check that would also catch it: it is the
-        // named vector, and "you aimed this at the shared mirror" is the diagnostic an operator can act
-        // on, where "this is not the repository we provisioned" is merely true.
+        return (gitDir, commonDir);
+    }
+
+    /// <summary>
+    /// The unpinned-identity form, for callers that do not know the agent repository. The
+    /// <c>gitdir:</c> pointer selects the repository, so every check below is load-bearing — and every
+    /// one of them now REFUSES rather than falling back to running unpinned, which was the same thing as
+    /// following the pointer plus its <c>commondir</c>.
+    /// </summary>
+    private static TrustedWorktreeLayout FromPointer(string workTree, string dotGit, string? forbiddenCommonDir)
+    {
+        var (gitDir, commonDir) = DerivePointerTargets(workTree, dotGit);
+
+        // The mirror is checked FIRST, ahead of the round-trip that might also catch it: it is the named
+        // vector, and "you aimed this at the shared mirror" is the diagnostic an operator can act on.
         if (forbiddenCommonDir is { Length: > 0 } && PathsEqual(commonDir, RealPath(forbiddenCommonDir)))
         {
             throw new RepoProvisioningException(
@@ -557,31 +889,28 @@ internal sealed class TrustedWorktreeLayout
                 + "it; refusing to reach it on the agent's behalf.");
         }
 
-        if (agentRepoPath is { Length: > 0 } && !PathsEqual(commonDir, RealPath(agentRepoPath)))
-        {
-            throw new RepoProvisioningException(
-                $"W1-A: the worktree at '{workTree}' claims to belong to '{commonDir}', but the daemon "
-                + $"provisioned it under '{RealPath(agentRepoPath)}'. Refusing to run daemon-side "
-                + "git against a repository the agent chose.");
-        }
-
         // Round-trip: the repository must itself have this worktree registered, and register it back at
-        // the path we were given. A pointer at a directory that does not name us back is not our layout.
+        // the path we were given. A pointer at a directory that does not name us back is not our layout —
+        // and a BROKEN round-trip is now a refusal. It used to return null, i.e. "run unpinned with the
+        // worktree as cwd", which handed git the very pointer chain (and the `commondir` beyond it) that
+        // this method exists to not follow. Blanking this one file was all an agent needed to do.
         var registration = Path.Combine(gitDir, "gitdir");
         try
         {
             if (!File.Exists(registration) || !PathsEqual(RealPath(File.ReadAllText(registration).Trim()), dotGit))
             {
-                return null;
+                throw new RepoProvisioningException(
+                    $"W1-A: '{gitDir}' does not register '{dotGit}' back (its `gitdir` file is missing or "
+                    + "names somewhere else), so this is not a layout the daemon can vouch for. Refusing to "
+                    + "run daemon-side git against it rather than running it unpinned, which would follow "
+                    + "the agent's own `commondir`.");
             }
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return null;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return null;
+            throw new RepoProvisioningException(
+                $"W1-A: '{registration}' could not be read ({ex.Message}), so the worktree's registration "
+                + "cannot be confirmed. Refusing to run daemon-side git against it.");
         }
 
         return new TrustedWorktreeLayout(workTree, gitDir, commonDir);

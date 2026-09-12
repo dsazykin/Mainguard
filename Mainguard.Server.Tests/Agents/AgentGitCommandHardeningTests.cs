@@ -86,6 +86,127 @@ public sealed class AgentGitCommandHardeningTests : IDisposable
     }
 
     /// <summary>
+    /// W1-A rework, blocker 1 — the enumeration reads ONE repository's config, and git does not stay in
+    /// one repository.
+    ///
+    /// <para><c>git status --porcelain</c> (the first thing every keep-alive cycle runs, and
+    /// <c>WorktreeManager.IsDirty</c>) calls <c>is_submodule_modified()</c> for every POPULATED gitlink —
+    /// a path staged as mode 160000 whose <c>&lt;path&gt;/.git</c> exists. <b>No <c>.gitmodules</c> is
+    /// needed</b>, which is what makes it reachable from a jail in four ordinary commands. That spawns
+    /// <c>git status --porcelain=2</c> inside the nested repository, whose <c>filter.&lt;d&gt;.clean</c>
+    /// the daemon's probe never listed and whose <c>GIT_DIR</c> pin <c>prepare_submodule_repo_env()</c>
+    /// drops. The nested driver then runs as the daemon user, on the host, outside the jail.</para>
+    ///
+    /// <para>The fixture is the audit scenario verbatim, and it proves itself non-vacuous first: plain
+    /// git executes the nested driver, then the same tree is driven through
+    /// <see cref="AgentGitCommand"/> and it must not.</para>
+    /// </summary>
+    [Fact]
+    public void HostileFilterInANestedRepository_IsNotExecuted_WhenTheDaemonProbesTheWorktree()
+    {
+        var (parent, sub) = NestedHostileRepo("nested");
+
+        // Non-vacuous: unhardened git recurses into the embedded repository and runs its clean filter.
+        AgentTestGit.RunChecked(parent, "status", "--porcelain");
+        Assert.Equal("yes", Marker(sub, "clean"));
+
+        ClearMarkers(sub);
+
+        // The daemon's own path must not — on every leg of the keep-alive cycle, asserted one at a time so
+        // a regression names the subcommand that reopened the hole.
+        AgentGitCommand.Run(parent, "status", "--porcelain");
+        Assert.Null(Marker(sub, "clean"));
+        AgentGitCommand.TryRun(parent, out _, "diff");
+        Assert.Null(Marker(sub, "clean"));
+        AgentGitCommand.TryRun(parent, out _, "diff", "--cached", "--quiet");
+        Assert.Null(Marker(sub, "clean"));
+        // …and `add` must still stage ORDINARY work while it skips the gitlink, or the fix would have
+        // traded a host RCE for a keep-alive cycle that snapshots nothing.
+        File.WriteAllText(Path.Combine(parent, "ordinary.txt"), "real work\n");
+        AgentGitCommand.Run(parent, "add", "-A");
+        Assert.Null(Marker(sub, "clean"));
+        Assert.Contains(
+            "ordinary.txt",
+            AgentGitCommand.Run(parent, "diff", "--cached", "--name-only"),
+            StringComparison.Ordinal);
+
+        AgentGitCommand.Run(parent, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "wip: sync");
+        Assert.Null(Marker(sub, "clean"));
+    }
+
+    /// <summary>
+    /// The cost of blocker 1's fix, stated as a test rather than as a comment, so that a later reader
+    /// finds the trade measured instead of rediscovering it as a bug.
+    ///
+    /// <para>Turning submodule recursion off means daemon-side git no longer SEES a submodule pointer
+    /// move: the keep-alive cycle's <c>IsDirty</c> reads clean for one, and
+    /// <c>WorktreeManager.CommitAgentWork</c> reports "nothing to commit". The agent's own in-jail git is
+    /// not hardened and records such a change normally, so what is given up is a daemon-side wip SNAPSHOT
+    /// of a submodule bump. The thing bought with it is that a repository the agent writes cannot make the
+    /// daemon execute an arbitrary command on the host.</para>
+    /// </summary>
+    [Fact]
+    public void SubmodulePointerMoves_AreInvisibleToDaemonGit_TheMeasuredCostOfTheSubmodulePins()
+    {
+        var (parent, sub) = NestedHostileRepo("nested-cost");
+        // A NEW path, not an edit: the nested repo's own clean filter writes nothing to stdout, so every
+        // blob in it stages empty and editing a tracked file changes no tree. Adding a path does.
+        File.WriteAllText(Path.Combine(sub, "g.txt"), "moved\n");
+        AgentTestGit.RunChecked(sub, "add", "-A");
+        AgentTestGit.RunChecked(sub, "commit", "-q", "-m", "the submodule moved");
+
+        // Plain git sees the gitlink move; the daemon's path deliberately does not.
+        Assert.Contains("sub", AgentTestGit.RunChecked(parent, "status", "--porcelain"), StringComparison.Ordinal);
+        Assert.Equal(string.Empty, AgentGitCommand.Run(parent, "status", "--porcelain").Trim());
+    }
+
+    /// <summary>
+    /// Why the always-on <c>-c diff.ignoreSubmodules=all</c> is not on its own enough, and the
+    /// command-line <c>--ignore-submodules=all</c> is not redundant with it.
+    ///
+    /// <para>A config pin is a DEFAULT. <c>set_diffopt_flags_from_submodule_config()</c> looks the path up
+    /// in <c>.gitmodules</c> and then applies <c>submodule.&lt;name&gt;.ignore</c> through
+    /// <c>handle_ignore_submodules_arg()</c>, which CLEARS <c>ignore_submodules</c> before applying its own
+    /// value — so an agent that writes a two-line <c>.gitmodules</c> and one inert config key re-arms the
+    /// probe the pin disarmed. <c>submodule.&lt;n&gt;.ignore</c> executes nothing, so the enumeration has
+    /// no business neutralizing it. Only the command-line option also sets
+    /// <c>override_submodule_config</c>, which makes that function a no-op.</para>
+    /// </summary>
+    [Fact]
+    public void NestedRepositoryFilter_IsStillNotExecuted_WhenTheRepoReEnablesSubmoduleDiffs()
+    {
+        var (parent, sub) = NestedHostileRepo("nested-override");
+
+        // The re-arm: name the embedded repo as a submodule and declare it un-ignorable.
+        File.WriteAllText(
+            Path.Combine(parent, ".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n");
+        AgentTestGit.RunChecked(parent, "config", "submodule.sub.ignore", "none");
+
+        AgentTestGit.RunChecked(parent, "status", "--porcelain");
+        Assert.Equal("yes", Marker(sub, "clean"));
+
+        ClearMarkers(sub);
+
+        AgentGitCommand.Run(parent, "status", "--porcelain");
+        AgentGitCommand.TryRun(parent, out _, "diff");
+        AgentGitCommand.Run(parent, "add", "-A");
+        AgentGitCommand.TryRun(parent, out _, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "wip: sync");
+        Assert.Null(Marker(sub, "clean"));
+    }
+
+    /// <summary>The submodule pins must not have broken ordinary daemon git: a worktree with a REAL
+    /// change still reads dirty through the same probe the rebaser gates its wip commit on.</summary>
+    [Fact]
+    public void OrdinaryDirtyWorktree_IsStillReportedDirty_WithTheSubmodulePinsOn()
+    {
+        var (parent, _) = NestedHostileRepo("nested-still-dirty");
+        File.WriteAllText(Path.Combine(parent, "ordinary.txt"), "a change the daemon must still see\n");
+
+        Assert.Contains("ordinary.txt", AgentGitCommand.Run(parent, "status", "--porcelain"), StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// The families that cannot be reached from a two-line fixture (<c>merge.&lt;d&gt;.driver</c> needs
     /// a real conflicting rebase, <c>uploadpack.packObjectsHook</c> needs a serving process) are pinned
     /// on the pure classifier instead, so the list is a tested artifact rather than a comment.
@@ -117,6 +238,11 @@ public sealed class AgentGitCommandHardeningTests : IDisposable
     [InlineData("init.templateDir")]
     [InlineData("gpg.program")]
     [InlineData("gpg.ssh.program")]
+    // W1-A rework, blocker 3. `commit.gpgsign=true` + `gpg.format=ssh` + no `user.signingkey` makes git
+    // run this THROUGH A SHELL to discover a key — on every commit the daemon makes in the agent's
+    // repository, and on every commit a rebase replays. Repo-local, so the agent writes all four.
+    [InlineData("gpg.ssh.defaultKeyCommand")]
+    [InlineData("gpg.x509.program")]
     [InlineData("trailer.sign.command")]
     [InlineData("submodule.sub.update")]
     [InlineData("pager.log")]
@@ -223,6 +349,44 @@ public sealed class AgentGitCommandHardeningTests : IDisposable
 
     private static void PlantAttributes(string repo, string line)
         => File.WriteAllText(Path.Combine(repo, ".gitattributes"), line + "\n");
+
+    /// <summary>
+    /// The audit's nested-repository payload, built with the five commands a jailed agent can run in its
+    /// own worktree — <c>git init sub</c>, one config key, one <c>.gitattributes</c> line, a commit in the
+    /// sub, and <c>git add sub</c> in the parent. Returns (parent worktree, nested repository).
+    ///
+    /// <para>The nested file is left MODIFIED on purpose: git compares a tracked file by stat first and
+    /// only converts its content (i.e. runs the clean filter) when the stat differs. A pristine nested
+    /// repo would make the test vacuous in the one direction that matters.</para>
+    /// </summary>
+    private (string Parent, string Sub) NestedHostileRepo(string name)
+    {
+        var parent = NewRepo(name);
+        File.WriteAllText(Path.Combine(parent, "a.txt"), "parent\n");
+        AgentTestGit.RunChecked(parent, "add", "-A");
+        AgentTestGit.RunChecked(parent, "commit", "-q", "-m", "seed");
+
+        var sub = Path.Combine(parent, "sub");
+        Directory.CreateDirectory(sub);
+        AgentTestGit.RunChecked(sub, "init", "-q");
+        AgentTestGit.SetIdentity(sub);
+        AgentTestGit.RunChecked(sub, "config", "filter.pwn.clean", MarkerCommand("clean"));
+        AgentTestGit.RunChecked(sub, "config", "filter.pwn.smudge", MarkerCommand("smudge"));
+        PlantAttributes(sub, "* filter=pwn");
+        File.WriteAllText(Path.Combine(sub, "f.txt"), "v1\n");
+        AgentTestGit.RunChecked(sub, "add", "-A");
+        AgentTestGit.RunChecked(sub, "commit", "-q", "-m", "nested seed");
+        ClearMarkers(sub);
+
+        // The gitlink. `add` warns about an embedded repository and stages it anyway, which is the point.
+        AgentTestGit.RunChecked(parent, "add", "sub");
+        AgentTestGit.RunChecked(parent, "commit", "-q", "-m", "embed");
+
+        // Dirty the nested worktree so the child status has content to convert.
+        File.WriteAllText(Path.Combine(sub, "f.txt"), "v2\n");
+        ClearMarkers(sub);
+        return (parent, sub);
+    }
 
     /// <summary>The payload: a command git will spawn through a shell, whose only effect is a
     /// config marker this test can read back. Never a shell utility — <c>git</c> is the one binary
