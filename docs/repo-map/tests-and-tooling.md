@@ -1135,7 +1135,14 @@
   value never is; a key name that is not a plain identifier reported as `<non-identifier>`, since a JSON
   key is chosen by whoever wrote the file and inside a jail that can be the agent; a clean credential file
   returned byte-identical; and unparseable content travelling unless it spells one of those keys (a bare
-  UUID is what `.gemini/installation_id` is, and refusing it would cost a real login).
+  UUID is what `.gemini/installation_id` is, and refusing it would cost a real login). The review follow-up
+  adds `enabledMcpjsonServers` to both `[Theory]` lists (it names programs it does not spell — it switches
+  on the servers the repository's own committed `.mcp.json` defines) and
+  `AWholeToolGrantInAProjectsAllowedTools_DoesNotTravel` + its empty-list twin: `projects.<dir>.allowedTools`
+  is a permission allowlist inside a credential file, and a jail refused `Bash(*)` through
+  `.claude/settings.json` could persist exactly that through `.claude.json` — one fact with two answers,
+  which is the MG-12 shape. The owner's bounded grants beside it are untouched, and the emptied list stays
+  an empty list rather than disappearing.
 - **`Mainguard.Tests/CliLoginVaultTests.cs`** also pins the **F2 repo scope**: the key is per kind AND
   per repo with a fixed-width hex suffix, two repos never resolve to one entry, `("a_b","c")` and
   `("a","b_c")` cannot collide across the separator, a blank scope yields null rather than a shared
@@ -1162,6 +1169,16 @@
   developer happens to have installed. Mutations watched red: the guard removed (2 — the pre-change
   behaviour), the empty-catalog carve-out removed (1), the refusal not naming the kinds (2), the launcher
   passing no kinds to the instructions (2), and the kind list hardcoded in the prose (3 + 2).
+  It also carries the END-TO-END half of F50's cross-kind eviction guard:
+  `AWorkerOfAnotherKind_StillGetsThatKindsKey_AfterTheUsersOwnSessionOfItStopped` runs the flow the
+  first cut of that eviction broke — the user's own `second-cli` session stops, and the live `probe-cli`
+  coordinator then spawns a `second-cli` worker over the real socket — and asserts on the ENV THE JAIL
+  RECEIVES rather than on the cache, because "the cache still holds it" and "the worker gets it" are two
+  claims and only the second is the feature. (Each installed marker declares an `ApiKeyEnvVar` so the
+  provider key is observable at all; without one, "booted with no credential" could not be told from
+  "this rig never injects one".) Paired with
+  `OnceTheCoordinatorIsGone_TheOtherKindsKey_IsDroppedWithItsLastSession`. Mutation watched red: the
+  coordinator guard removed — the worker boots with a null key.
 - **`Mainguard.Tests/CliSettingsStoreTests.cs`** — the host store's scope decision, made testable:
   `ApprovingSomethingInOneRepository_DoesNotApproveItInAnother` is the per-repo rule itself; plus
   per-adapter isolation, a blank scope never acting as a wildcard, merge-not-replace on save, an empty
@@ -1193,9 +1210,22 @@
   F2's last clause through the real stop: a credential path that is NOT settings-shaped (production's
   `.claude.json`) comes back with its `mcpServers` command definitions gone and the login beside them
   untouched — the negative control being that the refresh token and the account email are both still
-  there, so a filter that simply dropped the file would fail it. **EVICTION (F50):** `StoppingTheLastSessionOfAKind_DropsTheDaemonsCachedCredentials`
+  there, so a filter that simply dropped the file would fail it.
+  `StoppingAnAttendedJail_HarvestsASettingsShapedCredential_WithoutTheProgramsItNamed` is the same test
+  one path over, on the file the audit actually named: `.gemini/settings.json` is where gemini-cli
+  defines `mcpServers`, and the settings-shaped paths got the mount scrub ALONE, so the Critical stayed
+  live for two of the three. Its negative control is `selectedAuthType`, which survives — the reason the
+  claude-shaped allowlist could not simply be pointed at these files. Its restore twin is
+  `AStoredSettingsShapedCredentialNamingAProgram_NeverReachesAJail`, the half that needs no migration.
+  Mutation watched red: the strip removed from the composition (both fail).
+  **EVICTION (F50):** `StoppingTheLastSessionOfAKind_DropsTheDaemonsCachedCredentials`
   and its paired non-eviction `StoppingOneOfTwoSessions_KeepsTheCacheForTheSurvivor` — eviction is "the
-  last one left", not "one of them stopped".
+  last one left", not "one of them stopped" — plus the CROSS-KIND pair those two cannot see, because both
+  use one kind for the coordinator and the worker:
+  `StoppingTheLastSessionOfOneKind_KeepsIt_WhileACoordinatorOfAnotherKindIsLive` (a live coordinator
+  spawns workers of whatever kind its shim names, so the cache is still in use) and
+  `WithNoCoordinatorLeft_StoppingTheLastSessionOfAKind_DropsOnlyThatKind` (so the guard is a condition
+  and not a way of never evicting).
   **ROLE (defect D5b):** `AStoredJailGrantForTheDaemonsOwnMount_NeverReachesAJail` +
   `StoppingAnAttendedJail_HarvestsTheApprovalsWithoutTheJailsOwnToolGrant` — a stored grant naming
   `AgentIpcPaths.SandboxMount` is scrubbed on the way IN (which is what neutralises an already-poisoned

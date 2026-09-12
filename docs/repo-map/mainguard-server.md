@@ -241,15 +241,22 @@
     rather than truncated; and a declared credential path that is really a settings file (gemini-cli's /
     qwen-code's `settings.json`) is put through `CliSettingsGrantScrub.Scrub` and held to the settings
     ceiling WHERE IT SITS, in both directions (`FilterCliCredentials` applies the same pair on restore,
-    so an already-poisoned store is neutralised with no migration). **F2's last clause: a credential path
-    that is NOT settings-shaped — `.claude.json` — used to cross byte-identical in both directions, and it
-    carries `mcpServers` command definitions.** Both legs now put it through
-    `CliSettingsGrantScrub.StripExecutableConfig`, which removes only the keys that name a program and
-    leaves every other key alone (a targeted strip rather than an allowlist: this is the file that says the
-    user is logged in, and an allowlist over it cannot be proved safe without a live account). The
-    unreviewed top-level key NAMES it reports are logged by `LogUnreviewedCredentialKeys` on both legs —
-    names only, already reduced to plain identifiers, never a value — so a vendor's new executable key
-    surfaces instead of passing silently. `BuildSecrets`/`FilterCliCredentials` take an optional `ILogger`
+    so an already-poisoned store is neutralised with no migration). **F2's last clause: EVERY credential
+    file carries `mcpServers` command definitions** — `.claude.json` does, and so does
+    `~/.gemini/settings.json`, which is where gemini-cli defines them. One private
+    `CarryCredentialContent(path, content, leg, kind, log, reportWhatWasFiltered)` is now the single
+    filter BOTH legs call: the mount scrub where the path is settings-shaped, then
+    `CliSettingsGrantScrub.StripExecutableConfig` on everything, which removes only the keys that name a
+    program and leaves every other key alone (a targeted strip rather than an allowlist: these are the
+    files that say the user is logged in, and an allowlist over them cannot be proved safe without a live
+    account — a claude-shaped one would drop gemini's `selectedAuthType`). The settings-shaped files got
+    the scrub ALONE until the composition landed, so the `mcpServers` an attended gemini jail wrote
+    travelled into every later Managed worker of that repo. The unreviewed top-level key NAMES are logged
+    by `LogUnreviewedCredentialKeys` on both legs — names only, already reduced to plain identifiers,
+    never a value — for the paths `AdapterCredentialPolicy.ReportsUnreviewedKeys` admits; the two "this
+    file changed" Information lines fire on the HARVEST only, because on the restore leg the same stored
+    blob is re-filtered on every spawn and the line would repeat forever saying what the harvest already
+    said. `BuildSecrets`/`FilterCliCredentials` take an optional `ILogger`
     for that; the spawn chain passes the daemon's. WHETHER either harvest may run is
     the caller's decision — see `CliHarvestPolicy`. Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
     refused outright (`Conflict`), so a conflicted keep-alive rebase used to put one raw
@@ -558,12 +565,18 @@
     kind) **CLI settings** (`RememberCliSettings`/`TryGetCliSettings`), so an IPC-spawned worker inherits
     the repo's approved-command list instead of stalling on prompts. A blank repo handle forms no scope
     and is dropped rather than collapsed into a shared bucket (MG-6). Never persisted, never logged.
-    **F50 — it now evicts**: `Forget(repo, kind)` when the last session of that kind in that repo stops
-    and `ForgetRepo(repo)` when the repo has none left (both driven from `AgentSpawnService.StopAsync`,
-    after the harvest that legitimately refreshes it), plus `HasAnythingFor(repo, kind)` as the
-    observable a test asserts on. Nothing evicted anything before, so a provider key and a set of
-    harvested OAuth files stayed resident for the daemon's whole lifetime and stopping every agent left
-    them there.
+    **F50 — it now evicts**: `ForgetRepo(repo)` when the repo has no sessions left at all, and
+    `Forget(repo, kind)` when no session of that kind survives AND **no coordinator survives in the
+    repo** (both driven from `AgentSpawnService.StopAsync`, after the harvest that legitimately refreshes
+    it), plus `HasAnythingFor(repo, kind)` as the observable a test asserts on. Nothing evicted anything
+    before, so a provider key and a set of harvested OAuth files stayed resident for the daemon's whole
+    lifetime and stopping every agent left them there. The **coordinator** half of the per-kind condition
+    is load-bearing and was missing in the first cut: `SpawnWorkerAsync` takes the kind from the shim, so
+    a live coordinator spawns workers of ANY installed kind — a user who ran one codex session and
+    stopped it would otherwise leave the claude-code coordinator's every later codex worker booting with
+    no provider key and no login. Pinned end to end by
+    `CoordinatorSpawnKindTests.AWorkerOfAnotherKind_StillGetsThatKindsKey_…` (the key really reaches the
+    worker's jail) and at the cache by `CliSettingsBoundaryTests`' two cross-kind tests.
 - **`Runtime/CoordinatorSpawnGate.cs`** (**MG-2**) — the pure admission decision in front of the
   coordinator's in-jail spawn shim:
   `Evaluate(activeManagedWorkers, maxActiveWorkers, admission, planGate?)` returns a refusal reason or

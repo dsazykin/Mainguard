@@ -2110,13 +2110,25 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `permissions.defaultMode` stop crossing between jails, and an unbounded grant (`Bash(*)`,
       `Bash(:*)`, a bare tool name) is dropped from `allow`/`ask` while `deny` travels as written.
       Non-JSON fails closed. `Scrub` (mount-only) stays for the settings files parked under
-      `credentialPaths` — gemini-cli's and qwen-code's — whose schema is a different vendor's.
+      `credentialPaths` — gemini-cli's and qwen-code's — whose schema is a different vendor's, and it is
+      COMPOSED with the strip below rather than used alone (`SandboxAgentLauncher.CarryCredentialContent`):
+      `~/.gemini/settings.json` is where gemini-cli defines `mcpServers`, so the scrub on its own left the
+      original finding live for two of the three named files, while `CarryOnly` would have dropped
+      `selectedAuthType` and cost the sign-in.
       **F2's last clause — `StripExecutableConfig(content, out unreviewedTopLevelKeys)`** is the third
-      entry point, for the credential files that are NOT settings-shaped (`.claude.json` above all), and
-      it is `CarryOnly` INVERTED: it removes the keys that name a program — `ExecutableConfigKeys`
-      (`mcpServers`, `enableAllProjectMcpServers`, `hooks`, `apiKeyHelper`, `statusLine`, `env`), at ANY
-      depth, because claude-code keeps a project's servers under `projects.<dir>.mcpServers` — and
-      carries every other key untouched, byte-identical when nothing matched. An allowlist over this file
+      entry point, for EVERY declared credential file, and it is `CarryOnly` INVERTED: it removes the keys
+      that name a program — `ExecutableConfigKeys` (`mcpServers`, `enableAllProjectMcpServers`,
+      `enabledMcpjsonServers`, `hooks`, `apiKeyHelper`, `statusLine`, `env`), at ANY depth, because
+      claude-code keeps a project's servers under `projects.<dir>.mcpServers` — and carries every other
+      key untouched, byte-identical when nothing matched. `enabledMcpjsonServers` names programs it does
+      not spell: it switches on the servers a repository's own committed `.mcp.json` defines, and that
+      repository is the jail's writable workspace. `BoundedRuleListKeys` (`allowedTools`) is the one value
+      this filter edits rather than keeps or drops: the list survives — those are the owner's "yes, don't
+      ask again" answers — with the whole-tool grants taken out by the same `IsUnbounded` rule the settings
+      leg applies to `permissions.allow`, so a jail cannot persist `Bash(*)` through `.claude.json` after
+      being refused it through `.claude/settings.json`. `hasTrustDialogAccepted` is a KNOWN residual,
+      carried deliberately: it names no program, and dropping it would hang every Managed worker on a
+      trust dialog its read-only terminal cannot answer. An allowlist over this file
       was rejected: it is the file that says the user is logged in, and no unit test can prove a guessed
       auth field right without a live account, whereas "a program name is not a credential" is provable
       as written. `ExecutableConfigKeys` is the ONE list — `CarriedTopLevelKeys` is its complement and the
@@ -2126,7 +2138,8 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       Every top-level key outside `ReviewedCredentialKeys` is reported to the caller to LOG BY NAME —
       already reduced to a plain identifier or `<non-identifier>`, never a value — so a vendor that ships
       a new executable key surfaces instead of passing silently. The daemon-owned mount is deliberately
-      NOT scrubbed from these files; that is the settings leg's boundary).
+      NOT scrubbed from the files that are not settings-shaped; that is the settings leg's boundary, and
+      the settings-shaped credential paths DO get it, from the composition above).
     - `AdapterCredentialPolicy.cs` (**F2** — the limits and shape rules of the CREDENTIAL round trip,
       the twin of `AdapterSettingsPolicy`. `MaxFileBytes` (1 MiB, refused not truncated: half a
       credential file is a corrupt one and it would REPLACE the good copy in the vault),
@@ -2134,7 +2147,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       gemini-cli / qwen-code files parked in that field for the migration reason the manifest explains;
       matched on the name so a sixth adapter is covered the day it is added), and `MaxBytesFor(path)`
       (the settings ceiling for those, this one for everything else — one place, so the harvest's
-      in-shell `wc -c` and the restore-side filter cannot drift). Consumed by
+      in-shell `wc -c` and the restore-side filter cannot drift), plus `ReportsUnreviewedKeys(path)`
+      (whether the daemon should LOG this file's unreviewed top-level key names — true by default,
+      including for any path a future adapter declares; false for the settings-shaped files and for
+      opencode's provider-keyed `auth.json` via the private `IsProviderKeyed`, whose keys are provider
+      ids chosen at runtime, so every one of them was "unreviewed" and the line fired on every harvest
+      AND every restore of a perfectly ordinary login. Only the report is dropped — both kinds of file
+      still go through the full strip). Consumed by
       `SandboxAgentLauncher.HarvestCliCredentialsAsync` and `FilterCliCredentials`).
     - `AdapterSettingsPath.cs` (the `settingsPaths` declaration — the NON-credential twin of
       `credentialPaths`, so a CLI's permission allowlist survives a spawn instead of the user
