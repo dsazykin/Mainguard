@@ -61,6 +61,7 @@ INPUT_SPECS=(
   "Dockerfile"
   "packages.pinned.txt"
   "mainguardd.service"
+  "provision-keyring-passphrase.sh"   # run as root by the unit's ExecStartPre, COPY'd at Dockerfile:124
   "build.sh"
   "payload/daemon"        # the published daemon — COPY'd at Dockerfile:119
 )

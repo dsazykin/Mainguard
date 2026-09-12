@@ -73,9 +73,28 @@ public sealed class UnprotectedKeyringException : Exception
         : base($"Refusing to store '{key}' in an UNPROTECTED key ring. On this platform the "
                + "DataProtection master key would sit in plain XML next to the secrets it encrypts, "
                + $"so anything that can read the file can read the secret. Set {SecureKeyring.PassphraseVariable} "
+               + $"(or point {SecureKeyring.PassphraseFileVariable} at a file holding it) "
                + "to a passphrase (the key ring is then AES-256-GCM encrypted under a PBKDF2-derived key), "
                + $"or set {SecureKeyring.AllowUnprotectedVariable}=1 to accept the plaintext posture "
                + "deliberately.")
+        => Key = key;
+
+    public string Key { get; }
+}
+
+/// <summary>
+/// Thrown when the key ring's own master key is encrypted under a protector this process cannot use
+/// — a passphrase-wrapped ring opened without the passphrase, or a Keychain-wrapped ring on a box
+/// whose Keychain will not serve the key. Fail closed for the keys that must not be re-minted:
+/// DataProtection's own answer to an undecryptable ring is to generate a FRESH default key, which on
+/// an unprotected platform is a plaintext one — so a write that "succeeded" would have stored the
+/// audit master key in the clear and orphaned every payload the old key encrypted.
+/// </summary>
+public sealed class KeyringProtectorUnavailableException : Exception
+{
+    public KeyringProtectorUnavailableException(string key, string reason)
+        : base($"Refusing to store '{key}': {reason}. Storing it now would generate a NEW key ring key "
+               + "(unprotected on this platform) and silently orphan the secrets the old one protects.")
         => Key = key;
 
     public string Key { get; }
@@ -90,6 +109,17 @@ public class SecureKeyring : ISecureKeyring, ISecureKeyStore
     /// Windows service can opt into it too.
     /// </summary>
     public const string PassphraseVariable = "MAINGUARD_KEYRING_PASSPHRASE";
+
+    /// <summary>
+    /// A FILE holding the key-ring passphrase, as an alternative to putting it in the environment.
+    /// This is how the shipped Mainguard OS unit supplies it (<c>build/mainguardos/mainguardd.service</c>):
+    /// the secret stays in a root-owned 0640 file rather than in an environment block that
+    /// <c>systemctl show</c>, <c>/proc/&lt;pid&gt;/environ</c> and every child process can read. A
+    /// systemd <c>LoadCredential=</c> works the same way — point this at
+    /// <c>$CREDENTIALS_DIRECTORY/&lt;name&gt;</c>. Trailing newlines are stripped, so
+    /// <c>echo … &gt; file</c> and a here-doc agree.
+    /// </summary>
+    public const string PassphraseFileVariable = "MAINGUARD_KEYRING_PASSPHRASE_FILE";
 
     /// <summary>Set to <c>1</c>/<c>true</c> to accept an unprotected key ring for the keys that
     /// otherwise refuse to be stored in one (see <see cref="FailClosedKeys"/>).</summary>
@@ -131,6 +161,17 @@ public class SecureKeyring : ISecureKeyring, ISecureKeyStore
     /// corrupt-payload tests never touch the real user keyring.
     /// </summary>
     public SecureKeyring(string storageDirectory)
+        : this(storageDirectory, protectionOverride: null)
+    {
+    }
+
+    /// <summary>
+    /// Protection-override seam, test-only. The unprotected posture is reachable end to end on
+    /// exactly one family of platforms (Linux/WSL), which is precisely why its consequences — the
+    /// refusal, the plaintext ring, the re-wrap on upgrade — went unnoticed until F53. Forcing the
+    /// resolved protection lets the whole matrix be exercised on every platform CI runs.
+    /// </summary>
+    internal SecureKeyring(string storageDirectory, KeyringProtection? protectionOverride)
     {
         _storageDirectory = storageDirectory;
         if (!Directory.Exists(_storageDirectory))
@@ -138,7 +179,14 @@ public class SecureKeyring : ISecureKeyring, ISecureKeyStore
             Directory.CreateDirectory(_storageDirectory);
         }
 
-        Protection = ResolveProtection();
+        Protection = protectionOverride ?? ResolveProtection();
+
+        // Configuring an XmlEncryptor only ever protects NEWLY GENERATED keys, so an install that
+        // predates the protector keeps its plaintext master key — and keeps using it as the default
+        // until it expires 90 days later. Inspect the ring and re-wrap it in place (same key id, same
+        // key material, so every stored secret keeps decrypting) before the provider touches it.
+        Ring = KeyringRingMaintenance.InspectAndRewrap(
+            _storageDirectory, Protection, KeyringRingMaintenance.CreateEncryptor(Protection));
 
         var dataProtectionProvider = DataProtectionProvider.Create(
             new DirectoryInfo(_storageDirectory),
@@ -198,16 +246,57 @@ public class SecureKeyring : ISecureKeyring, ISecureKeyStore
     /// <summary>How this key ring's master key is protected at rest.</summary>
     public KeyringProtection Protection { get; }
 
+    /// <summary>What the key ring on disk turned out to be, and what was re-wrapped at open. The
+    /// daemon logs this at boot: a protector that only applies to keys generated from now on is a
+    /// protector that an upgraded install does not have.</summary>
+    public KeyringRingReport Ring { get; }
+
     /// <summary>True when the key ring has no at-rest protector, i.e. its master key is stored in
     /// plain XML beside the ciphertext it protects. A caller that surfaces daemon health should say
     /// so out loud rather than letting it pass unremarked.</summary>
-    public bool IsUnprotected => Protection == KeyringProtection.None;
+    public bool IsUnprotected => Protection == KeyringProtection.None || Ring.HasPlaintextKeys;
+
+    /// <summary>One line naming the posture, for the daemon's boot log and any health surface.</summary>
+    public string DescribeProtection()
+    {
+        var summary = $"keyring protection={Protection} keys={Ring.KeyFiles}";
+        if (Ring.RewrappedKeyFiles > 0)
+        {
+            summary += $" rewrapped={Ring.RewrappedKeyFiles}";
+        }
+
+        if (Ring.HasPlaintextKeys)
+        {
+            summary += $" PLAINTEXT={Ring.PlaintextKeyFiles}";
+        }
+
+        if (Ring.MasterKeyUnavailable)
+        {
+            summary += " MASTER-KEY-UNAVAILABLE";
+        }
+
+        return Ring.Detail is null ? summary : $"{summary} — {Ring.Detail}";
+    }
 
     public void SaveSecret(string key, string secret)
     {
-        if (RefusesUnprotectedWrite(Protection, key))
+        // Either the platform has no protector, or it has one and the ring on disk is STILL plaintext
+        // (a pre-protector key the re-wrap could not convert). Both mean the same thing for this key:
+        // the master key would sit in the clear beside the ciphertext it protects.
+        if (RefusesUnprotectedWrite(Protection, key)
+            || (Ring.HasPlaintextKeys && IsFailClosedKey(key) && !AllowUnprotected()))
         {
             throw new UnprotectedKeyringException(key);
+        }
+
+        // A ring whose master key cannot be decrypted is one DataProtection would silently replace:
+        // it sees no eligible key and generates a fresh default. For a fail-closed key that turns a
+        // recoverable "set the passphrase again" into an unrecoverable orphaning of every payload
+        // the old key protected — and on Linux the fresh key would be plaintext.
+        if (Ring.MasterKeyUnavailable && IsFailClosedKey(key))
+        {
+            throw new KeyringProtectorUnavailableException(
+                key, Ring.Detail ?? "the key ring's master key is encrypted under an unavailable protector");
         }
 
         string encryptedSecret = _protector.Protect(secret);
@@ -320,7 +409,12 @@ public class SecureKeyring : ISecureKeyring, ISecureKeyStore
         return value is "1" or "true" or "TRUE" or "True" or "yes";
     }
 
-    private static KeyringProtection ResolveProtection()
+    /// <summary>
+    /// The posture this process can actually achieve — internal so a test host can ask the same
+    /// question the keyring asks (a suite that needs a protected ring must configure one, not inherit
+    /// whatever the runner happens to provide).
+    /// </summary>
+    internal static KeyringProtection ResolveProtection()
     {
         // The passphrase wins on every platform: an operator who sets it has said what they want,
         // and a headless service is exactly where the OS-bound protectors are unavailable.
@@ -334,9 +428,15 @@ public class SecureKeyring : ISecureKeyring, ISecureKeyStore
             return KeyringProtection.Dpapi;
         }
 
+        // macOS only counts as protected when the login Keychain will actually serve the master key.
+        // MacKeychainXmlEncryptor fails OPEN when it will not (headless, locked), storing the key in
+        // plaintext under an <unencryptedKey> lid — so reporting MacKeychain there would be a lie, and
+        // the fail-closed refusal (the whole point of F53) would never fire on the machines that need it.
         if (OperatingSystem.IsMacOS())
         {
-            return KeyringProtection.MacKeychain;
+            return MacKeychainMasterKey.GetOrCreate() is not null
+                ? KeyringProtection.MacKeychain
+                : KeyringProtection.None;
         }
 
         return KeyringProtection.None;
@@ -449,17 +549,51 @@ internal static class PassphraseKeyDerivation
     /// secret, so the cost is paid at construction and never in a hot path.</summary>
     internal const int Iterations = 600_000;
 
-    internal static bool PassphraseIsSet()
-        => !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(SecureKeyring.PassphraseVariable));
+    internal static bool PassphraseIsSet() => Resolve() is not null;
+
+    /// <summary>
+    /// The operator passphrase, from the environment or from the file the environment names, or null.
+    /// The file form is what a service manager should use — a systemd <c>LoadCredential=</c> or a
+    /// root-owned 0640 file keeps the secret out of the process environment block, which
+    /// <c>systemctl show</c>, <c>/proc/&lt;pid&gt;/environ</c> and every child process can read.
+    /// </summary>
+    internal static string? Resolve()
+    {
+        var direct = Environment.GetEnvironmentVariable(SecureKeyring.PassphraseVariable);
+        if (!string.IsNullOrEmpty(direct))
+        {
+            return direct;
+        }
+
+        var path = Environment.GetEnvironmentVariable(SecureKeyring.PassphraseFileVariable);
+        if (string.IsNullOrEmpty(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            // Trailing newline only: a passphrase may legitimately contain leading or inner spaces,
+            // and silently trimming them would make a correct file derive the wrong key.
+            var text = File.ReadAllText(path).TrimEnd('\r', '\n');
+            return string.IsNullOrEmpty(text) ? null : text;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException
+                                       or ArgumentException)
+        {
+            return null;
+        }
+    }
 
     internal static byte[] DeriveOrThrow(byte[] salt, int iterations)
     {
-        var passphrase = Environment.GetEnvironmentVariable(SecureKeyring.PassphraseVariable);
+        var passphrase = Resolve();
         if (string.IsNullOrEmpty(passphrase))
         {
             throw new CryptographicException(
-                $"This Mainguard key ring is encrypted with {SecureKeyring.PassphraseVariable}, but the "
-                + "variable is not set in this process. Set it to the same passphrase and retry.");
+                $"This Mainguard key ring is encrypted with {SecureKeyring.PassphraseVariable}, but neither "
+                + $"it nor {SecureKeyring.PassphraseFileVariable} yields a passphrase in this process. Set "
+                + "it to the same passphrase and retry.");
         }
 
         return Rfc2898DeriveBytes.Pbkdf2(

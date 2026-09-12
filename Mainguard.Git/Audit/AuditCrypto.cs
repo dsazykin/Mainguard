@@ -25,6 +25,10 @@ public sealed class AuditCrypto
 
     private readonly byte[] _key;
 
+    /// <summary>
+    /// Opens the master key, MINTING AND STORING one when the keyring has none. For the daemon,
+    /// which owns the store. A reader must not use this: see <see cref="TryOpenExisting"/>.
+    /// </summary>
     public AuditCrypto(ISecureKeyStore keyStore)
     {
         ArgumentNullException.ThrowIfNull(keyStore);
@@ -40,6 +44,29 @@ public sealed class AuditCrypto
         {
             _key = Convert.FromBase64String(stored);
         }
+    }
+
+    private AuditCrypto(byte[] key) => _key = key;
+
+    /// <summary>
+    /// The READ-ONLY construction: returns null when no master key is stored, and never writes one.
+    ///
+    /// <para>The verify CLI is a reader — <c>mainguardd audit verify</c> is the thing an operator
+    /// runs on a box they are suspicious of, and it used to report an empty chain as OK on a fresh
+    /// install. Running the minting constructor there made it a WRITER: it generated a master key,
+    /// stored it, and on a Linux box with no key-ring protector exited 1 with "Refusing to store
+    /// 'audit-payload-key'…" instead of verifying anything. A verification tool that mutates the
+    /// thing it verifies is the wrong shape whatever the platform.</para>
+    ///
+    /// <para>An UNREADABLE key still throws (via <see cref="ISecureKeyStore.Get"/>'s fail-closed
+    /// path): "cannot verify" must never be reported as "nothing to verify".</para>
+    /// </summary>
+    public static AuditCrypto? TryOpenExisting(ISecureKeyStore keyStore)
+    {
+        ArgumentNullException.ThrowIfNull(keyStore);
+
+        var stored = keyStore.Get(KeyName);
+        return stored is null ? null : new AuditCrypto(Convert.FromBase64String(stored));
     }
 
     /// <summary>Encrypts <paramref name="plaintext"/> → nonce ‖ tag ‖ ciphertext.</summary>

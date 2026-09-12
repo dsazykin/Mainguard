@@ -167,9 +167,9 @@ public sealed class AuditRetentionLeaseTests : IDisposable
     // ---- the pure predicates ----
 
     [Fact]
-    public void LeaseReferences_TakesLeaseIdAndAgentId_ButNotRepoHash()
+    public void References_TakesLeaseIdAndAgentId_ButNotRepoHash()
     {
-        var references = AuditRetentionService.LeaseReferences(new[]
+        var references = AuditRetentionService.References(new[]
         {
             new Mainguard.Git.Models.MergeLeaseRow
             {
@@ -179,26 +179,72 @@ public sealed class AuditRetentionLeaseTests : IDisposable
             },
         });
 
-        Assert.Contains("lease-1", references);
-        Assert.Contains("agent-1", references);
+        Assert.Contains("lease-1", references.LeaseIds);
+        Assert.Contains("agent-1", references.AgentIds);
         // Holding on the repo hash would stop retention for a whole repository the moment one merge
         // began — a retention outage wearing a safety check's clothes.
-        Assert.DoesNotContain("repo-hash-do-not-hold-on-this", references);
+        Assert.DoesNotContain("repo-hash-do-not-hold-on-this", references.LeaseIds);
+        Assert.DoesNotContain("repo-hash-do-not-hold-on-this", references.AgentIds);
+        // The two kinds stay apart: a lease id is not an agent id, and the hold predicate compares
+        // each payload field against the right one.
+        Assert.DoesNotContain("agent-1", references.LeaseIds);
+        Assert.DoesNotContain("lease-1", references.AgentIds);
     }
 
     [Fact]
-    public void LeaseReferences_IsEmpty_WhenThereIsNoLeaseStore()
-        => Assert.Empty(AuditRetentionService.LeaseReferences(null));
+    public void References_IsEmpty_WhenThereIsNoLeaseStore()
+        => Assert.True(AuditRetentionService.References(null).IsEmpty);
 
     [Fact]
-    public void IsHeldByOpenLease_MatchesOnTheEnvelopeText()
+    public void IsHeldByOpenLease_MatchesTheParsedIdentityFields()
     {
-        var references = new HashSet<string>(StringComparer.Ordinal) { "agent-7" };
+        var references = Refs(agents: new[] { "agent-7" }, leases: new[] { "lease-7" });
 
         Assert.True(AuditRetentionService.IsHeldByOpenLease("{\"agent_id\":\"agent-7\"}", references));
+        // The merge-queue events spell it `agent` / `lease`; both spellings are identity fields.
+        Assert.True(AuditRetentionService.IsHeldByOpenLease("{\"agent\":\"agent-7\"}", references));
+        Assert.True(AuditRetentionService.IsHeldByOpenLease("{\"lease\":\"lease-7\"}", references));
         Assert.False(AuditRetentionService.IsHeldByOpenLease("{\"agent_id\":\"agent-8\"}", references));
         Assert.False(AuditRetentionService.IsHeldByOpenLease("", references));
     }
+
+    /// <summary>
+    /// The bug the substring match was: this predicate is asked about every expired record while ANY
+    /// lease is open, and agent ids as short as <c>a1</c> are valid. <c>payloadJson.Contains("a1")</c>
+    /// is true for roughly every other commit sha, most base64 blobs and plenty of timestamps — so one
+    /// such open lease froze retention for the whole store.
+    /// </summary>
+    [Fact]
+    public void IsHeldByOpenLease_IgnoresAnAgentIdThatMerelyOccursInTheEnvelopeText()
+    {
+        var references = Refs(agents: new[] { "a1" }, leases: Array.Empty<string>());
+
+        // A sha, a free-text reason and a path — none an identity field, all of them full of "a1".
+        const string unrelated =
+            "{\"agent\":\"worker-9\",\"sha\":\"9fa1c0de5a1b2c3d4e5f60718293a4b5c6d7e8f9\","
+            + "\"reason\":\"rebased onto a1b2c3\",\"path\":\"src/a1/main.cs\"}";
+
+        Assert.False(AuditRetentionService.IsHeldByOpenLease(unrelated, references));
+
+        // ...and the real thing still holds.
+        Assert.True(AuditRetentionService.IsHeldByOpenLease("{\"agent\":\"a1\"}", references));
+    }
+
+    /// <summary>A lease id must not hold a record because some AGENT happens to be called that, and
+    /// vice versa: the two id spaces are independent.</summary>
+    [Fact]
+    public void IsHeldByOpenLease_DoesNotCrossTheIdKinds()
+    {
+        var references = Refs(agents: new[] { "shared-name" }, leases: Array.Empty<string>());
+
+        Assert.False(AuditRetentionService.IsHeldByOpenLease("{\"lease\":\"shared-name\"}", references));
+        Assert.True(AuditRetentionService.IsHeldByOpenLease("{\"agent\":\"shared-name\"}", references));
+    }
+
+    private static LeaseReferences Refs(string[] agents, string[] leases)
+        => new(
+            new HashSet<string>(leases, StringComparer.Ordinal),
+            new HashSet<string>(agents, StringComparer.Ordinal));
 
     private sealed class InMemoryKeyStore : ISecureKeyStore
     {

@@ -24,6 +24,10 @@
     <!-- Lets the test suite drive internal test seams (e.g. the interactive-rebase
          editor self-invocation override in GitService). Test-only; not for production. -->
     <InternalsVisibleTo Include="Mainguard.Tests" />
+    <!-- Same test-only grant for the daemon suite: its in-proc hosts open real key rings, so it has
+         to be able to ask SecureKeyring which at-rest posture this machine can actually achieve
+         (KeyringTestPosture) rather than assume one. -->
+    <InternalsVisibleTo Include="Mainguard.Server.Tests" />
   </ItemGroup>
 
   <!-- The "all editions" git-engine + persistence base (ADR-0001 / step 2a). Pure git: NO

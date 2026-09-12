@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using Mainguard.Git;
 using Mainguard.Git.Audit;
 using Mainguard.Git.Security;
@@ -57,9 +58,35 @@ public static class AuditCommands
         {
             var directory = Path.GetDirectoryName(dbPath);
             var keyringDir = string.IsNullOrEmpty(directory) ? "audit-keyring" : Path.Combine(directory, "audit-keyring");
+
+            // READ-ONLY: verify never mints a master key. The minting constructor made this command a
+            // writer — on a box with no key-ring protector it exited 1 with "Refusing to store
+            // 'audit-payload-key'…" where it used to report an intact empty chain, and on every other
+            // box it left a key behind that the operator never asked for.
+            var crypto = AuditCrypto.TryOpenExisting(new SecureKeyring(keyringDir));
+            if (crypto is null)
+            {
+                // No master key means no encrypted payload can exist. An empty chain is intact by
+                // definition; a non-empty one cannot be verified, and that is not the same as OK.
+                using var probe = new AppDbContext(dbPath);
+                if (probe.AuditRecords.Any())
+                {
+                    Console.Error.WriteLine(
+                        $"audit verify failed: {dbPath} holds audit records but the master key "
+                        + $"('{AuditCrypto.KeyName}') is not in the key ring at {keyringDir} — the chain "
+                        + "cannot be decrypted, so it cannot be verified.");
+                    return 1;
+                }
+
+                Console.WriteLine($"audit verify: {dbPath}");
+                Console.WriteLine($"chain: empty · head: {HashChain.GenesisHash}");
+                Console.WriteLine("OK");
+                return 0;
+            }
+
             var log = new ChainedAuditLog(
                 () => new AppDbContext(dbPath),
-                new AuditCrypto(new SecureKeyring(keyringDir)),
+                crypto,
                 new AuditFileMirror(dbPath + ".audit-mirror"));
 
             var (valid, firstBadSeq) = log.VerifyAll();

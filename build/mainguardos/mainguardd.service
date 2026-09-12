@@ -35,6 +35,23 @@ Group=mainguard
 # account's never-materialized ~/.local/share, silently producing RELATIVE paths that resolved against
 # WorkingDirectory (root-owned /opt/mainguard) or / → EACCES → unhandled exception → restart loop.
 Environment=HOME=/home/mainguard
+# F53 — the key-ring passphrase. Without it the DataProtection key ring under $HOME/.mainguard/Keyring
+# has NO at-rest protector on Linux: its master key sits in plain XML beside the secrets it encrypts,
+# the audit chain's master key included. The daemon now refuses to boot in that posture rather than
+# silently fall back to an in-memory audit journal that loses every event at shutdown, so this pair of
+# lines is what makes a fresh MainguardOS install come up at all — and come up protected.
+#
+# ExecStartPre runs as ROOT (the `+` prefix; the service itself is User=mainguard) and mints ONE random
+# passphrase per install on first boot, into a root-owned 0640 file the daemon's user can read. It is
+# never regenerated: a new passphrase would make the existing ring unreadable.
+#
+# The passphrase is passed as a FILE PATH, never as the passphrase itself — an Environment= secret is
+# readable via `systemctl show`, /proc/<pid>/environ and every child process the daemon spawns (which,
+# for this daemon, means agent containers). An operator with a stronger custody model points
+# MAINGUARD_KEYRING_PASSPHRASE_FILE at their own file instead — e.g. LoadCredential=keyring:/path and
+# MAINGUARD_KEYRING_PASSPHRASE_FILE=%d/keyring — and drops the ExecStartPre.
+ExecStartPre=+/opt/mainguard/provision-keyring-passphrase.sh
+Environment=MAINGUARD_KEYRING_PASSPHRASE_FILE=/etc/mainguard/keyring.passphrase
 WorkingDirectory=/opt/mainguard
 ExecStart=/opt/mainguard/mainguardd
 Restart=on-failure

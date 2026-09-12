@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Orchestrator;
@@ -11,6 +12,22 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace Mainguard.Server.Runtime;
+
+/// <summary>
+/// The open leases a retention sweep must not tombstone evidence for, split BY KIND: a lease id is
+/// only a lease id, and an agent id is only an agent id. Keeping them apart is what lets the hold
+/// predicate compare a payload's <c>lease</c> field against lease ids and its <c>agent</c> field
+/// against agent ids, instead of asking whether either string happens to occur anywhere in the
+/// envelope text.
+/// </summary>
+internal sealed record LeaseReferences(
+    IReadOnlyCollection<string> LeaseIds, IReadOnlyCollection<string> AgentIds)
+{
+    internal bool IsEmpty => LeaseIds.Count == 0 && AgentIds.Count == 0;
+
+    /// <summary>How many distinct open leases this stands for, for the log line.</summary>
+    internal int Count => LeaseIds.Count == 0 ? AgentIds.Count : LeaseIds.Count;
+}
 
 /// <summary>
 /// P2-15 retention: once at boot and every 24 h, expire audit records older than 90 days — as
@@ -81,8 +98,8 @@ public sealed class AuditRetentionService : BackgroundService
     /// without standing up a hosted service and waiting 24 h.</summary>
     internal void Sweep(IChainedAuditLog chained, IMergeLeaseStore? leases)
     {
-        var references = LeaseReferences(leases?.AllOutstanding());
-        if (references.Count == 0)
+        var references = References(leases?.AllOutstanding());
+        if (references.IsEmpty)
         {
             // Nothing in flight: the store's own age sweep, unchanged.
             var expired = chained.ApplyRetention(RetentionPeriod);
@@ -110,12 +127,13 @@ public sealed class AuditRetentionService : BackgroundService
     /// mentions that, so holding on it would stop retention for the whole repo the moment one merge
     /// started, which is a retention outage dressed up as a safety check.
     /// </summary>
-    internal static IReadOnlyCollection<string> LeaseReferences(IReadOnlyList<MergeLeaseRow>? open)
+    internal static LeaseReferences References(IReadOnlyList<MergeLeaseRow>? open)
     {
-        var references = new HashSet<string>(StringComparer.Ordinal);
+        var leaseIds = new HashSet<string>(StringComparer.Ordinal);
+        var agentIds = new HashSet<string>(StringComparer.Ordinal);
         if (open is null)
         {
-            return references;
+            return new LeaseReferences(leaseIds, agentIds);
         }
 
         foreach (var lease in open)
@@ -127,36 +145,83 @@ public sealed class AuditRetentionService : BackgroundService
 
             if (!string.IsNullOrEmpty(lease.LeaseId))
             {
-                references.Add(lease.LeaseId);
+                leaseIds.Add(lease.LeaseId);
             }
 
             if (!string.IsNullOrEmpty(lease.AgentId))
             {
-                references.Add(lease.AgentId);
+                agentIds.Add(lease.AgentId);
             }
         }
 
-        return references;
+        return new LeaseReferences(leaseIds, agentIds);
     }
 
-    /// <summary>True when this record's canonical envelope names an open lease, i.e. it is evidence
-    /// for an operation that has not finished and must not be tombstoned yet.</summary>
-    internal static bool IsHeldByOpenLease(string payloadJson, IReadOnlyCollection<string> references)
+    /// <summary>The payload keys that carry an AGENT identity. Two spellings because both are in the
+    /// store: the merge-queue events write <c>agent</c>, the newer plan/worker events <c>agent_id</c>.</summary>
+    private static readonly HashSet<string> AgentFields =
+        new(StringComparer.Ordinal) { "agent", "agent_id", "worker", "worker_id" };
+
+    /// <summary>The payload keys that carry a MERGE LEASE id, same two spellings.</summary>
+    private static readonly HashSet<string> LeaseFields =
+        new(StringComparer.Ordinal) { "lease", "lease_id" };
+
+    /// <summary>
+    /// True when this record's canonical envelope names an open lease in an IDENTITY field, i.e. it is
+    /// evidence for an operation that has not finished and must not be tombstoned yet.
+    ///
+    /// <para>This used to be <c>payloadJson.Contains(reference)</c> over the whole envelope, which is
+    /// not a predicate about leases at all — it is a substring search. Agent ids as short as
+    /// <c>a1</c> or <c>pr-42</c> are valid, every envelope is full of hex shas and timestamps, and
+    /// <c>a1</c> occurs in roughly every other sha: while one such lease was open, nearly every
+    /// expired record in the store read as "held" and retention quietly stopped. Matching the parsed
+    /// <c>agent</c>/<c>lease</c> fields against the right kind of id makes the predicate mean what
+    /// its name says.</para>
+    /// </summary>
+    internal static bool IsHeldByOpenLease(string payloadJson, LeaseReferences references)
     {
-        if (string.IsNullOrEmpty(payloadJson))
+        if (string.IsNullOrEmpty(payloadJson) || references.IsEmpty)
         {
             return false;
         }
 
-        foreach (var reference in references)
+        try
         {
-            if (payloadJson.Contains(reference, StringComparison.Ordinal))
+            using var document = JsonDocument.Parse(payloadJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
             {
-                return true;
+                return false;
             }
-        }
 
-        return false;
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                if (property.Value.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                var value = property.Value.GetString();
+                if (string.IsNullOrEmpty(value))
+                {
+                    continue;
+                }
+
+                if ((AgentFields.Contains(property.Name) && references.AgentIds.Contains(value))
+                    || (LeaseFields.Contains(property.Name) && references.LeaseIds.Contains(value)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        catch (JsonException)
+        {
+            // A payload that will not parse is a record we cannot reason about. Redaction is
+            // irreversible and this branch only defers it while some lease is open, so the safe
+            // reading is "held" — evidence kept over evidence destroyed.
+            return true;
+        }
     }
 
     /// <summary>
@@ -165,7 +230,7 @@ public sealed class AuditRetentionService : BackgroundService
     /// expired), redacting each expired record that no open lease claims.
     /// </summary>
     private static (int Redacted, int Held) SweepHoldingLeases(
-        IChainedAuditLog chained, IReadOnlyCollection<string> references, DateTimeOffset cutoff)
+        IChainedAuditLog chained, LeaseReferences references, DateTimeOffset cutoff)
     {
         var headSeq = chained.Head()?.Seq ?? 0;
         var redacted = 0;

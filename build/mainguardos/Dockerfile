@@ -121,6 +121,11 @@ RUN set -eux; \
     chmod -R a+rX /opt/mainguard; \
     chmod 0755 /opt/mainguard/mainguardd
 
+# First-boot key-ring passphrase provisioning (F53). The unit runs this as root via ExecStartPre=+
+# before mainguardd starts; see the script header for what it does and does not protect against.
+COPY provision-keyring-passphrase.sh /opt/mainguard/provision-keyring-passphrase.sh
+RUN chmod 0755 /opt/mainguard/provision-keyring-passphrase.sh
+
 # The systemd unit that supervises the daemon, shipped ENABLED so it starts on first boot (P2-05
 # StartDaemonStep's `systemctl start mainguardd` act is then only a repair path — pgrep already matches).
 # Enable by writing the [Install] symlink directly (deterministic, no systemctl-in-build dependency).
