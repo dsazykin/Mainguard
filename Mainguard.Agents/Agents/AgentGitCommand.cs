@@ -331,10 +331,13 @@ internal static class AgentGitCommand
             }
 
             var path = entry[(tab + 1)..];
-            if (!Directory.Exists(Path.Combine(workingDir, path)) && !File.Exists(Path.Combine(workingDir, path, ".git")))
+            var nestedGit = Path.Combine(workingDir, path, ".git");
+            if (!Directory.Exists(nestedGit) && !File.Exists(nestedGit))
             {
-                // An UNPOPULATED gitlink has nothing for git to recurse into, and excluding it would
-                // needlessly stop the daemon recording a legitimate pointer change.
+                // An UNPOPULATED gitlink has no repository for git to recurse INTO — that is precisely the
+                // condition `is_submodule_modified()` needs — and excluding it would needlessly stop the
+                // daemon recording a legitimate pointer change. `.git` may be either a directory (an
+                // embedded repo, the agent's cheapest route) or a file (a real, initialized submodule).
                 continue;
             }
 
