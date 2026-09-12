@@ -686,7 +686,12 @@
     `SeverityVocabulary` glyph map is a rendering-only projection — no rule logic. Two notes on the
     LIVE panel: `KindOf` reads the `FlaggedKind` out of the item id (`kind|path|hash`, which is where
     the daemon's own kind travels) — it used to parse the `Category` string, a `RiskCategory` name, so
-    every daemon-flagged row but one arrived mislabelled `RiskCategory`; and
+    every daemon-flagged row but one arrived mislabelled `RiskCategory`. It recognises **both** RT-D2
+    gate ids, `changed-test-command` and `changed-toolchain` (fixed 2026-09-12): splitting the gate's one
+    waiver in two gave the toolchain its own wire id, and an id test that named only the first sent a
+    toolchain-only drift down the fallback path, where it rendered as an ordinary risk hunk with no
+    must-waive glyph. `DaemonFlaggedChangeSource.IsChangedVerificationItem` is the shared test, and
+    `ControlCenterViewModel`'s `ChangedTestCommand` projection uses it for the same reason; and
     `ReviewCockpitContext.LockfileFlags` is **local-composition only** — production always supplies
     `live:`, so the §3.6 lockfile rows are armed daemon-side by
     `MergeQueueProvisioner.ReviewLockfiles` and arrive through the ordinary projection.

@@ -58,6 +58,20 @@ public sealed class DaemonFlaggedChangeSource : IFlaggedChangeSource
     /// the wire vocabulary, not an internal detail; the cockpit header keys off it).</summary>
     public const string ChangedTestCommandItemId = "changed-test-command";
 
+    /// <summary>
+    /// The gate's OTHER well-known id — the verification TOOLCHAIN declaration
+    /// (<c>MergeQueueGrpcService.ChangedToolchainItemId</c>). It exists because splitting the gate's one
+    /// waiver into two meant splitting its one wire id into two; a client that knows only the id above
+    /// renders a toolchain-only drift as no drift at all, which is the same silence the split was made
+    /// to end.
+    /// </summary>
+    public const string ChangedToolchainItemId = "changed-toolchain";
+
+    /// <summary>True when <paramref name="itemId"/> is either half of the RT-D2 gate.</summary>
+    public static bool IsChangedVerificationItem(string? itemId)
+        => string.Equals(itemId, ChangedTestCommandItemId, StringComparison.Ordinal)
+           || string.Equals(itemId, ChangedToolchainItemId, StringComparison.Ordinal);
+
     private readonly IMergeQueueService _queue;
 
     public DaemonFlaggedChangeSource(IMergeQueueService queue)

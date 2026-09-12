@@ -271,7 +271,7 @@ public static class MergeActionRunner
         ArgumentNullException.ThrowIfNull(outcome);
 
         // External is the case that must never wear the local sentence, so it is the case named
-        // explicitly — the same shape MergeDispatch routes the transports with.
+        // explicitly — the same shape the runner routes the two transports with above.
         if (outcome.Origin == MergeEntryOrigin.External)
         {
             // The number IS the pull request (the queue key and the PR it merges cannot disagree). An id

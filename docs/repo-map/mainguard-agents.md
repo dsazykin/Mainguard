@@ -1636,7 +1636,7 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       SIGSTOPped process until the session reconciler's interval-driven pause pass corrected it. Found by
       composing this branch against the coordinator-op guards; the ordering is pinned on both sides of the
       assembly seam. Load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
-      `BeginMerge` and `MergeDispatch` contend for — the one-outstanding-merge-per-repo invariant only
+      `BeginMerge` and the external-PR merge path contend for — the one-outstanding-merge-per-repo invariant only
       spans origins while they share one store (MG-23). **P2-11 wiring:** `Build` now composes BOTH gates
       into the queue (`ChangedTestCommandGate` AND `FlaggedChangeGate`) and hangs the latter off
       `MergeQueueContext.FlaggedChanges` so the ack RPC can reach it. **The restart pair (L1)**, started
@@ -1679,11 +1679,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       new worktree, so nothing runs. `EnsureJailWorktreeCleanAsync` then asks git IN THE JAIL, before the
       command, whether the tree is clean (`status --porcelain --untracked-files=no`) and whether HEAD is
       the commit the record will name; a tracked modification or a HEAD/mirror mismatch refuses. It
-      refuses on an ANSWER, never on silence: a jail whose git cannot run — no git on the image, or a
-      worktree whose `.git` pointer names a repository the container was not given, which is every jail
-      until W1-A's git-pointer mount lands — is logged as unmeasured evidence rather than treated as a
-      dirty tree, the `BranchDescendsFromMain` posture. Tighten to fail-closed once the jail is
-      guaranteed a working git. `ArmFlaggedChangeReview` runs the
+      **fails CLOSED — on silence as well as on an answer** (tightened 2026-09-12, after review): an
+      unrunnable probe, a non-zero `git status` and an unreadable `HEAD` each REFUSE the verification and
+      name the substrate gap, the same posture `EnsureToolchainPresentAsync` already takes towards a jail
+      that cannot answer its toolchain probe. It shipped fail-open (logged as unmeasured evidence, the
+      `BranchDescendsFromMain` posture) while no jail's git could answer at all, which made the whole
+      probe a log line in production. **Merge order is binding: land W1-A (#363, the read-only `.git`
+      pointer mount that gives a jail a working git) FIRST.** An inverted order fails safe but
+      fleet-wide — every verification refuses with "the jail's git could not answer". The one silence
+      still not treated as failure is the MIRROR's: an empty `branchSha` is its own "not measured", so the
+      HEAD pairing is skipped (the cleanliness half has already run). `ArmFlaggedChangeReview` runs the
       required `IMergeBranchDiffService` + `FlaggedChangeDetector.DetectFlagged` at verification time (the
       same cadence the RT-D2 gate is armed at, so a re-push re-classifies and drops stale acks). **F35:**
       the WHOLE arm is guarded, and a classification that throws anywhere in it calls

@@ -170,7 +170,13 @@ public partial class FlaggedChangesPanelViewModel : ViewModelBase
     /// </summary>
     private static FlaggedKind KindOf(string itemId, string category)
     {
-        if (string.Equals(itemId, LiveChangedTestCommandItemId, StringComparison.Ordinal))
+        // Both halves of the RT-D2 gate, not only the command one: the daemon split its single waiver
+        // into (command, toolchain) and gave the toolchain its own wire id, so an id-based test that
+        // named only the first sent a toolchain-only drift down the fallback path below — where it parsed
+        // as nothing and rendered as an ordinary risk hunk, losing the glyph that says a human must
+        // waive it.
+        if (string.Equals(itemId, LiveChangedTestCommandItemId, StringComparison.Ordinal)
+            || string.Equals(itemId, LiveChangedToolchainItemId, StringComparison.Ordinal))
         {
             return FlaggedKind.ChangedTestCommand;
         }
@@ -190,6 +196,9 @@ public partial class FlaggedChangesPanelViewModel : ViewModelBase
 
     /// <summary>The id the daemon's own <c>AcknowledgeFlaggedChange</c> accepts for the RT-D2 gate item.</summary>
     internal const string LiveChangedTestCommandItemId = "changed-test-command";
+
+    /// <summary>…and for its other item, the verification toolchain declaration (one waiver each).</summary>
+    internal const string LiveChangedToolchainItemId = "changed-toolchain";
 
     private async Task AcknowledgeLiveAsync(FlaggedItemRowViewModel row)
     {

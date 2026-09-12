@@ -2026,7 +2026,16 @@
   a change there is a signal — and the gateway over that same stack delivers concurrent input
   byte-exact and in order. The frames are paste-sized because over the in-proc transport a small
   write completes before the next call starts and nothing overlaps; the deterministic version lives
-  in `Mainguard.Tests/TerminalInputSerializationTests`)**,
+  in `Mainguard.Tests/TerminalInputSerializationTests`. **The constraint test DRAINS the response
+  stream and carries a 60 s deadline** — added 2026-09-12, and it is what hung CI for six hours:
+  `Attach` is duplex and the daemon echoes, so 64 unread 64 KiB echoes filled the response pipe, the
+  server's write parked on `ResponseBodyPipeWriter.FlushAsync`, it stopped draining the request
+  stream, and the client's surviving `WriteAsync` parked on back-pressure with no deadline on either
+  end. It was a race — "a second write overlaps and throws" vs "enough bytes land to fill the pipe" —
+  so it usually passed in 9 s and, when it lost, took the whole assembly with it: the collection
+  runner waits forever, every later test is simply never reported (run 34259331113 stopped at 367 of
+  1011 results and was cancelled at the 6 h job timeout). Draining is also the honest shape — a real
+  client reads what it is sent — and the deadline makes a future regression fail rather than hang)**,
   **`TerminalDetachedAttachTests` (ISSUES-LOG #23 — an attach to a KNOWN agent with no bound CLI
   answers with `TerminalGrpcService.DetachedNotice` unprompted instead of falling silently into the
   echo, and discards input rather than reflecting it; the echo is still what an unknown id gets. The
@@ -3109,6 +3118,14 @@
   `ConfirmMerge_WhenMainAlreadyContainsTheAuthorizedTip_RecordsItAsMerged` (F37 — `--ff-only` of a
   contained branch moves nothing, and the row could previously reach no terminal but Discard) and its
   control `ConfirmMerge_WhenNothingMovedAndMainDoesNotContainTheBranch_IsStillRefused`.
+  `LandedMergeWorld.Build(fastForwardMain:)` also builds the UNMERGED world — the agent's commit on its
+  own branch, main left where it was — for `ConfirmMerge_ReportingTheVerifiedBranchTip_WithoutHavingMerged_IsRefused`,
+  the hole the ordinary-path belt closes: the daemon hands `ExpectedBranchSha` to the client at
+  `BeginMerge`, so reporting it back was the cheapest possible forgery and every check above the belt was
+  satisfied by it. Its positive control `ConfirmMerge_ReportingTheVerifiedBranchTip_Confirms` now builds a
+  real merged world and asserts the record lands under `MergeAuthorization.ConfirmRpcSource` (the ordinary
+  path), not the late one. The class removes every checkout it built in `Dispose` — they used to
+  accumulate one `mainguard-confirm-<guid>` directory per world, per run.
 Not in the solution (scratch/experiments, don't rely on them): `Mainguard.StyleConsole`, `Mainguard.StyleTests`, `Mainguard.AvaloniaTests`.
 
 ---

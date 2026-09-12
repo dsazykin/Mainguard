@@ -2007,11 +2007,12 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         SharedStores stores, out FakeSandboxEngine engine, IMergeLeaseStore? leases = null)
     {
         engine = new FakeSandboxEngine(0, null);
+        var jail = JailCheckedOutAtItsBranch(engine, (_, _) => ContainerId);
         return new MergeQueueProvisioner(
             registry: new MergeQueueRegistry(),
             repos: new RepoProvisioner(_vmRoot),
             leases: leases ?? new InMemoryMergeLeaseStore(),
-            resolveContainerId: (_, _) => ContainerId,
+            resolveContainerId: jail,
             queueStore: _ => stores.Queue,
             verificationStore: _ => stores.Verifications,
             sandboxes: engine,
@@ -2078,7 +2079,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         var ctx = provisioner.EnsureQueue(repoHash)!;
 
         // git, inside the jail, ANSWERS that a tracked file is modified.
-        engine.GitProbeResult = new SandboxExecResult(0, " M feature.cs\n", "");
+        engine.GitStatusResult = new SandboxExecResult(0, " M feature.cs\n", "");
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None));
@@ -2185,7 +2186,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             registry: new MergeQueueRegistry(),
             repos: new RepoProvisioner(vmRoot),
             leases: new InMemoryMergeLeaseStore(),
-            resolveContainerId: (_, agentId) => jailFor(agentId),
+            resolveContainerId: JailCheckedOutAtItsBranch(sandbox, (_, agentId) => jailFor(agentId)),
             queueStore: _ => new InMemoryMergeQueueStore(),
             verificationStore: _ => new InMemoryVerificationStore(),
             sandboxes: sandbox,
@@ -2438,7 +2439,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             registry: registry,
             repos: new RepoProvisioner(_vmRoot),
             leases: new InMemoryMergeLeaseStore(),
-            resolveContainerId: (_, _) => ContainerId,
+            resolveContainerId: JailCheckedOutAtItsBranch(engine, (_, _) => ContainerId),
             queueStore: _ => new InMemoryMergeQueueStore(),
             verificationStore: _ => new InMemoryVerificationStore(),
             sandboxes: engine,
@@ -2459,6 +2460,53 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             // purpose: the interesting risk is not that it fires when it should, it is that it fires when
             // it should not. Every other test here commits on agent/<id> and must stay green.
             checkAgentBranch: (repoHash, agentId) => new WorktreeManager(_vmRoot).CheckAgentBranch(repoHash, agentId));
+    }
+
+    /// <summary>
+    /// Wires the fake jail to answer <c>git rev-parse HEAD</c> with the commit it is supposed to be
+    /// carrying — the production invariant the pre-run evidence probe exists to CONFIRM, and what every
+    /// test here (bar the one that is about a dirty tree) means by "the agent's branch is its committed
+    /// work". Read from the mirror rather than hard-coded, so a test that moves the branch does not have
+    /// to remember to move this too.
+    ///
+    /// <para>WHICH agent it answers for comes from <c>resolveContainerId</c>, wrapped here: the
+    /// provisioner calls it for that agent immediately before it probes, and it is the only point in this
+    /// seam where the identity exists at all.</para>
+    /// </summary>
+    private Func<string, string, string?> JailCheckedOutAtItsBranch(
+        FakeSandboxEngine engine, Func<string, string, string?> resolveContainerId)
+    {
+        var target = new string[2];
+        engine.GitHeadResult = () => new SandboxExecResult(0, AgentBranchTip(target[0], target[1]) + "\n", "");
+        return (repoHash, agentId) =>
+        {
+            target[0] = repoHash;
+            target[1] = agentId;
+            return resolveContainerId(repoHash, agentId);
+        };
+    }
+
+    /// <summary>
+    /// The mirror's <c>agent/&lt;id&gt;</c> tip — what a jail that really carries the agent's committed
+    /// work answers to <c>git rev-parse HEAD</c>. Empty when the ref is not there yet (the seeded paths),
+    /// which the probe reads as the mirror's own "not measured" and does not pair against.
+    /// </summary>
+    private string AgentBranchTip(string? repoHash, string? agentId)
+    {
+        if (string.IsNullOrEmpty(repoHash) || string.IsNullOrEmpty(agentId))
+        {
+            return string.Empty;
+        }
+
+        var barePath = Path.Combine(_vmRoot, "repos", repoHash + ".git");
+        if (!Directory.Exists(barePath))
+        {
+            return string.Empty;
+        }
+
+        using var repo = new Repository(barePath);
+        return repo.Refs["refs/heads/agent/" + agentId]?.ResolveToDirectReference()?.TargetIdentifier
+               ?? string.Empty;
     }
 
     /// <summary>Seeds a source repo carrying a main-side verification config, then provisions its mirror.</summary>
@@ -2578,11 +2626,22 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         public List<IReadOnlyList<string>> Commands { get; } = new();
 
         /// <summary>
-        /// What the daemon's own pre-run git probes answer inside the fake jail. Defaults to a clean
-        /// worktree (exit 0, no output), which is what every test here means by "the agent's branch is
-        /// its committed work". A test that wants the dirty-tree refusal sets this.
+        /// What <c>git status --porcelain</c> answers inside the fake jail. Defaults to a clean worktree
+        /// (exit 0, no output), which is what every test here means by "the agent's branch is its
+        /// committed work". A test that wants the dirty-tree refusal sets this.
         /// </summary>
-        public SandboxExecResult GitProbeResult { get; set; } = new(0, "", "");
+        public SandboxExecResult GitStatusResult { get; set; } = new(0, "", "");
+
+        /// <summary>
+        /// What <c>git rev-parse HEAD</c> answers inside the fake jail — set by <c>NewProvisioner</c> to
+        /// read the mirror's <c>agent/&lt;id&gt;</c> tip, i.e. the production invariant that the jail is
+        /// checked out at the commit being verified.
+        ///
+        /// <para>It has to be an ANSWER rather than silence, because the probe now fails closed: a jail
+        /// whose git cannot say where it is refuses the run rather than proceeding unmeasured. Leaving it
+        /// null is therefore how a test says "this jail's git is broken", and gets that refusal.</para>
+        /// </summary>
+        public Func<SandboxExecResult>? GitHeadResult { get; set; }
 
         public Task<SandboxExecResult> ExecAsync(string containerId, IReadOnlyList<string> command, CancellationToken ct = default)
         {
@@ -2595,7 +2654,9 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             // double gives every other command would read as a permanently dirty worktree.
             if (command.Count > 0 && string.Equals(command[0], "git", StringComparison.Ordinal))
             {
-                return Task.FromResult(GitProbeResult);
+                return Task.FromResult(command.Contains("rev-parse")
+                    ? GitHeadResult?.Invoke() ?? new SandboxExecResult(128, "", "not a git repository")
+                    : GitStatusResult);
             }
 
             return Task.FromResult(new SandboxExecResult(_exitFor?.Invoke(command) ?? _exitCode, "output", ""));

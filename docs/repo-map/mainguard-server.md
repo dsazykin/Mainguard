@@ -774,14 +774,23 @@
   `lease.ExpectedBranchSha` — but the identity screen above has ALREADY refused every Local confirm for
   which that is false, so the condition was true by construction and every gate refusal became a terminal
   Merged plus a fired cascade on nothing but the caller's own claim about a ref on its own machine. It now
-  calls `MergeQueueProvisioner.TryObserveMergeLanded`, which fetches main FROM the user's checkout (the
+  calls `MergeQueueProvisioner.TryObserveMergeLanded`, which reads main FROM the user's checkout (the
   mirror's `origin`) and asks git two questions — is main the sha this confirm reports, and does it
   contain the tip the lease authorized. An unobservable merge is refused with both halves of the reason
-  and the lease kept for the reconcile. **F37 — a branch main ALREADY contains can now reach `Merged`.**
+  and the lease kept for the reconcile. **That observation now guards the ORDINARY confirm too**
+  (added 2026-09-12, after review — step (1.6), before the gate): every check before it compares the
+  caller's claim against a value the daemon itself handed the caller at `BeginMerge`, so a client that
+  reported `ExpectedBranchSha` without merging anything satisfied all of them and got a terminal `Merged`
+  plus a fired cascade. Applied wherever the daemon CAN look (a `Local` entry, a known branch tip, a
+  provisioner); the late path below then reuses that result instead of fetching a second time.
+  **F37 — a branch main ALREADY contains can now reach `Merged`.**
   `--ff-only` of a contained branch exits 0 and moves nothing, so the client honestly reports the
   pre-merge sha and the "nothing moved" screen refused it forever; reachable after an `Undecidable` boot
   reconcile or a hand pull, and once there only Discard could close the row. The same observation answers
-  it, so the record is the truth rather than a refusal. **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
+  it, so the record is the truth rather than a refusal — and it then routes through the queue's own
+  `TryConfirmHumanMerge` (gate + main CAS) rather than the unconditional `ConfirmHumanMerge`, falling to
+  the late record only on a gate refusal (fixed 2026-09-12: the contained path was the one way through
+  this RPC that no gate guarded). **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
   mirror (`MergeQueueProvisioner.TryRefreshMirrorMainAfterMerge`, best-effort) — without it, a spawn
   between a merge and the next repo-open based its worktree on the stale mirror main and
   `EnsureQueue`'s reconcile walked the queue's authoritative main BACKWARDS to it, leaving

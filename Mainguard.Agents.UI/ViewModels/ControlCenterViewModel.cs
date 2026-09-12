@@ -1306,12 +1306,17 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                     // exact false reassurance this surface exists to prevent.
                     VerifiedAgainstSha = entry?.VerifiedMainSha,
 
-                    // The changed-test-command fact is already on the wire as a flagged item — the gate
+                    // The changed-verification fact is already on the wire as a flagged item — the gate
                     // arms it daemon-side and streams it with the entry. TraceRanges/TestDelta stay
                     // null: the wire does not carry them, and inventing either would render provenance
                     // the daemon never attested.
+                    //
+                    // EITHER half counts. The gate has two items (the command and the toolchain) because
+                    // it has two waivers; this read knew only the first, so a branch that changed only its
+                    // toolchain declaration reached the cockpit header wearing no drift at all — the
+                    // silence the split was made to end, re-created one layer up.
                     ChangedTestCommand = entry?.FlaggedItems.Any(
-                        f => f.Id == Services.DaemonFlaggedChangeSource.ChangedTestCommandItemId) == true,
+                        f => Services.DaemonFlaggedChangeSource.IsChangedVerificationItem(f.Id)) == true,
 
                     // The other half of a review: what a human APPROVED. Real daemon data, like the sha
                     // above — the approved approach has always existed and the client had nowhere to put
