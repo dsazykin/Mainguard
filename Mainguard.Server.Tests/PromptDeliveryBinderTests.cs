@@ -39,6 +39,29 @@ public sealed class PromptDeliveryBinderTests : IDisposable
         "Add one more assertion to test.js covering the empty-input case, then re-run the suite and "
         + "record the result in your mainguard-plan commit.";
 
+    /// <summary>
+    /// The floor below is compared with one timer quantum of slack, and that is <b>not</b> a loosened
+    /// tolerance hiding a real gap.
+    ///
+    /// <para><c>BoundTerminalSession</c> separates the two writes with <c>Task.Delay(TerminatorSeparation)</c>,
+    /// which completes on the runtime's timer wheel; <see cref="RawModeCliDouble"/> stamps each write with
+    /// <c>DateTime.UtcNow</c>, which is the system clock. The two need not agree to the millisecond, and a
+    /// delay that really did elapse can be measured at marginally under its own length — CI read <b>50 ms</b>
+    /// for a 50 ms separation and failed the <c>&gt;=</c> by less than half a millisecond, which is the
+    /// assertion breaking at its own floor rather than the code failing to separate anything.</para>
+    ///
+    /// <para>What these assertions distinguish is "separated by the deliberate wait" from "not separated at
+    /// all", and the unseparated case is two writes issued back to back — sub-millisecond, as the mutation
+    /// check confirms when the fallback is deleted from <c>SubmitLineAndAwaitOutputAsync</c>. 5 ms is ten
+    /// times the shortfall ever observed and a tenth of the separation, so it cannot mask the defect and
+    /// does stop two disagreeing clocks failing a correct run.</para>
+    /// </summary>
+    private static readonly TimeSpan ClockQuantum = TimeSpan.FromMilliseconds(5);
+
+    /// <summary>The separation floor as an assertion can honestly measure it — see <see cref="ClockQuantum"/>.</summary>
+    private static readonly TimeSpan MeasurableSeparationFloor =
+        TerminalSubmit.TerminatorSeparation - ClockQuantum;
+
     public PromptDeliveryBinderTests()
     {
         Directory.CreateDirectory(_root);
@@ -162,7 +185,7 @@ public sealed class PromptDeliveryBinderTests : IDisposable
         Assert.Equal(2, writes.Count);
         var gap = writes[1].At - writes[0].At;
         Assert.True(
-            gap >= TerminalSubmit.TerminatorSeparation,
+            gap >= MeasurableSeparationFloor,
             $"Enter followed the body after only {gap.TotalMilliseconds:0}ms with no echo to separate "
             + "them — the PTY would hand the CLI a single read and the CR would be swallowed as content");
 
@@ -205,7 +228,7 @@ public sealed class PromptDeliveryBinderTests : IDisposable
 
         // (1) The writes were separated at all — the property under test.
         Assert.True(
-            gap >= TerminalSubmit.TerminatorSeparation,
+            gap >= MeasurableSeparationFloor,
             $"the terminator followed the body after {gap.TotalMilliseconds:0}ms with nothing separating "
             + "them — one read at the CLI, and the CR is content rather than Enter");
 
@@ -242,7 +265,7 @@ public sealed class PromptDeliveryBinderTests : IDisposable
         Assert.Equal(2, writes.Count);
         var gap = writes[1].At - writes[0].At;
         Assert.True(
-            gap >= TerminalSubmit.TerminatorSeparation,
+            gap >= MeasurableSeparationFloor,
             $"Enter followed the body after only {gap.TotalMilliseconds:0}ms because an unsolicited frame "
             + "counted as the echo — the PTY would hand the CLI a single read and the CR would be swallowed");
         Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
