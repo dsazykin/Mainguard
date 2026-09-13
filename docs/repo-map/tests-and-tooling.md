@@ -127,8 +127,51 @@
     cap, the line format, mask fidelity, swallowed IO, and the
     `DaemonLogCategories`↔`DaemonLogSubsystems` lockstep; plus the Lifecycle "bound" + Migration
     ("preparing db / stale migration lock cleared / migrate ok / watchdog fired") milestones (the
-    watchdog fallback driven through `TryPrepareDatabase` directly).
-  - `LoggingMaskTests` gains a non-`RpcException`-under-`Rpc` handler-fault test;
+    watchdog fallback driven through `TryPrepareDatabase` directly). **F56** adds the owner-only
+    permission tests (`[UnixOnlyFact]`: the logs dir is not group/world readable, the FIRST line lands
+    in an already-`0600` file, and a rolled file stays `0600`) — each also carrying
+    `[SupportedOSPlatform("linux")]`/`[SupportedOSPlatform("macos")]`, because `File.GetUnixFileMode`
+    inside a custom skip attribute is CA1416 to the analyzer and `dotnet format --verify-no-changes`
+    exited 2 on it.
+  - `LoggingMaskTests` gains a non-`RpcException`-under-`Rpc` handler-fault test; **F56** reworks its
+    assertions from "the field was masked" to "the body was never rendered", and adds
+    `FreeTextRequestFields_AreNeverRendered_EvenThoughTheyAreNotMarkedSecret` — a `task_prompt`
+    carrying a pasted API key, which the old six-field denylist wrote to `rpc.log` verbatim.
+  - **`Mainguard.Server.Tests/SecretFieldMaskAllowlistTests.cs`** (F56) — the allowlist itself, on
+    `SecretFieldMask.Summarize` directly: task prompts and audit payloads render `<str:LEN>` / a
+    record count, registered `// SECRET` fields render nothing at all, nested messages recurse under
+    the same rules, bytes render `<bytes:LEN>`, bounded scalars still render (an access log has to
+    stay worth reading), and an allowlisted NAME with an un-handle-like VALUE still renders a length.
+  - **`Mainguard.Server.Tests/SecretFieldMaskProtoSweepTests.cs`** (F56) — the sweep the per-message
+    tests cannot be, and the one test that survives the contract changing: it enumerates EVERY
+    `MessageDescriptor` in the generated contract assembly (nested types included, ~150 of them),
+    fills every string/bytes field — singular, repeated, map value, nested — with a 96-character
+    sentinel, runs `Summarize`, and asserts neither the sentinel nor a 16-char prefix of it survives.
+    A second sweep covers the other half of the rule: a SHORT identifier sentinel in every singular
+    string field, with the set of field names that render it verbatim pinned against the allowlist
+    restated in the test — so widening `LoggableNames` (adding `reason` or `title` while debugging)
+    fails here and names the field, which is the leak-by-omission an allowlist exists to prevent.
+  - **`Mainguard.Server.Tests/AuditRetentionLeaseTests.cs`** (F64b) — retention over a real
+    SQLite-backed `ChainedAuditLog` with an injected clock: with no lease everything expired expires;
+    an open `InMemoryMergeLeaseStore` lease holds back the records naming its agent or lease id while
+    unrelated ones still expire; the held record expires on the sweep after the lease confirms;
+    redaction events are never themselves redacted and the chain still verifies; plus the pure
+    `References` / `IsHeldByOpenLease` predicates (repo hash deliberately NOT a hold key; the two id
+    kinds never cross; and — the substring bug — an agent id of `a1` does not hold a record merely
+    because `a1` occurs inside a sha, a path or a free-text reason).
+  - **`Mainguard.Server.Tests/AuditPersistenceBootTests.cs`** (B1/B3) — the daemon must not come up
+    looking healthy while its audit trail goes nowhere. Drives `GatewayServiceRegistration.
+    RegisterAuditLog` directly over a real migrated SQLite DB: a key ring whose master key this
+    process cannot decrypt makes the boot THROW `AuditPersistenceUnavailableException` (message
+    naming the remedy, ERROR logged, and nothing registered — a half-wired fallback is the thing
+    being refused) while a protected ring registers the chained log and logs the posture line; a
+    missing daemon DB still falls back but reports at ERROR; the posture-vs-store classification is
+    pinned per exception type. Plus the read-only verify CLI: it creates no key ring on a box that
+    never ran the daemon (exit 0), exits 1 rather than "OK" when records exist but the master key is
+    gone, and still verifies a real chain.
+  - **`Mainguard.Server.Tests/AuditReadBoundTests.cs`** (F64a) — `ReadAudit` over a stub chain of fat
+    records: the page stops at the byte budget and fits under gRPC's 4 MB default, is a contiguous
+    prefix so the walk resumes, still returns a single oversized record, and leaves small pages alone.
   - `SpawnImagePreflightTests` asserts the `Spawn` step sequence + the image-missing failure.
   - **`Mainguard.Tests/Headless/DaemonLogsRenderHarness.cs`** — the Daemon logs window in all five
     themes × populated/spawn/loading/empty → `artifacts_headless/daemon_logs_<Theme>_<state>.png`.
@@ -439,7 +482,41 @@
   `SshKeyServiceTests` (T-14 ArgumentList argv construction + a REAL local ssh-keygen round trip —
   generate → files exist → `ListKeys` finds it → passphrase round-trips through the keyring,
   `RequiresGitCli`), `SecureKeyringTests` (T-14 round-trip + null-on-corrupt via the path override +
-  encrypted-at-rest), `CredentialResolverTests` (T-14 SSH-vs-token credential selection),
+  encrypted-at-rest), `SecureKeyringProtectionTests` (**F53**: the `Absent`/`Present`/`Unreadable`
+  tri-state, the audit master key failing closed on a tampered entry while a host token still degrades
+  to null, the `MAINGUARD_KEYRING_PASSPHRASE` protector round-tripping and leaving
+  `mainguardPassphraseEncryptedKey` in the key XML, a missing/wrong passphrase reading as `Unreadable`
+  rather than absent, and the unprotected-write refusal matrix — end-to-end only where a protector can
+  actually be absent, i.e. not Windows/macOS, via `RequiresUnprotectedPlatformFact`),
+  `SecureKeyringMigrationTests` (**B2**: what happens to a key ring that already EXISTS when the
+  protector arrives — a plaintext ring is re-wrapped in place when a passphrase appears, same key id,
+  and every secret still reads back; an already-protected ring is byte-for-byte untouched; an
+  unprotected one REPORTS its plaintext keys instead of passing silently; a still-plaintext ring
+  refuses the audit master key even under a configured protector; a passphrase-wrapped ring opened
+  without the passphrase refuses it too, rather than letting DataProtection mint a fresh unprotected
+  default key behind the operator's back; the `MAINGUARD_KEYRING_PASSPHRASE_FILE` source round-trips
+  with the env form, trailing newline and all; and `AuditCrypto.TryOpenExisting` writes nothing.
+  These run on every platform via `SecureKeyring`'s internal protection-override seam — the
+  unprotected posture is reachable end to end only on Linux/WSL, which is why its consequences went
+  unnoticed),
+  `MainguardOsKeyringProvisioningTests` (**F53, the shipped half**: the two suites above cover the
+  protector once a passphrase is in hand — nothing covered anything ever PUTTING one there. Pins the
+  four-link chain that supplies it on a VM, Docker-free, by reading the payload sources: the
+  `Dockerfile` `COPY`s `provision-keyring-passphrase.sh` to the path the unit invokes and makes it
+  executable; the unit runs it `ExecStartPre=+` (as root, so a `User=mainguard` service can write
+  root-owned `/etc/mainguard`); the unit's `Environment=` names
+  `SecureKeyring.PassphraseFileVariable` and carries the PATH, never the secret, and never the direct
+  `MAINGUARD_KEYRING_PASSPHRASE`; the script writes that same path, mints from `/dev/urandom`, and
+  never regenerates. Plus: neither unit nor Dockerfile may mention
+  `MAINGUARD_ALLOW_UNPROTECTED_KEYRING`, the image may not bake the passphrase path, and the script
+  must be in `build.sh`'s `INPUT_SPECS`. Since the daemon is fail-closed on Linux, a break in this
+  chain is not a degraded install but a VM whose daemon refuses to start — which is exactly how it
+  surfaced, as a P2-21 crash-loop),
+  `KeyringTestPosture` (both test assemblies) — a `[ModuleInitializer]` that gives the test process a
+  key-ring passphrase when the machine would otherwise resolve to `KeyringProtection.None`, so the
+  suite exercises the same protected path everywhere it runs. Deliberately here and not in `ci.yml`:
+  an environment variable in CI would hide the product defect rather than state a posture,
+  `CredentialResolverTests` (T-14 SSH-vs-token credential selection),
   `AccountsViewModelTests` (T-14 known-host catalog + PAT store/remove + add-custom-host),
   `SignatureStatusParserTests` (T-15 pure: the `%G?` code table + batched-log parse incl.
   separator-in-signer/CRLF/empty), `GitServiceSigningTests` (T-15 integration, `RequiresGpg`: signed
@@ -866,7 +943,19 @@
     every ACCEPT destination-constrained, and still terminates in DROP), `SandboxImageDigestTests`
     (**MG-27, pure** — see the jail-image note above), `EgressAllowlistTests` (defaults carry **no
     git-host entry**, add/remove round-trips + `allowlist_changed` audit events, a git-host entry
-    flagged `DefeatsA6`, JSON persistence round-trip), `GatewayReachabilityPolicyTests` (**MG-4, pure:
+    flagged `DefeatsA6`, JSON persistence round-trip),
+    `EgressHostPatternTests` (**F31, pure**: the three exploits the finding named are each pinned as a
+    refusal — `a|.*` (an alternation allowing every host, defeating default-deny while the UI still
+    shows one innocuous entry), `(` (an uncompilable filter, i.e. a fleet-wide egress outage), and a
+    `/` or newline (dnsmasq directive injection re-opening DNS exfil) — plus the legitimate shapes that
+    must keep working (wildcards, IPv4 literals, `host.docker.internal`), `Add` throwing, and the
+    DROP-not-throw behaviour of the persisted-form and render paths so one bad entry never costs the
+    user the valid ones),
+    `EgressGatewayPortBoundTests` (**F26/F25, pure**: the backstop admits the gateway port and drops
+    everything else to that host, renders nothing at all for a hostile or portless endpoint — the line
+    runs as root inside the proxy — and the rendered script is handed to a real `sh -n`, because a
+    syntax error there is a silent whole-fleet egress failure; plus the proxy's
+    `host.docker.internal:host-gateway` mapping), `GatewayReachabilityPolicyTests` (**MG-4, pure:
     the rendered egress policy that lets a CONFINED jail reach the model gateway, and the two things it
     must not disturb. The gateway's own host must appear in the tinyproxy filter as a bare host (a
     `host:port` pattern can never match, the same silent-no-op class as a wrong base-URL variable);
@@ -885,7 +974,21 @@
     `MacOnlyFact` skip-with-reason attributes. `UnixOnlyFact` (Linux + macOS) is for any-Unix
     behavior — forkpty, unix file modes — now that the macos-host substrate means "not Windows"
     no longer implies Linux; `LinuxOnlyFact` stays for genuinely Linux-bound dependencies
-    (cgroups, /proc, the in-VM daemon).
+    (cgroups, /proc, the in-VM daemon). It also holds `RequiresNetworkFact` and the shim-suite gates
+    `RequiresPython3Fact` / `RequiresPython3Theory` / `RequiresPython3AndBashFact`, over the cached
+    `Python3Availability` and `BashAvailability` probes — which LAUNCH the interpreter rather than
+    scanning `PATH`, because a name that exists but will not execute is exactly what the guards they
+    replaced were catching. **Why they exist:** `AgentIpcProtocolTests` opened every shim test with
+    `if (…) return;`, which xunit reports as **Passed** — a box with no python3 got a green result for
+    a check that ran nothing, and a permanently-green test that measures nothing is worse than no test
+    because the green is read as evidence. The condition is unchanged; only its expression moves, to a
+    `Skip` xunit reports with the reason attached. (Skip is set from the constructor, never thrown:
+    this repo is on xunit 2.9.3, where `Assert.Skip` reports as a FAILURE.) The `AndBash` composite is
+    a correction, not a convenience: the guard it replaced was commented "no python3/bash" and only
+    ever fired for a missing bash — with bash present and python3 absent, `bash -c "python3 …"` exits
+    127 with empty stdout, which the helper maps to a real result carrying a "command not found"
+    refusal, so the guard was skipped and the test failed on an assertion that reads like a shim
+    defect. Reproduced by driving the same bash/driver/shim pipeline with the interpreter renamed.
   - `TestTools/SelfInvocation.cs` — the quoted command prefix tests hand to
     `GitService.SelfInvocationOverride` to spawn the COPIED Mainguard.Client.App head. On macOS it
     always takes the `dotnet <dll>` form: current macOS pins an executable name to the location it
@@ -900,6 +1003,40 @@
     `RequiresNpmRegistryFactAttribute.cs` gates the ONE test that hits the real registry — it verifies
     npm's actual signature under the compiled-in key for all five shipped adapters and skips VISIBLY
     when offline, because an early `return` would report a green "Passed" while asserting nothing).
+    `NpmProvenanceTests` also pins `NpmProvenancePolicy.BuildProvenanceLimitation` verbatim in the
+    accepting verdict (audit F48), so the "DSSE signature / Fulcio chain / Rekor proof are NOT checked"
+    caveat cannot be tidied out of a message that would then read like full SLSA verification.
+  - `ReleaseBuildCarriesPinsTests.cs` (**audit F57 — the test the audit says did not exist**: a release
+    build carries signing pins. Two halves, because either alone is defeatable — the runtime implication
+    (`MainguardAttestedRelease` stamped ⇒ `SigningPolicy.HasUsablePins`, plus "no malformed pins" and
+    "the selected verifier agrees with the policy"), and the build-time guard read back out of
+    `Mainguard.Agents.csproj` so deleting the `MainguardRequirePinsOnReleaseBuild` target / `MG0057`
+    error fails CI instead of silently disarming it. Also drives `PayloadSignatureGate` through its whole
+    table: `Rejected` always refuses, `NotAvailable` refuses for a pin-covered kind once the build can
+    check, and `NotAvailable` still proceeds for kinds Authenticode structurally cannot cover.
+    **Plus the third half, which the first two do not give you: that some pipeline can actually TRIGGER
+    the guard.** `MG0057` fires only for a build that declares itself a release, and nothing in
+    `.github/` or `build/` declared one, so `AttestedReleaseAssembly_MustCarryUsablePins` was vacuously
+    true on every build CI produced while a real `pack.ps1 -Channel pro` still shipped a pin-less head.
+    `TheReleaseScriptArmsTheGuard_AndRefusesAPinlessRelease` reads `build/velopack/pack.ps1` for the
+    arming STATEMENT (`$publishArgs += "/p:MainguardPinsRequired=true"`, not the bare property name —
+    that also matches the explanatory comment above it, and commenting the real line out left the test
+    green) and the pin-less refusal, and asserts the script does NOT set `MainguardAttestedRelease`.
+    `CiProvesTheGuardFires_BothWays` requires the `release-pins-guard` job to exist by its YAML key at
+    its indent (a substring match is satisfied by `release-pins-guard-DISABLED:`) and to carry both
+    controls.)
+  - `TrustedResultPathTests.cs` (**audit F58** — the elevated helper's `--result` path: the real
+    `%LocalAppData%\Mainguard\elevated-result.json` and a second account's equivalent are accepted; an
+    arbitrary system path, a different file name in the right directory, traversal, UNC/device forms,
+    NTFS ADS spellings, relative paths and quoting/wildcard metacharacters are refused. Data root is
+    injected so the Windows cases run identically on Linux CI.)
+  - `AdapterPinOverrideHostTests.cs` (**audit F47** — `AdapterPinHosts` allows only the shipped channel's
+    own host; `Set` throws and, load-bearingly, the READ path drops a hand-edited entry, including the
+    self-consistent case where the attacker supplied both the redirected URL and a hash of their own
+    bytes. Its sibling `AdapterOverrideProvenanceGateTests` covers the other half: `EnsureAsync` runs the
+    provenance gate on every install an override governs, refuses on its verdict with nothing staged,
+    takes the rung from the MANIFEST rather than the override, and does NOT gate a plain bundled-pin
+    install — that sha256 is a reviewed constant, and gating it would break every offline install.)
 - **`Mainguard.Tests/Terminal/` + `Mainguard.Tests/Transcripts/`** — the **P2-04 VT conformance &
   replay harness**, since P2-18 parametrized over BOTH engines through `EngineCatalog.cs` (engine
   roster + per-engine allowlist/golden/input-encoder resolution; `MAINGUARD_REQUIRE_LIBVTERM=1` in CI
@@ -995,8 +1132,13 @@
   `AnOAuthSpawn_MintsNothing…` is the negative control (a daemon that minted unconditionally would pass
   the first test while breaking the OAuth path), and the revoke test also asserts `ResolveAgent(token)`
   is null, so a revoke that orphaned the reverse map would not pass. Docker-free: a fake substrate whose
-  sandbox engine RECORDS every `SandboxSpawnRequest`. The real-jail leg is
-  `Agents/GatewayConfinementDockerTests.cs`.
+  sandbox engine RECORDS every `SandboxSpawnRequest`. It also owns the three ways a BYOK key reaches a
+  jail UNCONFINED, each of which must read differently in the log because each has a different remedy:
+  a CLI that declares no base-URL/model-host pair ("IMPOSSIBLE", a vendor fact), a deliberate
+  `--gateway-bind off` ("OFF", an operator setting), and — audit B1 — a bind that AUTO-RESOLVED TO
+  NOTHING ("UNAVAILABLE", an error, because nobody asked for it and it is how a resolver bug became a
+  fleet-wide credential leak). Every one of them asserts the message does NOT quote the key. The
+  real-jail leg is `Agents/GatewayConfinementDockerTests.cs`.
 - **`Mainguard.Server.Tests/EgressRefusalLogLevelTests.cs`** — an egress **refusal** reaches the daemon
   log at `Warning`. `LoggingTransparencyLog` picked the level with
   `string.Equals(line.Verdict, "Denied", …)` against a free-form string field whose only daemon producer
@@ -1114,6 +1256,49 @@
   not parse as JSON does not travel at all. Mutations watched red: keyed on one shim filename instead of
   the mount (5), fail-open on unparseable content (1); plus, in the daemon suite, the scrub removed from
   each direction (1 each) and dropping the whole file instead of the rule (1).
+  **F45 adds the `CarryOnly` allowlist section**: the attack stated as a test (a jail writes
+  `permissions.defaultMode: bypassPermissions` beside a `SessionStart` hook — both dropped, the real
+  `Bash(git status:*)` grant kept), each executable key named one by one in a `[Theory]` so re-admitting
+  one means deleting an assertion that says what it is (`apiKeyHelper`, `statusLine`, `mcpServers`,
+  `env`, `enableAllProjectMcpServers`), an unknown vendor key dropped BECAUSE it is unknown, unbounded
+  grants dropped from `allow` while `deny` travels as written (dropping a deny would WIDEN the next
+  jail), a clean file still byte-identical, nothing-carriable ⇒ nothing travels (not an empty `{}` that
+  reads like a file the user wrote), non-JSON failing closed, and the mount rule still removed — the
+  allowlist has to subsume `Scrub`, since `permissions.allow` is exactly where the D5b grant lived.
+  **F2's last clause adds the `StripExecutableConfig` section** (the credential leg — `.claude.json`): a
+  realistic file (oauth account, user id, per-project state) plus `mcpServers` loses the definitions and
+  keeps everything else, asserted STRUCTURALLY by `AssertEveryOtherKeyIsUnchanged` — same key names, same
+  order, each value serialising to exactly the JSON it arrived as — because "we touched nothing else" is
+  the whole claim that lets this run over a login file with no live account to test against. Then: the
+  per-project `projects.<dir>.mcpServers` block goes too (top-level-only would have left the real finding
+  in place) while the rest of that project entry survives; each program-naming key one at a time in a
+  `[Theory]`; `CarriedTopLevelKeys` and `ExecutableConfigKeys` asserted DISJOINT so the two legs cannot
+  drift; an unreviewed key CARRIED and its name reported (a targeted strip, not an allowlist) while its
+  value never is; a key name that is not a plain identifier reported as `<non-identifier>`, since a JSON
+  key is chosen by whoever wrote the file and inside a jail that can be the agent; a clean credential file
+  returned byte-identical; and unparseable content travelling unless it spells one of those keys (a bare
+  UUID is what `.gemini/installation_id` is, and refusing it would cost a real login). The review follow-up
+  adds `enabledMcpjsonServers` to both `[Theory]` lists (it names programs it does not spell — it switches
+  on the servers the repository's own committed `.mcp.json` defines) and
+  `AWholeToolGrantInAProjectsAllowedTools_DoesNotTravel` + its empty-list twin: `projects.<dir>.allowedTools`
+  is a permission allowlist inside a credential file, and a jail refused `Bash(*)` through
+  `.claude/settings.json` could persist exactly that through `.claude.json` — one fact with two answers,
+  which is the MG-12 shape. The owner's bounded grants beside it are untouched, and the emptied list stays
+  an empty list rather than disappearing.
+- **`Mainguard.Tests/CliLoginVaultTests.cs`** also pins the **F2 repo scope**: the key is per kind AND
+  per repo with a fixed-width hex suffix, two repos never resolve to one entry, `("a_b","c")` and
+  `("a","b_c")` cannot collide across the separator, a blank scope yields null rather than a shared
+  bucket, a login saved in one repo is not readable from another (over a plain dictionary — the keystore
+  is a name→value map to this type, so the assertion is about the only thing the vault controls), and
+  `LegacyKeystoreKeyFor` names the pre-F2 entry that nothing reads any more.
+- **`Mainguard.Tests/AdapterManifestTests.cs`** gains the **lockfile schema** section: a declared
+  `lockfile` is validated at parse (escaping/absolute path → `Malformed`, bad hash → `BadHash`), a
+  well-formed one round-trips onto the spec, and — the honest one — the SHIPPED channel declares none,
+  so no install is lockfile-pinned and the manifest's residual-gap paragraph is still accurate. That
+  last test fails the day somebody adds a lockfile without landing the install-side half.
+- **`Mainguard.Tests/ApiKeySettingsViewModelTests.cs`** gains the **F51** pair: provider confinability is
+  read out of the shipped manifest (anthropic/google yes, openai no) rather than a hand-kept table, and
+  the stored-key row warns only for an unconfinable provider that actually has a key.
 - **`Mainguard.Server.Tests/CoordinatorSpawnKindTests.cs`** — defect D1, over the real Unix socket an
   in-jail shim writes to. A coordinator's `spawn coder` used to answer `Ok, Status: AwaitingPlan` while
   creating a jail with no CLI in it; it is now refused, mints no session, creates no jail, and the refusal
@@ -1126,6 +1311,16 @@
   developer happens to have installed. Mutations watched red: the guard removed (2 — the pre-change
   behaviour), the empty-catalog carve-out removed (1), the refusal not naming the kinds (2), the launcher
   passing no kinds to the instructions (2), and the kind list hardcoded in the prose (3 + 2).
+  It also carries the END-TO-END half of F50's cross-kind eviction guard:
+  `AWorkerOfAnotherKind_StillGetsThatKindsKey_AfterTheUsersOwnSessionOfItStopped` runs the flow the
+  first cut of that eviction broke — the user's own `second-cli` session stops, and the live `probe-cli`
+  coordinator then spawns a `second-cli` worker over the real socket — and asserts on the ENV THE JAIL
+  RECEIVES rather than on the cache, because "the cache still holds it" and "the worker gets it" are two
+  claims and only the second is the feature. (Each installed marker declares an `ApiKeyEnvVar` so the
+  provider key is observable at all; without one, "booted with no credential" could not be told from
+  "this rig never injects one".) Paired with
+  `OnceTheCoordinatorIsGone_TheOtherKindsKey_IsDroppedWithItsLastSession`. Mutation watched red: the
+  coordinator guard removed — the worker boots with a null key.
 - **`Mainguard.Tests/CliSettingsStoreTests.cs`** — the host store's scope decision, made testable:
   `ApprovingSomethingInOneRepository_DoesNotApproveItInAnother` is the per-repo rule itself; plus
   per-adapter isolation, a blank scope never acting as a wildcard, merge-not-replace on save, an empty
@@ -1141,7 +1336,38 @@
   refuses, not merely because the caller passed nothing. An inherited allowlist is inherited execution.
   **OUT:** `StoppingAnUnattendedWorker_PersistsNothing_EvenThoughTheFileIsRightThere` — the fake jail
   HAS the settings file (the attended test above harvests it from the same engine), so an empty result
-  can only be `CliSettingsHarvestPolicy`.
+  can only be `CliHarvestPolicy`.
+  **OUT, the CREDENTIAL leg (F2):** the same shape one field over —
+  `StoppingAnAttendedSession_HarvestsTheLogin` is the baseline that proves the rig serves the file, then
+  `StoppingAnUnattendedWorker_HarvestsNoLogin_EvenThoughTheFileIsRightThere` and
+  `HarvestingALiveUnattendedWorker_ReturnsNothing` (the live sweep runs against EVERY agent on the
+  daemon, so a gate on the stop path alone would leave an unattended worker's login being collected
+  every few seconds while it ran). `AnOversizedCredentialFile_IsRefused_NotTruncated` and
+  `ASettingsShapedCredentialPath_IsHeldToTheSettingsCeiling` (sized BETWEEN the two ceilings, so only
+  the right cap can explain the refusal) exercise the cap through a fake engine that emulates the real
+  in-shell `wc -c` — a fake that answered 0 with the bytes and let the daemon measure them afterwards
+  would be testing a check the production path does not have.
+  `ASettingsShapedCredentialPath_IsScrubbedOfRoleScopedGrants` reaches D5b into the files that were
+  exempt from it, and `StoppingAnAttendedJail_HarvestsTheLogin_WithoutTheProgramsTheJailNamed` closes
+  F2's last clause through the real stop: a credential path that is NOT settings-shaped (production's
+  `.claude.json`) comes back with its `mcpServers` command definitions gone and the login beside them
+  untouched — the negative control being that the refresh token and the account email are both still
+  there, so a filter that simply dropped the file would fail it.
+  `StoppingAnAttendedJail_HarvestsASettingsShapedCredential_WithoutTheProgramsItNamed` is the same test
+  one path over, on the file the audit actually named: `.gemini/settings.json` is where gemini-cli
+  defines `mcpServers`, and the settings-shaped paths got the mount scrub ALONE, so the Critical stayed
+  live for two of the three. Its negative control is `selectedAuthType`, which survives — the reason the
+  claude-shaped allowlist could not simply be pointed at these files. Its restore twin is
+  `AStoredSettingsShapedCredentialNamingAProgram_NeverReachesAJail`, the half that needs no migration.
+  Mutation watched red: the strip removed from the composition (both fail).
+  **EVICTION (F50):** `StoppingTheLastSessionOfAKind_DropsTheDaemonsCachedCredentials`
+  and its paired non-eviction `StoppingOneOfTwoSessions_KeepsTheCacheForTheSurvivor` — eviction is "the
+  last one left", not "one of them stopped" — plus the CROSS-KIND pair those two cannot see, because both
+  use one kind for the coordinator and the worker:
+  `StoppingTheLastSessionOfOneKind_KeepsIt_WhileACoordinatorOfAnotherKindIsLive` (a live coordinator
+  spawns workers of whatever kind its shim names, so the cache is still in use) and
+  `WithNoCoordinatorLeft_StoppingTheLastSessionOfAKind_DropsOnlyThatKind` (so the guard is a condition
+  and not a way of never evicting).
   **ROLE (defect D5b):** `AStoredJailGrantForTheDaemonsOwnMount_NeverReachesAJail` +
   `StoppingAnAttendedJail_HarvestsTheApprovalsWithoutTheJailsOwnToolGrant` — a stored grant naming
   `AgentIpcPaths.SandboxMount` is scrubbed on the way IN (which is what neutralises an already-poisoned
@@ -1376,7 +1602,14 @@
   scheme on the Pro head and ad-hoc signs) + `assets/` (the brand `.icns` rendered from the site
   favicon and its iconset inputs) + `README.md` (the Velopack packaging plan and what still
   needs an Apple Developer ID).
-- **`.github/workflows/ci.yml`** — CI. The `build-and-test` job builds the pinned libvterm before
+- **`.github/workflows/ci.yml`** — CI. Its **`release-pins-guard`** job (audit F57) is the one that
+  WATCHES the release-pins guard fire: it builds `Mainguard.Agents` with
+  `-p:MainguardAttestedRelease=true` and fails unless the build fails **with `error MG0057`** (a build
+  that fails for any other reason proves nothing and is reported as such), then runs a positive control
+  with a pin that must SUCCEED — without which a guard that refused every build regardless of pins would
+  look identical here while making a real release unbuildable — and greps `pack.ps1` for the arming
+  property. A guard nothing can be observed triggering is indistinguishable from a disarmed one, which
+  is exactly how this one stayed inert through the change that introduced it. The `build-and-test` job builds the pinned libvterm before
   testing and exports `MAINGUARD_LIBVTERM`/`MAINGUARD_REQUIRE_LIBVTERM` so the P2-04 suites gate the
   P2-18 engine; the allowlist shrink-guard covers both per-engine known-failures files. Its
   `payload-reproducible` job now also runs a **daemon-startup smoke in the real payload image as the
@@ -1384,7 +1617,19 @@
   actually listen on 127.0.0.1:5250, and have created an ABSOLUTE data root under `$HOME`. Both
   shipped crash-loop bugs (missing libicu; `GetFolderPath`→relative path) survived only because
   mainguardd had never once been STARTED in its shipping rootfs before a user did it — this asserts
-  behaviour, not an exit code. Its `client-closure` job (ADR-0001 payoff, automated) publishes the
+  behaviour, not an exit code. **"The context systemd gives it" is taken literally (F53):** the smoke
+  reads the `ExecStartPre=+` and `Environment=` lines out of the SHIPPED
+  `/etc/systemd/system/mainguardd.service` and replays them — running the provisioner as root, then
+  starting the daemon under the unit's own environment — rather than restating them here, so a unit
+  that grows a line is covered for free and one that loses a line fails here first. It hardcoded
+  `env HOME=…` instead, which is how the fail-closed keyring landed as a crash-loop: the unit had
+  grown `ExecStartPre=+provision-keyring-passphrase.sh` and
+  `Environment=MAINGUARD_KEYRING_PASSPHRASE_FILE=…`, the smoke replayed neither, and the daemon
+  (correctly) exited 78 on an unprotected key ring. It also asserts the POSTURE, not just the boot —
+  `keyring protection=Passphrase` from `SecureKeyring.DescribeProtection()` must appear in the
+  daemon's own output, so a future unit that quietly drops the provisioning cannot pass here by
+  setting `MAINGUARD_ALLOW_UNPROTECTED_KEYRING`, which boots fine and ships the audit master key in
+  cleartext. Its `client-closure` job (ADR-0001 payoff, automated) publishes the
   Client head and fails if the closure names any agent-platform assembly (`Mainguard.Agents(.UI)` /
   `Mainguard.Protos` / `Docker.DotNet` / `Porta.Pty` / `Grpc`), via
   `build/ci/verify-client-closure.sh` (also runnable locally). That script publishes **self-contained
@@ -1953,6 +2198,44 @@
   `AllowedMountRoots` on the spec, a bind source outside every declared substrate root (a user
   repo, a prefix-sibling like `<root>-evil`) is a typed refusal at construction; with no roots
   declared (WSL2 today) behavior is pinned unchanged.
+  **`SandboxResidueReapingTests.cs`** — audit F27/F32/F28, and every test in it is about a REFUSAL,
+  because a collector that takes too little wastes disk while one that takes too much destroys a live
+  agent's network or the image its jail is running on. Pins `SandboxSegmentReapPolicy` (the shared
+  `mainguard-agents` network is never a candidate; an unstamped network, an occupied one, one whose
+  jail still exists **stopped**, and one inside the grace are each kept), `ToolchainImageGcPolicy`
+  (an image any container references is never removed — asserted while old, unwanted and past
+  retention, so "in use" wins alone; plus wanted-by-tag-or-id, too-young, foreign-tagged, and that
+  retention spends its slots only on layers that would otherwise go), and
+  `ContainerSpecBuilder.InspectPosture` (a jail the builder just made shows no drift; a raised ceiling
+  is a RETIGHTEN not a recreate, so an operator moving a slider does not kill live sessions; a
+  pre-MG-26 jail with no CPU cap is caught; every hardening control missing is a recreate; an
+  unreadable `HostConfig` reports no drift). The last block drives the **shipped Docker half** —
+  `DockerSandboxEngine.RetightenCeilingAsync` / `InspectPostureAsync` against a `MobyShapedContainers`
+  fake that models the one engine rule that matters: moby refuses a memory update whose new ceiling
+  exceeds the memory+swap total the request carries, and an absent `MemorySwap` means "the total the
+  container already has". That is what made a Memory-only RAISE a permanent 409 — the Settings page
+  reading 8 GiB while the jail stayed at 2 GiB — so the raise test fails outright if the pair is ever
+  broken up again, the lowering test catches the leftover swap headroom, and a separate test proves the
+  fake really refuses the broken shape rather than accepting anything. The two best-effort catches are
+  pinned as REPORTED, not swallowed: a refused ceiling update and an unanswerable posture inspect each
+  leave a line naming the jail.
+  **`SandboxDefenceInDepthTests.cs`** — audit F33, the controls that had drifted into decoration. A
+  bind source that symlinks OUT of a daemon-owned root is refused (docker binds what a path resolves
+  to, not what it spells) while a source under a symlinked ROOT is still contained (the macOS
+  `/var` → `/private/var` shape, which resolving only one side would start refusing);
+  `ContainerSpecBuilder.RealPath` resolves through symlinked parents to a leaf that does not exist
+  yet. An innocuously-named env var carrying a real credential is refused by VALUE via the shared
+  `Mainguard.Git.Safety.SecretPatterns` catalog, and the refusal names the variable and the rule and
+  **never** the value. `NO_PROXY` exempts loopback only — the unroutable `git.mainguard.internal` is
+  gone. `DockerSandboxEngine.BirthTimeIsUsable` rejects the sentinels a filesystem without `statx`
+  produces. The world-writable package-cache leaf carries the sticky bit; the group-shared rung is not
+  world-writable and must not acquire one.
+  **`HandBackPermitTests.cs`** — audit F44 residual, the store half: a conflict hand-back permits the
+  rewrite while fresh, right up to `RebaseConflictParkingStore.HandBackLifetime`, and stops permitting
+  it after; expiry is not a latch (deciding again re-arms); consuming disarms; the key is the
+  (repo, agent) PAIR, so one repository's `pr-7` authorisation never excuses another's. The mediator
+  half — that the permit is spent by the next publish that MOVES the ref, fast-forward or not — is in
+  `Mainguard.Server.Tests/Agents/AgentRefMediationTests.cs` against real git.
   **`SandboxSecretWriteTimeoutTests.cs`** — the spawn path's secret delivery is TIME-BOUNDED: it
   drives the real `DockerSandboxEngine.WriteSecretFileAsync` against a fake `IDockerClient` whose exec
   create never completes and never observes its cancellation token (the shape of a Docker endpoint
@@ -2481,6 +2764,36 @@
   authenticated token instead of the spoofable `x-mainguard-agent` header, injects the daemon-held key
   at the network hop so the agent's own credential never survives it, refuses an unauthenticated
   caller with 401, and filters credential/Mainguard/hop-by-hop headers both directions),
+  `GatewayStreamingMeteringTests` (**F23/F29** — an SSE stream settles its REAL usage and still reaches
+  the agent byte for byte; the Anthropic dialect (input in `message_start`, a running output count per
+  `message_delta`) and the OpenAI one (one `usage` chunk, `[DONE]`) both parse; the exact bypass —
+  `stream:true` plus `x-mainguard-token-estimate: 0` — is charged the floor rather than nothing, while
+  an estimate ABOVE the floor still raises the reservation; an oversized request body is 413 with
+  nothing charged; and `BudgetLedger` charges the reserved amount for a zero settle against a live
+  reservation while a settle with no reservation keeps its old meaning. **Audit B2**: a client that
+  aborts MID-STREAM is charged what the provider had already reported (the stream is fed chunk by chunk
+  through a sink that throws on the second write, so the assertion is 1201 — the usage in the frames that
+  got out — and not zero, which is what the old `Abandon`-on-any-exception produced for a completion the
+  provider generated and billed in full); an abort before any usage frame still charges the reservation;
+  a failure BEFORE the upstream committed, and an abort while reading a 5xx, still refund; the estimate
+  raise is capped at 4× the default so one jail cannot drain the shared per-minute bucket; and Gemini's
+  `usageMetadata`/`modelVersion` shape parses in both streaming and whole-document form),
+  `GatewayBindPolicyTests` (**MG-13/F25/audit B1** — the bind rule and the default-bind resolver:
+  loopback and RFC-1918 permitted, wildcard and public refused (including the 172.16/12 off-by-ones);
+  the default IS whatever the resolver found and is never a LAN-facing address; `ProxyReachableHostFor`
+  translates loopback and nothing else; `off`/`auto`/explicit resolve as documented and an impermissible
+  explicit address passes through so startup can refuse it loudly. **B1's regression tests**: an IDLE
+  `docker0` — carrier-down, which is its normal state on a Mainguard host — is still selected, a `br-*`
+  segment bridge and a Wi-Fi address never are, and on a LINUX host that HAS a docker0 the resolver must
+  return that address rather than null. The pre-existing default-bind tests both PASS when the resolver
+  returns null, which is exactly how the gateway-disabled-fleet-wide regression shipped; these fail.
+  Also that a deliberate `--gateway-bind off` stays distinguishable from a bind that resolved to
+  nothing),
+  `AgentGatewayTokenRotationTests` (**F25** — the `mg_sess_` token rotates on a schedule: replaced after
+  the interval, the superseded one still resolving through the overlap so a request already in flight
+  finishes and failing after it, custody of the real key surviving the swap, one agent's rotation not
+  touching another, `Revoke` giving no grace, and — the safety property — NOTHING rotating when the new
+  token cannot be delivered to the jail, including when the delivery hook throws),
   `GatewayUpstreamBindingTests` (**the per-agent upstream binding — every request built the way a
   confined jail actually sends it, i.e. `Host` = the GATEWAY rather than the provider. The custody
   tests above all use `Host = api.anthropic.com`, a shape production cannot produce once a CLI is
@@ -2488,7 +2801,13 @@
   charged nothing. Covers: routing to the agent's bound upstream, `BudgetLedger` actually charged,
   an over-budget agent refused 402 with nothing forwarded, an OAuth agent passing through untouched
   and NOT 401'd (the regression that would hurt most), and an unknown token on the legacy model-host
-  shape still refused so the pass-through is not an auth bypass**),
+  shape still refused so the pass-through is not an auth bypass. **F46 adds the Google shape** —
+  `ConfinedGeminiAgent_PresentingXGoogApiKey_IsIdentifiedAndForwarded` and
+  `…_GetsTheRealKeyInGooglesHeader_AndItsOwnTokenIsDropped`: the same class of defect as this file's
+  headline one, one provider over. Identification read only `x-api-key`/`authorization` while gemini-cli
+  sends `x-goog-api-key`, so a "confinable, verified" adapter 404'd on every model call; the test rig's
+  token header is now a parameter, because which header the token arrives in is a property of the CLI,
+  not of the gateway**),
   `GatewayPipelineWiringTests` (**that the gateway is SERVING, not merely bound — the bind tests pass
   in a world where the port answers 404 to everything, which is exactly what the daemon did before
   the middleware was wired. Issues a real HTTP request over the real Kestrel listener, because
@@ -2513,7 +2832,25 @@
   carried by the proxy (paired with a not-allowlisted negative control so an offline runner cannot pass
   it for the wrong reason); and an unreachable gateway SKIPS confinement so the agent keeps its raw key
   and its working direct route — the precondition that makes gateway-on-by-default safe. Only the
-  provider itself is faked, via the `DaemonHost` `configureServices` seam**),
+  provider itself is faked, via the `DaemonHost` `configureServices` seam.
+  **Two legs added by this batch.** `ConfinedGeminiJail_IsIdentifiedByItsGoogleHeader_AndGetsTheRealKeyInTheSameShape`
+  (F46) launches a REAL jail of a second adapter kind — the world's registry now also carries a
+  `gemini-cli` marker, and `LaunchAsync` takes an `agentKind` — and issues the request in the shape
+  gemini-cli sends: nothing about the confinement machinery was Anthropic-specific except the two header
+  names nobody had generalised, and every test here used the one shape.
+  `ResumedJail_ComesBackWithTheTokenTheDaemonNowHolds_AndAnOobKey` (F24) STOPS a jail and relaunches the
+  same agent id, then compares the jail's own `agent.env` to the token the daemon CURRENTLY holds, not
+  to the one the first launch produced: the reuse branch restored logins and settings into a jail whose
+  tmpfs secrets `docker start` had just emptied, and wrote neither the env file nor `oob.key`. It
+  relaunches a COORDINATOR (`withoutRepositoryAccess`), because that is the only shape in which the
+  shipped launcher reaches the engine's reuse branch at all: `CreateAgentWorktree` refuses an id whose
+  `agent/<id>` exists, and `AdoptAgentWorktree` re-creates the worktree, which is exactly what
+  `WorkspaceMountAliveAsync` rebuilds a container for (§27.3) — while a coordinator has no worktree, and
+  its container is the one `AgentSpawnService` labels so a later daemon can adopt it back. `Jail.Reused`
+  is asserted BEFORE the secrets, because the first version of this test relaunched a repo-backed agent,
+  threw `AgentWorktreeConflictException` on worktree creation, and left every assertion below it
+  unreached — F24's fix shipped unproven. Mutation watched red: the two `WriteSecretFileAsync` calls
+  removed from the reuse branch**),
   `DailyBudgetCapBootTests` (MG-21 — the persisted PER-DAY caps survive a restart: boot built
   `BudgetCaps(..., 0, 0)`, and 0 means UNLIMITED, so a daily budget silently stopped being enforced
   after every daemon restart while `GetBudgets` still reported it; resolves the ledger from a freshly
@@ -2712,8 +3049,11 @@
   extracted from `ToolchainProvisioningDockerTests`, which now shares it), `Fixtures/RequiresDockerFact.cs`
   (`[RequiresDockerFact]` skips unless Docker is reachable AND the CI-built agent-base image is
   present; the sibling `[RequiresDockerDaemonFact]` gates on Docker-daemon presence only — for P2-08's
-  reconciler test that stands up its own trivial image; class-level
-  `[Trait("Category","RequiresDocker")]` carries the CI filter),
+  reconciler test that stands up its own trivial image; **`[RequiresDockerDesktopFact]` and
+  `[RequiresLinuxDockerEngineFact]`** split the claims that differ by engine, because `host-gateway`
+  means the host's loopback stack on Docker Desktop and the docker0 address on native Linux — a test
+  asserting one of those unconditionally fails the other platform's CI leg by design (audit B3);
+  class-level `[Trait("Category","RequiresDocker")]` carries the CI filter),
   `Fixtures/RequiresAccessDeniedFact.cs` (`[RequiresAccessDeniedFact]` — skips unless this process can
   actually be DENIED access to a directory it owns, which root, Windows and any metadata-less mount
   quietly are not; the probe performs the real deny-then-read rather than trusting `chmod`, because a
@@ -2927,6 +3267,24 @@
   CI and passed locally the deciding difference was that store's `RepoDigests` behaviour and **the
   runner's Docker version appears nowhere in the workflow logs**, so the question had to be answered
   by reasoning from an error string instead of by reading a fact),
+  `Agents/GatewayReachAndSegmentIsolationDockerTests.cs` (**F25/F26/F30** — the three claims in that
+  batch only a real engine can settle. The egress proxy reaches a LOOPBACK-bound gateway through
+  `host.docker.internal` and does NOT reach it at `127.0.0.1` (inside the proxy that is the proxy), so
+  the narrowed bind is usable and the daemon's loopback→alias translation is load-bearing rather than
+  decorative; the proxy really carries the `host-gateway` mapping and the name resolves inside it; the
+  F26 `OUTPUT` rules are asserted against `iptables -S OUTPUT` in the LIVE proxy, not against the
+  rendered text, because the finding is about what the proxy enforces. **The F30 measurement changed the
+  design**: an internal segment has no default route (everything off its subnet is "Network is
+  unreachable", the other bridge's gateway included) but its OWN bridge's gateway answers ping in
+  0.05 ms — which is why `GatewayBindPolicy` binds `docker0` and never a `br-*` segment bridge, since a
+  gateway on a segment's own address would be dialable by every jail on it without going through
+  tinyproxy. Both halves are asserted, with a non-internal control so a pass cannot be an inert probe.
+  **Audit B3 — the reach claim is per engine.** The loopback-via-alias test is `[RequiresDockerDesktopFact]`
+  (on Linux Docker Engine `host-gateway` IS docker0, so a `127.0.0.1` listener is genuinely unreachable
+  from a container and asserting otherwise failed the Linux runner by design), and its Linux counterpart
+  `Proxy_CanReachTheResolvedBridgeBoundGateway` binds a listener at the address `GatewayBindPolicy`
+  actually resolves and requires the proxy to reach it through the exact string `ProxyReachableHostFor`
+  hands the jail — which also fails loudly if that resolver ever returns null on a host with a bridge),
   `Agents/SandboxEgressDockerTests.cs` (the egress matrix — allowlisted API via proxy, non-allowlisted
   fails **fast**, direct-IP dropped despite proxy-env unset, DNS exfil NXDOMAIN, **in-jail DNS that
   depends on no public resolver** (`AllowlistedName_ShouldStillResolve_WithoutAnyPublicResolver` —

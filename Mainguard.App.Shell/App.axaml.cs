@@ -292,7 +292,16 @@ public partial class App : Application
     private static void HandleDeepLink(string uri, IClassicDesktopStyleApplicationLifetime desktop)
     {
         var result = Mainguard.Git.Security.DeepLinkParser.Parse(uri);
-        System.Diagnostics.Debug.WriteLine($"[Mainguard] deep link {result.Outcome}: {uri} {result.Reason}");
+
+        // Log the VERDICT, never the link. A mainguard:// URI arrives from the OS handler, so any
+        // process — or any web page that got the user to click through — chooses every byte of it,
+        // and Debug.WriteLine goes to the world-readable OS debug channel (OutputDebugString /
+        // os_log). The parser's secret guard only rejects secret-shaped parameter *names*, so
+        // `mainguard://open-agent/x?ref=<token>` passes it and would have put the token in that
+        // channel. The reason string is the parser's own bounded diagnostic (a scheme, a verb, or a
+        // refused key name) and is capped here so a long crafted verb cannot flood the log either.
+        var reason = result.Reason is { Length: > 120 } overlong ? overlong[..120] + "…" : result.Reason;
+        System.Diagnostics.Debug.WriteLine($"[Mainguard] deep link {result.Outcome}: {reason}");
         if (result.Outcome != Mainguard.Git.Security.DeepLinkOutcome.Command) return;
 
         ShowMainWindow(desktop);

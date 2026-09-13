@@ -103,6 +103,82 @@ public sealed class SessionKeyCache
         string repoHandle, string agentKind) =>
         TryScope(repoHandle, agentKind, out var scope) && _cliSettings.TryGetValue(scope, out var files) ? files : null;
 
+    /// <summary>
+    /// Drops everything held for one repo + kind: the provider key, the harvested CLI login files and
+    /// the settings. Called when the last session of that kind in that repo goes away.
+    ///
+    /// <para><b>F50 — why anything is dropped at all.</b> Nothing ever removed an entry. A provider key
+    /// and a set of harvested OAuth token files stayed resident for the daemon's whole lifetime, so
+    /// stopping every agent left the user's credentials in the daemon's memory with nothing left that
+    /// could legitimately use them — and the daemon is a long-lived background process, not something
+    /// the user restarts. "Stop all agents" is the gesture a person makes when they want the machine to
+    /// be holding nothing; it should mean that.</para>
+    ///
+    /// <para>What eviction costs: nothing a user notices, PROVIDED the caller asks the right question.
+    /// The cache exists so a COORDINATOR-initiated worker (no client in the loop) inherits the
+    /// credentials of the repo it belongs to, and a coordinator spawns workers of whatever kind its shim
+    /// names — not only its own. So "no session of this kind survives" does NOT by itself mean nobody
+    /// can ask for this kind again; only "no session of this kind AND no coordinator survives in the
+    /// repo" does. That is the condition <c>AgentSpawnService.StopAsync</c> evaluates before calling
+    /// this, and the reason it is stated there rather than here is that this type cannot see the session
+    /// store. Once the entry is gone the next client spawn supplies the credentials again from the host
+    /// keychain, which is the durable store; a miss was always a supported outcome — it spawns
+    /// unauthenticated rather than substituting something else.</para>
+    /// </summary>
+    public void Forget(string? repoHandle, string? agentKind)
+    {
+        if (!TryScope(repoHandle, agentKind, out var scope))
+        {
+            return;
+        }
+
+        _keys.TryRemove(scope, out _);
+        _cliCredentials.TryRemove(scope, out _);
+        _cliSettings.TryRemove(scope, out _);
+    }
+
+    /// <summary>Drops what is held for a whole repository — every kind's credentials plus the
+    /// repo-level custom env entries, which are not per kind and so outlive any single one of them.
+    /// Called when the repo has no sessions left at all.</summary>
+    public void ForgetRepo(string? repoHandle)
+    {
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return;
+        }
+
+        _extraEnvByRepo.TryRemove(repoHandle, out _);
+        foreach (var scope in _keys.Keys)
+        {
+            if (string.Equals(scope.RepoHandle, repoHandle, StringComparison.Ordinal))
+            {
+                _keys.TryRemove(scope, out _);
+            }
+        }
+
+        foreach (var scope in _cliCredentials.Keys)
+        {
+            if (string.Equals(scope.RepoHandle, repoHandle, StringComparison.Ordinal))
+            {
+                _cliCredentials.TryRemove(scope, out _);
+            }
+        }
+
+        foreach (var scope in _cliSettings.Keys)
+        {
+            if (string.Equals(scope.RepoHandle, repoHandle, StringComparison.Ordinal))
+            {
+                _cliSettings.TryRemove(scope, out _);
+            }
+        }
+    }
+
+    /// <summary>Whether anything at all is held for this repo + kind — the observable an eviction test
+    /// asserts on without the cache having to hand back a credential to prove it is gone.</summary>
+    public bool HasAnythingFor(string repoHandle, string agentKind) =>
+        TryScope(repoHandle, agentKind, out var scope)
+        && (_keys.ContainsKey(scope) || _cliCredentials.ContainsKey(scope) || _cliSettings.ContainsKey(scope));
+
     // A blank repo handle or kind can never form a scope — that would collapse distinct repos into one
     // shared bucket, which is exactly the MG-6 defect. Such calls are dropped (write) / miss (read).
     private static bool TryScope(string? repoHandle, string? agentKind, out ScopedKey scope)

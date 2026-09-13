@@ -39,7 +39,7 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
     public Wsl2AgentEnvironment(
         string? vmRoot = null, string? userName = null, string? distroName = null,
         IDockerClient? dockerClient = null, IAuditLog? auditLog = null,
-        string? gatewayEndpoint = null)
+        string? gatewayEndpoint = null, Action<string>? log = null)
     {
         var user = string.IsNullOrEmpty(userName)
             ? Environment.GetEnvironmentVariable("USER") ?? Environment.GetEnvironmentVariable("USERNAME") ?? "mainguard"
@@ -54,7 +54,8 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
         // AgentEnvironmentComposition.Compose. The provisioner's Windows-facing handle for a hash
         // IS the resolved sync-remote URL.
         var parts = AgentEnvironmentComposition.Compose(
-            vmRoot, dockerClient, auditLog, gatewayEndpoint, hash => ResolveSyncRemote(hash).Url);
+            vmRoot, dockerClient, auditLog, gatewayEndpoint, hash => ResolveSyncRemote(hash).Url,
+            log: log);
         Repos = parts.Repos;
         PackageCaches = parts.PackageCaches;
         Worktrees = parts.Worktrees;
