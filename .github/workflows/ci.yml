@@ -79,6 +79,81 @@ jobs:
       - name: Verify formatting
         run: dotnet format --no-restore --verify-no-changes
 
+  # ---------------------------------------------------------------------------------------------------
+  # Audit F57 — prove the release-pins guard FIRES. A guard that cannot be observed firing is
+  # indistinguishable from one that was disarmed: MG0057 keys off $(MainguardPinsRequired), derived
+  # from $(MainguardAttestedRelease), and for the whole life of the guard NOTHING in .github/ or
+  # build/ set either, so `ReleaseBuildCarriesPinsTests.AttestedReleaseAssembly_MustCarryUsablePins`
+  # was vacuously true on every build CI has ever produced and a real `pack.ps1 -Channel pro` run
+  # still shipped a pin-less head. This job is the missing observation.
+  #
+  # Both directions, because each alone is weak. Without the negative control the guard can be
+  # deleted and nothing notices; without the POSITIVE control a guard that fails every build
+  # regardless of pins (a typo in the condition, an Error with no condition at all) would look like
+  # a pass here while making a real release unbuildable.
+  #
+  # `continue-on-error` is deliberately NOT used: the expected failure is captured and inspected, so
+  # "the build failed for some other reason" cannot be mistaken for "the guard fired".
+  # ---------------------------------------------------------------------------------------------------
+  release-pins-guard:
+    name: Release pins guard fires (MG0057, audit F57)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
+
+      - name: An attested release with no pins must NOT compile
+        run: |
+          set -euo pipefail
+          # mktemp, not a file in the checkout: this step is meant to be runnable locally too, and a
+          # build log dropped into the working tree is one `git add -A` away from being committed.
+          log="$(mktemp)"
+          if dotnet build Mainguard.Agents/Mainguard.Agents.csproj --no-restore \
+               -p:MainguardAttestedRelease=true > "$log" 2>&1; then
+            echo "::error::A release build with no pins SUCCEEDED. The MG0057 guard in"\
+                 "Mainguard.Agents.csproj is disarmed: a release would ship"\
+                 "UnsignedBuildSignatureVerifier and every privileged promote would proceed"\
+                 "unverified (audit F57)."
+            cat "$log"
+            exit 1
+          fi
+          if ! grep -q 'error MG0057' "$log"; then
+            echo "::error::The build failed, but NOT with MG0057 — so this job proved nothing about"\
+                 "the pins guard. Actual output follows."
+            cat "$log"
+            exit 1
+          fi
+          grep -m1 'error MG0057' "$log"
+          echo "MG0057 fired: an attested release with no pins cannot be built."
+
+      - name: Positive control — the same build WITH a pin must compile
+        run: |
+          set -euo pipefail
+          dotnet build Mainguard.Agents/Mainguard.Agents.csproj --no-restore \
+            -p:MainguardAttestedRelease=true \
+            -p:MainguardPinnedThumbprints=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          echo "Positive control OK: the guard refuses only the pin-less release, not every release."
+
+      # The release script is the only thing that actually ships bytes, so its arming is checked here
+      # too — as text, because running it needs pwsh, a payload and `vpk`. package-smoke.yml's
+      # velopack-wiring job asserts the same property in the resolved -DryRun plan.
+      - name: pack.ps1 must arm the guard on every publish
+        run: |
+          set -euo pipefail
+          if ! grep -q '/p:MainguardPinsRequired=true' build/velopack/pack.ps1; then
+            echo "::error::build/velopack/pack.ps1 no longer passes /p:MainguardPinsRequired=true, so"\
+                 "MG0057 cannot fire for a real release and a pin-less head ships silently (audit F57)."
+            exit 1
+          fi
+          echo "pack.ps1 arms MG0057 on every publish."
+
   allowlist-shrink-guard:
     name: VT allowlist may only shrink (P2-04)
     runs-on: ubuntu-latest

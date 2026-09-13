@@ -79,6 +79,71 @@ public class ReleaseBuildCarriesPinsTests
     }
 
     /// <summary>
+    /// <b>The third half — the one the guard was missing.</b> A build-time error that no pipeline can
+    /// trigger is documentation, not a guard. <c>MG0057</c> fires only for a build that declares itself
+    /// a release, and for the entire life of the guard NOTHING in <c>.github/</c> or <c>build/</c>
+    /// declared one: <c>pack.ps1</c> passed <c>/p:MainguardPinnedThumbprints</c> only when a pin
+    /// happened to resolve and never passed a stamp, so an owner running <c>pack.ps1 -Channel pro</c>
+    /// with no certificate still shipped a pin-less Pro head — byte-for-byte the state the finding
+    /// describes — while <see cref="AttestedReleaseAssembly_MustCarryUsablePins"/> passed vacuously on
+    /// every build CI produced.
+    ///
+    /// <para>So the release script's arming is asserted here, as text, for the same reason the csproj
+    /// target is: it is the cheapest thing to delete and the most expensive to notice missing.</para>
+    /// </summary>
+    [Fact]
+    public void TheReleaseScriptArmsTheGuard_AndRefusesAPinlessRelease()
+    {
+        var pack = File.ReadAllText(Path.Combine(RepoRoot(), "build", "velopack", "pack.ps1"));
+
+        // Every publish declares itself a release, so MG0057 is reachable from the one script that
+        // ships bytes to users. Unconditional: a pin that "happens to resolve" is not a guarantee.
+        //
+        // The STATEMENT, not the string: pack.ps1 explains this arming in a comment directly above it,
+        // and an assertion on the bare property name passes on that prose alone — commenting the real
+        // line out left this test green, which is the same "guard that cannot fail" shape as the
+        // finding it is here to close.
+        Assert.Contains("$publishArgs += \"/p:MainguardPinsRequired=true\"", pack, StringComparison.Ordinal);
+
+        // And the script refuses in its own voice before spending minutes on a publish it cannot ship.
+        Assert.Contains("-not $DryRun -and -not $PinnedThumbprints", pack, StringComparison.Ordinal);
+        Assert.Contains("runtime signature pin", pack, StringComparison.Ordinal);
+
+        // The stamp that means "GitHub minted an attestation for these bytes" must NOT be set by a
+        // script that runs on the owner's release box, where no OIDC identity exists to mint one:
+        // BuildProvenanceGate would then demand an attestation that was never created and the shipped
+        // app would refuse its own payload. Being explicit here keeps a future edit from "fixing" the
+        // arming by reaching for the wrong property.
+        Assert.DoesNotContain("MainguardAttestedRelease=true", pack, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And CI must actually WATCH the guard fire. Without an expect-failure run, a disarmed guard and a
+    /// working one produce identical green pipelines — which is exactly how this one stayed inert
+    /// through the change that introduced it.
+    /// </summary>
+    [Fact]
+    public void CiProvesTheGuardFires_BothWays()
+    {
+        var ci = File.ReadAllText(Path.Combine(RepoRoot(), ".github", "workflows", "ci.yml"))
+            .Replace("\r\n", "\n", StringComparison.Ordinal);
+
+        // The job KEY, at its YAML indent — not the bare name. A substring match is satisfied by
+        // `release-pins-guard-DISABLED:`, and by the name sitting in a comment, so renaming the job out
+        // of existence would leave this test green while CI stopped watching the guard entirely.
+        Assert.Contains("\n  release-pins-guard:\n", ci, StringComparison.Ordinal);
+
+        // The negative control: a release with no pins is built and required to fail with MG0057.
+        Assert.Contains("-p:MainguardAttestedRelease=true", ci, StringComparison.Ordinal);
+        Assert.Contains("error MG0057", ci, StringComparison.Ordinal);
+
+        // The positive control, which is what stops "the guard fires" from being satisfied by a guard
+        // that refuses every build regardless of pins — that would pass the negative check while making
+        // a real, correctly-pinned release unbuildable.
+        Assert.Contains("-p:MainguardPinnedThumbprints=", ci, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// Audit F57's other half: the elevated paths must not proceed on
     /// <see cref="SignatureVerdictKind.NotAvailable"/> once the build claims it can check. Driven
     /// through the pure <see cref="PayloadSignatureGate"/> so both answers are testable on any OS.

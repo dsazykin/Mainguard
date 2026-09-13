@@ -69,6 +69,19 @@ The three installer projects. `Mainguard.Installer.Elevated` is the ONLY elevate
   `/p:BuildElevatedStage=false` shipped the escalation and passed the smoke green. That workflow also
   runs `pack.ps1 -Channel client|pro -DryRun` (the `velopack-wiring` job), which is the only CI exercise
   the release script gets, plus a canary check that `-DryRun` never prints the signing password.
+  **Audit F57 — the script declares itself a release.** Every publish (both channels) now carries
+  `/p:MainguardPinsRequired=true`, which is what ARMS the `MG0057` guard in `Mainguard.Agents.csproj`,
+  and a non-`-DryRun` run with no resolvable pin is REFUSED before anything is built. Until this, the
+  script passed `/p:MainguardPinnedThumbprints` only when a pin happened to resolve and passed no stamp
+  at all, so `pack.ps1 -Channel pro` with no certificate shipped a pin-less Pro head —
+  `UnsignedBuildSignatureVerifier`, every privileged promote proceeding on `NotAvailable` — with a green
+  build and no diagnostic: the guard existed, was tested, and could not fire in the one pipeline that
+  ships bytes. It deliberately does **not** set `MainguardAttestedRelease`, which asserts that a GitHub
+  artifact attestation exists and only the repo's OIDC identity (`ci.yml`'s `payload-reproducible`) can
+  mint one; setting it on the owner's release box would make `BuildProvenanceGate` demand an attestation
+  that was never created and the shipped app would refuse its own payload. `velopack-wiring` asserts
+  both halves — the property in the resolved `-DryRun` plan, and that a real pin-less publish throws
+  (matching on the refusal text, so a missing payload or absent `vpk` cannot satisfy it instead).
 - **`installer/Mainguard.Uninstall`** (P2-22 §J-6) — the thin `WinExe` clean-uninstall entry point.
   Parses the two user choices (`--keep-settings`, `--remove-sync-remote`) and drives the Core
   `Uninstaller` with the real Windows delegates (daemon stop via
