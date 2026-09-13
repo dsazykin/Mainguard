@@ -1543,7 +1543,9 @@
   tier-1 update bouncing `mainguardd`, an HTTP/2 reset — used to add one full ledger to the Resources
   rail's total AND to every per-agent row. Both halves are pinned through the new `SpendStreamOverride`
   seam, on the user-visible figures (`Current.SpendTodayUsd`, `GetAgentUsage().SpendUsd`) rather than on
-  the accumulators)**,
+  the accumulators. A third test pins the OTHER edge: the reset fires on a subscription's first SAMPLE,
+  never on the attempt to open one, so a daemon outage no longer empties every per-agent row while
+  `Current` still answers with the last fleet total it had)**,
   **`ProjectionRaiseIsolationTests` (F68 — the plan, conversation, spend and resource appliers raise on
   their pump's thread, so a throwing subscriber propagated into the `await foreach`, ended the stream, and
   cost every update until the reconnect delay elapsed. `ApplyAgentEvent`/`ApplyQueueUpdate` were already
@@ -1551,7 +1553,19 @@
   **`QueueUpdateScopingTests` (F69 — a queue update the OLD pump had already dequeued lands after
   `SetActiveRepo` swaps repos and rewrote the projection with the previous repository's rows. The daemon
   refuses a merge for an entry that is not the bound repo's, so nothing wrong reaches git; the rail simply
-  lied until the next push. Pinned by holding the old stream's message across the swap)**,
+  lied until the next push. Pinned by holding the old stream's message across the swap. A second test
+  covers the same projection's mirror-freshness pair, which `ClearActiveRepo` was leaving behind: an age
+  stamp that outlives the repo it describes reads as reassurance about nothing)**,
+  **`MergeCancelArmTests` (the B1 review finding — `MergeToken()` rotated the surface's CTS on every merge
+  while the cockpit's Merge command is sync fire-and-forget with the daemon's gate flag as its
+  `CanExecute`, so a second click cancelled the merge already in flight. The linked token also reached
+  RT-D1 step 3, which has neither an abandon nor a report arm: on the local path the `--ff-only` had
+  already landed on the user's own checkout, so only the RECORDING was stopped and the human was told
+  nothing was merged. Drives the SHIPPED `ConfirmMergeAsync` over the five new merge-leg seams
+  (`BeginMergeOverride`, `RecordMergeOverride`, `AbandonMergeOverride`, `MergeExecutorOverride`,
+  `ExternalMergeExecutorOverride`) plus `MergeToken` itself; each of the three parts fails with its own
+  half reverted, and the always-correct arm — a cancel BEFORE step 2 starts still hands the lease back —
+  is pinned too so the fix cannot swallow it)**,
   **`AgentStopFailureSurfacingTests` (F66 — `EndAgentAsync` swallowed every failure, so three surfaces
   reported a stop that never happened: the escalated-worker card's error branch was structurally
   unreachable while the worker kept its slot, the exit sweep logged a clean stop for jails still running,

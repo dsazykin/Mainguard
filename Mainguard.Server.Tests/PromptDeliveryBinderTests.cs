@@ -188,25 +188,35 @@ public sealed class PromptDeliveryBinderTests : IDisposable
 
         cli.Kill(); // completes the output stream: the echo wait now returns false with no delay at all
 
-        var started = System.Diagnostics.Stopwatch.StartNew();
         var delivery = await _binder.TrySendPromptAsync(_key, RealisticSteer, CancellationToken.None);
-        started.Stop();
 
         Assert.True(delivery.Submitted);
         Assert.False(delivery.Echoed);
 
-        // It returned fast, so the echo window did NOT lapse — and the writes were separated anyway.
-        Assert.True(
-            started.Elapsed < AgentCliBinder.PromptEchoWindow,
-            "the echo wait was expected to return instantly on a completed stream");
-
+        // BOTH halves are read off the interval BETWEEN THE TWO WRITES, which is the only interval either
+        // half is about. An outer stopwatch around the whole call also times the reaction wait, the
+        // fixture and every scheduling stall on the machine, and that is what made this test fail on a
+        // loaded CI runner — inside a jail, four xUnit threads deep — while the code path it exists to pin
+        // was exactly right. Timing the call to conclude something about one leg of it was the defect in
+        // the assertion, not a tolerance that needed widening.
         var writes = cli.Writes;
         Assert.Equal(2, writes.Count);
         var gap = writes[1].At - writes[0].At;
+
+        // (1) The writes were separated at all — the property under test.
         Assert.True(
             gap >= TerminalSubmit.TerminatorSeparation,
             $"the terminator followed the body after {gap.TotalMilliseconds:0}ms with nothing separating "
             + "them — one read at the CLI, and the CR is content rather than Enter");
+
+        // (2) And it was the FALLBACK that separated them, not a lapsed echo window — without which this
+        // test would pass on the 250 ms window alone and say nothing about the fallback being a guard
+        // rather than dead code. A lapsed window cannot produce a gap below its own length.
+        Assert.True(
+            gap < AgentCliBinder.PromptEchoWindow,
+            $"the two writes were {gap.TotalMilliseconds:0}ms apart, which is the echo window rather than "
+            + "the fallback — the stream was expected to be completed, so the echo wait should have "
+            + "returned instantly and this test proves nothing about the fallback");
     }
 
     /// <summary>
