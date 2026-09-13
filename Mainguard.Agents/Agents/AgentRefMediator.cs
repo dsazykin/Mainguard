@@ -135,12 +135,17 @@ public sealed class AgentRefMediator
     /// non-fast-forward tip be published? The provisioner sets it from the conflict parking's hand-back
     /// mark: a human chose "let the agent resolve", the worker finished the rebase, and the rewritten
     /// branch is what that human asked for. Null (the default, and every test rig's) means rule 2 is
-    /// absolute. Asked only on the non-fast-forward path, and the grant is consumed on the publish it lets
-    /// through (<see cref="RewriteConsumed"/>), so it authorises one rewrite, not a policy.
+    /// absolute.
+    ///
+    /// <para>Asked on EVERY publish, not only the non-fast-forward one, and the grant is consumed by the
+    /// first publish that moves the ref (<see cref="RewriteConsumed"/>) — see the F44 note at the call
+    /// site for why. That, plus the expiry the grant carries where it is stamped, is what makes this an
+    /// authorisation for one rewrite rather than a standing policy.</para>
     /// </summary>
     public Func<string, string, bool>? RewritePermitted { get; set; }
 
-    /// <summary>Invoked after a rewrite <see cref="RewritePermitted"/> allowed has been published.</summary>
+    /// <summary>Invoked when a publish that moved the ref found an armed
+    /// <see cref="RewritePermitted"/> grant — whether or not it needed the rewrite exception.</summary>
     public Action<string, string>? RewriteConsumed { get; set; }
 
     public AgentRefMediator(
@@ -291,6 +296,20 @@ public sealed class AgentRefMediator
                     repoHash, agentId, AgentRefPublishOutcome.Unchanged, oldSha, newSha);
             }
 
+            // AUDIT F44 (residual): read the permit ONCE, before the fast-forward test rather than inside
+            // its failing branch. It used to be consulted only where a rewrite needed excusing, and
+            // consumed only there too — so a plain fast-forward publish of the same branch sailed past an
+            // armed permit and left it armed for whatever came next. The permit is a human's
+            // authorisation about the branch AS THEY SAW IT, so the first publish that MOVES this ref
+            // spends it, whichever path that publish took.
+            //
+            // A refused or unchanged publish deliberately does NOT spend it: nothing moved, the world the
+            // human decided about is still the world, and burning the grant on a lost compare-and-swap
+            // would send them back to the card to re-authorise a decision that was never acted on. The
+            // other half of "one rewrite" — that a permit cannot sit armed indefinitely — is the grant's
+            // own expiry, next to where it is stamped (RebaseConflictParkingStore.HandBackLifetime).
+            var permitArmed = !daemonRebase && RewritePermitted?.Invoke(repoHash, agentId) == true;
+
             // Rule 2: fast-forward only. `merge-base --is-ancestor` is git's own answer to exactly this
             // question, and it is asked about the value we are about to compare-and-swap against.
             var handedBack = false;
@@ -302,7 +321,7 @@ public sealed class AgentRefMediator
                 // legitimately differ from what the mirror holds and neither the ancestor test nor the
                 // dropped-commit probe below can vouch for it. The human's click did. One rewrite, then
                 // the grant is consumed.
-                handedBack = !daemonRebase && RewritePermitted?.Invoke(repoHash, agentId) == true;
+                handedBack = permitArmed;
 
                 // ...and except for the daemon's OWN rebase, where the ancestor test is the wrong instrument
                 // and the property it stands for is asked directly instead. See PublishRebase.
@@ -334,7 +353,9 @@ public sealed class AgentRefMediator
                     "the compare-and-swap on the mirror's ref lost; another publish moved it concurrently");
             }
 
-            if (handedBack)
+            // F44: the ref moved, so an armed permit is spent — whether this publish needed it or simply
+            // fast-forwarded past it.
+            if (permitArmed)
             {
                 RewriteConsumed?.Invoke(repoHash, agentId);
             }

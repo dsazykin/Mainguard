@@ -13,8 +13,14 @@ namespace Mainguard.Agents.Agents;
 /// </summary>
 public static class AgentEnvironmentFactory
 {
-    public static IAgentEnvironment CreateForHost(IAuditLog auditLog, string? gatewayEndpoint) =>
+    /// <param name="log">Where the substrate's best-effort paths report what they could not do — the
+    /// sandbox engine's posture inspect and its in-place ceiling update. Both are non-fatal by design,
+    /// and a non-fatal failure with no diagnostic is how an operator ends up reading a ceiling in
+    /// Settings that no jail is actually running under. Null in the harnesses; the daemon passes its
+    /// own logger.</param>
+    public static IAgentEnvironment CreateForHost(
+        IAuditLog auditLog, string? gatewayEndpoint, Action<string>? log = null) =>
         OperatingSystem.IsMacOS()
-            ? new MacHostAgentEnvironment(auditLog: auditLog, gatewayEndpoint: gatewayEndpoint)
-            : new Wsl2AgentEnvironment(auditLog: auditLog, gatewayEndpoint: gatewayEndpoint);
+            ? new MacHostAgentEnvironment(auditLog: auditLog, gatewayEndpoint: gatewayEndpoint, log: log)
+            : new Wsl2AgentEnvironment(auditLog: auditLog, gatewayEndpoint: gatewayEndpoint, log: log);
 }

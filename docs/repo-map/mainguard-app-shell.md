@@ -1160,7 +1160,17 @@
     `InstalledCliOption` + the pure `ApiKeyProviderMap` (env-var name → `llm_<provider>` keystore key).
     `CliLoginVault.cs` — the host-side persistence format of the **CLI login round-trip** (a CLI's
     interactive login used to die with the jail's tmpfs `$HOME`, forcing a sign-in on every launch): one
-    OS-keyring entry per adapter kind (`cli_login_<id>`, JSON path→base64), `Parse` total (corrupt vault
+    OS-keyring entry per adapter kind **and repository** (`cli_login_<id>_<32 hex of the repo handle>`,
+    JSON path→base64). **F2 — the repo scope is new and it is the fix.** The entry was keyed by adapter
+    kind ALONE while the settings store beside it was already per repository, and that asymmetry is how
+    a login harvested from repo A's jail was restored into every other repo's jail of the same kind.
+    `KeystoreKeyFor(kind, repo)` returns null for a blank scope (a blank scope is not a wildcard) and
+    hashes the repo half unconditionally to a FIXED 32 characters, so no (kind, repo) pair can re-parse
+    as another's key; the repo half shares `CliSettingsStore.ScopeSegment`'s collapse rule for the kind
+    half rather than restating it. **Migration: none by choice** — `LegacyKeystoreKeyFor(kind)` names the
+    pre-F2 entry but nothing reads its value, because a read fallback would hand every repository the old
+    shared blob. The owner signs in once per repository; the stale entry is left in place (inert) rather
+    than deleted. `Parse` total (corrupt vault
     ⇒ empty ⇒ a fresh login, never a crash) and `MergeAndSerialize` folding a stop's harvest into the
     stored vault without erasing files the harvest didn't return; `DaemonBackedOrchestrator` restores
     the vault on `StartCoordinatorAsync` (`SpawnAgent.cli_credentials`) and persists `StopAgent`'s

@@ -60,6 +60,14 @@
     forward → on 429 `Report429` + PTY pause + backoff + retry + resume → settle actuals; the CLI only
     ever sees a delayed 200) + `ModelUsageParser` (provider usage → actual tokens) + the ASP.NET
     `ModelProxyMiddleware` fronting model hosts with per-agent-port attribution (`IAgentPortMap`).
+    **F46 — Google's header shape.** Identification (`ExtractPresentedToken`) read only `x-api-key` and
+    `authorization`, and injection was Anthropic-or-Bearer; gemini-cli sends `x-goog-api-key`, so a
+    confined Gemini agent resolved to no agent, found no upstream binding, and fell through unfronted —
+    404 per model call, for an adapter the table calls confinable and verified. `x-goog-api-key` is now
+    read on the way in, dropped from what is relayed, and written on the way out for a `googleapis.com`
+    upstream (`IsGoogleHost`). Pinned by `GatewayUpstreamBindingTests` (unit) and
+    `GatewayConfinementDockerTests.ConfinedGeminiJail_…` (a real jail, since the existing Docker
+    coverage used the Anthropic shape only).
   - **`Runtime/GatewayHostedService.cs`** — runs the RT-D1 boot sequence + the token-bucket pump loop on
     host start.
   - **`Runtime/WorkerReadinessHostedService.cs`** — the boot slot whose ENTIRE job is to **resolve**
@@ -281,7 +289,30 @@
     seed arbitrary agent-home files), and `HarvestCliCredentialsAsync` reads those files back out of the
     jail's tmpfs `$HOME` (base64 over the exec pipe, best-effort — a failed harvest never blocks a stop)
     so `AgentSpawnService.StopAsync` can hand them to the client for the host OS keychain
-    (`AgentStopResult`). Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
+    (`AgentStopResult`). **F2 — the credential leg now has the two protections the settings leg had:**
+    a size ceiling checked IN THE SHELL (`AdapterCredentialPolicy.MaxBytesFor`, the same `wc -c` script
+    the settings harvest uses, so an oversized file is never read into the daemon's memory) and REFUSED
+    rather than truncated; and a declared credential path that is really a settings file (gemini-cli's /
+    qwen-code's `settings.json`) is put through `CliSettingsGrantScrub.Scrub` and held to the settings
+    ceiling WHERE IT SITS, in both directions (`FilterCliCredentials` applies the same pair on restore,
+    so an already-poisoned store is neutralised with no migration). **F2's last clause: EVERY credential
+    file carries `mcpServers` command definitions** — `.claude.json` does, and so does
+    `~/.gemini/settings.json`, which is where gemini-cli defines them. One private
+    `CarryCredentialContent(path, content, leg, kind, log, reportWhatWasFiltered)` is now the single
+    filter BOTH legs call: the mount scrub where the path is settings-shaped, then
+    `CliSettingsGrantScrub.StripExecutableConfig` on everything, which removes only the keys that name a
+    program and leaves every other key alone (a targeted strip rather than an allowlist: these are the
+    files that say the user is logged in, and an allowlist over them cannot be proved safe without a live
+    account — a claude-shaped one would drop gemini's `selectedAuthType`). The settings-shaped files got
+    the scrub ALONE until the composition landed, so the `mcpServers` an attended gemini jail wrote
+    travelled into every later Managed worker of that repo. The unreviewed top-level key NAMES are logged
+    by `LogUnreviewedCredentialKeys` on both legs — names only, already reduced to plain identifiers,
+    never a value — for the paths `AdapterCredentialPolicy.ReportsUnreviewedKeys` admits; the two "this
+    file changed" Information lines fire on the HARVEST only, because on the restore leg the same stored
+    blob is re-filtered on every spawn and the line would repeat forever saying what the harvest already
+    said. `BuildSecrets`/`FilterCliCredentials` take an optional `ILogger`
+    for that; the spawn chain passes the daemon's. WHETHER either harvest may run is
+    the caller's decision — see `CliHarvestPolicy`. Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
     refused outright (`Conflict`), so a conflicted keep-alive rebase used to put one raw
     `Docker.DotNet.DockerApiException` stack trace per declared path into the operator log — a warning
     meaning "as expected", which is how the warnings that mean something stop being read. A frozen jail is
@@ -428,11 +459,18 @@
     harvested CLI login, **nor any CLI SETTINGS**, and seeds none of them). The settings gate is the
     stronger of the three: an inherited permission allowlist is inherited *execution*, so a jail holding
     a pull request's code must start asking about every command. `cliSettings` carries the repo's saved
-    approvals in; `CliSettingsHarvestPolicy` (in this file) gates them flowing back OUT — only a
-    HUMAN-ATTENDED session is harvested, because a `Managed` worker's terminal is daemon-locked
-    read-only, so anything in its settings file was written by the agent, not approved by a person.
-    Restore is deliberately wider than harvest (a Managed worker still receives the repo's approvals or
-    it stalls on prompts nobody can answer). `AgentStopResult` carries `CliSettings` + `RepoHandle` so
+    approvals in; **`CliHarvestPolicy`** (in this file; was `CliSettingsHarvestPolicy` until it stopped
+    being only about settings) gates them flowing back OUT — only a HUMAN-ATTENDED session is harvested,
+    because a `Managed` worker's terminal is daemon-locked read-only, so anything in its settings file
+    was written by the agent, not approved by a person. Restore is deliberately wider than harvest (a
+    Managed worker still receives the repo's approvals or it stalls on prompts nobody can answer).
+    **F2 — the same gate now covers CREDENTIALS** (`HarvestCredentialsIfAttendedAsync`, at both the live
+    `HarvestCredentialsAsync` and the `StopAsync` call sites). It did not before, and the asymmetry made
+    no sense in either direction it was argued: a coordinator's workers are spawned `Managed` running
+    real adapter kinds, so every one of them WAS harvested — the daemon read CLI login files out of an
+    unattended jail, on the word of the only party in it, and filed them in the host's durable
+    credential store. An OAuth refresh token is strictly more dangerous than a command allowlist, and it
+    was the one with no gate. `AgentStopResult` carries `CliSettings` + `RepoHandle` so
     the client files them under the right repository rather than whichever one is open. See
     [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md).
     **Phase 2** adds `heldTaskTitle`/`heldTaskPrompt`/
@@ -581,6 +619,18 @@
     kind) **CLI settings** (`RememberCliSettings`/`TryGetCliSettings`), so an IPC-spawned worker inherits
     the repo's approved-command list instead of stalling on prompts. A blank repo handle forms no scope
     and is dropped rather than collapsed into a shared bucket (MG-6). Never persisted, never logged.
+    **F50 — it now evicts**: `ForgetRepo(repo)` when the repo has no sessions left at all, and
+    `Forget(repo, kind)` when no session of that kind survives AND **no coordinator survives in the
+    repo** (both driven from `AgentSpawnService.StopAsync`, after the harvest that legitimately refreshes
+    it), plus `HasAnythingFor(repo, kind)` as the observable a test asserts on. Nothing evicted anything
+    before, so a provider key and a set of harvested OAuth files stayed resident for the daemon's whole
+    lifetime and stopping every agent left them there. The **coordinator** half of the per-kind condition
+    is load-bearing and was missing in the first cut: `SpawnWorkerAsync` takes the kind from the shim, so
+    a live coordinator spawns workers of ANY installed kind — a user who ran one codex session and
+    stopped it would otherwise leave the claude-code coordinator's every later codex worker booting with
+    no provider key and no login. Pinned end to end by
+    `CoordinatorSpawnKindTests.AWorkerOfAnotherKind_StillGetsThatKindsKey_…` (the key really reaches the
+    worker's jail) and at the cache by `CliSettingsBoundaryTests`' two cross-kind tests.
 - **`Runtime/CoordinatorSpawnGate.cs`** (**MG-2**) — the pure admission decision in front of the
   coordinator's in-jail spawn shim:
   `Evaluate(activeManagedWorkers, maxActiveWorkers, admission, planGate?)` returns a refusal reason or

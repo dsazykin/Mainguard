@@ -44,9 +44,11 @@ public static class SandboxImageVersions
     public const string EgressProxyName = "mainguard-egress-proxy";
 
     /// <summary>Source hash of <c>images/mainguard-agent-base/</c> (curated input: Dockerfile).
-    /// Moved by the TARGETARCH parametrization (per-arch nix-installer/devbox pins for the
-    /// macos-host substrate's arm64 builds); regenerated via the guard test's printed hash.</summary>
-    public const string AgentBase = "5b56114f0d002798d3e1b2e6344d8db463a509664f94099d28244d4a9cbcd4fe";
+    /// Last moved by the audit F33 correction to the header's <c>/nix</c> description (comment-only —
+    /// no build step changed, but the hash is over the FILE, which is the point of hashing the file);
+    /// before that by the TARGETARCH parametrization (per-arch nix-installer/devbox pins for the
+    /// macos-host substrate's arm64 builds). Regenerated via the guard test's printed hash.</summary>
+    public const string AgentBase = "97a92bade4b4ce988bf2d9b97bb9fd70465f201ad749cc2e6441437b855b83f1";
 
     /// <summary>Source hash of <c>images/mainguard-egress-proxy/</c> (curated inputs: Dockerfile,
     /// entrypoint.sh, reload.sh).</summary>
