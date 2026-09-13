@@ -35,12 +35,45 @@ public sealed class TerminalInputSerializationRpcTests : IClassFixture<DaemonFix
     /// The constraint itself, pinned on the real stack: two concurrent writes to one request stream
     /// throw. If gRPC ever serializes internally this test goes green-for-the-wrong-reason, so it
     /// asserts the exception rather than merely tolerating it — a change here is a signal, not noise.
+    ///
+    /// <para><b>It drains the response stream, and it has a deadline (2026-09-12).</b> It did neither,
+    /// and that is what hung CI for six hours: <c>Attach</c> is a DUPLEX stream and the daemon echoes
+    /// every input back, so 64 unread 64 KiB echoes filled the response pipe, the server's write blocked
+    /// on <c>ResponseBodyPipeWriter.FlushAsync</c>, it stopped draining the REQUEST stream, and the
+    /// client's surviving <c>WriteAsync</c> blocked on back-pressure — both ends parked with no deadline
+    /// on either. Whether it wedged was a race between "a second write overlaps and throws" and "enough
+    /// bytes land to fill the pipe", so it passed in 9 s most of the time and, when it lost, took the
+    /// whole <c>Mainguard.Server.Tests</c> run with it: the collection runner waits for it forever, so
+    /// every later test in the assembly is simply never reported (run 34259331113 — 367 of 1011 results,
+    /// then nothing until the 6 h job timeout cancelled the job). Draining is also the honest shape: a
+    /// real client reads what it is sent. The deadline is the belt — a future regression here must FAIL,
+    /// not hang.</para>
     /// </summary>
     [Fact]
     public async Task RawRequestStream_ConcurrentWrites_ThrowTheOneInFlightWriteConstraint()
     {
         var client = new TerminalService.TerminalServiceClient(_daemon.CreateChannel());
-        using var call = client.Attach(_daemon.AuthHeaders());
+        using var drain = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        using var call = client.Attach(
+            _daemon.AuthHeaders(), deadline: DateTime.UtcNow.AddSeconds(60), cancellationToken: drain.Token);
+
+        // The reader. Without it the daemon's echo back-pressures the request stream and every writer
+        // below blocks forever; with it the constraint under test is still what decides the outcome.
+        var reader = Task.Run(async () =>
+        {
+            try
+            {
+                while (await call.ResponseStream.MoveNext(drain.Token))
+                {
+                }
+            }
+            catch (Exception)
+            {
+                // The call is torn down at the end of the test (dispose, deadline or cancellation); how
+                // the read loop learns that is not what this test measures.
+            }
+        });
+
         await call.RequestStream.WriteAsync(new TerminalInput { AgentId = "agent-race" });
 
         var start = new SemaphoreSlim(0, 64);
@@ -62,10 +95,13 @@ public sealed class TerminalInputSerializationRpcTests : IClassFixture<DaemonFix
         })).ToArray();
 
         start.Release(64);
-        await Task.WhenAll(writers);
+        await Task.WhenAll(writers).WaitAsync(TimeSpan.FromSeconds(60));
 
         Assert.Contains(failures, ex =>
             ex is InvalidOperationException && ex.Message.Contains("previous write is in progress"));
+
+        drain.Cancel();
+        await reader.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     /// <summary>
