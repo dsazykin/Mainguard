@@ -204,10 +204,23 @@ public sealed class PromptDeliveryBinderTests : IDisposable
         Assert.Equal(2, writes.Count);
         var gap = writes[1].At - writes[0].At;
         Assert.True(
-            gap >= TerminalSubmit.TerminatorSeparation,
+            gap >= TerminalSubmit.TerminatorSeparation - TimerGranularity,
             $"the terminator followed the body after {gap.TotalMilliseconds:0}ms with nothing separating "
             + "them — one read at the CLI, and the CR is content rather than Enter");
     }
+
+    /// <summary>
+    /// Slack for the fact that <c>Task.Delay</c> is not a hard floor: it is free to complete a timer
+    /// tick EARLY relative to the clock the write stamps are taken from, so a 50 ms separation is
+    /// routinely observed as 49.x ms. This is the only assertion in the file sitting exactly ON the
+    /// separation — every other path has already spent the 250 ms echo window, so it clears the bar by
+    /// an order of magnitude — and it is why this test, alone, flaked in CI on trees that were fine.
+    ///
+    /// <para>It is slack for the CLOCK, not for the guard: half a millisecond is far below anything a
+    /// PTY can coalesce, while a regression that drops the separation altogether reports a gap of ~0 ms
+    /// and still fails. Widening this past a tick would start accepting real defects.</para>
+    /// </summary>
+    private static readonly TimeSpan TimerGranularity = TimeSpan.FromMilliseconds(2);
 
     /// <summary>
     /// The case the echo-gated fallback missed: a CLI that is <b>mid-turn</b> streams output whether or
