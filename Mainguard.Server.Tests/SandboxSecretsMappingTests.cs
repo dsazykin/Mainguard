@@ -1,5 +1,9 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
 using Mainguard.Agents.Agents.Adapters;
 using Mainguard.Server.Runtime;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace Mainguard.Server.Tests;
@@ -156,5 +160,145 @@ public sealed class SandboxSecretsMappingTests
 
         Assert.NotNull(back);
         Assert.Equal(new[] { ".claude/.credentials.json", ".claude.json" }, back!.CredentialPaths);
+    }
+
+    // ---- F2's last clause: .claude.json is filtered on the way IN as well ------------------------
+
+    /// <summary>A stored <c>.claude.json</c> as an owner's keychain holds it: a login, and a block naming
+    /// programs to launch.</summary>
+    private const string StoredClaudeJson = """
+        {
+          "oauthAccount": { "emailAddress": "owner@example.com" },
+          "mcpServers": { "grabber": { "command": "/tmp/grab" } }
+        }
+        """;
+
+    /// <summary>
+    /// <b>The restore leg matters on its own.</b> A blob harvested before this filter existed is already
+    /// sitting in the owner's keychain, and it would keep being restored into every later jail of that
+    /// repository until some future attended stop overwrote it. Filtering the way IN neutralises every
+    /// stored copy immediately, with no migration — the same argument the settings leg makes.
+    /// </summary>
+    [Fact]
+    public void FilterCliCredentials_StripsTheProgramNamingKeys_OutOfAStoredBlob()
+    {
+        var kept = SandboxAgentLauncher.FilterCliCredentials(
+            new[] { File(".claude.json", StoredClaudeJson) },
+            MarkerWithCredentialPaths(".claude.json"));
+
+        var carried = Encoding.UTF8.GetString(Assert.Single(kept!).Content);
+        Assert.DoesNotContain("mcpServers", carried, StringComparison.Ordinal);
+        Assert.DoesNotContain("/tmp/grab", carried, StringComparison.Ordinal);
+        // The negative control: the login the file exists to carry is still in it, so the assertion
+        // above cannot be satisfied by a filter that simply dropped the file.
+        Assert.Contains("owner@example.com", carried, StringComparison.Ordinal);
+    }
+
+    /// <summary>The production restore path, not just the filter it calls: this is the method the spawn
+    /// chain uses to build what a jail is given.</summary>
+    [Fact]
+    public void BuildSecrets_RestoresTheLogin_WithoutTheProgramDefinitions()
+    {
+        var secrets = SandboxAgentLauncher.BuildSecrets(
+            null, MarkerWithCredentialPaths(".claude.json"),
+            cliCredentials: new[] { File(".claude.json", StoredClaudeJson) });
+
+        var carried = Encoding.UTF8.GetString(Assert.Single(secrets.CliCredentialFiles!).Content);
+        Assert.DoesNotContain("mcpServers", carried, StringComparison.Ordinal);
+        Assert.Contains("owner@example.com", carried, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <b>The answer to "a denylist rots as the vendor adds keys."</b> An unreviewed key is CARRIED — this
+    /// is a targeted strip, and dropping an unknown key out of a login file is the risk that could not be
+    /// proved safe without a live account — but its NAME is logged, so a vendor that ships a new
+    /// executable key surfaces instead of passing silently. The name and nothing else: the value beside
+    /// it is exactly the kind of thing a credential file holds.
+    /// </summary>
+    [Fact]
+    public void FilterCliCredentials_LogsTheUnreviewedKeyNames_AndNeverTheValues()
+    {
+        var log = new RecordingLogger();
+
+        var kept = SandboxAgentLauncher.FilterCliCredentials(
+            new[] { File(".claude.json", """{"someFutureVendorKey":"sk-ant-not-a-real-secret"}""") },
+            MarkerWithCredentialPaths(".claude.json"),
+            log);
+
+        var carried = Encoding.UTF8.GetString(Assert.Single(kept!).Content);
+        Assert.Contains("someFutureVendorKey", carried, StringComparison.Ordinal);
+
+        var line = Assert.Single(log.Lines);
+        Assert.Contains("someFutureVendorKey", line, StringComparison.Ordinal);
+        Assert.DoesNotContain("sk-ant", line, StringComparison.Ordinal);
+    }
+
+    /// <summary>The ordinary contents of a credential file say nothing, or the line above would be one
+    /// per restore and nobody would read it.</summary>
+    [Fact]
+    public void FilterCliCredentials_SaysNothingAboutAnOrdinaryLogin()
+    {
+        var log = new RecordingLogger();
+
+        SandboxAgentLauncher.FilterCliCredentials(
+            new[] { File(".claude.json", StoredClaudeJson) },
+            MarkerWithCredentialPaths(".claude.json"),
+            log);
+
+        Assert.Empty(log.Lines);
+    }
+
+    /// <summary>
+    /// <b>The line has to be worth reading.</b> opencode's <c>auth.json</c> is keyed by PROVIDER ID, so
+    /// every one of its top-level keys is "unreviewed" by construction — the daemon logged the owner's
+    /// perfectly ordinary provider list on every harvest AND every restore, which is how a security
+    /// signal becomes a line people scroll past. The file is filtered exactly as before; only the report
+    /// is quiet, and only for the files that have no inventory to be unreviewed against.
+    /// </summary>
+    [Fact]
+    public void FilterCliCredentials_SaysNothingAboutAProviderKeyedAuthFile()
+    {
+        const string Path = ".local/share/opencode/auth.json";
+        var log = new RecordingLogger();
+
+        var kept = SandboxAgentLauncher.FilterCliCredentials(
+            new[] { File(Path, """{"anthropic":{"type":"oauth","refresh":"rt"},"openai":{"type":"api"}}""") },
+            MarkerWithCredentialPaths(Path),
+            log);
+
+        Assert.Empty(log.Lines);
+        // The negative control: it is quiet because the report was not asked for, not because the file
+        // was dropped on the floor.
+        Assert.Contains("anthropic", Encoding.UTF8.GetString(Assert.Single(kept!).Content), StringComparison.Ordinal);
+    }
+
+    /// <summary>codex's <c>.codex/auth.json</c> shares the file NAME and not the shape: its keys are a
+    /// fixed schema that IS inventoried, so it keeps the report. A name-only match would have silenced
+    /// the file that most deserves it.</summary>
+    [Fact]
+    public void AnInventoriedAuthFile_StillReportsItsUnreviewedKeys()
+    {
+        var log = new RecordingLogger();
+
+        SandboxAgentLauncher.FilterCliCredentials(
+            new[] { File(".codex/auth.json", """{"someFutureVendorKey":1}""") },
+            MarkerWithCredentialPaths(".codex/auth.json"),
+            log);
+
+        Assert.Contains("someFutureVendorKey", Assert.Single(log.Lines), StringComparison.Ordinal);
+    }
+
+    /// <summary>Captures the rendered log line, which is what a sink would actually write.</summary>
+    private sealed class RecordingLogger : ILogger
+    {
+        public List<string> Lines { get; } = new();
+
+        IDisposable? ILogger.BeginScope<TState>(TState state) => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) => Lines.Add(formatter(state, exception));
     }
 }
