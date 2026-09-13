@@ -40,27 +40,31 @@ public sealed class PromptDeliveryBinderTests : IDisposable
         + "record the result in your mainguard-plan commit.";
 
     /// <summary>
-    /// The floor below is compared with one timer quantum of slack, and that is <b>not</b> a loosened
-    /// tolerance hiding a real gap.
+    /// Slack for the fact that <c>Task.Delay</c> is not a hard floor: it is free to complete a timer
+    /// tick EARLY relative to the clock the write stamps are taken from, so a 50 ms separation is
+    /// routinely observed as 49.x ms. <c>BoundTerminalSession</c> separates the two writes with
+    /// <c>Task.Delay(TerminatorSeparation)</c>, which completes on the runtime's timer wheel, while
+    /// <see cref="RawModeCliDouble"/> stamps each write with <c>DateTime.UtcNow</c>; the two need not
+    /// agree to the millisecond, and CI read <b>50 ms</b> for a 50 ms separation and failed the
+    /// <c>&gt;=</c> by less than half a millisecond. That is the assertion breaking at its own floor,
+    /// not the code failing to separate anything.
     ///
-    /// <para><c>BoundTerminalSession</c> separates the two writes with <c>Task.Delay(TerminatorSeparation)</c>,
-    /// which completes on the runtime's timer wheel; <see cref="RawModeCliDouble"/> stamps each write with
-    /// <c>DateTime.UtcNow</c>, which is the system clock. The two need not agree to the millisecond, and a
-    /// delay that really did elapse can be measured at marginally under its own length — CI read <b>50 ms</b>
-    /// for a 50 ms separation and failed the <c>&gt;=</c> by less than half a millisecond, which is the
-    /// assertion breaking at its own floor rather than the code failing to separate anything.</para>
+    /// <para>It is slack for the CLOCK, not for the guard: half a millisecond is far below anything a
+    /// PTY can coalesce, while a regression that drops the separation altogether reports a gap of ~0 ms
+    /// — as the mutation check confirms when the fallback is deleted from
+    /// <c>SubmitLineAndAwaitOutputAsync</c> — and still fails. Widening this past a tick would start
+    /// accepting real defects.</para>
     ///
-    /// <para>What these assertions distinguish is "separated by the deliberate wait" from "not separated at
-    /// all", and the unseparated case is two writes issued back to back — sub-millisecond, as the mutation
-    /// check confirms when the fallback is deleted from <c>SubmitLineAndAwaitOutputAsync</c>. 5 ms is ten
-    /// times the shortfall ever observed and a tenth of the separation, so it cannot mask the defect and
-    /// does stop two disagreeing clocks failing a correct run.</para>
+    /// <para>Only the completed-stream test sits exactly ON the separation; the other two paths have
+    /// already spent the 250 ms echo window and clear the bar by an order of magnitude. The floor is
+    /// nonetheless expressed once and used by all three, so no assertion is left sitting on a bound it
+    /// cannot honestly measure.</para>
     /// </summary>
-    private static readonly TimeSpan ClockQuantum = TimeSpan.FromMilliseconds(5);
+    private static readonly TimeSpan TimerGranularity = TimeSpan.FromMilliseconds(2);
 
-    /// <summary>The separation floor as an assertion can honestly measure it — see <see cref="ClockQuantum"/>.</summary>
+    /// <summary>The separation floor as an assertion can honestly measure it — see <see cref="TimerGranularity"/>.</summary>
     private static readonly TimeSpan MeasurableSeparationFloor =
-        TerminalSubmit.TerminatorSeparation - ClockQuantum;
+        TerminalSubmit.TerminatorSeparation - TimerGranularity;
 
     public PromptDeliveryBinderTests()
     {

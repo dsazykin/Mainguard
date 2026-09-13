@@ -54,19 +54,32 @@ public enum AdapterProvenanceLevel
     NpmRegistrySignature,
 
     /// <summary>
-    /// Everything in <see cref="NpmRegistrySignature"/>, plus a published <b>build provenance</b>
-    /// attestation (SLSA <c>https://slsa.dev/provenance/v1</c>) whose in-toto subject digest binds to
-    /// the exact tarball we hold — i.e. the publisher's CI, not a laptop, produced these bytes.
+    /// Everything in <see cref="NpmRegistrySignature"/>, plus the <b>PRESENCE</b> of a published SLSA
+    /// build-provenance attestation (<c>https://slsa.dev/provenance/v1</c>) whose in-toto subject digest
+    /// names the exact tarball we hold.
     ///
-    /// <para>Only packages whose publisher opted into <c>npm publish --provenance</c> have this. See the
-    /// per-adapter notes in <c>adapters.starter.json</c> for who actually does.</para>
+    /// <para><b>Read the name as "an attestation is published and it names these bytes", not as "build
+    /// provenance verified" (audit F48).</b> That distinction is the whole of this rung's honesty, and
+    /// it used to be buried under a paragraph of prose that began by asserting "the publisher's CI, not
+    /// a laptop, produced these bytes" — which is precisely what is NOT established here.</para>
     ///
-    /// <para><b>Stated limit:</b> Mainguard checks that the attestation exists and that it is bound by
-    /// digest to our bytes. It does <b>not</b> validate the Sigstore certificate chain (Fulcio) or the
-    /// Rekor inclusion proof in-process — that needs a full Sigstore verifier, and the honest place for
-    /// it today is <c>npm audit signatures</c> in the manual matrix. So this rung's cryptographic root
-    /// is still the pinned npm key of the rung below; the attestation adds a build binding on top of
-    /// it, and its absence is a hard refusal. Do not read it as full SLSA verification.</para>
+    /// <para><b>What is actually checked:</b> the registry signature of the rung below (real
+    /// cryptography, against a compiled-in npm key), and then a JSON walk — the attestations endpoint
+    /// offers a document whose <c>predicateType</c> is the SLSA one, and the statement base64'd inside
+    /// its DSSE envelope lists a <c>subject[].digest.sha512</c> equal to the signed integrity.</para>
+    ///
+    /// <para><b>What is NOT checked, and why that matters:</b> the DSSE envelope's own SIGNATURE, the
+    /// Fulcio certificate chain that would say whose key made it, and the Rekor inclusion proof that
+    /// would say it was logged. The attestation document is therefore unauthenticated: anything that can
+    /// serve the attestations endpoint can serve a document naming any digest it likes. The one thing
+    /// this rung adds over <see cref="NpmRegistrySignature"/> is that such a document EXISTS and is
+    /// digest-bound — a change-detector ("a package that stops publishing provenance is something we
+    /// notice"), not an origin proof. Real verification needs a Sigstore trust root — pinned Fulcio
+    /// roots, Rekor's key, CT — and until Mainguard carries one, <c>npm audit signatures</c> in the
+    /// manual matrix is the honest place for it.</para>
+    ///
+    /// <para>Only packages whose publisher opted into <c>npm publish --provenance</c> have an
+    /// attestation at all. See the per-adapter notes in <c>adapters.starter.json</c> for who does.</para>
     /// </summary>
     NpmBuildProvenance,
 }
@@ -76,9 +89,12 @@ public enum AdapterProvenanceLevel
 /// must never share a spelling.</summary>
 public enum NpmProvenanceOutcome
 {
-    /// <summary>A build-provenance attestation was present and digest-bound to these bytes, and the
-    /// registry signature held under a pinned key.</summary>
-    BuildProvenanceVerified,
+    /// <summary>The registry signature held under a pinned key AND a build-provenance attestation was
+    /// published and digest-bound to these bytes. Named for what happened (audit F48): the attestation's
+    /// own DSSE signature, its Fulcio certificate and its Rekor proof are NOT checked, so this is
+    /// strictly <see cref="RegistrySignatureVerified"/> plus a presence-and-binding observation — it is
+    /// not "build provenance verified", and the previous spelling said it was.</summary>
+    BuildProvenanceAttestationPresent,
 
     /// <summary>The registry signature held under a pinned key and covered these exact bytes. Not
     /// publisher provenance — see <see cref="AdapterProvenanceLevel.NpmRegistrySignature"/>.</summary>
@@ -99,9 +115,11 @@ public sealed record NpmProvenanceVerdict(NpmProvenanceOutcome Outcome, string R
     /// <summary>True only for <see cref="NpmProvenanceOutcome.Refused"/>. Callers refuse on this.</summary>
     public bool MustRefuse => Outcome == NpmProvenanceOutcome.Refused;
 
-    /// <summary>True when something cryptographic actually held. <see cref="NpmProvenanceOutcome.KnownUnverified"/>
-    /// is deliberately excluded — an unverified adapter must never read as verified anywhere.</summary>
-    public bool IsVerified => Outcome is NpmProvenanceOutcome.BuildProvenanceVerified
+    /// <summary>True when something cryptographic actually held — which, for BOTH passing outcomes, is
+    /// the npm registry signature under a pinned key and nothing more.
+    /// <see cref="NpmProvenanceOutcome.KnownUnverified"/> is deliberately excluded: an unverified
+    /// adapter must never read as verified anywhere.</summary>
+    public bool IsVerified => Outcome is NpmProvenanceOutcome.BuildProvenanceAttestationPresent
         or NpmProvenanceOutcome.RegistrySignatureVerified;
 }
 
@@ -332,6 +350,18 @@ public static class NpmProvenancePolicy
     /// attestation at all, so it is explicitly NOT accepted as build provenance.</summary>
     public const string NpmPublishPredicate = "https://github.com/npm/attestation/tree/main/specs/publish/v0.1";
 
+    /// <summary>
+    /// The sentence every build-provenance verdict carries, stating the limit in the same breath as the
+    /// claim (audit F48). A constant rather than inline prose so a test can pin it: the failure mode
+    /// this guards against is not someone arguing the limit away, it is someone tidying the caveat out
+    /// of a message and leaving a sentence that reads like full SLSA verification.
+    /// </summary>
+    public const string BuildProvenanceLimitation =
+        "NOT VERIFIED: the attestation's own DSSE signature, its Fulcio certificate chain and its Rekor "
+        + "inclusion proof are not checked in-process, so the attestation document is unauthenticated — "
+        + "its presence and digest binding are a change-detector, not proof of who built these bytes. "
+        + "The cryptographic root here is the pinned npm registry key alone.";
+
     public static NpmProvenanceVerdict Decide(
         string adapterId,
         AdapterProvenanceLevel declared,
@@ -407,18 +437,18 @@ public static class NpmProvenancePolicy
                 + "Refusing to install.");
         }
 
-        return new NpmProvenanceVerdict(NpmProvenanceOutcome.BuildProvenanceVerified,
-            $"'{adapterId}': npm build-provenance attestation ({SlsaProvenancePredicate}) is published for "
-            + $"{evidence.Package}@{evidence.Version} and its in-toto subject digest binds to these exact "
-            + $"bytes; the registry signature also verified under pinned key {NpmSigningKeys.CurrentKeyId}. "
-            + "NOTE: the Sigstore certificate chain and Rekor inclusion proof are NOT validated in-process "
-            + "(see AdapterProvenanceLevel.NpmBuildProvenance) — `npm audit signatures` covers that in the "
-            + "manual matrix.");
+        return new NpmProvenanceVerdict(NpmProvenanceOutcome.BuildProvenanceAttestationPresent,
+            $"'{adapterId}': npm registry signature verified under pinned key {NpmSigningKeys.CurrentKeyId} "
+            + $"and the tarball matches the signed integrity. A build-provenance attestation "
+            + $"({SlsaProvenancePredicate}) is also published for {evidence.Package}@{evidence.Version} and "
+            + $"names these exact bytes as its subject. {BuildProvenanceLimitation}");
     }
 
     private static string Describe(AdapterProvenanceLevel level) => level switch
     {
-        AdapterProvenanceLevel.NpmBuildProvenance => "an npm build-provenance attestation",
+        AdapterProvenanceLevel.NpmBuildProvenance =>
+            "a published npm build-provenance attestation naming these exact bytes (presence and digest "
+            + "binding only — its DSSE signature is not verified)",
         AdapterProvenanceLevel.NpmRegistrySignature => "a pinned-key npm registry signature",
         _ => "no provenance",
     };

@@ -17,7 +17,13 @@ The three installer projects. `Mainguard.Installer.Elevated` is the ONLY elevate
 - **`installer/Mainguard.Installer.Elevated`** (P2-21) — the tiny elevated helper (the only elevated
   component): does EXACTLY the two enumerated privileged actions (enable the two Windows features via
   the surfaced PowerShell; register the elevated resume Scheduled Task), then reports via exit code +
-  `ElevatedHelperResult` JSON. No other privileged work ever moves here (plan §7). **P2-48:** `WinExe`
+  `ElevatedHelperResult` JSON. No other privileged work ever moves here (plan §7). **Audit F58:** BOTH
+  argv paths are now validated before anything privileged happens — `--resume-target` through
+  `TrustedExecutablePath` as before, and `--result` through the new `TrustedResultPath`, FIRST of all
+  (every `WriteResult` on the refusal paths writes to that value, so validating it later would leave the
+  administrator-level arbitrary-write primitive intact on exactly the failure path). **Audit F57:** the
+  resume target's signature check now goes through `PayloadSignatureGate`, so a `NotAvailable` verdict is
+  fatal on a build that can actually check rather than a shrug. **P2-48:** `WinExe`
   + windowless child processes (no console flash); an `app.manifest` (`requireAdministrator`) +
   branded version resource (`AssemblyTitle`="Mainguard Setup") make the UAC consent dialog show a
   trustworthy product name, and the `SignMainguardExecutables`/pack signing hooks upgrade it to a
@@ -40,7 +46,20 @@ The three installer projects. `Mainguard.Installer.Elevated` is the ONLY elevate
   `comm` is exactly `mainguardd`, what P2-05 `pgrep -x mainguardd` matches); the `Dockerfile` `COPY`s
   it to `/opt/mainguard/` and ships **`mainguardd.service` (sets `Environment=HOME=/home/mainguard`
   explicitly as belt-and-braces; all per-user daemon state — token, SQLite, keyring, leader registry,
-  plan store — lands under `$HOME/.mainguard` via `MainguardPaths`)** enabled; `/etc/wsl.conf` sets
+  plan store — lands under `$HOME/.mainguard` via `MainguardPaths`)** enabled. **The unit also
+  supplies the key-ring passphrase (B1/F53),** without which the DataProtection key ring under
+  `$HOME/.mainguard/Keyring` has no at-rest protector on Linux and the daemon now refuses to boot
+  rather than fall back to an audit journal that forgets everything at shutdown: `ExecStartPre=+`
+  runs **`provision-keyring-passphrase.sh`** as root (the `+` prefix; the service itself is
+  `User=mainguard`), which mints ONE random passphrase per INSTALL — never per image, since the
+  tarball is byte-reproducible and a baked-in secret would be identical on every machine — into a
+  root-owned `0640` `/etc/mainguard/keyring.passphrase` and never regenerates it (a new passphrase
+  would make the existing ring unreadable). The unit passes the PATH via
+  `Environment=MAINGUARD_KEYRING_PASSPHRASE_FILE`, never the secret itself, because an `Environment=`
+  secret is readable through `systemctl show`, `/proc/<pid>/environ` and every child process the
+  daemon spawns; an operator with a stronger custody model points that variable at their own file
+  (e.g. a systemd `LoadCredential=` target) and drops the `ExecStartPre`. The script is in
+  `build.sh`'s `INPUT_SPECS`, so it is covered by `BUILD_INPUTS_HASH` like every other COPY'd input; `/etc/wsl.conf` sets
   `[boot] systemd=true` (+ the dockerd boot command + `mainguard` default user) so systemd starts the
   loopback-`127.0.0.1:5250` daemon on first boot alongside dockerd (WSL2 `localhostForwarding` reaches
   it from the Windows app). `packages.pinned.txt` gained `systemd`/`systemd-sysv`, and (P2-48)
@@ -63,6 +82,19 @@ The three installer projects. `Mainguard.Installer.Elevated` is the ONLY elevate
   `/p:BuildElevatedStage=false` shipped the escalation and passed the smoke green. That workflow also
   runs `pack.ps1 -Channel client|pro -DryRun` (the `velopack-wiring` job), which is the only CI exercise
   the release script gets, plus a canary check that `-DryRun` never prints the signing password.
+  **Audit F57 — the script declares itself a release.** Every publish (both channels) now carries
+  `/p:MainguardPinsRequired=true`, which is what ARMS the `MG0057` guard in `Mainguard.Agents.csproj`,
+  and a non-`-DryRun` run with no resolvable pin is REFUSED before anything is built. Until this, the
+  script passed `/p:MainguardPinnedThumbprints` only when a pin happened to resolve and passed no stamp
+  at all, so `pack.ps1 -Channel pro` with no certificate shipped a pin-less Pro head —
+  `UnsignedBuildSignatureVerifier`, every privileged promote proceeding on `NotAvailable` — with a green
+  build and no diagnostic: the guard existed, was tested, and could not fire in the one pipeline that
+  ships bytes. It deliberately does **not** set `MainguardAttestedRelease`, which asserts that a GitHub
+  artifact attestation exists and only the repo's OIDC identity (`ci.yml`'s `payload-reproducible`) can
+  mint one; setting it on the owner's release box would make `BuildProvenanceGate` demand an attestation
+  that was never created and the shipped app would refuse its own payload. `velopack-wiring` asserts
+  both halves — the property in the resolved `-DryRun` plan, and that a real pin-less publish throws
+  (matching on the refusal text, so a missing payload or absent `vpk` cannot satisfy it instead).
 - **`installer/Mainguard.Uninstall`** (P2-22 §J-6) — the thin `WinExe` clean-uninstall entry point.
   Parses the two user choices (`--keep-settings`, `--remove-sync-remote`) and drives the Core
   `Uninstaller` with the real Windows delegates (daemon stop via

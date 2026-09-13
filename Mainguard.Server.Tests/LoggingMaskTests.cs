@@ -16,9 +16,11 @@ using Microsoft.Extensions.DependencyInjection;
 namespace Mainguard.Server.Tests;
 
 /// <summary>
-/// TI-P2-02 §8 / plan §6 row 5 — the G-13 field-mask. A <c>// SECRET</c> field never
-/// appears in captured logs (value, length, or prefix), and every <c>// SECRET</c> proto
-/// field is registered in <see cref="SecretFieldMask"/>.
+/// TI-P2-02 §8 / plan §6 row 5 — the G-13 field-mask, and F56, which turned it from a six-field
+/// denylist into an allowlist. A <c>// SECRET</c> field never appears in captured logs (value,
+/// length, or prefix); neither does any other field's content, because the access log now records
+/// the op, the message size and the allowlisted ids and nothing else. Every <c>// SECRET</c> proto
+/// field is still registered in <see cref="SecretFieldMask"/> as a second belt.
 /// </summary>
 public sealed class LoggingMaskTests : IClassFixture<DaemonFixture>
 {
@@ -45,8 +47,47 @@ public sealed class LoggingMaskTests : IClassFixture<DaemonFixture>
         // Zero occurrences of the secret anywhere — not even a prefix of it.
         Assert.DoesNotContain(logs, line => line.Contains("SUPER-SECRET", StringComparison.Ordinal));
         Assert.DoesNotContain(logs, line => line.Contains(sentinel, StringComparison.Ordinal));
-        // The request WAS logged, with the field masked.
-        Assert.Contains(logs, line => line.Contains("model_api_key=***", StringComparison.Ordinal));
+        // The request WAS logged — as an op/size/id summary, so "no secret in the logs" cannot pass
+        // for a request that was never rendered at all.
+        Assert.Contains(logs, line =>
+            line.Contains("SpawnAgent", StringComparison.Ordinal)
+            && line.Contains("req=SpawnAgentRequest{", StringComparison.Ordinal)
+            && line.Contains("repo_handle=repo-handle-opaque", StringComparison.Ordinal));
+        // …and the field name no longer carries a rendered value of any shape, masked or otherwise.
+        Assert.DoesNotContain(logs, line => line.Contains("model_api_key=", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// F56 — the leak the six-field denylist could not see. <c>task_prompt</c> was never a
+    /// <c>// SECRET</c> field, so the old renderer wrote it verbatim into <c>rpc.log</c>: an API key
+    /// pasted into a prompt (the way people actually paste them) landed in a world-readable rolling
+    /// file. The allowlist withholds it because it withholds everything it was not told to render.
+    /// </summary>
+    [Fact]
+    public async Task FreeTextRequestFields_AreNeverRendered_EvenThoughTheyAreNotMarkedSecret()
+    {
+        const string prompt = "PROMPT-BODY-DEADBEEF here is my key sk-live-0123456789abcdef";
+
+        var client = new AgentService.AgentServiceClient(_daemon.CreateChannel());
+        await client.SpawnAgentAsync(new SpawnAgentRequest
+        {
+            RepoHandle = "repo-handle-opaque",
+            TaskPrompt = prompt,
+            AgentKind = "claude-code",
+        }, _daemon.AuthHeaders());
+
+        var logs = _daemon.CapturedLogs;
+        Assert.NotEmpty(logs);
+        foreach (var fragment in new[] { prompt, "PROMPT-BODY", "sk-live-0123456789abcdef", "sk-live" })
+        {
+            Assert.DoesNotContain(logs, line => line.Contains(fragment, StringComparison.Ordinal));
+        }
+
+        // The op is still diagnosable: method, size, and the opaque handle.
+        Assert.Contains(logs, line =>
+            line.Contains("req=SpawnAgentRequest{", StringComparison.Ordinal)
+            && line.Contains("size=", StringComparison.Ordinal)
+            && line.Contains($"task_prompt=<str:{prompt.Length}>", StringComparison.Ordinal));
     }
 
     /// <summary>
@@ -100,11 +141,18 @@ public sealed class LoggingMaskTests : IClassFixture<DaemonFixture>
             Assert.DoesNotContain(logs, line => line.Contains(secret, StringComparison.Ordinal));
         }
 
-        // …and the request WAS logged, with the key masked — otherwise "no secret in the logs" would pass
-        // for a request that was never rendered at all.
+        // …and the request WAS logged, as an op/size/id summary — otherwise "no secret in the logs"
+        // would pass for a request that was never rendered at all.
         Assert.Contains(logs, line =>
             line.Contains("ResumeAgent", StringComparison.Ordinal)
-            && line.Contains("model_api_key=***", StringComparison.Ordinal));
+            && line.Contains("req=ResumeAgentRequest{", StringComparison.Ordinal)
+            && line.Contains("agent_id=stranded-agent", StringComparison.Ordinal));
+        // The repeated credential-bearing fields render a COUNT and nothing else — the shape that
+        // used to walk every element through RenderList.
+        Assert.Contains(logs, line =>
+            line.Contains("req=ResumeAgentRequest{", StringComparison.Ordinal)
+            && line.Contains("extra_env=[1]", StringComparison.Ordinal)
+            && line.Contains("cli_credentials=[1]", StringComparison.Ordinal));
     }
 
     // A non-RpcException that escapes a handler used to reach the client as a bare UNKNOWN with nothing

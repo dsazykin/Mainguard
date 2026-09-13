@@ -572,19 +572,116 @@ public static class ContainerSpecBuilder
         return tmpfs;
     }
 
-    /// <summary>True when <paramref name="path"/> equals a root or sits inside one (textual, in the
-    /// daemon's own namespace — mount sources are daemon-produced paths, never user input).</summary>
+    /// <summary>
+    /// True when <paramref name="path"/> equals a root or sits inside one — compared on the REAL paths,
+    /// not the spelled ones.
+    ///
+    /// <para><b>Audit F33.</b> This used to be pure textual prefix matching, and the docker daemon does
+    /// not bind what a path spells — it binds what the path RESOLVES to. So a symlink anywhere under a
+    /// daemon-owned root pointed anywhere else passed a containment check the bind then ignored, and
+    /// this is exactly the shape ESC-I1 exists to make structural. The specific reachable case on the
+    /// shipping substrate is macOS's own <c>/var → /private/var</c> (and <c>/tmp</c>), which every
+    /// fixture that crosses the boundary already has to canonicalize by hand.</para>
+    ///
+    /// <para>Both sides are resolved, because a root spelled through a symlink is just as wrong as a
+    /// source spelled through one: resolving only the source would start REFUSING every legitimate mount
+    /// on a machine whose data root happens to sit under <c>/var</c>. Resolution is best-effort on a path
+    /// that does not exist yet — a not-yet-created cache directory is a legitimate source, so an
+    /// unresolvable path falls back to its normalized form and is compared as before rather than being
+    /// refused for not existing.</para>
+    /// </summary>
     private static bool IsUnderAnyRoot(string path, IReadOnlyList<string> roots)
     {
-        var full = Path.GetFullPath(path);
+        var full = RealPath(path);
         foreach (var root in roots)
         {
-            var fullRoot = Path.GetFullPath(root);
+            var fullRoot = RealPath(root);
             if (string.Equals(full, fullRoot, Mainguard.Git.Services.FileSystemPaths.Comparison)) return true;
             var prefix = fullRoot.EndsWith(Path.DirectorySeparatorChar) ? fullRoot : fullRoot + Path.DirectorySeparatorChar;
             if (full.StartsWith(prefix, Mainguard.Git.Services.FileSystemPaths.Comparison)) return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// <paramref name="path"/> with every symlink on it resolved, normalized. Falls back to
+    /// <see cref="Path.GetFullPath(string)"/> for a path that does not exist or cannot be resolved —
+    /// see <see cref="IsUnderAnyRoot"/> for why that fallback is the safe direction here.
+    ///
+    /// <para>Resolved COMPONENT BY COMPONENT, from the root down, which is the part that matters: the
+    /// escape shape is an intermediate link (<c>/var</c> → <c>/private/var</c>), and asking only whether
+    /// the leaf is a link would miss every one of them. A component that does not exist yet is simply
+    /// appended — a not-yet-created cache directory under a resolved parent is still contained by that
+    /// parent. <c>ResolveLinkTarget(returnFinalTarget: true)</c> is the framework's own "follow the whole
+    /// chain", and answers null for a path that is not a link, which is the ordinary case.</para>
+    /// </summary>
+    internal static string RealPath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        try
+        {
+            var current = full;
+            // Each pass substitutes the FIRST link it meets and starts again, because a link's target
+            // may itself be spelled through links (macOS: /tmp → /private/tmp, and /var → /private/var
+            // under it). Bounded so a link cycle terminates instead of spinning; a path that has not
+            // settled in this many substitutions is one we decline to have an opinion about.
+            for (var hops = 0; hops < 64; hops++)
+            {
+                var next = SubstituteFirstLink(current);
+                if (next is null)
+                {
+                    return Path.GetFullPath(current);
+                }
+
+                current = next;
+            }
+
+            return full;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return full;
+        }
+    }
+
+    /// <summary>The path with its first symlinked component replaced by that link's target (and the rest
+    /// of the path re-appended), or null when it contains no link left to substitute.</summary>
+    private static string? SubstituteFirstLink(string full)
+    {
+        var root = Path.GetPathRoot(full);
+        if (string.IsNullOrEmpty(root))
+        {
+            return null;
+        }
+
+        var segments = full[root.Length..]
+            .Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                StringSplitOptions.RemoveEmptyEntries);
+
+        var walked = root;
+        for (var i = 0; i < segments.Length; i++)
+        {
+            walked = Path.Combine(walked, segments[i]);
+
+            // A component that does not exist cannot be a link, and a not-yet-created leaf under a
+            // resolved parent is a legitimate mount source — so absence is simply walked past.
+            var target = Directory.Exists(walked)
+                ? new DirectoryInfo(walked).ResolveLinkTarget(returnFinalTarget: false)?.FullName
+                : File.Exists(walked)
+                    ? new FileInfo(walked).ResolveLinkTarget(returnFinalTarget: false)?.FullName
+                    : null;
+            if (string.IsNullOrEmpty(target))
+            {
+                continue;
+            }
+
+            var tail = segments.Skip(i + 1).ToArray();
+            return tail.Length == 0
+                ? target
+                : Path.GetFullPath(Path.Combine(new[] { target }.Concat(tail).ToArray()));
+        }
+
+        return null;
     }
 
     /// <summary>Builds the hardened create request; throws typed on any invariant violation.</summary>
@@ -641,6 +738,16 @@ public static class ContainerSpecBuilder
             UsernsMode = request.UsernsMode,
 
             Memory = request.Limits.MemoryBytes,
+
+            // F28 follow-up: stated EXPLICITLY rather than left to dockerd's implicit default, because
+            // the update endpoint cannot be given one without the other. moby's adaptContainerSettings
+            // fills an unset MemorySwap with Memory*2 and persists THAT, so a container created without
+            // this line still reports 2x — but `UpdateContainerAsync` validates the new Memory against
+            // the swap total it is being sent, and a Memory-only update raising the ceiling above the
+            // OLD swap total is rejected (409). Recording the value here is what lets RetightenCeiling
+            // send the matching pair; the created posture itself is byte-for-byte what it always was.
+            MemorySwap = MemorySwapFor(request.Limits.MemoryBytes),
+
             PidsLimit = request.Limits.Pids,
 
             // MG-26: a CPU ceiling (cgroup cpu.max) — without it one `while :; do :; done` per pid
@@ -877,15 +984,23 @@ public static class ContainerSpecBuilder
     private static List<string> BuildProxyEnv(string proxyUrl)
     {
         // Only proxy routing — NEVER a secret (G-13). Both upper- and lower-case forms so every
-        // toolchain honours the proxy; NO_PROXY carries loopback + the internal git proxy host.
+        // toolchain honours the proxy; NO_PROXY carries loopback and nothing else.
+        //
+        // AUDIT F33: `git.mainguard.internal` used to be in this list. Nothing anywhere resolves that
+        // name — no DNS record on any segment, no `url.insteadOf` rewriting to it, and the A6
+        // DaemonGitProxy it was reserved for has only test callers — so the entry described a route that
+        // does not exist. That is worse than useless in a default-deny design: it is a standing
+        // pre-authorisation to BYPASS the proxy for a hostname, sitting in every jail's environment,
+        // waiting for the day something makes the name resolve. Re-add it in the same commit that gives
+        // the name an address, not before.
         return new List<string>
         {
             $"HTTP_PROXY={proxyUrl}",
             $"HTTPS_PROXY={proxyUrl}",
             $"http_proxy={proxyUrl}",
             $"https_proxy={proxyUrl}",
-            "NO_PROXY=localhost,127.0.0.1,::1,git.mainguard.internal",
-            "no_proxy=localhost,127.0.0.1,::1,git.mainguard.internal",
+            "NO_PROXY=localhost,127.0.0.1,::1",
+            "no_proxy=localhost,127.0.0.1,::1",
             // CLIs must not self-update: versions are pinned by the adapter channel (sha256-verified
             // installs into a mount the jail sees READ-ONLY), so an in-CLI updater can only fail —
             // claude-code's footer showed a permanent "Auto-update failed" until this was set.
@@ -936,7 +1051,137 @@ public static class ContainerSpecBuilder
     }
 
     /// <summary>Whole cores → Docker's <c>NanoCPUs</c> (1e9 nanoCPU = 1 core).</summary>
-    private static long NanoCpus(double cpus) => (long)Math.Round(cpus * 1_000_000_000d, MidpointRounding.AwayFromZero);
+    internal static long NanoCpus(double cpus) => (long)Math.Round(cpus * 1_000_000_000d, MidpointRounding.AwayFromZero);
+
+    /// <summary>
+    /// Docker's <c>MemorySwap</c> for a memory ceiling: the memory+swap TOTAL, not the swap allowance.
+    /// <c>Memory * 2</c> is exactly the value moby's <c>adaptContainerSettings</c> writes when the field
+    /// is left unset with a memory limit present, so naming it changes no jail's posture — it makes the
+    /// number available to the update endpoint, which needs the pair or it rejects the raise.
+    /// </summary>
+    internal static long MemorySwapFor(long memoryBytes) => memoryBytes * 2;
+
+    /// <summary>
+    /// What a jail we are about to REUSE is missing, relative to the posture this builder would create
+    /// it with today (audit F28).
+    /// </summary>
+    /// <param name="Recreate">Reasons that can only be fixed by creating a new container: every G2/G-15
+    /// hardening control, and the MG-26 rlimits, are fixed at create time.</param>
+    /// <param name="Ceiling">Reasons the engine CAN change on a live container: memory, CPU and pids are
+    /// all writable through Docker's container-update endpoint.</param>
+    public sealed record JailPostureVerdict(
+        IReadOnlyList<string> Recreate, IReadOnlyList<string> Ceiling)
+    {
+        /// <summary>The jail must be destroyed and rebuilt — its posture cannot be repaired in place.</summary>
+        public bool MustRecreate => Recreate.Count > 0;
+
+        /// <summary>The jail's resource ceiling has drifted and can be re-applied without recreating it.</summary>
+        public bool MustRetighten => Ceiling.Count > 0;
+
+        public string Describe() => string.Join("; ", Recreate.Concat(Ceiling));
+
+        internal static readonly JailPostureVerdict Clean =
+            new(Array.Empty<string>(), Array.Empty<string>());
+    }
+
+    /// <summary>
+    /// <b>Audit F28 — does this already-running jail still match the posture we would create today?</b>
+    ///
+    /// <para>The reuse path in <see cref="DockerSandboxEngine"/> re-checks mounts, DNS, network and the
+    /// secret layout, and every one of those questions is "was this container created by a build that
+    /// knows about X?". Two things it never asked were the ones an operator can change from the UI and
+    /// the ones a Mainguard upgrade tightens: the per-jail ceiling, and the hardening set. So lowering
+    /// the ceiling reached no jail already running, and a jail created before MG-26 was reused
+    /// indefinitely with no CPU cap at all — hardened everywhere except the axis a prompt-injected agent
+    /// reaches with <c>while :; do :; done</c>.</para>
+    ///
+    /// <para><b>The split between the two lists is the whole design.</b> Hardening is fixed at create,
+    /// so drift there can only be answered by recreating — the same answer every other reuse check
+    /// gives. A ceiling is not: Docker's update endpoint writes memory, CPU and pids to a live cgroup,
+    /// so the ceiling is re-applied IN PLACE and a running agent keeps its session. Recreating for a
+    /// ceiling change would mean an operator moving a slider killed every live jail, which is a worse
+    /// product than the bug.</para>
+    ///
+    /// <para>Pure, and it takes the engine's <see cref="HostConfig"/> as an argument, so every drift
+    /// shape is unit-assertable with no Docker daemon. A null <paramref name="actual"/> reports NO drift:
+    /// the convention across every sibling probe is that an unanswerable question is not a reason to
+    /// destroy a container.</para>
+    /// </summary>
+    public static JailPostureVerdict InspectPosture(HostConfig? actual, SandboxLimits expected)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        if (actual is null)
+        {
+            return JailPostureVerdict.Clean;
+        }
+
+        var recreate = new List<string>();
+        var ceiling = new List<string>();
+
+        if (actual.Privileged)
+            recreate.Add("the jail is privileged");
+        if (!actual.ReadonlyRootfs)
+            recreate.Add("the rootfs is writable (created before ReadonlyRootfs)");
+
+        var capDrop = actual.CapDrop ?? new List<string>();
+        if (!capDrop.Any(c => string.Equals(c, "ALL", StringComparison.OrdinalIgnoreCase)))
+            recreate.Add("G2 control 4: capabilities were not dropped (no CapDrop ALL)");
+
+        var capAdd = actual.CapAdd ?? new List<string>();
+        if (capAdd.Any(c => c.Contains("SYS_PTRACE", StringComparison.OrdinalIgnoreCase)))
+            recreate.Add("G2 control 4: CAP_SYS_PTRACE is in the effective set");
+
+        var securityOpt = actual.SecurityOpt ?? new List<string>();
+        if (!securityOpt.Any(o => o.Contains("no-new-privileges", StringComparison.OrdinalIgnoreCase)))
+            recreate.Add("G-15: no-new-privileges is missing");
+
+        var seccomp = securityOpt.FirstOrDefault(o => o.StartsWith("seccomp=", StringComparison.Ordinal));
+        if (seccomp is null)
+            recreate.Add("G2 control 3: no seccomp profile");
+        else if (seccomp.Contains("unconfined", StringComparison.OrdinalIgnoreCase))
+            recreate.Add("G2 control 3: seccomp=unconfined");
+
+        if (string.Equals(actual.UsernsMode, UsernsRemapPolicy.OptOutUsernsMode, StringComparison.OrdinalIgnoreCase))
+            recreate.Add("MG-17: the jail opts OUT of the daemon's userns remap");
+
+        // MG-26 rlimits. Docker's update endpoint does not write ulimits, so an absent or slack one is a
+        // recreate, not a retighten. Checked by presence-and-value: these are compiled constants, so the
+        // only way they differ is a Mainguard upgrade — exactly when a recreate is the right answer.
+        var ulimits = actual.Ulimits ?? new List<Ulimit>();
+        foreach (var (name, want) in new[] { ("nofile", expected.NoFile), ("nproc", expected.NProc) })
+        {
+            var found = ulimits.FirstOrDefault(u => string.Equals(u.Name, name, StringComparison.Ordinal));
+            if (found is null)
+                recreate.Add($"MG-26: no '{name}' ulimit");
+            else if (found.Hard != want || found.Soft != want)
+                recreate.Add($"MG-26: '{name}' ulimit is {found.Soft}/{found.Hard}, expected {want}/{want}");
+        }
+
+        if (actual.Memory != expected.MemoryBytes)
+            ceiling.Add($"memory is {actual.Memory}, expected {expected.MemoryBytes}");
+
+        // The memory+swap TOTAL, and it is not decoration: an update that raises Memory past the swap
+        // total the container currently carries is REFUSED by the engine, so a ceiling raise that did
+        // not also move this one could never apply. Drift here is by definition drift in memory too
+        // (both are a pure function of MemoryBytes), so it costs no extra recreate — it is listed so the
+        // retighten is told what to send and the reason names the axis that would otherwise 409.
+        var wantMemorySwap = MemorySwapFor(expected.MemoryBytes);
+        if (actual.MemorySwap != wantMemorySwap)
+            ceiling.Add($"memory+swap total is {actual.MemorySwap}, expected {wantMemorySwap}");
+
+        var wantNanoCpus = NanoCpus(expected.Cpus);
+        if (actual.NanoCPUs != wantNanoCpus)
+        {
+            ceiling.Add(actual.NanoCPUs <= 0
+                ? $"no CPU ceiling at all (created before MG-26), expected {wantNanoCpus} NanoCPUs"
+                : $"CPU ceiling is {actual.NanoCPUs} NanoCPUs, expected {wantNanoCpus}");
+        }
+
+        if ((actual.PidsLimit ?? 0) != expected.Pids)
+            ceiling.Add($"pids ceiling is {actual.PidsLimit?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unset"}, expected {expected.Pids}");
+
+        return new JailPostureVerdict(recreate, ceiling);
+    }
 
     private static void AssertResourceCeilings(CreateContainerParameters create)
     {
@@ -946,6 +1191,14 @@ public static class ContainerSpecBuilder
         var host = create.HostConfig;
         if (host.Memory <= 0)
             throw new SandboxSpecException("MG-26: the agent jail must carry a memory ceiling.");
+        // A memory ceiling with unbounded swap (MemorySwap = -1) is not a memory ceiling: the jail
+        // simply spills past it onto disk. Asserted rather than assumed, because the field is now set
+        // explicitly and an explicit field is one a future edit can get wrong.
+        if (host.MemorySwap < host.Memory)
+            throw new SandboxSpecException(
+                "MG-26: the agent jail's memory+swap total must be at least its memory ceiling; "
+                + $"got MemorySwap={host.MemorySwap} for Memory={host.Memory} "
+                + "(-1 or 0 would leave swap unbounded, which defeats the ceiling).");
         if (host.PidsLimit is null or <= 0)
             throw new SandboxSpecException("MG-26: the agent jail must carry a pids ceiling.");
         if (host.NanoCPUs <= 0)
@@ -1126,19 +1379,54 @@ public static class ContainerSpecBuilder
             throw new SandboxSpecException("kernel.yama.ptrace_scope is VM-wide (P2-05); it must not be set on the container create request.");
     }
 
+    /// <summary>
+    /// G-13 — the create request's environment carries proxy routing and toolchain PATH only; a
+    /// credential reaches a jail through the 0400 tmpfs and nowhere else.
+    ///
+    /// <para><b>Audit F33: this was name-shaped only.</b> An anonymously-named variable holding a real
+    /// token — <c>ANTHROPIC_AUTH=sk-ant-…</c>, <c>GH=ghp_…</c> — passed a check built entirely out of
+    /// KEY/TOKEN/SECRET substrings, which is precisely the shape a mistake takes: nobody writes
+    /// <c>MY_SECRET_TOKEN=</c> by accident. So the VALUE is now checked too, against the same rule
+    /// catalog the pre-commit scanner uses (<see cref="Mainguard.Git.Safety.SecretPatterns"/>) — the
+    /// single place in this codebase where "does this text look like a credential" is written down, and
+    /// one whose public surface is a bool by construction, so a refusal here can never echo the value it
+    /// refused.</para>
+    ///
+    /// <para>The name rule is kept alongside it, not replaced: a variable NAMED like a secret is worth
+    /// refusing even when its value is a placeholder, because the next edit fills it in.</para>
+    /// </summary>
+    /// <summary>The G-13 guard, reachable by the suite so a planted credential can be driven through it
+    /// on a request the builder has already accepted — <see cref="Build"/> runs it on the way out, so
+    /// there is otherwise no way to add an env entry and then ask.</summary>
+    internal static void AssertNoSecretsInEnvForTests(CreateContainerParameters create) =>
+        AssertNoSecretsInEnv(create);
+
     private static void AssertNoSecretsInEnv(CreateContainerParameters create)
     {
-        // G-13: the environment carries proxy routing ONLY. Any KEY/TOKEN/SECRET/PASSWORD-shaped var
-        // is a leak — the credential path is the 0400 tmpfs, never Env.
         foreach (var entry in create.Env ?? new List<string>())
         {
-            var name = entry.Split('=', 2)[0];
+            var split = entry.Split('=', 2);
+            var name = split[0];
+            var value = split.Length > 1 ? split[1] : string.Empty;
             var upper = name.ToUpperInvariant();
-            var isProxy = upper is "HTTP_PROXY" or "HTTPS_PROXY" or "NO_PROXY";
-            if (isProxy) continue;
+
+            // The proxy variables carry a URL that is allowed to look like anything; nothing else is
+            // exempt from either half of the check.
+            if (upper is "HTTP_PROXY" or "HTTPS_PROXY" or "NO_PROXY") continue;
+
             if (upper.Contains("KEY") || upper.Contains("TOKEN") || upper.Contains("SECRET")
                 || upper.Contains("PASSWORD") || upper.Contains("CREDENTIAL"))
                 throw new SandboxSpecException($"G-13: environment variable '{name}' looks like a secret; secrets go on the 0400 tmpfs, never Env.");
+
+            foreach (var rule in Mainguard.Git.Safety.SecretPatterns.All)
+            {
+                // The rule NAME and the variable NAME; never the value. The catalog's own invariant is
+                // that a match cannot hand back what it matched, and this message keeps that true.
+                if (rule.IsMatch(value))
+                    throw new SandboxSpecException(
+                        $"G-13: environment variable '{name}' carries a value matching the "
+                        + $"'{rule.DisplayName}' rule; secrets go on the 0400 tmpfs, never Env.");
+            }
         }
     }
 }

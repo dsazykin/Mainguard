@@ -81,6 +81,31 @@ public interface IToolchainImageBuilder
     /// </summary>
     Task<string> DescribeBuildContextAsync(
         string baseDigest, string baseImageName, CancellationToken ct = default) => Task.FromResult(string.Empty);
+
+    /// <summary>
+    /// <b>Audit F32 — removes the toolchain layers nothing can still be using.</b>
+    ///
+    /// <para>Every base-image refresh and every recipe edit changes the content-addressed tag, so each
+    /// one leaves a 1–3 GB image behind and nothing ever removed them. This is the engine-side half:
+    /// gather the facts (which layers exist, when, and which containers reference them), hand them to
+    /// the pure <see cref="ToolchainImageGcPolicy"/>, and delete only what it clears.</para>
+    ///
+    /// <para><paramref name="keep"/> names the refs the caller still wants — the tag and digest it just
+    /// resolved. Removal must be NON-FORCED, so the engine's own refusal to delete a referenced image is
+    /// a second, independent safety net under the policy's first one. Never throws: a failed collection
+    /// leaves disk usage where it was, which is exactly where it has always been.</para>
+    ///
+    /// <para>The default implementation collects nothing, so every existing test double and any
+    /// non-Docker engine is unaffected and simply keeps its layers.</para>
+    /// </summary>
+    /// <returns>The image refs actually removed.</returns>
+    Task<IReadOnlyList<string>> CollectGarbageAsync(
+        IReadOnlyCollection<string> keep,
+        DateTimeOffset now,
+        TimeSpan minimumAge,
+        int retain,
+        CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
 }
 
 /// <summary>
@@ -337,6 +362,14 @@ public sealed class ToolchainProvisioner
 
             _log?.Invoke($"toolchain build ok: repo={repoHandle} image={hit}");
             _progress?.Report(BuiltMessage);
+
+            // Audit F32: collect the layers this build just made stale. Here rather than in a background
+            // sweep because THIS is the only thing in the system that creates them — a new base digest or
+            // a recipe edit produces a new content-addressed tag and abandons the old one, so the moment
+            // sprawl grows is the moment to look. It costs two Docker list calls after a build that took
+            // minutes, it names the layer this spawn is about to use as wanted so it cannot collect what
+            // it just built, and it never throws.
+            await CollectGarbageAsync(new[] { tag, hit }, ct).ConfigureAwait(false);
         }
 
         // The pin, PROVEN rather than requested. Everything above only decides which base we ASKED
@@ -347,6 +380,39 @@ public sealed class ToolchainProvisioner
         await VerifyBuiltOnBaseAsync(repoHandle, declaration, hit, baseDigest, ct).ConfigureAwait(false);
 
         return new ProvisionedToolchain(hit, baseDigest, declaration.Ids);
+    }
+
+    /// <summary>
+    /// Audit F32 — asks the builder to remove the toolchain layers nothing can still be using, keeping
+    /// <paramref name="keep"/> whatever else is true. Best effort by contract: a collection that fails
+    /// leaves disk usage exactly where it already was, and failing a spawn over it would be absurd.
+    /// </summary>
+    /// <returns>The refs removed, for the caller's log; empty on any failure.</returns>
+    public async Task<IReadOnlyList<string>> CollectGarbageAsync(
+        IReadOnlyCollection<string> keep, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(keep);
+        try
+        {
+            var removed = await _builder.CollectGarbageAsync(
+                keep, DateTimeOffset.UtcNow, ToolchainImageGcPolicy.DefaultMinimumAge,
+                ToolchainImageGcPolicy.DefaultRetain, ct).ConfigureAwait(false);
+            if (removed.Count > 0)
+            {
+                _log?.Invoke($"toolchain image gc: removed {removed.Count} stale layer(s): {string.Join(", ", removed)}");
+            }
+
+            return removed;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"toolchain image gc: skipped ({ex.GetType().Name}: {ex.Message})");
+            return Array.Empty<string>();
+        }
     }
 
     /// <summary>
