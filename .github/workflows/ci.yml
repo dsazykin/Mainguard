@@ -299,7 +299,11 @@ jobs:
       # import` untars as root exactly like `wsl --import` does, so ownership/modes land as they will in
       # the VM. Asserts behaviour, not an exit code: correct ownership/modes, the process stays alive,
       # it actually listens on 127.0.0.1:5250 (DaemonOptions.DefaultPort → hex 1482 in /proc/net/tcp),
-      # and its data root landed ABSOLUTE under $HOME.
+      # its data root landed ABSOLUTE under $HOME, and (F53) its key ring is passphrase-protected at rest.
+      #
+      # "The exact context systemd gives it" is taken LITERALLY: the ExecStartPre=+ lines and the
+      # Environment= lines are read out of the shipped unit and replayed here, so a unit that grows a
+      # new one is covered without touching this file — and a unit that loses one fails here first.
       - name: Daemon startup smoke (shipped tarball, uid 1000)
         run: |
           set -euo pipefail
@@ -330,27 +334,81 @@ jobs:
               echo "::error::/tmp is mode $tmpmode, expected 1777 — the repack dropped high mode bits (non-root tar extraction applies the umask)"
               exit 1
             fi
+
+            # systemd does two things before ExecStart that this smoke must do too, or mainguardd is
+            # started in a context the VM never gives it. Since F53 that gap is FATAL BY DESIGN: the
+            # unit mints the key-ring passphrase in ExecStartPre and hands the daemon its path with
+            # Environment=, and a daemon that finds no passphrase on Linux refuses to boot rather than
+            # keep the audit master key in plain XML beside the secrets it encrypts. Both are READ OUT
+            # OF THE SHIPPED UNIT, never restated here, so this smoke cannot drift from what actually
+            # runs on a user machine — the next Environment= or ExecStartPre= is picked up for free.
+            unit=/etc/systemd/system/mainguardd.service
+            if [ ! -f "$unit" ]; then
+              echo "::error::the shipped rootfs has no $unit — nothing supervises mainguardd in the VM"
+              exit 1
+            fi
+
+            # ExecStartPre=+<cmd>: the + prefix means systemd runs it as ROOT even though the service
+            # itself is User=mainguard. This shell is root, so run each one exactly as the unit spells it.
+            while IFS= read -r pre; do
+              echo "ExecStartPre (as root): $pre"
+              if ! $pre; then
+                echo "::error::ExecStartPre failed in the shipped rootfs: $pre"
+                exit 1
+              fi
+            done < <(sed -n "s/^ExecStartPre=+//p" "$unit")
+
+            # Environment=K=V: every one of them, handed to ExecStart. HOME=/home/mainguard is one.
+            mapfile -t unit_env < <(sed -n "s/^Environment=//p" "$unit")
+            if [ "${#unit_env[@]}" -eq 0 ]; then
+              echo "::error::$unit declares no Environment= — HOME is what keeps the data root absolute"
+              exit 1
+            fi
+            printf "unit Environment: %s\n" "${unit_env[@]}"
+
+            log=/tmp/mainguardd-smoke.log
             setpriv --reuid=1000 --regid=1000 --init-groups \
-              env HOME=/home/mainguard /opt/mainguard/mainguardd &
+              env "${unit_env[@]}" /opt/mainguard/mainguardd > "$log" 2>&1 &
             pid=$!
             for i in $(seq 1 60); do
               if ! kill -0 "$pid" 2>/dev/null; then
-                echo "::error::mainguardd exited prematurely (crash-loop class bug — check ICU/paths)"
+                echo "::error::mainguardd exited prematurely (crash-loop class bug — check ICU/paths/keyring posture)"
                 wait "$pid" || echo "exit code: $?"
+                cat "$log"
                 exit 1
               fi
               if grep -q ":1482 " /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
                 echo "mainguardd is alive and listening on 5250."
                 if ! test -d /home/mainguard/.mainguard; then
                   echo "::error::daemon data root /home/mainguard/.mainguard was never created — path resolution regressed"
+                  cat "$log"
                   exit 1
                 fi
                 echo "Data root landed at /home/mainguard/.mainguard (absolute, service-user-owned)."
+                # Booting is not the bar F53 sets — booting PROTECTED is. Asserting the posture line is
+                # what stops a future unit that quietly drops ExecStartPre from passing here by having
+                # someone set MAINGUARD_ALLOW_UNPROTECTED_KEYRING, which boots fine and ships the master
+                # key in cleartext. SecureKeyring.DescribeProtection() prints this at every boot.
+                # The posture is logged before Kestrel binds, but the logger flushes on its own thread,
+                # so give the line a moment to land rather than racing it to the file.
+                posture=""
+                for j in $(seq 1 20); do
+                  posture="$(grep -o "keyring protection=[A-Za-z]*" "$log" | head -1)"
+                  [ -n "$posture" ] && break
+                  sleep 1
+                done
+                if [ "$posture" != "keyring protection=Passphrase" ]; then
+                  echo "::error::the shipped daemon booted with ${posture:-no keyring posture line at all}, expected keyring protection=Passphrase — the units ExecStartPre provisioning did not reach it (F53)"
+                  cat "$log"
+                  exit 1
+                fi
+                echo "Key ring is passphrase-protected at rest (F53: $posture)."
                 exit 0
               fi
               sleep 1
             done
             echo "::error::mainguardd never began listening on 127.0.0.1:5250 within 60s"
+            cat "$log"
             exit 1
           '
 

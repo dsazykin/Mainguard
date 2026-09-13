@@ -314,6 +314,9 @@ public sealed class ModelProxyMiddleware
     private static readonly string[] CredentialHeaders =
     {
         "authorization", "x-api-key", "api-key", "anthropic-api-key", "openai-api-key",
+        // F46: Google's shape. It was missing from BOTH this drop list and the identification below,
+        // so a confined gemini-cli presented its Mainguard token in a header the gateway never read.
+        "x-goog-api-key",
     };
 
     /// <summary>Mainguard's own control headers — internal, never forwarded to the provider.</summary>
@@ -363,14 +366,27 @@ public sealed class ModelProxyMiddleware
         }
 
         // Inject the real key at the network hop, in the shape the provider expects. Anthropic reads
-        // `x-api-key`; the bearer form covers OpenAI-style providers. Absent a key in custody (an
-        // interactive-login CLI rather than BYOK) nothing is injected and the call goes out unauthenticated,
-        // which the provider rejects — never a silent fallback to whatever the agent sent.
+        // `x-api-key`; Google reads `x-goog-api-key`; the bearer form covers OpenAI-style providers.
+        // Absent a key in custody (an interactive-login CLI rather than BYOK) nothing is injected and the
+        // call goes out unauthenticated, which the provider rejects — never a silent fallback to
+        // whatever the agent sent.
+        //
+        // F46: the Google arm is the other half of the same defect as the identification below. The
+        // adapter table lists gemini-cli as confinable and verified, its key WAS being replaced with an
+        // `mg_sess_` token — and then the token arrived in a header nothing read (a 404), and even had it
+        // been read, the real key would have gone upstream as `Authorization: Bearer`, which the
+        // Generative Language API does not accept for an API key. Confinement that is announced and does
+        // not work is worse than confinement that is refused out loud: the refusal path in
+        // TryConfineToGatewayAsync says so in the log, this said nothing.
         if (!string.IsNullOrEmpty(providerKey))
         {
             if (IsAnthropicHost(host))
             {
                 request.Headers.TryAddWithoutValidation("x-api-key", providerKey);
+            }
+            else if (IsGoogleHost(host))
+            {
+                request.Headers.TryAddWithoutValidation("x-goog-api-key", providerKey);
             }
             else
             {
@@ -389,13 +405,34 @@ public sealed class ModelProxyMiddleware
     private static bool IsAnthropicHost(string host) =>
         host.EndsWith("anthropic.com", StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>The Mainguard token the agent presents as its API key (either header shape).</summary>
+    /// <summary>Google's model endpoints — <c>generativelanguage.googleapis.com</c> is the one
+    /// gemini-cli declares as its <c>modelHost</c>, and <c>cloudcode-pa.googleapis.com</c> is the other
+    /// host in that adapter's egress set.</summary>
+    private static bool IsGoogleHost(string host) =>
+        host.EndsWith("googleapis.com", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The Mainguard token the agent presents as its API key, in any of the header shapes the fronted
+    /// CLIs use.
+    ///
+    /// <para><b>F46.</b> This read only <c>x-api-key</c> and <c>authorization</c>. gemini-cli sends its
+    /// key as <c>x-goog-api-key</c>, so a confined Gemini agent's every request resolved to no agent,
+    /// found no upstream binding, and fell through as unfronted traffic to a gateway that has no route
+    /// for it — a 404 per model call, for an adapter the table describes as confinable and verified.
+    /// The Docker test that covers this path used the Anthropic header shape, so nothing caught it.</para>
+    /// </summary>
     private static string? ExtractPresentedToken(HttpContext context)
     {
         var apiKey = context.Request.Headers["x-api-key"].FirstOrDefault();
         if (!string.IsNullOrEmpty(apiKey))
         {
             return apiKey;
+        }
+
+        var googleKey = context.Request.Headers["x-goog-api-key"].FirstOrDefault();
+        if (!string.IsNullOrEmpty(googleKey))
+        {
+            return googleKey;
         }
 
         var auth = context.Request.Headers["authorization"].FirstOrDefault();
