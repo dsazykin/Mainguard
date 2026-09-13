@@ -510,6 +510,17 @@
     because a `Managed` worker's terminal is daemon-locked read-only, so anything in its settings file
     was written by the agent, not approved by a person. Restore is deliberately wider than harvest (a
     Managed worker still receives the repo's approvals or it stalls on prompts nobody can answer).
+    **Audit F19, at the `StopAsync` call site: the two harvests sit inside a
+    `try`/`catch (OperationCanceledException)`, the TEARDOWN below them does not.** The harvests may
+    honour the RPC's token — they are best-effort reads and a client that hung up has stopped waiting for
+    its credentials — but past that point the session record is already gone, so a cancellation that
+    skipped the teardown would leave a running container nothing in the app can see, on a worktree the
+    same stop is about to want removed. The disconnect that reaches it is the ordinary case: a user
+    closing the window on a stop taking a few seconds. **The guard wraps the gate; it never replaces
+    it** — the call inside the `try` is `HarvestCredentialsIfAttendedAsync`, and swapping it back to the
+    ungated `_launcher.HarvestCliCredentialsAsync` reopens F2 with a green build, which is why the
+    reason is restated at the line and pinned by
+    `CliSettingsBoundaryTests.StoppingAnUnattendedWorker_HarvestsNoLogin_EvenThoughTheFileIsRightThere`.
     **F2 — the same gate now covers CREDENTIALS** (`HarvestCredentialsIfAttendedAsync`, at both the live
     `HarvestCredentialsAsync` and the `StopAsync` call sites). It did not before, and the asymmetry made
     no sense in either direction it was argued: a coordinator's workers are spawned `Managed` running

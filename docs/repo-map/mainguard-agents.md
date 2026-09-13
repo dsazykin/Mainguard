@@ -1497,7 +1497,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (`MarkHandedBack`/`IsHandedBack`/
       `ClearHandedBack`): "let the agent resolve" sets it, the composition root installs it on the ref
       mediator as `RewritePermitted`, and the worker's finished rebase — a rewrite of published history —
-      is published exactly once before rule 2 is absolute again).
+      is published exactly once before rule 2 is absolute again. The permit is **both stamped and
+      durable**, which are independent properties from two different audit findings: F44 gave it a
+      `HandBackLifetime` (24h) measured against the injected `_clock`, so Monday's decision stops
+      authorising Friday's rewrite; F3 write-through made it survive a restart, because the rewrite it
+      authorises arrives whenever the agent finishes. The single constructor takes both seams
+      (`IAgentRestartLedger? persist`, `Func<DateTimeOffset>? clock`, in that order — pass the clock by
+      NAME). `IsHandedBack`'s expiry path clears the LEDGER as well as memory, or the next restart would
+      resurrect what just expired. **Known gap:** `AgentRestartRecord.HandedBackRepos` carries the repo
+      list only, not the grant stamp, so a restored permit is stamped with restore time — it stays usable
+      and still expires, at the cost that a restart refreshes its 24h lifetime. Carrying the stamp
+      through the ledger record is the real fix and wants a schema change).
     - `AgentLifecycle.cs` (`AgentContext : IDisposable`/`IAsyncDisposable` — ordered, idempotent,
       failure-tolerant teardown from an injected `TeardownPlan`: kill PTY (leader) → stop container (per
       policy) → `RemoveAgentWorktree(force:true)` (also deletes `agent/<id>`) → emit the terminal event →
