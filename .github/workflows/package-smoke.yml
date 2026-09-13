@@ -149,8 +149,37 @@ jobs:
             if ($out -notmatch 'Plan resolved for channel') {
               throw "pack.ps1 -Channel $channel -DryRun did not resolve a plan."
             }
+            # Audit F57: the resolved plan must ARM the release-pins guard. This is the assertion that
+            # the MG0057 error is reachable from the script that actually ships bytes — it was not,
+            # for the whole life of the guard, and nothing here would have said so.
+            if ($out -notmatch '/p:MainguardPinsRequired=true') {
+              throw "pack.ps1 -Channel $channel resolved a publish that does NOT pass /p:MainguardPinsRequired=true. MG0057 cannot fire, so a release with no pins builds clean and ships UnsignedBuildSignatureVerifier (audit F57)."
+            }
           }
-          Write-Host "Both Velopack channel plans resolve."
+          Write-Host "Both Velopack channel plans resolve, and both arm the release-pins guard."
+
+      # The other half of the same rule: -DryRun resolves a plan without a certificate (that is what it
+      # is for), but a REAL publish with no pin must be refused before anything is built. Asserted by
+      # running the script for real with no certificate and requiring it to throw.
+      - name: A real publish with no pin must be refused
+        shell: pwsh
+        run: |
+          $err = $null
+          try {
+            & "$PWD/build/velopack/pack.ps1" -Channel pro -Version 0.0.0-pinless *>&1 | Out-String | Write-Host
+          } catch {
+            $err = "$_"
+            Write-Host "pack.ps1 refused, as it must: $err"
+          }
+          if ($null -eq $err) {
+            throw "pack.ps1 published a release with no runtime signature pin. That ships UnsignedBuildSignatureVerifier, whose verdict is never Rejected, so every privileged promote proceeds unverified (audit F57)."
+          }
+          # It has to refuse for the RIGHT reason: a missing payload, an absent `vpk` or a Linux-only
+          # quirk would also throw, and would make this guard pass while proving nothing.
+          if ($err -notmatch 'runtime signature pin') {
+            throw "pack.ps1 threw, but not the no-pin refusal — so this guard did not test the F57 rule. Actual error: $err"
+          }
+          Write-Host "A real publish with no pin is refused before anything is built."
 
       # Regression guard for the -DryRun secret leak: the mode documented as "verify the wiring safely"
       # used to echo /p:MainguardSigningCertPassword=<pw> and signtool's /p "<pw>" verbatim. A canary

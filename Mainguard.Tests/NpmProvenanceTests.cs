@@ -226,7 +226,13 @@ public class NpmProvenanceTests
         var withProvenance = Evidence(key, Tarball, withProvenanceAttestation: true);
         var accepted = NpmProvenancePolicy.Decide(
             "tool", AdapterProvenanceLevel.NpmBuildProvenance, withProvenance, Tarball, key.Keys);
-        Assert.Equal(NpmProvenanceOutcome.BuildProvenanceVerified, accepted.Outcome);
+        Assert.Equal(NpmProvenanceOutcome.BuildProvenanceAttestationPresent, accepted.Outcome);
+
+        // Audit F48: the verdict must state, in the same sentence it accepts, that the attestation's
+        // DSSE signature / Fulcio chain / Rekor proof are NOT checked. Pinned so the caveat cannot be
+        // tidied out later, leaving a message that reads like full SLSA verification.
+        Assert.Contains(NpmProvenancePolicy.BuildProvenanceLimitation, accepted.Reason, StringComparison.Ordinal);
+        Assert.Contains("NOT VERIFIED", accepted.Reason, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -450,9 +456,14 @@ public class NpmProvenanceTests
 
             Source = new AdapterChannelTests.FakeSource { ManifestToServe = manifest, PayloadToServe = PayloadOld };
             var channel = new AdapterChannel(Source, Host, new AdapterChannelTests.FakeCache(manifest),
-                delay: (_, _) => Task.CompletedTask, pins: Pins);
+                delay: (_, _) => Task.CompletedTask, pins: Pins, provenance: Provenance);
+            // autoAdoptRegistryLatest: these tests exercise what the GATE does when a pin is about to
+            // move on the install path, which only happens when adoption is enabled. Whether adoption
+            // should be on by default is a separate decision, pinned in
+            // AgentCliUpdateServiceTests.EnsureLatest_ByDefault_… (audit F48).
             Updater = new AgentCliUpdateService(
-                channel, Pins, new NpmStub(PayloadNew), Log.Add, Provenance);
+                channel, Pins, new NpmStub(PayloadNew), Log.Add, Provenance,
+                autoAdoptRegistryLatest: true);
         }
 
         /// <summary>Serves just enough registry for the updater's own fetches; provenance comes from the
