@@ -127,8 +127,51 @@
     cap, the line format, mask fidelity, swallowed IO, and the
     `DaemonLogCategories`↔`DaemonLogSubsystems` lockstep; plus the Lifecycle "bound" + Migration
     ("preparing db / stale migration lock cleared / migrate ok / watchdog fired") milestones (the
-    watchdog fallback driven through `TryPrepareDatabase` directly).
-  - `LoggingMaskTests` gains a non-`RpcException`-under-`Rpc` handler-fault test;
+    watchdog fallback driven through `TryPrepareDatabase` directly). **F56** adds the owner-only
+    permission tests (`[UnixOnlyFact]`: the logs dir is not group/world readable, the FIRST line lands
+    in an already-`0600` file, and a rolled file stays `0600`) — each also carrying
+    `[SupportedOSPlatform("linux")]`/`[SupportedOSPlatform("macos")]`, because `File.GetUnixFileMode`
+    inside a custom skip attribute is CA1416 to the analyzer and `dotnet format --verify-no-changes`
+    exited 2 on it.
+  - `LoggingMaskTests` gains a non-`RpcException`-under-`Rpc` handler-fault test; **F56** reworks its
+    assertions from "the field was masked" to "the body was never rendered", and adds
+    `FreeTextRequestFields_AreNeverRendered_EvenThoughTheyAreNotMarkedSecret` — a `task_prompt`
+    carrying a pasted API key, which the old six-field denylist wrote to `rpc.log` verbatim.
+  - **`Mainguard.Server.Tests/SecretFieldMaskAllowlistTests.cs`** (F56) — the allowlist itself, on
+    `SecretFieldMask.Summarize` directly: task prompts and audit payloads render `<str:LEN>` / a
+    record count, registered `// SECRET` fields render nothing at all, nested messages recurse under
+    the same rules, bytes render `<bytes:LEN>`, bounded scalars still render (an access log has to
+    stay worth reading), and an allowlisted NAME with an un-handle-like VALUE still renders a length.
+  - **`Mainguard.Server.Tests/SecretFieldMaskProtoSweepTests.cs`** (F56) — the sweep the per-message
+    tests cannot be, and the one test that survives the contract changing: it enumerates EVERY
+    `MessageDescriptor` in the generated contract assembly (nested types included, ~150 of them),
+    fills every string/bytes field — singular, repeated, map value, nested — with a 96-character
+    sentinel, runs `Summarize`, and asserts neither the sentinel nor a 16-char prefix of it survives.
+    A second sweep covers the other half of the rule: a SHORT identifier sentinel in every singular
+    string field, with the set of field names that render it verbatim pinned against the allowlist
+    restated in the test — so widening `LoggableNames` (adding `reason` or `title` while debugging)
+    fails here and names the field, which is the leak-by-omission an allowlist exists to prevent.
+  - **`Mainguard.Server.Tests/AuditRetentionLeaseTests.cs`** (F64b) — retention over a real
+    SQLite-backed `ChainedAuditLog` with an injected clock: with no lease everything expired expires;
+    an open `InMemoryMergeLeaseStore` lease holds back the records naming its agent or lease id while
+    unrelated ones still expire; the held record expires on the sweep after the lease confirms;
+    redaction events are never themselves redacted and the chain still verifies; plus the pure
+    `References` / `IsHeldByOpenLease` predicates (repo hash deliberately NOT a hold key; the two id
+    kinds never cross; and — the substring bug — an agent id of `a1` does not hold a record merely
+    because `a1` occurs inside a sha, a path or a free-text reason).
+  - **`Mainguard.Server.Tests/AuditPersistenceBootTests.cs`** (B1/B3) — the daemon must not come up
+    looking healthy while its audit trail goes nowhere. Drives `GatewayServiceRegistration.
+    RegisterAuditLog` directly over a real migrated SQLite DB: a key ring whose master key this
+    process cannot decrypt makes the boot THROW `AuditPersistenceUnavailableException` (message
+    naming the remedy, ERROR logged, and nothing registered — a half-wired fallback is the thing
+    being refused) while a protected ring registers the chained log and logs the posture line; a
+    missing daemon DB still falls back but reports at ERROR; the posture-vs-store classification is
+    pinned per exception type. Plus the read-only verify CLI: it creates no key ring on a box that
+    never ran the daemon (exit 0), exits 1 rather than "OK" when records exist but the master key is
+    gone, and still verifies a real chain.
+  - **`Mainguard.Server.Tests/AuditReadBoundTests.cs`** (F64a) — `ReadAudit` over a stub chain of fat
+    records: the page stops at the byte budget and fits under gRPC's 4 MB default, is a contiguous
+    prefix so the walk resumes, still returns a single oversized record, and leaves small pages alone.
   - `SpawnImagePreflightTests` asserts the `Spawn` step sequence + the image-missing failure.
   - **`Mainguard.Tests/Headless/DaemonLogsRenderHarness.cs`** — the Daemon logs window in all five
     themes × populated/spawn/loading/empty → `artifacts_headless/daemon_logs_<Theme>_<state>.png`.
@@ -439,7 +482,41 @@
   `SshKeyServiceTests` (T-14 ArgumentList argv construction + a REAL local ssh-keygen round trip —
   generate → files exist → `ListKeys` finds it → passphrase round-trips through the keyring,
   `RequiresGitCli`), `SecureKeyringTests` (T-14 round-trip + null-on-corrupt via the path override +
-  encrypted-at-rest), `CredentialResolverTests` (T-14 SSH-vs-token credential selection),
+  encrypted-at-rest), `SecureKeyringProtectionTests` (**F53**: the `Absent`/`Present`/`Unreadable`
+  tri-state, the audit master key failing closed on a tampered entry while a host token still degrades
+  to null, the `MAINGUARD_KEYRING_PASSPHRASE` protector round-tripping and leaving
+  `mainguardPassphraseEncryptedKey` in the key XML, a missing/wrong passphrase reading as `Unreadable`
+  rather than absent, and the unprotected-write refusal matrix — end-to-end only where a protector can
+  actually be absent, i.e. not Windows/macOS, via `RequiresUnprotectedPlatformFact`),
+  `SecureKeyringMigrationTests` (**B2**: what happens to a key ring that already EXISTS when the
+  protector arrives — a plaintext ring is re-wrapped in place when a passphrase appears, same key id,
+  and every secret still reads back; an already-protected ring is byte-for-byte untouched; an
+  unprotected one REPORTS its plaintext keys instead of passing silently; a still-plaintext ring
+  refuses the audit master key even under a configured protector; a passphrase-wrapped ring opened
+  without the passphrase refuses it too, rather than letting DataProtection mint a fresh unprotected
+  default key behind the operator's back; the `MAINGUARD_KEYRING_PASSPHRASE_FILE` source round-trips
+  with the env form, trailing newline and all; and `AuditCrypto.TryOpenExisting` writes nothing.
+  These run on every platform via `SecureKeyring`'s internal protection-override seam — the
+  unprotected posture is reachable end to end only on Linux/WSL, which is why its consequences went
+  unnoticed),
+  `MainguardOsKeyringProvisioningTests` (**F53, the shipped half**: the two suites above cover the
+  protector once a passphrase is in hand — nothing covered anything ever PUTTING one there. Pins the
+  four-link chain that supplies it on a VM, Docker-free, by reading the payload sources: the
+  `Dockerfile` `COPY`s `provision-keyring-passphrase.sh` to the path the unit invokes and makes it
+  executable; the unit runs it `ExecStartPre=+` (as root, so a `User=mainguard` service can write
+  root-owned `/etc/mainguard`); the unit's `Environment=` names
+  `SecureKeyring.PassphraseFileVariable` and carries the PATH, never the secret, and never the direct
+  `MAINGUARD_KEYRING_PASSPHRASE`; the script writes that same path, mints from `/dev/urandom`, and
+  never regenerates. Plus: neither unit nor Dockerfile may mention
+  `MAINGUARD_ALLOW_UNPROTECTED_KEYRING`, the image may not bake the passphrase path, and the script
+  must be in `build.sh`'s `INPUT_SPECS`. Since the daemon is fail-closed on Linux, a break in this
+  chain is not a degraded install but a VM whose daemon refuses to start — which is exactly how it
+  surfaced, as a P2-21 crash-loop),
+  `KeyringTestPosture` (both test assemblies) — a `[ModuleInitializer]` that gives the test process a
+  key-ring passphrase when the machine would otherwise resolve to `KeyringProtection.None`, so the
+  suite exercises the same protected path everywhere it runs. Deliberately here and not in `ci.yml`:
+  an environment variable in CI would hide the product defect rather than state a posture,
+  `CredentialResolverTests` (T-14 SSH-vs-token credential selection),
   `AccountsViewModelTests` (T-14 known-host catalog + PAT store/remove + add-custom-host),
   `SignatureStatusParserTests` (T-15 pure: the `%G?` code table + batched-log parse incl.
   separator-in-signer/CRLF/empty), `GitServiceSigningTests` (T-15 integration, `RequiresGpg`: signed
@@ -1482,7 +1559,19 @@
   actually listen on 127.0.0.1:5250, and have created an ABSOLUTE data root under `$HOME`. Both
   shipped crash-loop bugs (missing libicu; `GetFolderPath`→relative path) survived only because
   mainguardd had never once been STARTED in its shipping rootfs before a user did it — this asserts
-  behaviour, not an exit code. Its `client-closure` job (ADR-0001 payoff, automated) publishes the
+  behaviour, not an exit code. **"The context systemd gives it" is taken literally (F53):** the smoke
+  reads the `ExecStartPre=+` and `Environment=` lines out of the SHIPPED
+  `/etc/systemd/system/mainguardd.service` and replays them — running the provisioner as root, then
+  starting the daemon under the unit's own environment — rather than restating them here, so a unit
+  that grows a line is covered for free and one that loses a line fails here first. It hardcoded
+  `env HOME=…` instead, which is how the fail-closed keyring landed as a crash-loop: the unit had
+  grown `ExecStartPre=+provision-keyring-passphrase.sh` and
+  `Environment=MAINGUARD_KEYRING_PASSPHRASE_FILE=…`, the smoke replayed neither, and the daemon
+  (correctly) exited 78 on an unprotected key ring. It also asserts the POSTURE, not just the boot —
+  `keyring protection=Passphrase` from `SecureKeyring.DescribeProtection()` must appear in the
+  daemon's own output, so a future unit that quietly drops the provisioning cannot pass here by
+  setting `MAINGUARD_ALLOW_UNPROTECTED_KEYRING`, which boots fine and ships the audit master key in
+  cleartext. Its `client-closure` job (ADR-0001 payoff, automated) publishes the
   Client head and fails if the closure names any agent-platform assembly (`Mainguard.Agents(.UI)` /
   `Mainguard.Protos` / `Docker.DotNet` / `Porta.Pty` / `Grpc`), via
   `build/ci/verify-client-closure.sh` (also runnable locally). That script publishes **self-contained
