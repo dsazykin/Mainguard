@@ -81,7 +81,16 @@
   at all — but it is logged through a new `logError` delegate at ERROR, alongside the key-ring posture
   line (`SecureKeyring.DescribeProtection()`) which is now logged at every boot. `RegisterAuditLog` and
   `IsKeyringPosture` are `internal` so `AuditPersistenceBootTests` drives the whole decision without a
-  host; **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
+  host. **The two boot refusals cannot be confused with each other.** `Register` runs from
+  `ConfigureServices`, i.e. before the Kestrel options callback takes the instance lock, so the
+  key-ring check gets first refusal on paper — but in the case that matters, a second daemon on a data
+  root another daemon owns, it never runs: `ClearStaleMigrationLock` fails to take that same
+  `DaemonInstanceLock`, `TryPrepareDatabase` returns false, `dbFactory` is null, and `RegisterAuditLog`
+  takes its no-db branch, which opens no key ring. The loser therefore always exits through
+  `DaemonExitCodes.RefusedStart()` with the winner's token, mTLS material, key ring and migration lock
+  untouched; 78 stays reserved for "this machine's key ring cannot hold the audit master key".
+  `Register` takes BOTH the `logError` delegate (B1) and the `lockDirectory` (F55);
+  **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
   (`IPullRequestService`→`PullRequestService`, `IPrIntakeStore`→`DbPrIntakeStore`/in-memory fallback,
   `IPrHeadFetcher`→`PrHeadFetcher` over the substrate worktree path,
   **`IPrWorkerHost`→`Runtime/ExternalPrWorkerHost` (the spawn seam, sharing the merge queue's
