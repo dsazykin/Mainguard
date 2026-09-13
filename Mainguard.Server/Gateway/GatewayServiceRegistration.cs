@@ -24,10 +24,27 @@ namespace Mainguard.Server.Gateway;
 /// <see cref="SwarmReconciler"/> (run through the RT-D1 ordered <see cref="DaemonBootSequence"/>). All
 /// persistence is best-effort: if the daemon SQLite DB cannot be opened/migrated the stack falls back
 /// to in-memory stores so the daemon still starts (the gRPC surface must never fail to bind on a DB
-/// hiccup).
+/// hiccup). The ONE exception is the audit key ring's posture — see <see cref="RegisterAuditLog"/>,
+/// which throws <see cref="AuditPersistenceUnavailableException"/> rather than pretend.
+///
+/// <para><b>How that refusal coexists with the F55 instance-lock refusal.</b> Both are boot-sequence
+/// refusals and neither may swallow the other. This method runs from <c>ConfigureServices</c>, i.e.
+/// strictly before <c>DaemonHost.Build</c>'s Kestrel options callback takes the data root's
+/// <c>DaemonInstanceLock</c>, so on paper the key-ring check gets first refusal. In the case that
+/// matters — a second daemon started against a data root another daemon already owns — it does not
+/// fire at all, and by construction: <see cref="ClearStaleMigrationLock"/> fails to take the very same
+/// instance lock, <see cref="TryPrepareDatabase"/> returns false, <c>dbFactory</c> is null, and
+/// <see cref="RegisterAuditLog"/> takes its no-db branch, which never opens a key ring. The loser
+/// therefore reaches the Kestrel callback and exits through <c>DaemonExitCodes.RefusedStart()</c> with
+/// the winner's credentials, key ring and migration lock untouched. A key-ring refusal (exit 78,
+/// EX_CONFIG) means what it says: this machine's key ring cannot hold the audit master key.</para>
 /// </summary>
 public static class GatewayServiceRegistration
 {
+    /// <param name="logError">
+    /// Degraded or refused persistence, reported at ERROR rather than as a milestone (#360). Optional
+    /// for the same reason <paramref name="log"/> is: the unit tests drive this path without a host.
+    /// </param>
     /// <param name="lockDirectory">
     /// F55: the DATA ROOT this daemon's <c>Runtime.DaemonInstanceLock</c> guards — which is not
     /// necessarily <paramref name="dbPath"/>'s directory, because <c>--data-path</c> can point the DB
@@ -38,7 +55,11 @@ public static class GatewayServiceRegistration
     /// that does not split the two.
     /// </param>
     public static void Register(
-        WebApplicationBuilder builder, string dbPath, Action<string>? log = null, DaemonOptions? options = null,
+        WebApplicationBuilder builder,
+        string dbPath,
+        Action<string>? log = null,
+        DaemonOptions? options = null,
+        Action<string, Exception?>? logError = null,
         string? lockDirectory = null)
     {
         var services = builder.Services;
@@ -73,7 +94,7 @@ public static class GatewayServiceRegistration
         // EAGERLY (it needs no DI) so a store problem surfaces here in migration.log rather than as
         // a mid-flight RPC failure; on any failure the daemon still starts, on the in-memory
         // journal — which is exactly the pre-P2-15 behavior, now with the loss stated out loud.
-        RegisterAuditLog(services, dbFactory, dbPath, log);
+        RegisterAuditLog(services, dbFactory, dbPath, log, logError);
 
         // The P2-10 queue-state + immutable-verification stores follow the same posture as the gateway
         // stores above: SQLite when the daemon DB opened, in-memory otherwise so the daemon always starts.
@@ -132,8 +153,9 @@ public static class GatewayServiceRegistration
         // they were simply not running. The provisioner builds a repo's queue on the events that make a repo
         // active (ProvisionRepo / CreateWorktree / a jailed spawn) over the SAME persisted stores, and — the
         // load-bearing detail — the SAME IMergeLeaseStore singleton the foreground merge, BeginMerge and
-        // MergeDispatch contend for, since the one-outstanding-merge-per-repo invariant only spans origins
-        // while they share one store (MG-23).
+        // the boot MergeReconcileTask contend for, since the one-outstanding-merge-per-repo invariant only
+        // spans origins while they share one store (MG-23). (This list previously named MergeDispatch,
+        // which fix/audit-w2b-merge-and-verification deleted; the surviving contenders are the ones above.)
         services.AddSingleton(sp =>
         {
             var provisioner = new MergeQueueProvisioner(
@@ -668,9 +690,22 @@ public static class GatewayServiceRegistration
     /// the AES-GCM master key lives in a <see cref="Mainguard.Git.Security.SecureKeyring"/> rooted
     /// beside it too — production puts both under the data root, in-proc test hosts under their
     /// isolated token directory, with no extra knob to drift.
+    ///
+    /// <para><b>A key-ring posture failure is FATAL, not a fallback.</b> The in-memory journal exists
+    /// for the one thing it can honestly stand in for: a daemon DB that would not open, where the
+    /// alternative is a daemon that never binds and a user with no app at all. It is NOT a stand-in
+    /// for a key ring that refuses to hold the audit master key, because there the daemon comes up
+    /// looking healthy, answers <c>VerifyAudit</c> with <c>persistent=false</c>, and loses every
+    /// audit event at shutdown — a security store that silently stops storing. That was exactly the
+    /// "carries on looking healthy" failure this work set out to remove, so it now refuses to boot
+    /// and the message names both remedies.</para>
     /// </summary>
-    private static void RegisterAuditLog(
-        IServiceCollection services, Func<AppDbContext>? dbFactory, string dbPath, Action<string>? log)
+    internal static void RegisterAuditLog(
+        IServiceCollection services,
+        Func<AppDbContext>? dbFactory,
+        string dbPath,
+        Action<string>? log,
+        Action<string, Exception?>? logError = null)
     {
         if (dbFactory is not null)
         {
@@ -680,9 +715,24 @@ public static class GatewayServiceRegistration
                 var keyringDir = string.IsNullOrEmpty(directory)
                     ? "audit-keyring"
                     : Path.Combine(directory, "audit-keyring");
+                var keyring = new Mainguard.Git.Security.SecureKeyring(keyringDir);
+
+                // Posture, stated at boot whatever it is: a protector that only covers keys generated
+                // from now on is a protector an upgraded install does not have, and B2's re-wrap
+                // outcome (or its failure) is exactly the thing no caller surfaced before.
+                var posture = keyring.DescribeProtection();
+                if (keyring.IsUnprotected || keyring.Ring.MasterKeyUnavailable)
+                {
+                    logError?.Invoke(posture, null);
+                }
+                else
+                {
+                    log?.Invoke(posture);
+                }
+
                 var chained = new ChainedAuditLog(
                     dbFactory,
-                    new AuditCrypto(new Mainguard.Git.Security.SecureKeyring(keyringDir)),
+                    new AuditCrypto(keyring),
                     new AuditFileMirror(dbPath + ".audit-mirror"));
                 services.AddSingleton<IAuditLog>(chained);
                 services.AddSingleton<IChainedAuditLog>(chained);
@@ -692,18 +742,36 @@ public static class GatewayServiceRegistration
                 log?.Invoke("audit chain ready (db-backed, mirror recovered)");
                 return;
             }
+            catch (Exception ex) when (IsKeyringPosture(ex))
+            {
+                logError?.Invoke("audit chain refused: " + ex.Message, ex);
+                throw new AuditPersistenceUnavailableException(ex);
+            }
             catch (Exception ex)
             {
-                log?.Invoke($"audit chain unavailable → in-memory journal (EVENTS WILL NOT SURVIVE RESTART): {ex.Message}");
+                logError?.Invoke(
+                    $"audit chain unavailable → in-memory journal (EVENTS WILL NOT SURVIVE RESTART): {ex.Message}",
+                    ex);
             }
         }
         else
         {
-            log?.Invoke("audit chain on in-memory journal (no daemon db) — EVENTS WILL NOT SURVIVE RESTART");
+            logError?.Invoke("audit chain on in-memory journal (no daemon db) — EVENTS WILL NOT SURVIVE RESTART", null);
         }
 
         services.AddSingleton<IAuditLog, InMemoryAuditLog>();
     }
+
+    /// <summary>
+    /// The failures that are about the KEY RING's posture rather than about the store: the audit
+    /// master key cannot be stored safely, cannot be read back, or would be re-minted under a
+    /// protector this process cannot use. Each has a named remedy and none of them is survivable by
+    /// dropping to a journal that forgets everything at shutdown.
+    /// </summary>
+    internal static bool IsKeyringPosture(Exception ex)
+        => ex is Mainguard.Git.Security.UnprotectedKeyringException
+            or Mainguard.Git.Security.KeyringUnreadableException
+            or Mainguard.Git.Security.KeyringProtectorUnavailableException;
 
     /// <summary>How long <see cref="TryPrepareDatabase"/> lets a migration run before falling back
     /// to in-memory stores. Generous — a real migration is sub-second; only a hang exceeds this.</summary>

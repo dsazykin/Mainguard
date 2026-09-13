@@ -21,9 +21,91 @@ namespace Mainguard.Agents.Agents.Sandbox;
 /// PATH when present (the coordinator's <c>mainguard-agent</c> spawn shim), and hand off with
 /// <c>exec</c> so the CLI is the TTY's foreground process.</para>
 /// </summary>
+/// <summary>
+/// <b>Where the docker CLI is allowed to come from (audit F54).</b>
+///
+/// <para><b>What went wrong.</b> Every daemon-side docker invocation named the bare string
+/// <c>"docker"</c>, which <see cref="System.Diagnostics.Process"/> resolves against the daemon's
+/// INHERITED <c>PATH</c>. The daemon is the component that creates jails, writes the shared adapters
+/// tree, and — on the macOS substrate — runs installs; whoever can prepend a directory to the
+/// environment it was started with therefore chooses the program that does all of that. Every other
+/// executable this codebase hands to a privileged facility goes through
+/// <see cref="Bootstrap.TrustedExecutablePath"/>; the one binary the whole sandbox boundary is built
+/// out of did not.</para>
+///
+/// <para><b>The rule.</b> Resolve to an ABSOLUTE path from a fixed list of system-owned directories,
+/// in order, and use the first that exists. No <c>PATH</c> lookup, and deliberately no environment
+/// override: an override variable is the same primitive as <c>PATH</c> wearing a different name. The
+/// list contains only directories a normal user cannot write (notably NOT <c>~/.docker/bin</c>, which
+/// Docker Desktop offers and which is same-user-writable).</para>
+///
+/// <para><b>When nothing is found</b> the first candidate is returned anyway, so the answer is always an
+/// absolute path and the spawn fails with a plain "no such file" — the degrade
+/// <c>AgentCliBinder.TryBind</c> already audits on a box with no docker CLI. Returning the bare name as
+/// a fallback would reinstate exactly the lookup this class exists to remove.</para>
+/// </summary>
+public static class TrustedDockerBinary
+{
+    /// <summary>The system-owned directories a docker CLI may be run from, in preference order.</summary>
+    public static IReadOnlyList<string> SearchPath { get; } = OperatingSystem.IsWindows()
+        ? new[]
+        {
+            @"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+            @"C:\ProgramData\DockerDesktop\version-bin\docker.exe",
+        }
+        : new[]
+        {
+            "/usr/local/bin/docker",
+            "/usr/bin/docker",
+            "/bin/docker",
+            // Docker Desktop for Mac's own copy, and Homebrew's prefix on Apple Silicon. Both are
+            // root-owned on a normal install; both are needed because a Mac may have either.
+            "/Applications/Docker.app/Contents/Resources/bin/docker",
+            "/opt/homebrew/bin/docker",
+        };
+
+    private static readonly Lazy<string> Resolved = new(Pick, isThreadSafe: true);
+
+    /// <summary>The absolute docker path this host uses. Resolved once per process.</summary>
+    public static string Resolve() => Resolved.Value;
+
+    /// <summary>The <c>PATH</c> a docker child process is given — the same fixed directories, never the
+    /// daemon's inherited one. docker still needs a PATH for its credential helpers and CLI plugins, so
+    /// this replaces it with a trusted value rather than removing it.</summary>
+    public static string TrustedChildPath { get; } = string.Join(
+        OperatingSystem.IsWindows() ? ';' : ':',
+        SearchPath.Select(DirectoryOf).Distinct(StringComparer.Ordinal));
+
+    private static string Pick()
+    {
+        foreach (var candidate in SearchPath)
+        {
+            try
+            {
+                if (System.IO.File.Exists(candidate))
+                    return candidate;
+            }
+            catch (Exception)
+            {
+                // An unreadable directory is not this candidate — keep looking.
+            }
+        }
+
+        return SearchPath[0];
+    }
+
+    private static string DirectoryOf(string path)
+    {
+        var cut = path.LastIndexOfAny(new[] { '\\', '/' });
+        return cut <= 0 ? path : path[..cut];
+    }
+}
+
 public static class SandboxCliLaunch
 {
-    /// <summary>The docker CLI binary the daemon spawns under its PTY.</summary>
+    /// <summary>The docker CLI binary's NAME. Kept for the log/diagnostic sentences that talk about
+    /// "the docker CLI"; what actually gets executed is <see cref="TrustedDockerBinary.Resolve"/>, an
+    /// absolute path — see that type for why a bare name was a hole rather than a convenience.</summary>
     public const string DockerBinary = "docker";
 
     /// <summary>The terminal type advertised to the CLI on BOTH sides of the exec: the daemon-side
@@ -80,6 +162,8 @@ public static class SandboxCliLaunch
             "sh", "-c", WrapperScript, "mainguard-launch",
         };
         args.AddRange(launch);
-        return (DockerBinary, args);
+        // Audit F54: the absolute, allow-listed path — never the bare name resolved out of whatever
+        // PATH the daemon inherited.
+        return (TrustedDockerBinary.Resolve(), args);
     }
 }

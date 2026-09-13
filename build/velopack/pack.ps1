@@ -168,6 +168,32 @@ if ($SigningCertPath -and -not $PinnedThumbprints) {
           "pinning ships a build that LOOKS signed and verifies nothing (docs/design/code-signing-plan.md §3)."
 }
 
+# ---- Step 3b (audit F57): this script is the release, so it must SAY it is a release. ----
+# The MG0057 guard in Mainguard.Agents.csproj only fires for a build that declares itself one, and
+# nothing declared it. This script passed /p:MainguardPinnedThumbprints only when a pin happened to
+# resolve, and passed no stamp at all, so `pack.ps1 -Channel pro` with no certificate produced a
+# PIN-LESS Pro head — UnsignedBuildSignatureVerifier, whose verdict is never Rejected, so every
+# privileged promote proceeds on NotAvailable — with a green build and no diagnostic anywhere. The
+# guard existed, was tested, and could not fire in the one pipeline that ships bytes to users.
+#
+# Two statements of one rule, deliberately. The refusal below is this script's own voice and comes
+# BEFORE a multi-minute publish; /p:MainguardPinsRequired=true below is the same rule enforced by the
+# compiler, so deleting or mis-editing the refusal still cannot produce a pin-less release.
+#
+# NOT MainguardAttestedRelease: that stamp asserts "a GitHub artifact attestation exists for these
+# bytes", which only the repository's OIDC identity can mint (ci.yml's payload-reproducible job).
+# Setting it here, on the owner's release box, would make BuildProvenanceGate demand an attestation
+# that was never minted and the shipped app would refuse its own payload. MainguardPinsRequired is
+# the property the csproj documents for precisely this case — a signed-but-not-attested pipeline
+# opting into the same guard — and the attested stamp turns it on by itself when that day comes.
+if (-not $DryRun -and -not $PinnedThumbprints) {
+    throw "Refusing to publish a Mainguard release with no runtime signature pin. A pin-less build " +
+          "selects UnsignedBuildSignatureVerifier, whose verdict is never Rejected, so the elevated " +
+          "helper and the resume target are promoted unverified (audit F57). Pass -PinnedThumbprints " +
+          "<thumbprint>, or -SigningCertPath <cert.pfx> to derive it from the certificate you sign " +
+          "with (build/signing/README.md is the recipe). Use -DryRun to resolve the plan without one."
+}
+
 # ---- Publish the selected head (self-contained win-x64), same flags as the single-channel script used. ----
 Write-Host "==> [$Channel] Publishing $projectPath (self-contained $Runtime) -> $publishDir"
 $publishArgs = @(
@@ -190,6 +216,9 @@ if ($bundlePayload) {
 if ($PinnedThumbprints) {
     $publishArgs += "/p:MainguardPinnedThumbprints=$PinnedThumbprints"
 }
+# Unconditional, and on -DryRun too: this is what arms MG0057 (see step 3b). Printing it in the dry-run
+# plan is also what lets the velopack-wiring smoke assert the arming without a certificate or a publish.
+$publishArgs += "/p:MainguardPinsRequired=true"
 if ($DryRun) {
     Write-Host "    [dry-run] dotnet $(Format-CommandForDisplay $publishArgs)"
 } else {

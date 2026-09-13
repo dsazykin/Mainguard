@@ -25,11 +25,20 @@ if (options.Smoke)
 // Normal daemon run. Build via the shared host configuration so the in-proc test
 // tier (WebApplicationFactory<Program>) exercises the same pipeline. app.Run() is
 // reached so the test harness can intercept host startup.
-// F55: the single-instance guard fires during Build (the Kestrel options callback takes the lock before
-// a listener is configured), so the refusal is caught around Build as well as around Run. It is the guard
-// working, not a crash — one line on stderr and a named exit code, no stack trace. Nothing has been
-// written: the credential files and the migration lock still belong to the daemon that is up.
-Microsoft.AspNetCore.Builder.WebApplication app;
+// Two DIFFERENT refusals can come out of Build, and they must keep their own exit codes:
+//
+//  * F55 — the single-instance guard fires during Build (the Kestrel options callback takes the lock
+//    before a listener is configured), so the refusal is caught around Build as well as around Run. It
+//    is the guard working, not a crash — one line on stderr and a named exit code, no stack trace.
+//    Nothing has been written: the credential files and the migration lock still belong to the daemon
+//    that is up.
+//  * B1 — the audit chain's key ring cannot hold the master key safely. That is decided inside
+//    ConfigureServices, i.e. strictly before the Kestrel callback, and is a configuration the operator
+//    must fix, so it exits 78 (EX_CONFIG) instead.
+//
+// Neither may collapse into the other: "another daemon is already up" is a healthy machine, "this
+// daemon cannot keep an audit trail" is not.
+WebApplication app;
 try
 {
     app = DaemonHost.Build(options);
@@ -38,6 +47,15 @@ catch (Mainguard.Server.Runtime.DaemonAlreadyRunningException already)
 {
     Console.Error.WriteLine(already.Message);
     return DaemonExitCodes.RefusedStart();
+}
+catch (AuditPersistenceUnavailableException ex)
+{
+    // Fail closed, and say so in the one place a human is certainly looking: the console/journal at
+    // the moment the daemon did not come up. The alternative — a daemon that binds and quietly keeps
+    // no audit trail — is the failure this refusal exists to prevent, so it must not be papered over
+    // with an unhandled-exception stack trace either.
+    Console.Error.WriteLine(ex.Message);
+    return 78; // EX_CONFIG: a configuration the operator has to fix, not a crash.
 }
 
 try

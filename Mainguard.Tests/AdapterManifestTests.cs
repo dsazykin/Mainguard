@@ -296,6 +296,62 @@ public class AdapterManifestTests
         Assert.Equal(AdapterManifestError.BadPlatformBinary, ex.Error);
     }
 
+    // ---- the lockfile field (the schema half of the dependency-closure gap) ----------------------
+
+    /// <summary>A declared lockfile names a file and carries a hash, so both are validated at parse —
+    /// before anything reads the field — exactly as platformBinary's paths are.</summary>
+    [Theory]
+    [InlineData("\"path\": \"../../etc/passwd\", \"sha256\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+        AdapterManifestError.Malformed)]
+    [InlineData("\"path\": \"/etc/passwd\", \"sha256\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+        AdapterManifestError.Malformed)]
+    [InlineData("\"path\": \"lockfiles/a.json\", \"sha256\": \"not-a-hash\"", AdapterManifestError.BadHash)]
+    public void Lockfile_WithABadPathOrHash_IsRefused(string lockfileBody, AdapterManifestError expected)
+    {
+        var json = """
+        { "adapters": [ { "id": "a", "displayName": "A", "version": "1.0.0",
+          "provenance": "none",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" },
+          "lockfile": { LOCKFILE } } ] }
+        """.Replace("LOCKFILE", lockfileBody, StringComparison.Ordinal);
+
+        var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(json));
+        Assert.Equal(expected, ex.Error);
+    }
+
+    /// <summary>A well-formed one parses and round-trips onto the spec, so the follow-up that teaches
+    /// the install path to consume it needs no schema change.</summary>
+    [Fact]
+    public void Lockfile_WellFormed_IsCarriedOntoTheSpec()
+    {
+        const string json = """
+        { "adapters": [ { "id": "a", "displayName": "A", "version": "1.0.0",
+          "provenance": "none",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" },
+          "lockfile": { "path": "lockfiles/a-1.0.0.json",
+                        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } ] }
+        """;
+
+        var spec = Assert.Single(AdapterManifest.Parse(json).Adapters);
+        Assert.Equal("lockfiles/a-1.0.0.json", spec.Lockfile!.Path);
+    }
+
+    /// <summary>
+    /// And the honest state of the SHIPPED channel: no adapter declares one yet, so no install is
+    /// lockfile-pinned. This is a NOTE, not an aspiration — it fails the day somebody adds a lockfile
+    /// without also landing the install-side half, which is exactly when the manifest's residual-gap
+    /// paragraph would start being wrong in the reassuring direction.
+    /// </summary>
+    [Fact]
+    public void BundledStarterCatalog_DeclaresNoLockfilesYet_SoTheResidualGapNoteIsStillAccurate()
+    {
+        var manifest = AdapterManifest.Parse(BundledAdapterChannelSource.StarterManifestJson());
+
+        Assert.All(manifest.Adapters, a => Assert.Null(a.Lockfile));
+    }
+
     [Fact]
     public void BundledStarterCatalog_LauncherOnlyPackages_DeclareTheirPlatformBinary()
     {

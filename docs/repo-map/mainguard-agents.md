@@ -810,7 +810,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       digest would prove nothing; an untrusted chain is EXPECTED for a self-signed key, a bad digest never
       is) and `PinnedThumbprintSignatureVerifier` (on a signing-enabled build an unsigned covered artifact
       is `Rejected`, never `NotAvailable`). `PayloadSignature` now selects its default from the build's
-      own configuration, so no entry point opts in. Packaging: the Pro head's
+      own configuration, so no entry point opts in. **Audit F57** adds two things on top:
+      `PayloadSignatureGate` in `PayloadSignature.cs` — the one shared "must this refuse?" decision, which
+      makes `NotAvailable` FATAL for a pin-covered kind once the build can actually check (pins
+      configured, or stamped `MainguardAttestedRelease`), so a missing/unusable `wintrust.dll` is no
+      longer a cheaper bypass than forging a signature; and the `MainguardRequirePinsOnReleaseBuild`
+      MSBuild target in `Mainguard.Agents.csproj` (error `MG0057`), which FAILS a build stamped as a
+      release that set no pins — the property defaults empty, so before this a release shipping the
+      never-Rejecting unsigned verifier was indistinguishable at runtime from a dev build.
+      `Mainguard.Tests/ReleaseBuildCarriesPinsTests.cs` pins both halves (the runtime implication
+      attested ⇒ usable pins, and the csproj guard's own existence). Packaging: the Pro head's
       `StageElevatedComponentsToPublish` target self-contained-publishes the helper into `elevated-stage/`
       at PUBLISH (never on a dev build) — an EMPTY stage is now an `<Error>`, not a `<Warning>` buried in
       the publish log, since it means the packaged app silently falls back to the per-user helper, i.e.
@@ -830,6 +839,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       path outside the install root, compared segment-wise so `Mainguard-evil\` fails against
       `Mainguard\`; applied in the schtasks **builder** rather than at the call sites so no caller can
       forget it. Syntactic and platform-independent on purpose — the Windows cases run on Linux CI.)
+      `TrustedResultPath.cs` (**audit F58** — the WRITE-side twin: the elevated helper validated
+      `--resume-target` and not `--result`, although both arrive on the same argv and the second is
+      opened for writing AS ADMINISTRATOR with content that echoes the caller's own string back. Reuses
+      `TrustedExecutablePath`'s normalisation (absolute, canonical, no traversal/UNC/device/ADS/quoting
+      metacharacters) and adds two rules: the file must be named `elevated-result.json` — the one name
+      both production callers pass — and its directory must be a Mainguard data root, either this
+      process's own or a directory named `Mainguard`/`.mainguard` so over-the-shoulder elevation by a
+      second account still works. Pure and injectable; `Mainguard.Tests/TrustedResultPathTests.cs`.)
   - **`Agents/Sandbox/`** (P2-07 sandbox hardening + default-deny egress — daemon-side, no UI; the
     launch-tier prompt-injection exfiltration control). Adds `Docker.DotNet` to `Mainguard.Agents`
     (never referenced from `Mainguard.App.Shell` — G-18). **Pure, unit-tested heart:**
@@ -943,8 +960,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `/workspace` workdir, and a fixed argv-safe `sh -c` wrapper that sources
       `CredTmpfsSpec.DefaultCredentialPath` — `/run/secrets/agent/agent.env`, spelled through the constant
       because the wrapper's `[ -r … ]` guard makes a stale copy of the path fail SILENTLY — and puts the
-      IPC mount on PATH before `exec "$@"`). **Engine-agnostic seams (no Docker.DotNet in the
-      signature):**
+      IPC mount on PATH before `exec "$@"`). The same file now carries `TrustedDockerBinary` (**audit
+      F54**): every daemon-side docker invocation used the bare name `"docker"`, resolved against the
+      daemon's INHERITED `PATH` — so whoever controlled the environment the daemon was started with chose
+      the program that creates every jail. It resolves to an absolute path from a fixed list of
+      system-owned directories (deliberately excluding the same-user-writable `~/.docker/bin`), with no
+      environment override, and `TrustedChildPath` is the matching fixed `PATH` handed to the child
+      instead of ours (`AgentCliBinder.BuildPtyLaunch`). Nothing found ⇒ the first candidate, so the
+      answer is always absolute and the spawn fails with a plain ENOENT — the degrade `TryBind` already
+      audits. **Engine-agnostic seams (no Docker.DotNet in the signature):**
     - `ISandboxEngine.cs` (`SpawnAsync`/`ExecAsync`/`PauseAsync`/`UnpauseAsync` (P2-09 yield-timeout
       `docker pause`/`unpause`)/`StopAsync`/`RemoveAsync`/`ImageExistsAsync` (the v1 spawn-preflight image
       probe; defaults true — an engine/fake with no separate image store has nothing to preflight, the
@@ -1024,6 +1048,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       adds `staleSecretLayout` to the reuse staleness list, because tmpfs entries are fixed at create and
       reusing a pre-upgrade jail would exec a non-root owner into a directory that does not exist —
       resurrecting the same EPERM for every container that outlived the upgrade.
+      **F24 — the reuse path now writes the jail's SECRETS too** (`agent.env` + `oob.key`, before the
+      restores below it). Both live on tmpfs, which Docker recreates EMPTY on `docker start`, and the
+      launcher mints a fresh gateway token every launch while `Issue` retires the previous one — so a
+      resumed jail came back either with no token or with one the daemon had already replaced (every
+      model call 401s, and the OOB supervisor has no key at all). Written UNCONDITIONALLY, unlike the
+      write-if-absent restores beside them: those carry the user's state and a live jail may hold a
+      fresher copy, while these carry THIS launch's secrets, which the launch has already replaced
+      daemon-side. Pinned by `GatewayConfinementDockerTests.ResumedJail_…`.
       `RestoreCliCredentialsAsync`/**`RestoreCliSettingsAsync`** run on BOTH the create and the reuse
       paths, write-if-absent as the AGENT uid over exec stdin — `docker cp` would write UNDER the tmpfs
       `$HOME` and report success while the container sees nothing, and write-if-absent stops the host's
@@ -1040,7 +1072,23 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       filename: the union is `SandboxAgentLauncher.DeclaredWorkspaceIgnorePaths`. The instructions half
       was found in production — `git check-ignore CLAUDE.md` answered rc=1 in a live worker jail and the
       worker's own report flagged the stray `?? CLAUDE.md`. The exclude file lives in the per-agent repo
-      the daemon deletes at teardown, so nothing tracked is touched and no state outlives the agent) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
+      the daemon deletes at teardown, so nothing tracked is touched and no state outlives the agent.
+      **Audit F28 — `InspectPostureAsync` + `RetightenCeilingAsync`,** the two questions the reuse path
+      never asked: does this jail still carry today's hardening set, and today's ceiling?
+      `ContainerSpecBuilder.InspectPosture` splits the answer — hardening is fixed at create and joins
+      the recreate set, a ceiling is writable on a live cgroup and is re-applied in place, because an
+      operator moving a slider must not kill every running session. **The update sends `Memory` and
+      `MemorySwap` as the pair they are:** moby validates a memory update against the memory+swap total
+      the request carries and falls back to the container's existing one, so a Memory-only raise past
+      2x the created ceiling was rejected 409 on every reuse — the Settings page reading 8 GiB and the
+      jail sitting at 2 GiB indefinitely — while a lowering "worked" and left the old swap headroom
+      behind. `ContainerSpecBuilder` therefore states `MemorySwap` explicitly at create (the same
+      `Memory * 2` moby would have filled in, so no jail's posture moves) and `InspectPosture` compares
+      it. Both best-effort paths take the engine's `log` sink rather than swallowing: a refused ceiling
+      update, and an inspect that could not answer, each say so with the jail named — a tolerated
+      failure with no diagnostic is the "reads as applied while measuring nothing" shape this whole
+      lane is about. The daemon wires that sink from `DaemonHost` through
+      `AgentEnvironmentFactory`/`AgentEnvironmentComposition`) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
       the `mainguard-egress-proxy` container (image `DefaultImageRef` — the ref the v1 spawn preflight
       probes); renders + pushes the allowlist config; a `gatewayUpstream` ctor arg pushes the P2-08
       model-host fronting, and an `installedAdapterHosts` provider unions each installed CLI's declared
@@ -1070,7 +1118,34 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       on (MG-7's resolver pin, MG-18's posture check) — a gate that compared against the literal
       `mainguard-agents` would have silently switched itself off the moment a second network appeared.
       `ProxyAddressesOf` collects the proxy's address on EVERY segment so the MG-18 backstop admits each
-      (a single-address render would DROP agents 2..N). **MG-27:** the proxy's image ref is resolved to
+      (a single-address render would DROP agents 2..N).
+    - `SandboxSegmentReaper.cs` (**audit F27 — the segments teardown never got to.** The segment is
+      created BEFORE `SpawnAsync`, and a failed spawn's rollback removes the container and the worktree
+      but not the segment; only a clean teardown calls `RemoveAgentSegmentAsync`. A few dozen failed
+      spawns exhaust Docker's default address pool, after which EVERY spawn fails at network creation on
+      a machine with no running agents. `SandboxSegmentReapPolicy` is the pure decision — `JailNameFor`
+      inverts `AgentSegmentName` back to the container name, which is what lets the sweep ask Docker
+      directly whether the jail this segment exists for is still present — and five independent
+      conditions each save a network on their own: not a segment name (`mainguard-agents` itself is one
+      character off the prefix and can never match), missing Mainguard's own `mainguard.role=agent-net`
+      stamp, anything attached other than the egress proxy (which is on every segment by construction),
+      a container with the segment's jail name existing **running or stopped**, and an age inside the
+      ten-minute grace, since a spawn creates the segment before the jail. `SandboxSegmentReaper.SweepAsync`
+      gathers the facts — networks, then ALL containers, then a per-candidate inspect because the network
+      LIST does not populate `Containers` — fails closed if either list is unavailable, and swallows
+      per-network failures so one bad network never stops the sweep. **Not wired from this file's own
+      branch — `fix/audit-w3a-restart-survival` (PR #369) owns the wiring and the launcher's rollback
+      release**, and carries its own copy of this file: the daemon-side caller is one `SweepAsync` per
+      sweep in `Mainguard.Server/Runtime/JailReaperHostedService`, and the grant at
+      `SandboxAgentLauncher.cs:347` gets its matching `RemoveAgentSegmentAsync` on the rollback path
+      there. Splitting it that way keeps both branches off a three-way conflict in the launcher.
+      **Merge note:** the two copies were byte-identical until the `Created`-`Kind` fix landed here
+      (`JudgeAsync` now uses `.ToUniversalTime()`, never `SpecifyKind(..., Utc)` — Docker.DotNet parses
+      RFC3339 with `RoundtripKind`, so an offset-suffixed `Created` from a non-UTC dockerd comes back
+      `Kind=Local` and stamping it Utc shifts the age by the host offset, defeating the grace), so an
+      add/add merge takes **this** file's contents and **#369's** wiring.
+      Refusals are pinned in `Mainguard.Tests/SandboxResidueReapingTests.cs`.
+      **MG-27:** the proxy's image ref is resolved to
       its content digest and both compared and created against that).
     - `EgressBlockDetector.cs` (pure: a CLI's failure output → the egress host the default-deny proxy
       refused, skipping already-allowlisted + git hosts — the "what was blocked" core behind the Fix-2
@@ -1231,6 +1306,23 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       builds), which is also why the layer is chosen at spawn — a live jail's image cannot be swapped
       underneath it. **Failure:** typed `ToolchainProvisioningException`/`UnknownToolchainException`
       (`Mainguard.Git/Exceptions/`), never a degrade;
+    - `ToolchainImageGc.cs` (**audit F32 — the layers nothing removed.** Every base-image refresh and
+      every recipe edit changes the content-addressed tag, so each one strands a 1–3 GB image forever.
+      `ToolchainImageCandidate` is one layer as the engine reports it (id, `RepoTags`, created, and the
+      count of containers referencing it, counted from the container list because the image list leaves
+      its own `Containers` field at `-1`); `ToolchainImageGcPolicy.Judge` is the pure decision, and its
+      whole value is the five independent conditions that each save a layer ON THEIR OWN, evaluated
+      most-certain-first so the reported reason is the strongest one: a tag outside
+      `mainguard-agent-toolchain` (`KeptForeign`), any referencing container **running or stopped** —
+      a stopped jail is a reusable jail (`KeptInUse`), a ref the caller still wants (`KeptWanted`),
+      younger than the six-hour grace, because a layer is built BEFORE the jail that uses it
+      (`KeptTooYoung`), and the newest N of whatever is left (`KeptRetained`, default 3, so a revert
+      does not rebuild). `DockerToolchainImageBuilder.CollectGarbageAsync` gathers the facts, lists ONLY
+      the toolchain repository, and deletes **non-forced** — the engine's own refusal to remove a
+      referenced image is a second safety net independent of the policy. Collection runs from
+      `ToolchainProvisioner` right after a successful BUILD (the one thing that creates the sprawl,
+      already minutes long) and never throws; refusals are pinned in
+      `Mainguard.Tests/SandboxResidueReapingTests.cs`);
     - `MergeQueueProvisioner` additionally runs each recipe's catalogued probe **inside the worker's own
       jail** before every verification, so "our records say provisioned, the container says otherwise"
       surfaces as a provisioning failure instead of an exit-127 that reads like the agent's code being
@@ -2151,7 +2243,59 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       neutralises an already-poisoned store with no migration, and on harvest
       (`HarvestCliSettingsAsync`), which stops the store re-acquiring one and makes it self-heal at the
       next attended stop. Covered by `Mainguard.Tests/CliSettingsGrantScrubTests.cs` +
-      `CliSettingsBoundaryTests` gate 3).
+      `CliSettingsBoundaryTests` gate 3.
+      **F45 — `CarryOnly(content)` is now the entry point for a declared `settingsPaths` file**: an
+      ALLOWLIST of carried keys (`permissions` — itself reduced to `allow`/`ask`/`deny`/
+      `additionalDirectories` — plus `model`, `outputStyle`, `includeCoAuthoredBy`) rather than a
+      denylist, so `hooks`, `apiKeyHelper`, `statusLine`, `mcpServers`, `env` and
+      `permissions.defaultMode` stop crossing between jails, and an unbounded grant (`Bash(*)`,
+      `Bash(:*)`, a bare tool name) is dropped from `allow`/`ask` while `deny` travels as written.
+      Non-JSON fails closed. `Scrub` (mount-only) stays for the settings files parked under
+      `credentialPaths` — gemini-cli's and qwen-code's — whose schema is a different vendor's, and it is
+      COMPOSED with the strip below rather than used alone (`SandboxAgentLauncher.CarryCredentialContent`):
+      `~/.gemini/settings.json` is where gemini-cli defines `mcpServers`, so the scrub on its own left the
+      original finding live for two of the three named files, while `CarryOnly` would have dropped
+      `selectedAuthType` and cost the sign-in.
+      **F2's last clause — `StripExecutableConfig(content, out unreviewedTopLevelKeys)`** is the third
+      entry point, for EVERY declared credential file, and it is `CarryOnly` INVERTED: it removes the keys
+      that name a program — `ExecutableConfigKeys` (`mcpServers`, `enableAllProjectMcpServers`,
+      `enabledMcpjsonServers`, `hooks`, `apiKeyHelper`, `statusLine`, `env`), at ANY depth, because
+      claude-code keeps a project's servers under `projects.<dir>.mcpServers` — and carries every other
+      key untouched, byte-identical when nothing matched. `enabledMcpjsonServers` names programs it does
+      not spell: it switches on the servers a repository's own committed `.mcp.json` defines, and that
+      repository is the jail's writable workspace. `BoundedRuleListKeys` (`allowedTools`) is the one value
+      this filter edits rather than keeps or drops: the list survives — those are the owner's "yes, don't
+      ask again" answers — with the whole-tool grants taken out by the same `IsUnbounded` rule the settings
+      leg applies to `permissions.allow`, so a jail cannot persist `Bash(*)` through `.claude.json` after
+      being refused it through `.claude/settings.json`. `hasTrustDialogAccepted` is a KNOWN residual,
+      carried deliberately: it names no program, and dropping it would hang every Managed worker on a
+      trust dialog its read-only terminal cannot answer. An allowlist over this file
+      was rejected: it is the file that says the user is logged in, and no unit test can prove a guessed
+      auth field right without a live account, whereas "a program name is not a credential" is provable
+      as written. `ExecutableConfigKeys` is the ONE list — `CarriedTopLevelKeys` is its complement and the
+      two are asserted disjoint, so the legs cannot drift (MG-12). Unparseable content follows `Scrub`
+      rather than `CarryOnly` (it travels unless it spells one of those keys as a JSON key), because
+      `.gemini/installation_id` is a bare UUID by design and a blanket refusal would cost a real login.
+      Every top-level key outside `ReviewedCredentialKeys` is reported to the caller to LOG BY NAME —
+      already reduced to a plain identifier or `<non-identifier>`, never a value — so a vendor that ships
+      a new executable key surfaces instead of passing silently. The daemon-owned mount is deliberately
+      NOT scrubbed from the files that are not settings-shaped; that is the settings leg's boundary, and
+      the settings-shaped credential paths DO get it, from the composition above).
+    - `AdapterCredentialPolicy.cs` (**F2** — the limits and shape rules of the CREDENTIAL round trip,
+      the twin of `AdapterSettingsPolicy`. `MaxFileBytes` (1 MiB, refused not truncated: half a
+      credential file is a corrupt one and it would REPLACE the good copy in the vault),
+      `IsSettingsShaped(path)` (a declared credential path whose file name is `settings.json` — the
+      gemini-cli / qwen-code files parked in that field for the migration reason the manifest explains;
+      matched on the name so a sixth adapter is covered the day it is added), and `MaxBytesFor(path)`
+      (the settings ceiling for those, this one for everything else — one place, so the harvest's
+      in-shell `wc -c` and the restore-side filter cannot drift), plus `ReportsUnreviewedKeys(path)`
+      (whether the daemon should LOG this file's unreviewed top-level key names — true by default,
+      including for any path a future adapter declares; false for the settings-shaped files and for
+      opencode's provider-keyed `auth.json` via the private `IsProviderKeyed`, whose keys are provider
+      ids chosen at runtime, so every one of them was "unreviewed" and the line fired on every harvest
+      AND every restore of a perfectly ordinary login. Only the report is dropped — both kinds of file
+      still go through the full strip). Consumed by
+      `SandboxAgentLauncher.HarvestCliCredentialsAsync` and `FilterCliCredentials`).
     - `AdapterSettingsPath.cs` (the `settingsPaths` declaration — the NON-credential twin of
       `credentialPaths`, so a CLI's permission allowlist survives a spawn instead of the user
       re-approving every command. `AdapterSettingsRoot` (`home` = the tmpfs `$HOME`, `workspace` = the
@@ -2163,14 +2307,21 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       see [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md)).
     - `AdapterChannel.cs` (`AdapterChannel.EnsureAsync(id)` — idempotent: green probe at the pinned
       version → no-op; else fetch payload → verify SHA-256 against the pin (typed `HashMismatch` refusal)
-      → run `installCmd` INSIDE the VM at the pinned version → write config shims → **place the platform
+      → **run the npm provenance gate whenever an OVERRIDE governs the install (audit F47)** → run
+      `installCmd` INSIDE the VM at the pinned version → write config shims → **place the platform
       executable** when the spec declares one → probe (exit 0 AND the
       pinned version substring); pin survival is structural — the install cmd + probe both carry the pin,
       so a breaking upstream never changes what's installed (the simulation test). Seams:
       `IAdapterChannelSource` (+ real `HttpsAdapterChannelSource`, HTTPS-only), `IAdapterInstallHost` (+
       real `WslAdapterInstallHost` over `IWslRunner` `wsl -d MainguardEnv --`, and
       `ContainerAdapterInstallHost.cs` — the macos-host implementation: every command runs in a
-      DISPOSABLE agent-base container with the daemon-owned adapters + toolchains roots mounted
+      DISPOSABLE **hardened** agent-base container (audit F49 — `HardeningArgs` mirrors
+      `ContainerSpecBuilder`'s jail posture: `--cap-drop ALL` + the minimal add-backs,
+      `no-new-privileges`, the shared default-deny `SeccompProfile` written out as a file for the docker
+      CLI, `--read-only` rootfs with two named tmpfs for npm's cache/temp, `SandboxLimits.Default`
+      memory/pids/CPU + nofile/nproc rlimits, and an explicit `--user 1000` pin; the default bridge is
+      kept and stated, because reaching the registry IS the job) with the daemon-owned adapters +
+      toolchains roots mounted
       read-write AT THEIR VM PATHS, so the channels' command shapes, markers and the spawn path's
       VmRoot→SandboxMount rewrite work verbatim while the bytes land in the host trees the jails
       later mount read-only; `AdapterPaths.DaemonSideRoot()`/`ToolchainPaths.DaemonSideRoot()` are
@@ -2241,14 +2392,27 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the effective pin — version/payloadUrl/sha256/probe-substring together via
       `AdapterPinOverride.Apply` — with the replaced pin kept as one-step revert history;
       `AdapterChannel.EffectiveSpec` applies it inside `EnsureAsync`, `Set` validates like the manifest
-      parser so a hand-edited entry can never weaken an install).
+      parser so a hand-edited entry can never weaken an install). **Audit F47** adds `AdapterPinHosts` —
+      an override's `payloadUrl` must name a host the shipped channel itself uses
+      (`registry.npmjs.org`), enforced on BOTH sides of the file (write throws, read drops the entry),
+      because the same file supplies the URL *and* the sha256 that "verifies" it, so any-HTTPS-host was
+      a redirect primitive whose hash check passed by construction. The host rule alone is not the whole
+      fix — see the provenance gate in `AdapterChannel.EnsureAsync`. Covered by
+      `Mainguard.Tests/AdapterPinOverrideHostTests.cs`.
     - `AgentCliUpdateService.cs` (the Mainguard-managed CLI updater — the in-CLI self-updaters are
       disabled in every jail via `DISABLE_AUTOUPDATER=1`: `CheckForUpdatesAsync` sweeps npm for newer
       releases of npm-sourced CLIs (per-CLI failures silent — harmless at launch), `ApplyUpdateAsync`
-      downloads the exact new tarball, sha256-pins it as an override and installs through the channel's
-      verify path (a failure rolls the override back), `RevertAsync` restores the previous pin, and
-      `EnsureLatestAsync` is the INSTALL policy: resolve the registry's current release and pin THAT —
-      there is no fixed default install version; the bundled pins are the offline fallback.
+      downloads the exact new tarball, runs the provenance gate, INSTALLS it, and only then writes the
+      sha256 pin as an override (**audit F54** — writing the pin first left a crash window in which a
+      new pin was active over the old binary and the next `Ensure` installed it unprompted;
+      `AdapterChannel.VerifiedPin` carries the already-gated pin down so the user-writable file is
+      untouched until the install succeeds), `RevertAsync` restores the previous pin, and
+      `EnsureLatestAsync` is the INSTALL policy. **Audit F48 flipped that policy's default**: it now
+      installs the SHIPPED PIN and merely records a newer registry release as an offer, because every
+      check in this file is a check on the BYTES and none is a check on the CHOICE OF VERSION — a
+      legitimately signed release from a taken-over publisher account clears the whole ladder. The old
+      behaviour is the opt-in `autoAdoptRegistryLatest: true` ctor flag. The bundled pins remain the
+      offline fallback and are now also the default floor.
       `AgentCliInstaller` composes it in `CreateDefault`; the Pro launch sequence
       (`ProDesktopHost.KickAgentCliUpdateCheck`) toasts when an installed CLI has a newer release, and the
       Agent CLIs settings rows carry Update/Revert).
@@ -2301,9 +2465,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the self-derived hash), and the `INpmProvenanceGate`/`NpmProvenanceGate` +
       `INpmProvenanceSource`/`HttpNpmProvenanceSource` seams (the gate is the whole fetch+decide unit so
       the pinned key stays unreachable from outside it; an unreachable registry is a REFUSAL, not a pass).
-      Wired at the one point that MOVES a pin (`ApplyUpdateAsync` → typed
-      `AdapterChannelError.ProvenanceRejected`); `EnsureLatestAsync` refuses the registry's bytes and
-      falls back to the REVIEWED bundled pin, loudly. **Measured 2026-07-26:** only `@openai/codex`
+      **Audit F48 downgraded the top rung's LABEL rather than pretending to verify it**: the outcome is
+      now `BuildProvenanceAttestationPresent`, not `BuildProvenanceVerified`, and every passing verdict
+      carries `NpmProvenancePolicy.BuildProvenanceLimitation` — the attestation's own DSSE signature,
+      its Fulcio certificate chain and its Rekor inclusion proof are NOT checked, so the attestation
+      document is unauthenticated and its presence+digest binding is a change-detector, not an origin
+      proof. Real verification needs a pinned Sigstore trust root, which this build does not carry; the
+      caveat string is pinned by `NpmProvenanceTests` so it cannot be tidied back out.
+      Wired at the point that MOVES a pin (`ApplyUpdateAsync` → typed
+      `AdapterChannelError.ProvenanceRejected`) **and, since audit F47, at every install an override
+      governs (`AdapterChannel.EnsureAsync`)** — the rung always comes from the MANIFEST spec, never from
+      the user-writable override, so the file cannot lower its own requirement; a composition that passes
+      no gate gets the real registry-backed one lazily rather than silently skipping the check.
+      `EnsureLatestAsync` refuses the registry's bytes and falls back to the REVIEWED bundled pin, loudly. **Measured 2026-07-26:** only `@openai/codex`
       publishes npm build provenance; claude-code / gemini-cli / qwen-code / opencode-ai 404 on the
       attestations endpoint, so they sit at `npm-registry-signature` — a statement about upstream, not a
       Mainguard gap. **Residual, stated in the manifest too:** the pin-override file is user-writable

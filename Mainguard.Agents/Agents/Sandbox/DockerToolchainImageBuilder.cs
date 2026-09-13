@@ -222,6 +222,98 @@ public sealed class DockerToolchainImageBuilder : IToolchainImageBuilder
         }
     }
 
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<string>> CollectGarbageAsync(
+        IReadOnlyCollection<string> keep,
+        DateTimeOffset now,
+        TimeSpan minimumAge,
+        int retain,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(keep);
+
+        IList<ImagesListResponse> images;
+        IList<ContainerListResponse> containers;
+        try
+        {
+            // Only the toolchain repository is ever listed. The base image, the egress proxy image, and
+            // everything else on the machine are outside the query, so no bug in the policy below can
+            // reach them.
+            images = await _docker.Images.ListImagesAsync(new ImagesListParameters
+            {
+                Filters = new Dictionary<string, IDictionary<string, bool>>
+                {
+                    ["reference"] = new Dictionary<string, bool> { [ToolchainProvisioner.ImageName] = true },
+                },
+            }, ct).ConfigureAwait(false);
+
+            // ALL containers — a stopped jail is a reusable jail, and its image is in use.
+            containers = await _docker.Containers.ListContainersAsync(
+                new ContainersListParameters { All = true }, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Fail closed. Without BOTH lists the "nothing references this" answer would be a guess, and
+            // a wrong guess deletes the image a live jail is running on.
+            return Array.Empty<string>();
+        }
+
+        // The image list's own `Containers` field is -1 unless the engine was asked to compute it, so
+        // usage is counted from the container list instead — by content id AND by the image string the
+        // container was created from, since a container created from a tag reports that tag.
+        var usage = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var container in containers)
+        {
+            foreach (var key in new[] { container.ImageID, container.Image })
+            {
+                if (string.IsNullOrEmpty(key)) continue;
+                usage[key] = usage.TryGetValue(key, out var n) ? n + 1 : 1;
+            }
+        }
+
+        var candidates = images.Select(i =>
+        {
+            var tags = (IReadOnlyList<string>)(i.RepoTags?.ToArray() ?? Array.Empty<string>());
+            var used = usage.TryGetValue(i.ID, out var byId) ? byId : 0;
+            foreach (var tag in tags)
+            {
+                if (usage.TryGetValue(tag, out var byTag)) used += byTag;
+            }
+
+            return new ToolchainImageCandidate(
+                // .ToUniversalTime(), never SpecifyKind(..., Utc) — Docker.DotNet parses RFC3339 with
+                // RoundtripKind, so an offset-suffixed Created (a non-UTC dockerd host) comes back
+                // Kind=Local and stamping it Utc shifts the age by that offset. Here that would age a
+                // just-built layer past the six-hour grace and delete the image the next jail needs.
+                i.ID, tags, new DateTimeOffset(i.Created.ToUniversalTime()), used);
+        }).ToArray();
+
+        var removed = new List<string>();
+        foreach (var verdict in ToolchainImageGcPolicy.Judge(candidates, keep, now, minimumAge, retain))
+        {
+            if (!verdict.Remove) continue;
+            try
+            {
+                // NOT forced. The engine refuses to delete an image any container references, so this
+                // call is a second safety net independent of the policy — and a refusal is a no-op,
+                // never a failure worth reporting. Untagged parents ARE pruned (NoPrune stays false):
+                // they are the intermediate layers of the very image being removed, reachable from
+                // nothing else once it is gone, and leaving them behind would reclaim almost nothing.
+                await _docker.Images.DeleteImageAsync(
+                    verdict.Image.Id, new ImageDeleteParameters { Force = false }, ct)
+                    .ConfigureAwait(false);
+                removed.Add(verdict.Image.Id);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // In use after all, already gone, or the engine said no. All fine: the next collection
+                // tries again and the only cost until then is disk that was already spent.
+            }
+        }
+
+        return removed;
+    }
+
     /// <summary>A tar stream holding just the generated Dockerfile — the whole build context.</summary>
     private static Stream BuildContext(string dockerfile)
     {

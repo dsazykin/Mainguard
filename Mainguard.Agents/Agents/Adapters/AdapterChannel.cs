@@ -166,6 +166,7 @@ public sealed class AdapterChannel
     private readonly IAdapterManifestCache _cache;
     private readonly IAdapterPinOverrideStore? _pins;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
+    private INpmProvenanceGate? _provenance;
 
     /// <summary>
     /// Backoff before each install retry. The failure this exists for is a cold VM whose networking has
@@ -183,17 +184,24 @@ public sealed class AdapterChannel
 
     /// <param name="pins">User-applied pin overrides (accepted CLI updates / reverts). Null = the
     /// manifest's pins always apply verbatim (OOBE flows and every pre-update caller).</param>
+    /// <param name="provenance">The MG-9 gate <see cref="EnsureAsync(string,CancellationToken)"/> runs
+    /// whenever an OVERRIDE governs the install (audit F47). Null in production is not "no gate": the
+    /// real registry-backed gate is created lazily the first time one is actually needed, so a
+    /// composition that forgot to pass one still fails closed rather than silently installing on a
+    /// self-derived hash. Tests inject a fake and never touch the network.</param>
     public AdapterChannel(
         IAdapterChannelSource source,
         IAdapterInstallHost host,
         IAdapterManifestCache cache,
         Func<TimeSpan, CancellationToken, Task>? delay = null,
-        IAdapterPinOverrideStore? pins = null)
+        IAdapterPinOverrideStore? pins = null,
+        INpmProvenanceGate? provenance = null)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _host = host ?? throw new ArgumentNullException(nameof(host));
         _cache = cache ?? throw new ArgumentNullException(nameof(cache));
         _pins = pins;
+        _provenance = provenance;
         // Injected so the retry tests assert the backoff without ever sleeping.
         _delay = delay ?? Task.Delay;
     }
@@ -203,6 +211,21 @@ public sealed class AdapterChannel
     /// replaces version/payload/hash/probe-substring together.</summary>
     public AdapterSpec EffectiveSpec(AdapterSpec spec)
         => _pins?.TryGet(spec.Id) is { } pin ? pin.Apply(spec) : spec;
+
+    /// <summary>
+    /// A pin whose bytes have ALREADY cleared the provenance gate in the caller's own operation — what
+    /// <see cref="AgentCliUpdateService.ApplyUpdateAsync"/> hands down so the accepted update installs
+    /// without a second (identical) registry round-trip, and, crucially, so the pin is not written to
+    /// the user-writable override file until the install has actually succeeded (audit F54: a crash
+    /// between the write and the install used to leave a NEW pin active over the OLD binary, and the
+    /// next Ensure then installed it unprompted).
+    ///
+    /// <para>Skipping the re-gate is sound because the sha256 check below still runs: bytes that hash to
+    /// <see cref="AdapterPinOverride.Sha256"/> ARE the bytes the gate passed. <paramref name="Verdict"/>
+    /// is the gate's own answer, carried verbatim — never re-badged as something stronger — so a
+    /// <c>KnownUnverified</c> accept stays legible as one.</para>
+    /// </summary>
+    internal sealed record VerifiedPin(AdapterPinOverride Pin, NpmProvenanceVerdict Verdict);
 
     /// <summary>
     /// Whether a failed in-VM install looks like a transient network fault worth retrying, as opposed to
@@ -302,12 +325,26 @@ public sealed class AdapterChannel
     /// SHA-256 against the pin (refuse on mismatch) → run install in VM → write config shims → probe;
     /// the probe must exit 0 AND report the pinned version substring.
     /// </summary>
-    public async Task<AdapterEnsureResult> EnsureAsync(string adapterId, CancellationToken ct = default)
+    public Task<AdapterEnsureResult> EnsureAsync(string adapterId, CancellationToken ct = default)
+        => EnsureAsync(adapterId, verified: null, ct);
+
+    /// <summary>
+    /// The full form. <paramref name="verified"/> is a pin the caller has ALREADY put through the
+    /// provenance gate in this same operation (see <see cref="VerifiedPin"/>); it replaces the stored
+    /// override for this install and is not re-gated. Null is the normal case: whatever the override
+    /// store holds applies, and — because that file is user-writable — it IS gated here.
+    /// </summary>
+    internal async Task<AdapterEnsureResult> EnsureAsync(
+        string adapterId, VerifiedPin? verified, CancellationToken ct)
     {
         var manifest = await LoadManifestAsync(ct).ConfigureAwait(false);
-        var spec = manifest.Adapters.FirstOrDefault(a => string.Equals(a.Id, adapterId, StringComparison.Ordinal))
+        var manifestSpec = manifest.Adapters.FirstOrDefault(a => string.Equals(a.Id, adapterId, StringComparison.Ordinal))
             ?? throw new AdapterChannelException(AdapterChannelError.UnknownAdapter, $"No adapter '{adapterId}' in the channel manifest.");
-        spec = EffectiveSpec(spec); // a user-accepted update moves the pin; the discipline is unchanged
+
+        // A user-accepted update moves the pin; the discipline is unchanged. Which override applies:
+        // the caller's freshly-verified one when it passed one, otherwise whatever the store holds.
+        var override_ = verified?.Pin ?? _pins?.TryGet(adapterId);
+        var spec = override_ is null ? manifestSpec : override_.Apply(manifestSpec);
 
         // Idempotent: a green probe at the pinned version means nothing to do.
         var pre = await _host.RunAsync(spec.HealthProbe!.Command, ct).ConfigureAwait(false);
@@ -343,6 +380,30 @@ public sealed class AdapterChannel
         {
             throw new AdapterChannelException(AdapterChannelError.SignatureRejected,
                 $"Adapter '{adapterId}' payload failed its signature check; install refused: {signature.Reason}");
+        }
+
+        // ===================== Audit F47: the provenance gate, on the INSTALL path =====================
+        // It used to run only where a pin was MOVED (AgentCliUpdateService.ApplyUpdateAsync). Every
+        // install AFTERWARDS — a reinstall, a repair, a fresh VM, the very next Ensure — re-read the
+        // override out of pin-overrides.json and installed on the strength of a sha256 that file itself
+        // supplied. That file is plain user-writable JSON: anyone who can write it could name any
+        // payloadUrl and any hash, and the hash check above would pass BY CONSTRUCTION because both
+        // sides came from the attacker. That is trust-on-first-use against a same-user-writable file,
+        // which is exactly what MG-4/MG-19 defend against elsewhere, and the starter manifest calls it
+        // the "SECOND RESIDUAL GAP".
+        //
+        // So: whenever an override governs this install, the bytes must clear the rung the MANIFEST
+        // declares. The rung comes from manifestSpec, never from the override — letting a user-writable
+        // file carry the requirement would let it lower the requirement to 'none'.
+        if (override_ is not null)
+        {
+            var provenance = verified?.Verdict
+                ?? await GateOverrideAsync(adapterId, manifestSpec, spec, payload, ct).ConfigureAwait(false);
+            if (provenance.MustRefuse)
+            {
+                throw new AdapterChannelException(AdapterChannelError.ProvenanceRejected,
+                    $"Adapter '{adapterId}' install refused: {provenance.Reason}");
+            }
         }
 
         // Stage the VERIFIED bytes into the VM and expand {payload} in the install command — the
@@ -410,6 +471,44 @@ public sealed class AdapterChannel
 
         return AdapterEnsureResult.Installed;
     }
+
+    /// <summary>
+    /// Establishes ORIGIN for bytes an override chose (audit F47). Fail-closed at every step: an
+    /// override that names a package this app cannot even identify is refused, and so is one whose rung
+    /// cannot be evaluated. The declared rung comes from <paramref name="manifestSpec"/> — the shipped,
+    /// reviewed manifest — so the user-writable override file cannot lower its own requirement.
+    /// </summary>
+    private async Task<NpmProvenanceVerdict> GateOverrideAsync(
+        string adapterId, AdapterSpec manifestSpec, AdapterSpec effective, byte[] payload, CancellationToken ct)
+    {
+        if (manifestSpec.ProvenanceLevel == AdapterProvenanceLevel.None)
+        {
+            // The manifest says this adapter carries no origin assurance at all. Say so out loud rather
+            // than inventing one; the pure policy owns that sentence.
+            return NpmProvenancePolicy.Decide(adapterId, AdapterProvenanceLevel.None, evidence: null, payload);
+        }
+
+        var package = AgentCliUpdateService.TryParseNpmPackage(effective.PayloadUrl);
+        if (package is null)
+        {
+            return new NpmProvenanceVerdict(NpmProvenanceOutcome.Refused,
+                $"'{adapterId}' is pinned by an OVERRIDE whose payloadUrl ('{effective.PayloadUrl}') is not "
+                + "an npm registry tarball, so the origin assurance the manifest requires "
+                + $"({manifestSpec.ProvenanceLevel}) cannot be established for it. An override is a "
+                + "user-writable file; refusing to install bytes it alone vouches for.");
+        }
+
+        // Lazy, not eager: a composition that never installs an override never opens a socket, and an
+        // injected gate (tests) is kept as-is because the null-coalescing assignment only fires on null.
+        var gate = _provenance ??= new NpmProvenanceGate(new HttpNpmProvenanceSource(SharedProvenanceHttp));
+        return await gate
+            .EvaluateAsync(adapterId, manifestSpec.ProvenanceLevel, package, effective.Version, payload, ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>One shared client for the lazily-created gate. Static because a channel is constructed
+    /// per composition and a per-instance <see cref="HttpClient"/> is the socket-exhaustion pattern.</summary>
+    private static readonly HttpClient SharedProvenanceHttp = new();
 
     /// <summary>
     /// Runs the health probe — placing the CLI's platform executable first when the adapter declares
