@@ -728,6 +728,24 @@ public sealed class SandboxAgentLauncher
         // — codex, qwen-code and opencode expose no base-URL environment variable at all).
         if (_credentials is null || _gatewayOptions is not { } gateway || !gateway.CanConfine)
         {
+            // Audit B1 — the two ways to arrive here are not the same event. `--gateway-bind off` is an
+            // operator's choice and a warning states it; a bind that AUTO-RESOLVED TO NOTHING is a defect
+            // that silently turns into a credential leak, which is exactly how a resolver bug (docker0
+            // filtered out for being carrier-down) shipped as "every BYOK jail gets the raw key". That one
+            // is an error, and it names the remedy.
+            if (_gatewayOptions is { DisabledUnintentionally: true })
+            {
+                _log.LogError(
+                    "gateway confinement UNAVAILABLE: agent={Agent} adapter={Adapter} supplied a BYOK "
+                    + "provider key, but the daemon could not resolve a gateway bind address (nobody asked "
+                    + "for the gateway to be off), so THE RAW KEY IS INJECTED INTO THE JAIL under {KeyVar}. "
+                    + "MG-4 is not in effect for this agent and its model spend is not metered. Set "
+                    + "MAINGUARD_GATEWAY_BIND (or --gateway-bind) to the Docker bridge address, or to 'off' "
+                    + "if that is genuinely intended.",
+                    agentId, adapter?.Id ?? "<unknown>", adapter?.ApiKeyEnvVar ?? LegacyApiKeyEnvVar);
+                return null;
+            }
+
             _log.LogWarning(
                 "gateway confinement OFF: agent={Agent} adapter={Adapter} supplied a BYOK provider key, but "
                 + "the model gateway is disabled, so THE RAW KEY IS INJECTED INTO THE JAIL under {KeyVar}. "
