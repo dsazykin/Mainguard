@@ -1380,25 +1380,49 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     private System.Threading.CancellationTokenSource? _mergeCts;
 
     /// <summary>
-    /// A fresh token for one human merge, replacing (and cancelling) any previous one.
+    /// The token every human merge from this surface runs under. <b>One source for the surface's whole
+    /// life</b> — deliberately not one per merge.
     ///
     /// <para>The merge's middle leg is real network work — a host pull-request fetch, or a <c>git fetch</c>
     /// over the sync remote — performed while the daemon holds the repository's single merge lease. Bound
-    /// only to the adapter's own lifetime token, as it was, a host that hangs held that lease until the app
-    /// was closed, and Dispose could then be waiting on the abandon that follows. Owned here, the wait ends
-    /// when the surface that started it goes away.</para>
+    /// only to the adapter's own lifetime token, as it once was, a host that hangs held that lease until
+    /// the app was closed. Owned here, the wait ends when the surface that started it goes away.</para>
+    ///
+    /// <para><b>Why it must not rotate.</b> This method used to cancel the previous source and hand back a
+    /// fresh one, on the reading that a merge is a singleton. Nothing enforces that: the cockpit's Merge
+    /// command is sync fire-and-forget and its <c>CanExecute</c> is the daemon's gate flag, not an
+    /// in-flight guard, so a second press — a double-click, or Merge on entry B while A is still fetching
+    /// — reached here and cancelled A. On the local path A's <c>--ff-only</c> had already landed on the
+    /// user's own checkout by then and only the RECORDING was stopped, so the human was told "nothing was
+    /// merged and the queue is unchanged" about a merge that was sitting in their git history. That is the
+    /// precise defect class this surface exists to remove, it was reachable with one extra click, and it
+    /// bought nothing: there is no Cancel control, so no user action ever wanted the old merge stopped.
+    /// The source is cancelled in exactly one place now — <see cref="CancelPendingMerge"/> on teardown,
+    /// where the surface really is going away.</para>
     /// </summary>
-    private System.Threading.CancellationToken MergeToken()
+    internal System.Threading.CancellationToken MergeToken()
     {
-        CancelPendingMerge();
-        _mergeCts = new System.Threading.CancellationTokenSource();
-        return _mergeCts.Token;
+        // After teardown the lazy create below would hand out a fresh LIVE source, which would be a merge
+        // running unbounded on a surface that is gone. An already-cancelled token instead: the runner
+        // checks it before the call, so such a merge never starts and is reported as cancelled — which it
+        // is, since nothing was begun.
+        if (_mergeSurfaceTornDown)
+        {
+            return new System.Threading.CancellationToken(canceled: true);
+        }
+
+        return (_mergeCts ??= new System.Threading.CancellationTokenSource()).Token;
     }
 
+    /// <summary>True once <see cref="CancelPendingMerge"/> has run — see <see cref="MergeToken"/>.</summary>
+    private bool _mergeSurfaceTornDown;
+
     /// <summary>Ends any merge this surface is still waiting on. The adapter hands the lease back on the
-    /// cancel, so the entry is mergeable again rather than stranded.</summary>
+    /// cancel, so the entry is mergeable again rather than stranded. Called on teardown only: this is the
+    /// one place the merge token is ever cancelled (see <see cref="MergeToken"/>).</summary>
     private void CancelPendingMerge()
     {
+        _mergeSurfaceTornDown = true;
         try { _mergeCts?.Cancel(); } catch { /* already disposed */ }
         _mergeCts?.Dispose();
         _mergeCts = null;
@@ -1479,8 +1503,8 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                     },
                     // Run under a token this surface owns, so a merge whose host-side fetch hangs is not
                     // holding the repository's one merge lease with nothing able to release it short of
-                    // closing the app. Cancelled when the cockpit is closed or the VM is disposed; the
-                    // adapter's abandon arm then hands the lease straight back.
+                    // closing the app. Cancelled on teardown ONLY — never by a subsequent press, which is
+                    // reachable and used to stop a merge already landing (see MergeToken).
                     onMerge: id => _ = Services.MergeActionRunner.RunAsync(_queue, id, ct: MergeToken()),
                     live: new Services.DaemonFlaggedChangeSource(_queue),
                     onReject: async (id, reason) =>

@@ -185,4 +185,72 @@ public sealed class SpendLedgerReplayTests
             DaemonBackedOrchestrator.ReconnectDelay = previousDelay;
         }
     }
+
+    /// <summary>
+    /// The other half of the same property: the reset must not fire on a subscribe ATTEMPT.
+    ///
+    /// <para>It used to run at the top of the reconnect loop's body, before the stream was opened, so the
+    /// moment the daemon went away <c>_agentSpend</c> was emptied — and emptied again on every retry for
+    /// as long as the outage lasted. <c>Current</c> meanwhile went on answering with the last sample it
+    /// had, so the Resources rail rendered a non-zero fleet total above a table of $0.00 rows: two
+    /// readings of one ledger that cannot both be true, with nothing to tell a human which to believe. The
+    /// reset belongs to the ARRIVAL of a replacement ledger, not to the hope of one.</para>
+    /// </summary>
+    [Fact]
+    public async Task SpendPump_KeepsTheLastGoodLedger_WhileTheDaemonIsUnreachable()
+    {
+        var previousDelay = DaemonBackedOrchestrator.ReconnectDelay;
+        DaemonBackedOrchestrator.ReconnectDelay = TimeSpan.FromMilliseconds(10);
+        try
+        {
+            using var client = UncontactedClient();
+            using var adapter = new DaemonBackedOrchestrator(client, ownsClient: false);
+            adapter.ApplyAgentEvent(OneAgentSnapshot("agent-a"));
+            adapter.ApplyResourceSnapshot(MeteredReading("agent-a"));
+
+            var subscribes = 0;
+            var outageRetries = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            adapter.SpendStreamOverride = ct =>
+            {
+                var n = Interlocked.Increment(ref subscribes);
+
+                // One good subscription delivers the ledger and ends; every attempt after it fails to
+                // open, which is the shape a daemon that has gone away takes.
+                if (n == 1)
+                {
+                    return LedgerReplay("agent-a", thenHold: false, ct);
+                }
+
+                // Several failed attempts, so what is asserted below survived the RETRIES and not merely
+                // the first drop.
+                if (n >= 4)
+                {
+                    outageRetries.TrySetResult();
+                }
+
+                throw new InvalidOperationException("the daemon is unreachable");
+            };
+
+            using var cts = new CancellationTokenSource();
+            var pump = adapter.RunSpendPumpForTestAsync(cts.Token);
+
+            var completed = await Task.WhenAny(outageRetries.Task, Task.Delay(Timeout));
+            cts.Cancel();
+            await pump;
+
+            Assert.True(
+                ReferenceEquals(completed, outageRetries.Task),
+                $"the pump never retried through the outage (subscribes={subscribes}); this test cannot "
+                + "say anything about what a retry does to the ledger");
+
+            // The fleet total never moved, so a blank per-agent table beside it IS the disagreement.
+            Assert.Equal(3.00m, adapter.Current.SpendTodayUsd);
+            var stillThere = Assert.Single(adapter.GetAgentUsage(), u => u.AgentId == "agent-a");
+            Assert.Equal(3.00m, stillThere.SpendUsd);
+        }
+        finally
+        {
+            DaemonBackedOrchestrator.ReconnectDelay = previousDelay;
+        }
+    }
 }

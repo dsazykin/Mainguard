@@ -102,6 +102,37 @@ public sealed class QueueUpdateScopingTests
         await stalePump;
     }
 
+    /// <summary>
+    /// The same projection's OTHER half, which <c>ClearActiveRepo</c> was leaving behind: the mirror
+    /// freshness pair.
+    ///
+    /// <para>Detaching emptied the entries, the gate reasons, the origins and the main sha, and then left
+    /// <c>MirrorMainRefreshedAt</c> / <c>MirrorMainRefreshError</c> exactly as the departing repository had
+    /// set them — so the rail went on reporting "mirror main refreshed 2 minutes ago", or the PREVIOUS
+    /// repository's refresh failure, about a repo this adapter is no longer bound to. An age stamp that
+    /// outlives the thing it describes is a fact about nothing, and it reads as reassurance.</para>
+    /// </summary>
+    [Fact]
+    public void ClearActiveRepo_ResetsTheMirrorFreshnessPair_NotOnlyTheEntries()
+    {
+        using var client = UncontactedClient();
+        using var adapter = new DaemonBackedOrchestrator(client, ownsClient: false);
+
+        var update = Update("agent-of-repo-a", "aaaaaaa");
+        update.MirrorMainRefreshedAt = "2026-09-08T17:21:28.4877551+00:00";
+        update.MirrorMainRefreshError = "couldn't reach the sync remote";
+        adapter.ApplyQueueUpdate(update);
+
+        Assert.NotNull(adapter.MirrorMainRefreshedAt);
+        Assert.NotNull(adapter.MirrorMainRefreshError);
+
+        adapter.ClearActiveRepo();
+
+        Assert.Empty(adapter.GetQueue());
+        Assert.Null(adapter.MirrorMainRefreshedAt);
+        Assert.Null(adapter.MirrorMainRefreshError);
+    }
+
     private static TaskCompletionSource ReleasedNow()
     {
         var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

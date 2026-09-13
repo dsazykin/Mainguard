@@ -104,6 +104,34 @@ public sealed class DaemonBackedOrchestrator :
     internal Func<CancellationToken, IAsyncEnumerable<Proto.SpendSample>>? SpendStreamOverride { get; set; }
 
     /// <summary>
+    /// The five legs of one human merge — the RT-D1 conversation's three RPCs and the two transports that
+    /// can perform step 2 — as test seams, in the same spirit as <see cref="SpendStreamOverride"/> and
+    /// never set in production.
+    ///
+    /// <para><b>What they exist to assert.</b> Which token each leg runs under, and which legs run at all,
+    /// is the whole of <see cref="ConfirmMergeAsync(string, CancellationToken)"/>'s honesty: a merge that
+    /// LANDED must still be recorded even though the caller stopped waiting, and must never be abandoned
+    /// or described as not having happened. Every one of those is a statement about ordering and
+    /// cancellation between the legs, and none of it is observable through the real transport — the RPCs
+    /// need a live daemon and step 2 needs a real checkout with a real remote and a real host API. So the
+    /// legs are injected and the SHIPPED method is driven; what a test replaces is who answers, never
+    /// what the method does with the answer.</para>
+    /// </summary>
+    internal Func<string, string, CancellationToken, Task<Proto.BeginMergeResponse>>? BeginMergeOverride { get; set; }
+
+    /// <inheritdoc cref="BeginMergeOverride"/>
+    internal Func<string, string, string, string, CancellationToken, Task<bool>>? RecordMergeOverride { get; set; }
+
+    /// <inheritdoc cref="BeginMergeOverride"/>
+    internal Func<string, string, string, string, CancellationToken, Task<bool>>? AbandonMergeOverride { get; set; }
+
+    /// <inheritdoc cref="BeginMergeOverride"/>
+    internal Func<string, Mainguard.Agents.Services.IJournaledMergeExecutor>? MergeExecutorOverride { get; set; }
+
+    /// <inheritdoc cref="BeginMergeOverride"/>
+    internal Func<string, Mainguard.Agents.Services.IExternalPrMergeExecutor>? ExternalMergeExecutorOverride { get; set; }
+
+    /// <summary>
     /// How often the login-harvest pump sweeps every live agent's CLI login state into the host OS
     /// keychain. A minute is a compromise: each sweep is one <c>ListAgents</c> plus one read-only
     /// <c>HarvestAgentCredentials</c> per agent (a <c>base64</c> of a few small files inside the jail),
@@ -428,6 +456,13 @@ public sealed class DaemonBackedOrchestrator :
             _gate_.Clear();
             _origins.Clear();
             _mainSha = string.Empty;
+
+            // The mirror-freshness pair is part of the same projection and was being left behind: after
+            // detaching, the rail went on reporting "mirror main refreshed 2 minutes ago" — or the PREVIOUS
+            // repo's refresh error — about a repository this adapter is no longer bound to. An age stamp
+            // that survives the thing it describes is a fact about nothing.
+            _mirrorMainRefreshedAt = null;
+            _mirrorMainRefreshError = null;
         }
 
         RaiseIsolated(() => Changed?.Invoke());
@@ -526,8 +561,8 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>
-    /// The spend pump. <b>Zeroes the accumulators on every subscribe</b>, and that reset is the whole
-    /// correctness of this surface.
+    /// The spend pump. <b>Zeroes the accumulators once per subscription, on its first sample</b>, and that
+    /// reset is the whole correctness of this surface.
     ///
     /// <para><b>Why.</b> <c>StreamSpend</c> is a REPLAY stream, not a delta stream: the daemon walks the
     /// repo's whole spend ledger from the beginning for each subscriber, then follows it live. This client
@@ -540,16 +575,32 @@ public sealed class DaemonBackedOrchestrator :
     ///
     /// <para>The reset belongs here rather than in the applier because the ledger's identity is the
     /// SUBSCRIPTION: everything one subscription delivers is the complete history as of that moment, so
-    /// the totals it builds replace the previous subscription's rather than extending them.</para>
+    /// the totals it builds replace the previous subscription's rather than extending them. It is deferred
+    /// to that subscription's FIRST sample so that a reconnect ATTEMPT — of which there is one every
+    /// <see cref="ReconnectDelay"/> while the daemon is down — never blanks a ledger it has nothing to
+    /// replace with. See the body.</para>
     /// </summary>
     private async Task SpendPumpAsync(CancellationToken ct)
     {
         var stream = SpendStreamOverride ?? (token => _client.StreamSpendAsync(token));
         await ReconnectLoopAsync(async token =>
         {
-            ResetSpendAccumulators();
+            // The reset is LAZY — it fires on the first sample a subscription actually delivers, never on
+            // the ATTEMPT to open one. Zeroing up front emptied `_agentSpend` the moment the daemon went
+            // away and kept it empty for every retry of the reconnect loop, while `Current` went on
+            // returning the last sample it had: during an outage the Resources rail showed a non-zero
+            // fleet total with $0.00 against every agent in it, which is two readings of the same ledger
+            // that cannot both be true. The previous subscription's totals now stand, unchanged and
+            // correct-as-of-last-contact, until the replacement has something to replace them with.
+            var replaced = false;
             await foreach (var sample in stream(token).ConfigureAwait(false))
             {
+                if (!replaced)
+                {
+                    ResetSpendAccumulators();
+                    replaced = true;
+                }
+
                 ApplySpendSample(sample);
             }
         }, ct).ConfigureAwait(false);
@@ -1917,7 +1968,8 @@ public sealed class DaemonBackedOrchestrator :
 
         // RT-D1 step 1 — the daemon's lease. BeginMerge is also where CanMerge is enforced, UNDER the
         // lease (MG-11), so a refusal here is the gate speaking and nothing has been touched.
-        var begun = await _client.BeginMergeAsync(repoHandle!, agentId, cts.Token).ConfigureAwait(false);
+        var begun = await (BeginMergeOverride ?? ((handle, id, token) => _client.BeginMergeAsync(handle, id, token)))(
+            repoHandle!, agentId, cts.Token).ConfigureAwait(false);
         if (!begun.Granted)
         {
             throw new InvalidOperationException($"Can't merge — {begun.Reason}.");
@@ -1970,10 +2022,30 @@ public sealed class DaemonBackedOrchestrator :
                     () => CreateMergeExecutor(syncRemote).PerformJournaledMerge(mergeRequest, lease),
                     cts.Token).ConfigureAwait(false);
         }
+        catch (OperationCanceledException ex) when (origin == MergeEntryOrigin.External)
+        {
+            // AMBIGUOUS BY CONSTRUCTION, so it must not be reported as either outcome. The only awaits the
+            // external leg cancels at are the host's own read and merge calls, and an HTTP request whose
+            // CLIENT stopped waiting may still have been served: the pull request can be merged upstream
+            // right now. Abandoning here and letting MergeActionRunner say "nothing was merged and the
+            // queue is unchanged" would be a confident false report about a merge that may have happened —
+            // the exact failure this path exists to prevent. So: no abandon (the lease names work whose
+            // fate is unknown, and the RT-D1 boot reconcile settles it against the host), and a sentence
+            // that says what is actually known.
+            var pullRequest = Mainguard.Agents.Services.ExternalPrMergeService.PrNumberFor(agentId) is int number
+                ? $"pull request #{number}"
+                : "the pull request";
+            throw new InvalidOperationException(
+                $"Stopped waiting while {pullRequest} was being merged on its host — Mainguard can't tell "
+                + "whether the host merged it. Check the pull request before merging again.", ex);
+        }
         catch (Exception ex)
         {
-            // The merge threw rather than refusing. Hand the lease back before surfacing it, or this repo
-            // stays unmergeable until the daemon restarts.
+            // The merge threw rather than refusing. On the local path this is the only shape a cancel can
+            // take too: Task.Run throws for a delegate that never STARTED, and once PerformJournaledMerge
+            // is running it ignores the token and returns a real result — so nothing landed, and the lease
+            // goes back. Hand it back before surfacing, or this repo stays unmergeable until the daemon
+            // restarts.
             await TryAbandonAsync(repoHandle!, agentId, begun.LeaseId, ex.Message).ConfigureAwait(false);
             throw;
         }
@@ -1991,8 +2063,32 @@ public sealed class DaemonBackedOrchestrator :
         // RT-D1 step 3 — record the outcome against the sha main REALLY moved to. The daemon re-checks the
         // gate and the CAS under its queue lock before it writes anything (MG-11), so a race lost between
         // the two legs is refused there rather than papered over here.
-        await _client.ConfirmMergeAsync(repoHandle!, agentId, begun.LeaseId, result.NewMainSha!, cts.Token)
-            .ConfigureAwait(false);
+        //
+        // ON `_cts.Token`, NOT `cts.Token` — the SURFACE's token ends at step 2 and must not reach here.
+        // Past this line the merge has LANDED: main has moved in the user's own checkout, or the pull
+        // request is merged upstream. A caller who stops waiting is asking to stop WAITING; they cannot
+        // ask for a merge that already happened to go unrecorded, and running step 3 on their token made
+        // exactly that reachable — the recording was skipped, the daemon kept the lease until the next
+        // BeginMerge reconciled it, and the raw `Status(StatusCode="Cancelled")` was toasted at a human
+        // whose git history already contained the merge. Only the app's own lifetime bounds this leg.
+        try
+        {
+            await (RecordMergeOverride ?? ((handle, id, leaseId, sha, token)
+                    => _client.ConfirmMergeAsync(handle, id, leaseId, sha, token)))(
+                repoHandle!, agentId, begun.LeaseId, result.NewMainSha!, _cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The merge landed and the daemon did not record it — app exit, or an unreachable daemon. The
+            // two things that must NOT happen here are an abandon (the lease names a merge that really
+            // occurred) and any sentence implying nothing was merged. Say both halves: what git now holds,
+            // and what the queue does not yet know. The RT-D1 boot reconcile settles the entry against git
+            // on the next connect.
+            throw new InvalidOperationException(
+                $"{MergeLandedSentence(origin, agentId, result.NewMainSha!)} Mainguard couldn't record it "
+                + $"with the daemon ({ex.Message}), so the queue entry still shows it as unmerged — it "
+                + "settles itself once the daemon is reachable again.", ex);
+        }
 
         // The origin that actually ran the merge, reported with the sha main really moved to. It is the
         // SAME `origin` the transport was chosen by above — read once, under the lock — so what the human
@@ -2001,11 +2097,33 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>
+    /// What step 2 did, in the terms of the origin that did it — the opening half of the sentence a human
+    /// reads when the merge LANDED but step 3 could not record it. Kept in the origin's own vocabulary for
+    /// the same reason <see cref="MergeActionRunner.Confirmation"/> is: an upstream pull request wearing
+    /// the local fast-forward's wording describes something that did not happen.
+    /// </summary>
+    private static string MergeLandedSentence(MergeEntryOrigin origin, string agentId, string newMainSha)
+    {
+        var shortSha = newMainSha.Length <= 7 ? newMainSha : newMainSha[..7];
+        if (origin == MergeEntryOrigin.External)
+        {
+            var pullRequest = Mainguard.Agents.Services.ExternalPrMergeService.PrNumberFor(agentId) is int number
+                ? $"Pull request #{number}"
+                : "The pull request";
+            return $"{pullRequest} IS merged upstream and {MainBranchName} fast-forwarded onto {shortSha}.";
+        }
+
+        return $"agent/{agentId} IS merged into {MainBranchName} ({shortSha}).";
+    }
+
+    /// <summary>
     /// The host-side merge leg, bound to this repo's SC-2 sync remote and the app's T-19 journal.
     /// Built per merge because the sync-remote binding is per active repo.
     /// </summary>
     private Mainguard.Agents.Services.IJournaledMergeExecutor CreateMergeExecutor(string syncRemoteName)
-        => new Mainguard.Agents.Services.ForegroundMergeService(
+        => MergeExecutorOverride is { } make
+        ? make(syncRemoteName)
+        : new Mainguard.Agents.Services.ForegroundMergeService(
             resolveSyncRemote: _ => new Mainguard.Agents.Agents.SyncRemote(syncRemoteName, string.Empty),
             journal: _journalFactory(),
             leases: null); // the lease is the daemon's; see the ctor doc on why this must not be a store.
@@ -2018,7 +2136,9 @@ public sealed class DaemonBackedOrchestrator :
     /// is compare-and-swapped against.
     /// </summary>
     private Mainguard.Agents.Services.IExternalPrMergeExecutor CreateExternalMergeExecutor(string syncRemoteName)
-        => new Mainguard.Agents.Services.ExternalPrMergeService(
+        => ExternalMergeExecutorOverride is { } make
+        ? make(syncRemoteName)
+        : new Mainguard.Agents.Services.ExternalPrMergeService(
             resolveSyncRemote: _ => new Mainguard.Agents.Agents.SyncRemote(syncRemoteName, string.Empty),
             host: _hostPullRequests.Value,
             journal: _journalFactory());
@@ -2049,7 +2169,9 @@ public sealed class DaemonBackedOrchestrator :
         try
         {
             using var cts = new CancellationTokenSource(AbandonBudget);
-            await _client.AbandonMergeAsync(repoHandle, agentId, leaseId, reason, cts.Token).ConfigureAwait(false);
+            await (AbandonMergeOverride ?? ((handle, id, lease, why, token)
+                    => _client.AbandonMergeAsync(handle, id, lease, why, token)))(
+                repoHandle, agentId, leaseId, reason, cts.Token).ConfigureAwait(false);
         }
         catch (Exception)
         {
