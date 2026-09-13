@@ -36,7 +36,7 @@ public sealed class MacHostAgentEnvironment : IAgentEnvironment
     public MacHostAgentEnvironment(
         string? vmRoot = null,
         IDockerClient? dockerClient = null, IAuditLog? auditLog = null,
-        string? gatewayEndpoint = null)
+        string? gatewayEndpoint = null, Action<string>? log = null)
     {
         // The substrate-neutral collaborators, shared with Wsl2AgentEnvironment; every invariant
         // is documented on AgentEnvironmentComposition.Compose. The daemon and the client are the
@@ -46,7 +46,8 @@ public sealed class MacHostAgentEnvironment : IAgentEnvironment
             // ESC-I1 made structural on this substrate: bind sources may only name the substrate
             // root (repos/worktrees/agents/caches) or the daemon's data root (IPC socket dir) —
             // never a user repo or anything else on the host.
-            allowedMountRoots: root => new[] { root, Mainguard.Git.MainguardPaths.DataRoot() });
+            allowedMountRoots: root => new[] { root, Mainguard.Git.MainguardPaths.DataRoot() },
+            log: log);
         _reposRoot = Path.Combine(parts.Root, "repos");
         Repos = parts.Repos;
         PackageCaches = parts.PackageCaches;

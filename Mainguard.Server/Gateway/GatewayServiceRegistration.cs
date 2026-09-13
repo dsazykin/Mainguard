@@ -122,8 +122,9 @@ public static class GatewayServiceRegistration
         // they were simply not running. The provisioner builds a repo's queue on the events that make a repo
         // active (ProvisionRepo / CreateWorktree / a jailed spawn) over the SAME persisted stores, and — the
         // load-bearing detail — the SAME IMergeLeaseStore singleton the foreground merge, BeginMerge and
-        // MergeDispatch contend for, since the one-outstanding-merge-per-repo invariant only spans origins
-        // while they share one store (MG-23).
+        // the boot MergeReconcileTask contend for, since the one-outstanding-merge-per-repo invariant only
+        // spans origins while they share one store (MG-23). (This list previously named MergeDispatch,
+        // which fix/audit-w2b-merge-and-verification deleted; the surviving contenders are the ones above.)
         services.AddSingleton(sp =>
         {
             var provisioner = new MergeQueueProvisioner(
