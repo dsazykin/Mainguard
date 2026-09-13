@@ -991,6 +991,40 @@
     `RequiresNpmRegistryFactAttribute.cs` gates the ONE test that hits the real registry — it verifies
     npm's actual signature under the compiled-in key for all five shipped adapters and skips VISIBLY
     when offline, because an early `return` would report a green "Passed" while asserting nothing).
+    `NpmProvenanceTests` also pins `NpmProvenancePolicy.BuildProvenanceLimitation` verbatim in the
+    accepting verdict (audit F48), so the "DSSE signature / Fulcio chain / Rekor proof are NOT checked"
+    caveat cannot be tidied out of a message that would then read like full SLSA verification.
+  - `ReleaseBuildCarriesPinsTests.cs` (**audit F57 — the test the audit says did not exist**: a release
+    build carries signing pins. Two halves, because either alone is defeatable — the runtime implication
+    (`MainguardAttestedRelease` stamped ⇒ `SigningPolicy.HasUsablePins`, plus "no malformed pins" and
+    "the selected verifier agrees with the policy"), and the build-time guard read back out of
+    `Mainguard.Agents.csproj` so deleting the `MainguardRequirePinsOnReleaseBuild` target / `MG0057`
+    error fails CI instead of silently disarming it. Also drives `PayloadSignatureGate` through its whole
+    table: `Rejected` always refuses, `NotAvailable` refuses for a pin-covered kind once the build can
+    check, and `NotAvailable` still proceeds for kinds Authenticode structurally cannot cover.
+    **Plus the third half, which the first two do not give you: that some pipeline can actually TRIGGER
+    the guard.** `MG0057` fires only for a build that declares itself a release, and nothing in
+    `.github/` or `build/` declared one, so `AttestedReleaseAssembly_MustCarryUsablePins` was vacuously
+    true on every build CI produced while a real `pack.ps1 -Channel pro` still shipped a pin-less head.
+    `TheReleaseScriptArmsTheGuard_AndRefusesAPinlessRelease` reads `build/velopack/pack.ps1` for the
+    arming STATEMENT (`$publishArgs += "/p:MainguardPinsRequired=true"`, not the bare property name —
+    that also matches the explanatory comment above it, and commenting the real line out left the test
+    green) and the pin-less refusal, and asserts the script does NOT set `MainguardAttestedRelease`.
+    `CiProvesTheGuardFires_BothWays` requires the `release-pins-guard` job to exist by its YAML key at
+    its indent (a substring match is satisfied by `release-pins-guard-DISABLED:`) and to carry both
+    controls.)
+  - `TrustedResultPathTests.cs` (**audit F58** — the elevated helper's `--result` path: the real
+    `%LocalAppData%\Mainguard\elevated-result.json` and a second account's equivalent are accepted; an
+    arbitrary system path, a different file name in the right directory, traversal, UNC/device forms,
+    NTFS ADS spellings, relative paths and quoting/wildcard metacharacters are refused. Data root is
+    injected so the Windows cases run identically on Linux CI.)
+  - `AdapterPinOverrideHostTests.cs` (**audit F47** — `AdapterPinHosts` allows only the shipped channel's
+    own host; `Set` throws and, load-bearingly, the READ path drops a hand-edited entry, including the
+    self-consistent case where the attacker supplied both the redirected URL and a hash of their own
+    bytes. Its sibling `AdapterOverrideProvenanceGateTests` covers the other half: `EnsureAsync` runs the
+    provenance gate on every install an override governs, refuses on its verdict with nothing staged,
+    takes the rung from the MANIFEST rather than the override, and does NOT gate a plain bundled-pin
+    install — that sha256 is a reviewed constant, and gating it would break every offline install.)
 - **`Mainguard.Tests/Terminal/` + `Mainguard.Tests/Transcripts/`** — the **P2-04 VT conformance &
   replay harness**, since P2-18 parametrized over BOTH engines through `EngineCatalog.cs` (engine
   roster + per-engine allowlist/golden/input-encoder resolution; `MAINGUARD_REQUIRE_LIBVTERM=1` in CI
@@ -1596,7 +1630,14 @@
   scheme on the Pro head and ad-hoc signs) + `assets/` (the brand `.icns` rendered from the site
   favicon and its iconset inputs) + `README.md` (the Velopack packaging plan and what still
   needs an Apple Developer ID).
-- **`.github/workflows/ci.yml`** — CI. The `build-and-test` job builds the pinned libvterm before
+- **`.github/workflows/ci.yml`** — CI. Its **`release-pins-guard`** job (audit F57) is the one that
+  WATCHES the release-pins guard fire: it builds `Mainguard.Agents` with
+  `-p:MainguardAttestedRelease=true` and fails unless the build fails **with `error MG0057`** (a build
+  that fails for any other reason proves nothing and is reported as such), then runs a positive control
+  with a pin that must SUCCEED — without which a guard that refused every build regardless of pins would
+  look identical here while making a real release unbuildable — and greps `pack.ps1` for the arming
+  property. A guard nothing can be observed triggering is indistinguishable from a disarmed one, which
+  is exactly how this one stayed inert through the change that introduced it. The `build-and-test` job builds the pinned libvterm before
   testing and exports `MAINGUARD_LIBVTERM`/`MAINGUARD_REQUIRE_LIBVTERM` so the P2-04 suites gate the
   P2-18 engine; the allowlist shrink-guard covers both per-engine known-failures files. Its
   `payload-reproducible` job now also runs a **daemon-startup smoke in the real payload image as the

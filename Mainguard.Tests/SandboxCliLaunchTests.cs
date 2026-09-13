@@ -20,7 +20,10 @@ public class SandboxCliLaunchTests
         var (command, args) = SandboxCliLaunch.BuildDockerExecArgv(
             "ctr-abc", new[] { "claude", "--permission-mode", "plan" }, agentUid: 1000);
 
-        Assert.Equal("docker", command);
+        // Audit F54: an absolute, allow-listed path — never the bare name resolved out of the daemon's
+        // inherited PATH.
+        Assert.Equal(TrustedDockerBinary.Resolve(), command);
+        Assert.Contains(command, TrustedDockerBinary.SearchPath);
         Assert.Equal(
             new[]
             {
@@ -72,7 +75,10 @@ public class SandboxCliLaunchTests
         // The daemon-side command is the docker binary exec'd directly; the only `sh` is the fixed
         // in-container wrapper (the same pattern as the sandbox engine's secret writer).
         var (command, args) = SandboxCliLaunch.BuildDockerExecArgv("ctr-abc", new[] { "claude" }, 1000);
-        Assert.Equal("docker", command);
+        // Audit F54: an absolute, allow-listed path — never the bare name resolved out of the daemon's
+        // inherited PATH.
+        Assert.Equal(TrustedDockerBinary.Resolve(), command);
+        Assert.Contains(command, TrustedDockerBinary.SearchPath);
         Assert.Equal("exec", args.First());
     }
 }

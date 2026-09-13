@@ -216,8 +216,20 @@ public class WslConfigMergerTests
             }
         });
 
-        for (var i = 0; i < 40 && seen.Count < 2; i++)
+        // Keep writing until the reader has ACTUALLY observed the file in both states, rather than for a
+        // fixed number of iterations. The count-bounded loop could finish all 40 writes before the reader
+        // thread landed a single successful read — every attempt losing a share race and taking the
+        // `continue` above — leaving `reads == 0` and failing this test on its own premise ("the test
+        // proved nothing") on a loaded CI runner, while saying nothing about the atomicity it exists to
+        // measure. The stress is unchanged: the writer still rewrites a 1 MiB file under a live reader.
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        for (var i = 0;
+             DateTime.UtcNow < deadline
+             && (System.Threading.Volatile.Read(ref reads) == 0 || seen.Count < 2);
+             i++)
+        {
             fs.WriteWslConfig(i % 2 == 0 ? b : a);
+        }
 
         System.Threading.Volatile.Write(ref stop, true);
         await reader.WaitAsync(TimeSpan.FromSeconds(30));
