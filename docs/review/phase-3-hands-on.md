@@ -4,21 +4,43 @@
 `get_worker_status`, `send_worker_prompt`, `request_verification` — and everything else is refused
 **at the daemon**. It also loses its worktree: the coordinator's jail no longer has the repo in it.
 
-**Not merged.** PR **#292**, branch `feat/coordinator-phase-3-role-lock`, stacked on phase 2. Testing
-this branch exercises phases 1+2+3 together; use #290's branch if you want phase 2 alone.
+**Merged.** PR **#292** (`feat/coordinator-phase-3-role-lock`) has landed on `phase2`, as has #290
+(phase 2). `phase2` therefore exercises phases 1+2+3 together and is what this procedure now targets;
+check out #290's branch only if you want phase 2 in isolation.
 
 ---
 
 ## Setup
 
+**Windows — the WSL2 substrate**
+
 ```powershell
 cd C:\Users\yikes\Code\Mainguard
 git fetch origin
-git checkout feat/coordinator-phase-3-role-lock
+git checkout phase2
 dotnet build
 $env:MAINGUARD_DATA_ROOT = "$env:TEMP\mg-test-p3"
 dotnet run --project Mainguard.Pro.App
 ```
+
+**macOS — the macos-host substrate**
+
+```bash
+cd ~/Code/Mainguard
+git fetch origin
+git checkout phase2
+dotnet build
+export MAINGUARD_DATA_ROOT=~/mg-test-p3
+dotnet run --project Mainguard.Pro.App
+```
+
+**The two substrates differ in exactly one way that matters to this procedure.** On Windows the
+daemon and every jail live inside the `MainguardEnv` WSL2 VM, so each inspection command is prefixed
+`wsl -d MainguardEnv -u root --`. On macOS the daemon is a native `osx-arm64` process and the jails
+run in whichever Docker engine the machine has (Docker Desktop / OrbStack / Colima — `DockerEndpointResolver`
+finds it), so the same commands run directly and there is no VM to enter. Both variants are given at
+every step below; run the one for your machine. See `docs/phase-2/Mainguard_Substrate_MacHost.md` and
+ADR-008 for the substrate itself.
 
 Run the phase-2 procedure first. Phase 3 shouldn't change any of it — if phase 2's flow breaks here,
 that's the finding.
@@ -28,8 +50,9 @@ variable used below. **Testing note:** read *"Running the test suite while an ag
 running any Docker-backed test — it covers the unfiltered-run trap, the two Docker daemons, and how a
 severed jail masquerades as a provider outage.
 
-**Shell note:** Windows PowerShell 5.1 has **no `&&`** — one command per line. `.mainguard/verify`
-has no shell either (it is argv), so chained verify commands need `sh -c "…"`.
+**Shell note:** Windows PowerShell 5.1 has **no `&&`** — one command per line. (zsh/bash on macOS
+does, so the macOS blocks below chain freely.) `.mainguard/verify` has no shell on either platform —
+it is argv — so chained verify commands need `sh -c "…"` everywhere.
 
 **Toolchain:** same as phase 2 — Python 3 installed in **Settings → Toolchains**, done once, lives in
 the VM. Note what it should look like here: the toolchain mount is a **worker** concern. The
@@ -51,8 +74,15 @@ itself be a finding.
 **Check from outside.** Find the coordinator's container, then look for a worktree in it:
 
 ```powershell
+# Windows
 wsl -d MainguardEnv -u root -- docker ps --format '{{.Names}}'
 wsl -d MainguardEnv -u root -- docker exec <coordinator-container> ls /workspace
+```
+
+```bash
+# macOS
+docker ps --format '{{.Names}}'
+docker exec <coordinator-container> ls /workspace
 ```
 
 **Expect:** no `/workspace`. Compare against a **worker's** container, which should have one — that
@@ -62,7 +92,13 @@ creates; if both look the same, nothing changed.
 Also confirm the coordinator got no per-agent repo of its own:
 
 ```powershell
+# Windows — the VM's own fixed layout
 wsl -d MainguardEnv -u root -- ls /home/mainguard/mainguard/agents/$H
+```
+
+```bash
+# macOS — the same layout, under the daemon's own home rather than a VM's
+ls ~/mainguard/agents/$H
 ```
 
 **Why this matters.** The contract said the coordinator "has no worktree, no git credentials and no
@@ -86,9 +122,13 @@ job with only four tools, the surface is wrong and the contract changes — deli
 quietly handing a capability back. So if you hit something it genuinely needs and can't do, that's
 not a bug to patch, it's a design decision for you.
 
-**Note:** a fully live end-to-end run driven by a real model was never completed — it needs your
-daemon replaced with a build from this branch. That is exactly what this procedure does, which makes
-you the first real run.
+**Note, and it is still true:** a fully live end-to-end run of the four-tool contract driven by a
+real model **has not been completed**. Merging #292 changed where the code lives, not whether anyone
+has watched a real coordinator do its job with only these four tools — and the automated suite cannot
+answer it, because what is being tested is whether a MODEL can still coordinate under the
+restriction. Running this section makes you the first real run. If that ever changes, replace this
+paragraph with the date and what happened; leaving it as a permanent "never completed" would be the
+same kind of stale claim as the merge status above.
 
 ---
 
@@ -105,7 +145,13 @@ approval (`ApprovePlan`, `RejectPlan`) are denied **at the daemon**.
 **Confirm it's the daemon refusing, not the model being agreeable:**
 
 ```powershell
+# Windows — the daemon is a systemd unit inside the VM
 wsl -d MainguardEnv -u root -- journalctl -u mainguardd -n 60 | Select-String -Pattern 'denied|permission|role'
+```
+
+```bash
+# macOS — there is no journal; the daemon writes rolling per-subsystem files under the data root
+grep -Ei 'denied|permission|role' "$MAINGUARD_DATA_ROOT"/logs/*.log | tail -n 60
 ```
 
 **This distinction is the whole point.** A system prompt is not a security boundary — telling the
@@ -160,14 +206,30 @@ Phase 3 removes coordinator capability. It should remove nothing else.
 ## Cleanup
 
 ```powershell
+# Windows
 Remove-Item -Recurse -Force $env:TEMP\mg-test-p3
 wsl -d MainguardEnv -u root -- docker ps -aq | ForEach-Object { wsl -d MainguardEnv -u root -- docker rm -f $_ }
 ```
 
-**Restoring your daemon:** these builds deploy their daemon into `MainguardEnv` on launch, and
-`DaemonUpdater` **refuses downgrades**. To go back to plain `phase2`, check out `phase2`, `dotnet
-build`, launch, and confirm with:
+```bash
+# macOS. Named rather than "everything": this Docker engine is your ordinary one, and `docker rm -f`
+# over a bare `ps -aq` would take your other containers with it.
+rm -rf ~/mg-test-p3
+docker ps -aq --filter 'name=^mainguard-' | xargs -r docker rm -f
+docker network ls -q --filter 'name=^mainguard-agent-' | xargs -r docker network rm
+```
+
+**Restoring your daemon:** on Windows these builds deploy their daemon into `MainguardEnv` on launch,
+and `DaemonUpdater` **refuses downgrades**. To go back to a plain `phase2` daemon, check out `phase2`,
+`dotnet build`, launch, and confirm with:
 
 ```powershell
+# Windows
 wsl -d MainguardEnv -u root -- journalctl -u mainguardd -n 5
+```
+
+```bash
+# macOS — the daemon is a host process, so "restoring" is just relaunching a head built from the
+# branch you want; the same no-downgrade rule applies to the deployed payload.
+tail -n 5 "$MAINGUARD_DATA_ROOT"/logs/*.log
 ```

@@ -1,7 +1,7 @@
 <!-- Extracted verbatim from the AGENTS.md Repository Map. Keep current: when you add, move, or delete a file, update its entry here. -->
 ### `Mainguard.Server/` (P2-02 daemon — ASP.NET Core gRPC host)
 
-- **`Program.cs`** — thin entry point: parses `DaemonOptions`, runs the `--local-dev --smoke` self-probe or the daemon (`app.Run()`), maps a bind failure to a typed `DaemonStartupException`. `public partial class Program {}` so `WebApplicationFactory<Program>` can host it in-proc.
+- **`Program.cs`** — thin entry point: parses `DaemonOptions`, runs the `--local-dev --smoke` self-probe or the daemon (`app.Run()`), maps a bind failure to a typed `DaemonStartupException`, and prints + exits 78 (`EX_CONFIG`) on `AuditPersistenceUnavailableException` (B1: the audit chain cannot be opened safely, so the daemon refuses to start rather than run with an in-memory journal that looks healthy). `public partial class Program {}` so `WebApplicationFactory<Program>` can host it in-proc.
 - **`DaemonHost.cs`** — the shared host configuration (services, interceptors, gRPC service map,
   loopback-only Kestrel bind, silent logging) used by both the entry point and the in-proc tests;
   registers the durable `IKillJournal` (`JsonKillJournal` at `ResolveKillJournalPath`, beside the
@@ -31,7 +31,20 @@
   `SecureKeyring` rooted beside it, constructed EAGERLY so a store problem lands in migration.log;
   `InMemoryAuditLog` fallback otherwise, with the will-not-survive-restart loss logged out loud
   (note: the in-proc test tier's hosts share one run-scoped daemon DB, so Server.Tests audit
-  assertions are repo/agent-scoped, and the chain itself re-reads its head per append); **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
+  assertions are repo/agent-scoped, and the chain itself re-reads its head per append).
+  **B1 — a key-ring posture failure is FATAL, not a fallback.** The catch-all used to swallow
+  `SecureKeyring`'s refusal to store the audit master key, so a fresh Linux/WSL box bound its port,
+  served every RPC, answered `VerifyAudit` with `persistent=false` and lost every audit event at
+  shutdown — the exact "carries on looking healthy" failure the fail-closed keyring was written to
+  remove, one layer up, and the reason the MainguardOS startup smoke passed. `IsKeyringPosture`
+  (`UnprotectedKeyringException` / `KeyringUnreadableException` /
+  `KeyringProtectorUnavailableException`) now rethrows as `AuditPersistenceUnavailableException` and
+  the daemon refuses to boot; `Program.cs` prints it and exits **78** (`EX_CONFIG`) rather than
+  crashing with a stack trace. The DB-unavailable fallback stays — there the alternative is no daemon
+  at all — but it is logged through a new `logError` delegate at ERROR, alongside the key-ring posture
+  line (`SecureKeyring.DescribeProtection()`) which is now logged at every boot. `RegisterAuditLog` and
+  `IsKeyringPosture` are `internal` so `AuditPersistenceBootTests` drives the whole decision without a
+  host; **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
   (`IPullRequestService`→`PullRequestService`, `IPrIntakeStore`→`DbPrIntakeStore`/in-memory fallback,
   `IPrHeadFetcher`→`PrHeadFetcher` over the substrate worktree path,
   **`IPrWorkerHost`→`Runtime/ExternalPrWorkerHost` (the spawn seam, sharing the merge queue's
@@ -47,6 +60,14 @@
     forward → on 429 `Report429` + PTY pause + backoff + retry + resume → settle actuals; the CLI only
     ever sees a delayed 200) + `ModelUsageParser` (provider usage → actual tokens) + the ASP.NET
     `ModelProxyMiddleware` fronting model hosts with per-agent-port attribution (`IAgentPortMap`).
+    **F46 — Google's header shape.** Identification (`ExtractPresentedToken`) read only `x-api-key` and
+    `authorization`, and injection was Anthropic-or-Bearer; gemini-cli sends `x-goog-api-key`, so a
+    confined Gemini agent resolved to no agent, found no upstream binding, and fell through unfronted —
+    404 per model call, for an adapter the table calls confinable and verified. `x-goog-api-key` is now
+    read on the way in, dropped from what is relayed, and written on the way out for a `googleapis.com`
+    upstream (`IsGoogleHost`). Pinned by `GatewayUpstreamBindingTests` (unit) and
+    `GatewayConfinementDockerTests.ConfinedGeminiJail_…` (a real jail, since the existing Docker
+    coverage used the Anthropic shape only).
   - **`Runtime/GatewayHostedService.cs`** — runs the RT-D1 boot sequence + the token-bucket pump loop on
     host start.
   - **`Runtime/WorkerReadinessHostedService.cs`** — the boot slot whose ENTIRE job is to **resolve**
@@ -58,16 +79,34 @@
     still boots and still serves the human Verify button. Stop disposes the trigger (unsubscribe + wait
     for the sweep in flight). Asserted from the real composition root by
     `WorkerReadinessTriggerWiringTests`.
-  - **`Runtime/AuditRetentionService.cs`** (P2-15) — hosted retention sweep: once at boot and every
-    24 h, records older than 90 d are expired as chained REDACTIONS (tombstoned payloads, count
+  - **`Runtime/AuditRetentionService.cs`** (P2-15, F64b) — hosted retention sweep: once at boot and
+    every 24 h, records older than 90 d are expired as chained REDACTIONS (tombstoned payloads, count
     unchanged, chain verifiable — the schema's triggers would refuse a delete anyway); a no-op on
     the in-memory fallback journal, and a failed sweep logs + retries next round, never taking the
-    daemon down.
-  - **`Runtime/AuditAnchorService.cs`** (P2-15) — hourly best-effort RFC 3161 sweep: heads queue by
-    the `AuditAnchorQueue` policy (1000 records / 24 h) regardless, but nothing is SENT unless
-    `MAINGUARD_TSA_URL` names an endpoint — no default install silently talks to a third party, and
-    an operator who configures a TSA later gets the queued backlog anchored on the next sweep. A
-    TSA failure leaves rows pending (anchoring is best-effort, chaining is not).
+    daemon down. **Open merge leases hold their evidence back (F64b):** the sweep reads
+    `IMergeLeaseStore.AllOutstanding()` first and, when anything is in flight, walks the chain itself
+    instead of calling `ApplyRetention`, skipping every expired record whose canonical envelope names
+    an open lease's `LeaseId` or `AgentId` (never its `RepoHash` — that would stop retention for a
+    whole repository the moment one merge began). Held records are deferred, not exempt: the sweep
+    after the lease confirms expires them, and the held count is logged so a lease stuck open is
+    visible. **The hold predicate matches PARSED identity fields, not envelope text:** it used to be
+    `payloadJson.Contains(reference)` over the whole envelope, which is a substring search rather than
+    a statement about leases — agent ids as short as `a1` or `pr-42` are valid and `a1` occurs in
+    roughly every other hex sha, so while one such lease was open nearly every expired record read as
+    "held" and retention quietly stopped. `IsHeldByOpenLease` now parses the payload and compares the
+    `agent`/`agent_id`/`worker`/`worker_id` fields against agent ids and `lease`/`lease_id` against
+    lease ids (both spellings because both are in the store), with the two id kinds kept apart in a
+    `LeaseReferences` record. `Sweep`, `References` and `IsHeldByOpenLease` are `internal` so
+    `AuditRetentionLeaseTests` pins the behaviour without a 24 h wait.
+  - **`Runtime/AuditAnchorService.cs`** (P2-15, F64c) — hourly best-effort RFC 3161 sweep: heads queue
+    by the `AuditAnchorQueue` policy (1000 records / 24 h) regardless, but nothing is SENT unless
+    `MAINGUARD_TSA_URL` names an endpoint. **Off by default is a decision, and the daemon now says so
+    at boot** (an INFO line naming the variable and what turning it on would do) rather than leaving
+    a null client to be inferred: anchoring is the one part of the chain that leaves the machine, and
+    defaulting it on would have every install POST chain-head hashes to a TSA nobody chose, leaking
+    the fact and cadence of a user's activity. An install without a TSA still has the hash chain and
+    the file-mirror witness; what it lacks is third-party proof of WHEN a head existed. A TSA failure
+    leaves rows pending (anchoring is best-effort, chaining is not).
   - **`Runtime/MacSleepAssertion.cs`** — macos-host only (registered on macOS alone): while any
     `mainguard.agent`-labeled container is running, hold a sleep assertion via a child
     `caffeinate -im -w <daemon pid>` so idle sleep / App Nap cannot stall a verification; the
@@ -82,6 +121,13 @@
     is active" posture the merge-reconcile takes.
 - **`Gateway/GatewayBindPolicy.cs`** (**MG-13/MG-4**) — the pure bind-address rule for the model-gateway listener: loopback and private ranges are permitted; a wildcard bind and any public address are refused. `TryResolvePrivateHostAddress()` is the **default** bind since MG-4 turned the gateway on: a private, non-loopback IPv4 on an interface that is up, chosen deterministically so the address written into every confined jail is stable across restarts. Loopback is excluded as a default precisely because it binds cleanly and confines nothing — inside a container `127.0.0.1` is the container. It picks an address; whether a jail can REACH it is measured per spawn by `IEgressPolicy.CanProxyReachAsync`. The gateway fronts the user's provider key, so a listener that answers off-box is a credential-exposure surface rather than a convenience. Pure, so every case runs without a host.
 - **`Gateway/GatewayConfinementOptions.cs`** — `GatewayConfinementOptions` (the spawn path's answer to "is there a gateway to point this jail at, and where"; `Disabled` is the default and means the provider key goes into the jail exactly as before), `ModelHosts` (the model-API hosts, derived from `EgressAllowlist.DefaultEntries` so the allowlist and the gateway cannot drift), and `NullAgentPortMap` (Mainguard runs one gateway listener, so attribution comes from the agent token; this returns null rather than guessing an agent).
+- **`AuditPersistenceUnavailableException.cs`** (B1) — the typed boot refusal: the audit chain cannot
+  be opened without losing its tamper-evidence guarantees (no at-rest key-ring protector and no
+  explicit opt-in, a tampered/foreign ring, or a ring wrapped under a protector this process cannot
+  use). Its message carries the inner exception's named remedies, because the operator reading it is
+  looking at a daemon that did not start. Deliberately NOT survivable by the in-memory journal — see
+  the `RegisterAuditLog` note above for why that fallback is legitimate for a DB failure and not for
+  this one.
 - **`DaemonOptions.cs`** / **`DaemonStartupException.cs`** — parsed launch options (`--local-dev`/`--smoke`/`--port`, loopback-only by construction; `DataPath` overrides the P2-08 daemon SQLite path for test isolation; **`--gateway-bind`/`--gateway-port` control the model gateway, which is now ON BY DEFAULT (MG-4 item 3). It was previously settable only through `MAINGUARD_GATEWAY_BIND`, which nothing in the repo ever set, so in every supported deployment a BYOK jail received the raw provider key. `ResolveBindAddress` maps unset/`auto` → a private host address, `off` → disabled (the old posture), and an explicit address straight through to `GatewayBindPolicy`**) and the typed startup failure naming the port.
 - **`Auth/SessionTokenFile.cs`** — generates a 256-bit session token (`RandomNumberGenerator.GetBytes(32)`) written user-only-readable (Linux `~/.mainguard/daemon.token` mode 0600; Windows `%LocalAppData%\Mainguard\daemon.token` current-user ACL); prints nothing (G-13). Path via `Core.Daemon.DaemonPaths`.
 - **`Auth/SessionTransportCertificates.cs`** (MG-19) — the control plane's **peer-authentication**
@@ -149,12 +195,23 @@
     `User=mainguard`) render a bare `uid:1000`; `Environment.UserName` goes through `getpwuid`, not
     `$USER`, so it is not env-spoofable. `uid:<euid>` remains only as the last resort for a euid with no
     passwd entry, where `Environment.UserName` returns `""`.
-- **`Logging/SecretFieldMask.cs`** + **`SecretMaskingInterceptor.cs`** — the G-13 registry of
-  `(message, field number)` secrets (every `// SECRET` proto field) and the access-log formatter that
-  redacts them (value/length/prefix never logged). **`SecretMaskingInterceptor` now also records
-  handler faults** — a non-`RpcException` out of a handler is logged Error under the `Rpc` category
-  (method/peer/type/message/stack) then rethrown, so a bare `Unknown` to the client is no longer
-  invisible daemon-side.
+- **`Logging/SecretFieldMask.cs`** + **`SecretMaskingInterceptor.cs`** — the access-log renderer.
+  **Since F56 this is an ALLOWLIST, not a denylist: RPC bodies are never logged.**
+  `SecretFieldMask.Summarize(IMessage)` emits the op, the wire size, the allowlisted ids and bounded
+  scalars, and a count of what it withheld — e.g.
+  `SpawnAgentRequest{size=412B, repo_handle=…, agent_kind=claude-code, task_prompt=<str:57>, omitted=3}`.
+  Three rules: a bool/enum/number renders its value; a string renders its value only if its NAME is in
+  the `LoggableNames` handle allowlist AND the value is ≤64 identifier-shaped chars (else `<str:LEN>`);
+  bytes, repeated fields, maps and nested messages never render content (`<bytes:LEN>`, `[N]`, `{N}`,
+  shallow recursion). The old renderer wrote every field of every message and masked six names, so
+  `ReadAudit`'s decrypted payloads, scrollback rows, merge diffs, verification logs, task prompts, chat
+  text and plan text all went to `rpc.log` verbatim. The G-13 `(message, field number)` `// SECRET`
+  registry survives as a **second belt** (a registered field is refused even if the allowlist rules
+  would pass it) and the `// SECRET`-coverage test still holds it to the proto comments — but
+  forgetting an entry is no longer a leak. There is deliberately **no verbose-bodies switch**.
+  **`SecretMaskingInterceptor` also records handler faults** — a non-`RpcException` out of a handler is
+  logged Error under the `Rpc` category (method/peer/type/message/stack) then rethrown, so a bare
+  `Unknown` to the client is no longer invisible daemon-side.
 - **`Logging/DaemonLogCategories.cs`** + **`SubsystemFileLoggerProvider.cs`** +
   **`LoggingTransparencyLog.cs`** — the in-depth per-subsystem daemon logging.
   - `DaemonLogCategories` maps each `DaemonLogSubsystems` name to an `ILogger` category
@@ -163,7 +220,12 @@
     rolling (5 MB × 3), per-line flush, format `{ts:O} [LVL] [subsystem] (scope) message` + exception on
     the following lines; its **file writers are process-static + lock-guarded** so the pre-DI bootstrap
     factory and the runtime DI factory share one writer per file, and every file op is swallowed
-    (diagnostics never break the daemon).
+    (diagnostics never break the daemon). **Owner-only on disk (F56):** the nested
+    `RestrictedFiles` helper creates the logs directory `0700` and pre-creates every log file `0600`
+    before the first byte lands (the process umask made `rpc.log` world-readable); on Windows the
+    directory and each file get an inheritance-free single-ACE DACL, mirroring
+    `Auth/SessionTransportCertificates.WriteRestricted` rather than inventing a second pattern.
+    Rolled files keep the mode through `File.Move`.
   - `LoggingTransparencyLog` decorates `INetworkTransparencyLog` to tee each egress verdict summary into
     the `Egress` category (schema kept stable for P2-17/P2-44). Wired in `DaemonHost` (journald console
     + files when `!Smoke`; a bootstrap `LoggerFactory` logs the Lifecycle/Migration startup milestones
@@ -227,7 +289,30 @@
     seed arbitrary agent-home files), and `HarvestCliCredentialsAsync` reads those files back out of the
     jail's tmpfs `$HOME` (base64 over the exec pipe, best-effort — a failed harvest never blocks a stop)
     so `AgentSpawnService.StopAsync` can hand them to the client for the host OS keychain
-    (`AgentStopResult`). Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
+    (`AgentStopResult`). **F2 — the credential leg now has the two protections the settings leg had:**
+    a size ceiling checked IN THE SHELL (`AdapterCredentialPolicy.MaxBytesFor`, the same `wc -c` script
+    the settings harvest uses, so an oversized file is never read into the daemon's memory) and REFUSED
+    rather than truncated; and a declared credential path that is really a settings file (gemini-cli's /
+    qwen-code's `settings.json`) is put through `CliSettingsGrantScrub.Scrub` and held to the settings
+    ceiling WHERE IT SITS, in both directions (`FilterCliCredentials` applies the same pair on restore,
+    so an already-poisoned store is neutralised with no migration). **F2's last clause: EVERY credential
+    file carries `mcpServers` command definitions** — `.claude.json` does, and so does
+    `~/.gemini/settings.json`, which is where gemini-cli defines them. One private
+    `CarryCredentialContent(path, content, leg, kind, log, reportWhatWasFiltered)` is now the single
+    filter BOTH legs call: the mount scrub where the path is settings-shaped, then
+    `CliSettingsGrantScrub.StripExecutableConfig` on everything, which removes only the keys that name a
+    program and leaves every other key alone (a targeted strip rather than an allowlist: these are the
+    files that say the user is logged in, and an allowlist over them cannot be proved safe without a live
+    account — a claude-shaped one would drop gemini's `selectedAuthType`). The settings-shaped files got
+    the scrub ALONE until the composition landed, so the `mcpServers` an attended gemini jail wrote
+    travelled into every later Managed worker of that repo. The unreviewed top-level key NAMES are logged
+    by `LogUnreviewedCredentialKeys` on both legs — names only, already reduced to plain identifiers,
+    never a value — for the paths `AdapterCredentialPolicy.ReportsUnreviewedKeys` admits; the two "this
+    file changed" Information lines fire on the HARVEST only, because on the restore leg the same stored
+    blob is re-filtered on every spawn and the line would repeat forever saying what the harvest already
+    said. `BuildSecrets`/`FilterCliCredentials` take an optional `ILogger`
+    for that; the spawn chain passes the daemon's. WHETHER either harvest may run is
+    the caller's decision — see `CliHarvestPolicy`. Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
     refused outright (`Conflict`), so a conflicted keep-alive rebase used to put one raw
     `Docker.DotNet.DockerApiException` stack trace per declared path into the operator log — a warning
     meaning "as expected", which is how the warnings that mean something stop being read. A frozen jail is
@@ -378,11 +463,18 @@
     harvested CLI login, **nor any CLI SETTINGS**, and seeds none of them). The settings gate is the
     stronger of the three: an inherited permission allowlist is inherited *execution*, so a jail holding
     a pull request's code must start asking about every command. `cliSettings` carries the repo's saved
-    approvals in; `CliSettingsHarvestPolicy` (in this file) gates them flowing back OUT — only a
-    HUMAN-ATTENDED session is harvested, because a `Managed` worker's terminal is daemon-locked
-    read-only, so anything in its settings file was written by the agent, not approved by a person.
-    Restore is deliberately wider than harvest (a Managed worker still receives the repo's approvals or
-    it stalls on prompts nobody can answer). `AgentStopResult` carries `CliSettings` + `RepoHandle` so
+    approvals in; **`CliHarvestPolicy`** (in this file; was `CliSettingsHarvestPolicy` until it stopped
+    being only about settings) gates them flowing back OUT — only a HUMAN-ATTENDED session is harvested,
+    because a `Managed` worker's terminal is daemon-locked read-only, so anything in its settings file
+    was written by the agent, not approved by a person. Restore is deliberately wider than harvest (a
+    Managed worker still receives the repo's approvals or it stalls on prompts nobody can answer).
+    **F2 — the same gate now covers CREDENTIALS** (`HarvestCredentialsIfAttendedAsync`, at both the live
+    `HarvestCredentialsAsync` and the `StopAsync` call sites). It did not before, and the asymmetry made
+    no sense in either direction it was argued: a coordinator's workers are spawned `Managed` running
+    real adapter kinds, so every one of them WAS harvested — the daemon read CLI login files out of an
+    unattended jail, on the word of the only party in it, and filed them in the host's durable
+    credential store. An OAuth refresh token is strictly more dangerous than a command allowlist, and it
+    was the one with no gate. `AgentStopResult` carries `CliSettings` + `RepoHandle` so
     the client files them under the right repository rather than whichever one is open. See
     [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md).
     **Phase 2** adds `heldTaskTitle`/`heldTaskPrompt`/
@@ -531,6 +623,18 @@
     kind) **CLI settings** (`RememberCliSettings`/`TryGetCliSettings`), so an IPC-spawned worker inherits
     the repo's approved-command list instead of stalling on prompts. A blank repo handle forms no scope
     and is dropped rather than collapsed into a shared bucket (MG-6). Never persisted, never logged.
+    **F50 — it now evicts**: `ForgetRepo(repo)` when the repo has no sessions left at all, and
+    `Forget(repo, kind)` when no session of that kind survives AND **no coordinator survives in the
+    repo** (both driven from `AgentSpawnService.StopAsync`, after the harvest that legitimately refreshes
+    it), plus `HasAnythingFor(repo, kind)` as the observable a test asserts on. Nothing evicted anything
+    before, so a provider key and a set of harvested OAuth files stayed resident for the daemon's whole
+    lifetime and stopping every agent left them there. The **coordinator** half of the per-kind condition
+    is load-bearing and was missing in the first cut: `SpawnWorkerAsync` takes the kind from the shim, so
+    a live coordinator spawns workers of ANY installed kind — a user who ran one codex session and
+    stopped it would otherwise leave the claude-code coordinator's every later codex worker booting with
+    no provider key and no login. Pinned end to end by
+    `CoordinatorSpawnKindTests.AWorkerOfAnotherKind_StillGetsThatKindsKey_…` (the key really reaches the
+    worker's jail) and at the cache by `CliSettingsBoundaryTests`' two cross-kind tests.
 - **`Runtime/CoordinatorSpawnGate.cs`** (**MG-2**) — the pure admission decision in front of the
   coordinator's in-jail spawn shim:
   `Evaluate(activeManagedWorkers, maxActiveWorkers, admission, planGate?)` returns a refusal reason or
@@ -812,14 +916,24 @@
     `ReadAudit`): the audit store's first production readers. Verification/decryption live in
     `IChainedAuditLog`; on the in-memory fallback journal both RPCs still answer with
     `persistent=false` (a heap verify must never read as tamper-evidence). Coordinator-denied at
-    the `RoleInterceptor`; `ReadAudit` pages are capped at 500 records (payloads carry full
-    prompts/outputs).
+    the `RoleInterceptor`; `ReadAudit` pages are **doubly capped (F64a)** — 500 records AND a 3 MB
+    response budget (`MaxResponseBytes`), because a record carries a decrypted prompt, verification
+    log or merge diff and 500 of them can exceed gRPC's 4 MB default receive limit, which turns the
+    whole page into a ResourceExhausted instead of a short one. The page is always a contiguous
+    prefix and a single oversized record is still returned, so the caller resumes from the last seq
+    it got exactly as it does at the end of the chain; no proto field signals truncation.
   - **`Cli/AuditCommands.cs`** (P2-15) — the offline `mainguardd audit verify [--data <db>]` verb
     (dispatched in `Program.cs` before daemon options, so it can never bind a port): walks the
     chain + mirror via `ChainedAuditLog` and validates stored RFC 3161 anchor tokens structurally
     (an anchor that no longer matches its recorded head hash exits 2 like chain tamper), prints
     head seq/hash; exit contract 0 intact (missing store / pre-chain DB = intact by definition) /
-    2 tampered with first-bad-seq printed / 64 usage / 1 cannot-verify.
+    2 tampered with first-bad-seq printed / 64 usage / 1 cannot-verify. **B3 — it is a READER again:**
+    it built an `AuditCrypto`, whose constructor mints and STORES a master key when there is none, so
+    on a box with no key-ring protector `audit verify` exited 1 with "Refusing to store
+    'audit-payload-key'…" where it previously reported an intact empty chain, and everywhere else it
+    left a key nobody asked for. It now uses `AuditCrypto.TryOpenExisting`, does not even create the
+    key-ring directory, and distinguishes "no key and no records" (0, intact by definition) from "no
+    key but records exist" (1, cannot verify — never reported as OK).
   - **`Runtime/SandboxKillTarget.cs`** (MG-8) — the `IKillTarget` that actually **stops work**, in
     three ordered steps: sever terminal input (`TerminalLockRegistry` + `SessionLeader.PauseInput` —
     in-proc and I/O-free, so they run BEFORE any Docker round-trip and an unreachable engine can never
@@ -903,9 +1017,12 @@ and per-subsystem **rolling files** under `~/.mainguard/logs/<subsystem>.log` (5
 survive tier-1/tier-2 upgrades). The 12 categories are `DaemonLogSubsystems.All`
 (`lifecycle · migration · rpc · spawn · egress · gateway · terminal · merge · approval · killswitch · coordinator · intake`);
 a new daemon subsystem adds one name there + one `DaemonLogCategories` constant (the P2-46/P2-49
-extension point). **Mask discipline:** RPC bodies always go through `SecretFieldMask.Redact`; keep
-`LoggingMaskTests` + the `// SECRET`-coverage test green — this is G-13 (secret *transport*, not
-silence: masked logs are compliant). **Core stays log-free** — instrument Server-side
+extension point). **Mask discipline (F56):** RPC bodies are NOT logged — they go through
+`SecretFieldMask.Summarize`, which renders the op, the size and the allowlisted ids and withholds
+everything else by default; keep `LoggingMaskTests`, `SecretFieldMaskAllowlistTests` and the
+`// SECRET`-coverage test green. Adding a proto field never requires a mask entry to stay safe, and
+adding a name to `LoggableNames` is a deliberate decision to publish that field to disk. Log files
+are owner-only (`0700` dir, `0600` files; single-ACE DACL on Windows). **Core stays log-free** — instrument Server-side
 (`Mainguard.Server`) or tee from existing seams (`IAuditLog`, `INetworkTransparencyLog`); the
 operational log is the *diagnostic complement* to the governance audit log, never a replacement.
 `MAINGUARD_LOG_LEVEL` (default Information) sets the floor; per-frame paths (terminal streaming)

@@ -9,8 +9,14 @@
 # The container is spawned with the hardened spec from ContainerSpecBuilder:
 #   - no-new-privileges, seccomp denylist (process_vm_readv/process_vm_writev/ptrace), CapDrop ALL
 #   - userns remap, memory/pids limits, read-only rootfs (writable surfaces are tmpfs)
-#   - the ONLY host bind mount is the ext4 agent worktree at /workspace (G-11); /nix is an EPHEMERAL
-#     per-container writable volume pre-populated from this image's baked store (a tmpfs would hide it)
+#   - the ONLY host bind mount is the ext4 agent worktree at /workspace (G-11)
+#   - /nix is READ-ONLY at runtime: it lives on the read-only rootfs and ContainerSpecBuilder mounts
+#     no volume or tmpfs over it. (This header used to describe /nix as "an EPHEMERAL per-container
+#     writable volume pre-populated from this image's baked store". No such volume was ever created —
+#     audit F33 — and the description mattered because it made a writable Nix store look like an
+#     available capability. A per-repo toolchain is a BUILT LAYER instead: ToolchainProvisioner
+#     produces mainguard-agent-toolchain:<hash> on top of this image at spawn time, which is the
+#     mechanism that replaced runtime `devbox add` and needs nothing here to be writable.)
 # and reaches the network only through the mainguard-egress-proxy (default-deny: model APIs + package
 # registries incl. cache.nixos.org; A6 keeps the git host off the allowlist).
 
@@ -39,7 +45,8 @@ RUN groupadd -g 1000 agent      && useradd -u 1000 -g 1000 -m -s /bin/bash agent
 
 # --- Nix (build-time, single-user, no daemon) ---------------------------------------------------
 # The Determinate installer with `--init none` installs Nix WITHOUT systemd (correct for a container)
-# into /nix, owned root. Flakes on. At runtime /nix is remounted as a writable volume seeded from here.
+# into /nix, owned root. Flakes on. At runtime /nix is READ-ONLY — it is part of the read-only rootfs
+# and nothing remounts it (see the header note on audit F33); everything Nix has to do is done here.
 #
 # MG-27: this was `curl https://install.determinate.systems/nix | sh`. That URL serves a bootstrap
 # script whose CONTENT changes with every upstream release, and piping it straight into a shell means

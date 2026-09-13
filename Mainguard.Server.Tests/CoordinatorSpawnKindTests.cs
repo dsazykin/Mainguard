@@ -44,6 +44,11 @@ public sealed class CoordinatorSpawnKindTests : IDisposable
     private const string Installed = "probe-cli";
     private const string AlsoInstalled = "second-cli";
 
+    /// <summary>The env var each installed adapter declares for its model API key — the only place a
+    /// spawn's provider key is observable from outside the daemon.</summary>
+    private static string ApiKeyEnvVarFor(string kind) =>
+        kind.Replace("-", "_", StringComparison.Ordinal).ToUpperInvariant() + "_API_KEY";
+
     private readonly SpawnKindRig _rig = SpawnKindRig.Create();
     private readonly List<string> _spawned = new();
 
@@ -114,6 +119,70 @@ public sealed class CoordinatorSpawnKindTests : IDisposable
 
         var request = Assert.Single(_rig.Engine.Requests, r => r.AgentId == response.AgentId);
         Assert.Equal(Installed, request.AgentKind);
+    }
+
+    // ---- a coordinator's workers are not all of the coordinator's own kind ----------------------
+
+    /// <summary>
+    /// <b>The flow F50's per-kind eviction broke.</b> A coordinator spawns a worker of whatever kind its
+    /// shim names — <c>mainguard-agent spawn second-cli …</c> — and <c>SpawnWorkerAsync</c> resolves that
+    /// worker's provider key from the daemon's per-(repo, kind) cache, which only a CLIENT spawn of that
+    /// kind ever fills. So the user's own stopped <c>second-cli</c> session is the ONLY source of a key
+    /// for every <c>second-cli</c> worker the live coordinator will ever spawn in that repository.
+    ///
+    /// <para>Evicting on "no session of this kind survives" therefore emptied an entry that was still in
+    /// use: the justification ("once no session of that kind survives there is no coordinator left to
+    /// spawn one") holds only when the coordinator's kind equals the worker's kind, which is exactly the
+    /// case the sibling test in <c>CliSettingsBoundaryTests</c> was written in. Real usage is the other
+    /// one — a claude-code coordinator driving codex workers — and there the worker booted with no
+    /// provider key and no login, silently, for the rest of the daemon's life.</para>
+    ///
+    /// <para>Driven end to end over the real Unix socket, and asserted on the ENV THE JAIL WOULD HAVE
+    /// RECEIVED rather than on the cache, because "the cache still holds it" and "the worker gets it" are
+    /// two claims and only the second one is the feature.</para>
+    /// </summary>
+    [Fact]
+    public async Task AWorkerOfAnotherKind_StillGetsThatKindsKey_AfterTheUsersOwnSessionOfItStopped()
+    {
+        var coordinator = await SpawnCoordinatorAsync();
+
+        // The user's own session of the OTHER kind: a client spawn, so it carries the key from the host
+        // keystore and is the thing that fills the daemon's cache for that kind.
+        var ownSession = await _rig.Spawns.SpawnAsync(
+            Repo, AlsoInstalled, "sk-second-kind", role: string.Empty, CancellationToken.None);
+        await _rig.Spawns.StopAsync(ownSession, CancellationToken.None);
+
+        var response = await CallAsync(coordinator, new AgentIpcRequest(
+            AgentIpcRequest.SpawnOp, AgentKind: AlsoInstalled, TaskPrompt: "do the thing",
+            Title: "Plan the thing"));
+
+        Assert.True(response.Ok, response.Error);
+        _spawned.Add(response.AgentId!);
+        var worker = Assert.Single(_rig.Engine.Requests, r => r.AgentId == response.AgentId);
+        Assert.Equal(AlsoInstalled, worker.AgentKind);
+        Assert.Equal(
+            "sk-second-kind",
+            worker.Secrets.AgentEnv.TryGetValue(ApiKeyEnvVarFor(AlsoInstalled), out var key) ? key : null);
+    }
+
+    /// <summary>
+    /// The paired eviction, so the guard above is a condition and not a way of never evicting: with the
+    /// coordinator gone there is nothing left that can spawn that kind without a client, and the daemon's
+    /// custody of it ends — which is the whole of F50.
+    /// </summary>
+    [Fact]
+    public async Task OnceTheCoordinatorIsGone_TheOtherKindsKey_IsDroppedWithItsLastSession()
+    {
+        var keys = _rig.Host.Services.GetRequiredService<SessionKeyCache>();
+        var coordinator = await SpawnCoordinatorAsync();
+        var ownSession = await _rig.Spawns.SpawnAsync(
+            Repo, AlsoInstalled, "sk-second-kind", role: string.Empty, CancellationToken.None);
+
+        await _rig.Spawns.StopAsync(coordinator, CancellationToken.None);
+        _spawned.Remove(coordinator);
+        await _rig.Spawns.StopAsync(ownSession, CancellationToken.None);
+
+        Assert.False(keys.HasAnythingFor(Repo, AlsoInstalled));
     }
 
     /// <summary>
@@ -402,6 +471,10 @@ public sealed class CoordinatorSpawnKindTests : IDisposable
                         Path.Combine(registry, id + ".json"),
                         InstalledAdapterMarker.Serialize(new InstalledAdapterMarker(
                             id, "1.0.0", new[] { "/bin/" + id },
+                            // Declared so a spawn's provider key is OBSERVABLE in the jail's env: without
+                            // an env var to read it from, a CLI gets no key and "the worker booted with
+                            // no credential" could not be told from "this rig never injects one".
+                            ApiKeyEnvVar: ApiKeyEnvVarFor(id),
                             SystemPromptArg: "--append-system-prompt")));
                 }
             }
