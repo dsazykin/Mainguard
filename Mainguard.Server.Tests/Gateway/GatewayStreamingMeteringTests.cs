@@ -289,7 +289,7 @@ public class GatewayStreamingMeteringTests
         var forwarder = new GatewayForwarder(
             gateway,
             new HttpMessageInvoker(new ChunkedHandler(
-                new[] { "{\"error\":" , "\"overloaded\"}" }, "application/json", HttpStatusCode.InternalServerError)),
+                new[] { "{\"error\":", "\"overloaded\"}" }, "application/json", HttpStatusCode.InternalServerError)),
             delay: (_, _) => Task.CompletedTask);
 
         using var request = new HttpRequestMessage(HttpMethod.Post, "https://" + ModelHost + "/v1/messages")
