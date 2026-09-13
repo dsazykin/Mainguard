@@ -113,6 +113,11 @@
                                         <StackPanel Grid.Column="0" Spacing="3" VerticalAlignment="Center">
                                             <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextPrimary}"/>
                                             <TextBlock Text="{Binding StatusLabel}" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
+                                            <!-- F51: a stored key that Mainguard cannot keep out of the jail says so here,
+                                                 not only in a daemon log line the user never sees. -->
+                                            <TextBlock Text="{Binding ConfinementNotice}" IsVisible="{Binding ShowsConfinementNotice}"
+                                                       FontSize="11" TextWrapping="Wrap" MaxWidth="520"
+                                                       Foreground="{DynamicResource TextMuted}"/>
                                         </StackPanel>
                                         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
                                             <Border CornerRadius="999" Padding="10,3" VerticalAlignment="Center"
