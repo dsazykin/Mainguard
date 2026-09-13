@@ -499,6 +499,19 @@
   These run on every platform via `SecureKeyring`'s internal protection-override seam — the
   unprotected posture is reachable end to end only on Linux/WSL, which is why its consequences went
   unnoticed),
+  `MainguardOsKeyringProvisioningTests` (**F53, the shipped half**: the two suites above cover the
+  protector once a passphrase is in hand — nothing covered anything ever PUTTING one there. Pins the
+  four-link chain that supplies it on a VM, Docker-free, by reading the payload sources: the
+  `Dockerfile` `COPY`s `provision-keyring-passphrase.sh` to the path the unit invokes and makes it
+  executable; the unit runs it `ExecStartPre=+` (as root, so a `User=mainguard` service can write
+  root-owned `/etc/mainguard`); the unit's `Environment=` names
+  `SecureKeyring.PassphraseFileVariable` and carries the PATH, never the secret, and never the direct
+  `MAINGUARD_KEYRING_PASSPHRASE`; the script writes that same path, mints from `/dev/urandom`, and
+  never regenerates. Plus: neither unit nor Dockerfile may mention
+  `MAINGUARD_ALLOW_UNPROTECTED_KEYRING`, the image may not bake the passphrase path, and the script
+  must be in `build.sh`'s `INPUT_SPECS`. Since the daemon is fail-closed on Linux, a break in this
+  chain is not a degraded install but a VM whose daemon refuses to start — which is exactly how it
+  surfaced, as a P2-21 crash-loop),
   `KeyringTestPosture` (both test assemblies) — a `[ModuleInitializer]` that gives the test process a
   key-ring passphrase when the machine would otherwise resolve to `KeyringProtection.None`, so the
   suite exercises the same protected path everywhere it runs. Deliberately here and not in `ci.yml`:
@@ -1448,7 +1461,19 @@
   actually listen on 127.0.0.1:5250, and have created an ABSOLUTE data root under `$HOME`. Both
   shipped crash-loop bugs (missing libicu; `GetFolderPath`→relative path) survived only because
   mainguardd had never once been STARTED in its shipping rootfs before a user did it — this asserts
-  behaviour, not an exit code. Its `client-closure` job (ADR-0001 payoff, automated) publishes the
+  behaviour, not an exit code. **"The context systemd gives it" is taken literally (F53):** the smoke
+  reads the `ExecStartPre=+` and `Environment=` lines out of the SHIPPED
+  `/etc/systemd/system/mainguardd.service` and replays them — running the provisioner as root, then
+  starting the daemon under the unit's own environment — rather than restating them here, so a unit
+  that grows a line is covered for free and one that loses a line fails here first. It hardcoded
+  `env HOME=…` instead, which is how the fail-closed keyring landed as a crash-loop: the unit had
+  grown `ExecStartPre=+provision-keyring-passphrase.sh` and
+  `Environment=MAINGUARD_KEYRING_PASSPHRASE_FILE=…`, the smoke replayed neither, and the daemon
+  (correctly) exited 78 on an unprotected key ring. It also asserts the POSTURE, not just the boot —
+  `keyring protection=Passphrase` from `SecureKeyring.DescribeProtection()` must appear in the
+  daemon's own output, so a future unit that quietly drops the provisioning cannot pass here by
+  setting `MAINGUARD_ALLOW_UNPROTECTED_KEYRING`, which boots fine and ships the audit master key in
+  cleartext. Its `client-closure` job (ADR-0001 payoff, automated) publishes the
   Client head and fails if the closure names any agent-platform assembly (`Mainguard.Agents(.UI)` /
   `Mainguard.Protos` / `Docker.DotNet` / `Porta.Pty` / `Grpc`), via
   `build/ci/verify-client-closure.sh` (also runnable locally). That script publishes **self-contained
