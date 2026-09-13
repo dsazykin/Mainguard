@@ -41,10 +41,10 @@ public static class RebaseEditorShim
             return Fail(stderr, "no todo path was supplied to the rebase editor.");
         }
 
-        string todo;
+        int steps;
         try
         {
-            todo = File.ReadAllText(generatedTodoPath);
+            steps = CountTodoSteps(File.ReadAllLines(generatedTodoPath));
         }
         catch (Exception ex)
         {
@@ -60,9 +60,17 @@ public static class RebaseEditorShim
             return Fail(stderr, $"could not write git's sequence file '{gitTodoPath}': {ex.Message}");
         }
 
-        // Invariant 5: log the todo actually applied to git's sequence file. Only reached once the
-        // copy has succeeded, so this can never report a todo git did not receive.
-        System.Diagnostics.Debug.WriteLine("[Mainguard] Interactive rebase applied todo:\n" + todo);
+        // Invariant 5: log that the todo reached git's sequence file. Only reached once the copy has
+        // succeeded, so this can never report a todo git did not receive.
+        //
+        // The step COUNT is logged, never the todo body. Every todo line carries a commit subject,
+        // which is attacker-influenced text from any branch the user fetched, and Debug.WriteLine
+        // goes to the OS debug channel (OutputDebugString / os_log) — world-readable, and not
+        // something the user opted into. The count is what makes "git took our todo, not its default
+        // pick-everything fallback" checkable, which is the whole point of the invariant; the todo
+        // body itself is on disk at the path git was handed if a human needs it.
+        System.Diagnostics.Debug.WriteLine(
+            $"[Mainguard] Interactive rebase applied todo: {steps} step(s) written to git's sequence file.");
         return Success;
     }
 
@@ -112,6 +120,22 @@ public static class RebaseEditorShim
         }
 
         return Success;
+    }
+
+    /// <summary>
+    /// The number of real rebase steps in a todo — blank lines and git's comment footer excluded.
+    /// Counting rather than echoing keeps the commit subjects on each line out of the debug channel.
+    /// </summary>
+    private static int CountTodoSteps(string[] lines)
+    {
+        var steps = 0;
+        foreach (var line in lines)
+        {
+            var trimmed = line.Trim();
+            if (trimmed.Length == 0 || trimmed.StartsWith("#", StringComparison.Ordinal)) continue;
+            steps++;
+        }
+        return steps;
     }
 
     private static int Fail(TextWriter stderr, string reason)

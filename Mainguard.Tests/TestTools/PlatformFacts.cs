@@ -124,6 +124,50 @@ public sealed class RequiresPython3FactAttribute : FactAttribute
     }
 }
 
+/// <summary><see cref="RequiresPython3FactAttribute"/> for a <see cref="TheoryAttribute"/>. Several of
+/// the shim suites are data-driven, and a <c>[Theory]</c> cannot wear a <c>[Fact]</c>-derived
+/// attribute — without this the conversion would have to turn a table of cases into one case, which is
+/// exactly the coverage the table exists to give.</summary>
+public sealed class RequiresPython3TheoryAttribute : TheoryAttribute
+{
+    public RequiresPython3TheoryAttribute(string? because = null)
+    {
+        if (!Python3Availability.IsAvailable)
+        {
+            Skip = because is null
+                ? "python3 is not launchable on this box — the shim scripts cannot be compiled or run here."
+                : $"python3 is not launchable on this box: {because}.";
+        }
+    }
+}
+
+/// <summary>
+/// A <see cref="FactAttribute"/> for the shim tests that measure a command line THROUGH A REAL SHELL,
+/// so they need <c>bash</c> as well as <c>python3</c>.
+///
+/// <para><b>The composite is the point.</b> The guard this replaces was commented "no python3/bash on
+/// this box" and only ever caught a missing <i>bash</i>: with bash present and python3 absent,
+/// <c>bash -c "python3 …"</c> exits 127 with empty stdout, which the helper maps to a real result
+/// carrying <c>Refusal = "bash: python3: command not found"</c> — so the guard was skipped and the test
+/// failed on an assertion that reads like a shim defect and is not one. Both halves are probed here,
+/// up front, so the reason a run does not measure anything is stated instead of discovered.</para>
+/// </summary>
+public sealed class RequiresPython3AndBashFactAttribute : FactAttribute
+{
+    public RequiresPython3AndBashFactAttribute(string? because = null)
+    {
+        var missing = !Python3Availability.IsAvailable
+            ? "python3"
+            : !BashAvailability.IsAvailable ? "bash" : null;
+        if (missing is not null)
+        {
+            Skip = because is null
+                ? $"{missing} is not launchable on this box — a command line cannot be measured through a real shell here."
+                : $"{missing} is not launchable on this box: {because}.";
+        }
+    }
+}
+
 /// <summary>
 /// Probes once (and caches) whether <c>python3</c> can actually be STARTED. A PATH scan would report
 /// a name that exists but is not executable as present; launching it is the condition the tests
@@ -162,6 +206,44 @@ internal static class Python3Availability
         catch (System.ComponentModel.Win32Exception)
         {
             return false; // python3 is not installed here
+        }
+    }
+}
+
+/// <summary>The same probe for <c>bash</c> — the second half of
+/// <see cref="RequiresPython3AndBashFactAttribute"/>.</summary>
+internal static class BashAvailability
+{
+    private static readonly Lazy<bool> _probe = new(Probe);
+
+    public static bool IsAvailable => _probe.Value;
+
+    private static bool Probe()
+    {
+        try
+        {
+            var start = new ProcessStartInfo("bash")
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+            };
+            start.ArgumentList.Add("-c");
+            start.ArgumentList.Add("exit 0");
+
+            using var process = Process.Start(start);
+            if (process is null)
+            {
+                return false;
+            }
+
+            process.StandardOutput.ReadToEnd();
+            process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            return process.ExitCode == 0;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return false; // no bash here
         }
     }
 }

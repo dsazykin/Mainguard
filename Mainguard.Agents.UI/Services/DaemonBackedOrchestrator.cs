@@ -1304,18 +1304,24 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>Folds the login-state files a stop harvested from the jail into the host OS
-    /// keychain (<c>cli_login_&lt;kind&gt;</c>) — the durable half of the login round-trip; the
-    /// next spawn of this kind restores them so the CLI boots signed in.</summary>
+    /// keychain (<c>cli_login_&lt;kind&gt;_&lt;repoScope&gt;</c>) — the durable half of the login
+    /// round-trip; the next spawn of this kind IN THIS REPOSITORY restores them so the CLI boots
+    /// signed in.
+    ///
+    /// <para>The repo comes from the outcome, never from whichever repository happens to be open —
+    /// the same rule, and the same reason, as the settings sibling below: the harvest sweep walks
+    /// every agent on the daemon. A harvest with no repo handle is dropped rather than filed under a
+    /// blank scope (F2: the unscoped entry is what let one repo's login reach another's jail).</para></summary>
     private void PersistHarvestedLogin(AgentStopOutcome outcome)
     {
         PersistHarvestedSettings(outcome);
 
-        if (outcome.CliCredentials.Count == 0 || string.IsNullOrWhiteSpace(outcome.AgentKind))
+        if (outcome.CliCredentials.Count == 0
+            || CliLoginVault.KeystoreKeyFor(outcome.AgentKind, outcome.RepoHandle) is not { } keystoreKey)
         {
             return;
         }
 
-        var keystoreKey = CliLoginVault.KeystoreKeyFor(outcome.AgentKind);
         if (CliLoginVault.MergeAndSerialize(_keystoreLookup(keystoreKey), outcome.CliCredentials) is { } vault)
         {
             _keystoreSave(keystoreKey, vault);
@@ -1359,7 +1365,17 @@ public sealed class DaemonBackedOrchestrator :
             return true;
         }
 
-        if (!string.IsNullOrEmpty(_keystoreLookup(CliLoginVault.KeystoreKeyPrefix + cli.Id)))
+        // F2: asked against THIS repository's entry, because that is the one a spawn here will
+        // restore. A login saved while working on another repository is not this repo's credential and
+        // reporting it as one would put the "already signed in" badge on a jail that will prompt.
+        string? openRepoHandle;
+        lock (_gate)
+        {
+            openRepoHandle = _repoHandle;
+        }
+
+        if (CliLoginVault.KeystoreKeyFor(cli.Id, openRepoHandle) is { } loginKey
+            && !string.IsNullOrEmpty(_keystoreLookup(loginKey)))
         {
             return true;
         }
@@ -2146,7 +2162,11 @@ public sealed class DaemonBackedOrchestrator :
         var cli = installed.FirstOrDefault(c => string.Equals(c.Id, agentKind, StringComparison.Ordinal));
         var provider = ApiKeyProviderMap.ProviderForEnvVar(cli?.ApiKeyEnvVar ?? string.Empty);
         var key = provider is null ? null : _keystoreLookup(ApiKeyProviderMap.KeystoreKeyFor(provider));
-        var savedLogin = CliLoginVault.Parse(_keystoreLookup(CliLoginVault.KeystoreKeyFor(agentKind)));
+        // F2: this repository's saved login, by the same rule as its saved settings below. The vault
+        // key carries the repo scope, so a login performed in another repository is not readable here.
+        var savedLogin = CliLoginVault.KeystoreKeyFor(agentKind, repoHandle) is { } loginKey
+            ? CliLoginVault.Parse(_keystoreLookup(loginKey))
+            : Array.Empty<CliLoginFile>();
 
         // Same provision chain as a fresh spawn (toolchain build included), so the same silence-bounded
         // wait rather than a flat deadline that a cold first build outruns.
@@ -2414,7 +2434,10 @@ public sealed class DaemonBackedOrchestrator :
 
         // The CLI's saved login state (host OS keychain → jail tmpfs $HOME), so an interactive
         // login performed in an earlier session survives into this one instead of prompting again.
-        var savedLogin = CliLoginVault.Parse(_keystoreLookup(CliLoginVault.KeystoreKeyFor(cli.Id)));
+        // Scoped to THIS repository (F2), exactly like the settings loaded just below it.
+        var savedLogin = CliLoginVault.KeystoreKeyFor(cli.Id, repoHandle) is { } loginKey
+            ? CliLoginVault.Parse(_keystoreLookup(loginKey))
+            : Array.Empty<CliLoginFile>();
 
         // THIS repository's saved settings — the commands the user already approved here. Loaded by
         // repo handle, so an approval made in another repository is not in this list at all.
