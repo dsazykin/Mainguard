@@ -236,12 +236,28 @@ public partial class ResourceMonitorViewModel : ViewModelBase, IDisposable
     private async Task ConfirmEndAsync()
     {
         IsEndConfirmVisible = false;
-        if (_pendingEndAgentId is { } id)
+        if (_pendingEndAgentId is not { } id)
         {
-            _pendingEndAgentId = null;
-            await _agents.EndAgentAsync(id);
-            Refresh();
+            return;
         }
+
+        _pendingEndAgentId = null;
+        try
+        {
+            await _agents.EndAgentAsync(id);
+        }
+        catch (Exception ex)
+        {
+            // The daemon's refusal is the answer the human asked for by confirming — exactly as the
+            // pause/resume path above already does. Before this, EndAgentAsync swallowed everything and
+            // the row simply stayed where it was: the dialog closed, nothing changed, and the only
+            // available reading was that the end had worked and the rail was slow. An agent that is still
+            // running and still holding its slot against the worker cap must say so.
+            Editions.ProComposition.ShowShellToast(
+                $"Could not end this agent — {ex.Message}. It is still running.", true);
+        }
+
+        Refresh();
     }
 
     [RelayCommand]

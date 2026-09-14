@@ -329,21 +329,7 @@ public sealed class AgentIpcObservabilityTests : IDisposable
                 for (var i = 0; i < AgentIpcPaths.MaxInFlightConnections; i++)
                 {
                     var client = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-                    // The listener's backlog is 8, so a burst of connects can be refused by the kernel
-                    // before the accept loop drains it — that is the kernel's bound, not the one under
-                    // test, so a refused connect is simply retried.
-                    for (var attempt = 0; ; attempt++)
-                    {
-                        try
-                        {
-                            await client.ConnectAsync(new UnixDomainSocketEndPoint(Path.Combine(dir, AgentIpcPaths.SocketFileName)));
-                            break;
-                        }
-                        catch (SocketException) when (attempt < 50)
-                        {
-                            await Task.Delay(20);
-                        }
-                    }
+                    await ConnectWithBacklogRetryAsync(client, dir);
 
                     var stream = new NetworkStream(client, ownsSocket: false);
                     await stream.WriteAsync(Encoding.UTF8.GetBytes("{\"op\":\"status\"}\n"));
@@ -438,12 +424,42 @@ public sealed class AgentIpcObservabilityTests : IDisposable
     private static async Task<string> SocketRoundTripAsync(string dir, string requestLine)
     {
         using var client = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-        await client.ConnectAsync(new UnixDomainSocketEndPoint(Path.Combine(dir, AgentIpcPaths.SocketFileName)));
+        await ConnectWithBacklogRetryAsync(client, dir);
         await using var stream = new NetworkStream(client, ownsSocket: false);
         var bytes = Encoding.UTF8.GetBytes(requestLine + "\n");
         await stream.WriteAsync(bytes);
         using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
         return await reader.ReadLineAsync() ?? string.Empty;
+    }
+
+    /// <summary>
+    /// Connects to an endpoint's socket, retrying the kernel's own backlog refusal.
+    ///
+    /// <para>The listener's backlog is 8. A connect that arrives while the accept loop has not yet drained
+    /// it is refused by the KERNEL — <c>EAGAIN</c> on a Unix domain socket, surfaced as a bare
+    /// <see cref="SocketException"/> from <c>ConnectAsync</c> — before the server has seen anything. That
+    /// is the kernel's bound, never the one any test here is about, and on a loaded CI runner with the
+    /// accept loop's task starved behind three other xUnit threads it is reachable: it failed
+    /// <c>ConnectionsPastTheInFlightCap_…</c> on the (cap+1)th caller, whose whole point is that the
+    /// SERVER refuses it with a reason. The parking loop in that test already retried for exactly this
+    /// reason; this helper is the same retry, so every connect in the file gets it rather than only the
+    /// one that happened to be written with it.</para>
+    /// </summary>
+    private static async Task ConnectWithBacklogRetryAsync(Socket client, string dir)
+    {
+        var endpoint = new UnixDomainSocketEndPoint(Path.Combine(dir, AgentIpcPaths.SocketFileName));
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await client.ConnectAsync(endpoint);
+                return;
+            }
+            catch (SocketException) when (attempt < 50)
+            {
+                await Task.Delay(20);
+            }
+        }
     }
 
     /// <summary>Stage-then-rename, exactly as the shim's outbox transport does.</summary>

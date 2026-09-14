@@ -45,7 +45,6 @@ Mainguard.Tests/CheckStatusServiceTests.cs
 Mainguard.Tests/ChecksViewModelTests.cs
 Mainguard.Tests/CliLoginVaultTests.cs
 Mainguard.Tests/ContainerReadinessTests.cs
-Mainguard.Tests/CoordinatorCliStartTests.cs
 Mainguard.Tests/DaemonTokenLocatorTests.cs
 Mainguard.Tests/DeepLinkTests.cs
 Mainguard.Tests/DetectDistroStepTests.cs

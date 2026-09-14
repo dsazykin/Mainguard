@@ -117,11 +117,11 @@
                   <Button Classes="Primary" Content="Start coordinator" FontSize="12"
                           IsVisible="{Binding CanStartCoordinator}"
                           Command="{Binding StartCoordinatorCommand}"
-                          IsEnabled="{Binding !IsStartingCoordinator}"/>
+                          IsEnabled="{Binding CanRunCoordinatorLifecycle}"/>
                   <Button Classes="Secondary" Content="Restart" FontSize="12"
                           IsVisible="{Binding IsCoordinatorLive}"
                           Command="{Binding RestartCoordinatorCommand}"
-                          IsEnabled="{Binding !IsStartingCoordinator}"/>
+                          IsEnabled="{Binding CanRunCoordinatorLifecycle}"/>
                   <!-- Reachable even mid-launch (ShowStopCoordinator covers starting/connecting), so a
                        startup that never returns can still be cancelled — the escape hatch from the loader. -->
                   <Button Classes="Danger" Content="Stop coordinator" FontSize="12"
@@ -294,7 +294,7 @@
                           <Button Classes="Primary" Content="Restart the coordinator" FontSize="12"
                                   HorizontalAlignment="Center"
                                   Command="{Binding RestartCoordinatorCommand}"
-                                  IsEnabled="{Binding !IsStartingCoordinator}"/>
+                                  IsEnabled="{Binding CanRunCoordinatorLifecycle}"/>
                         </StackPanel>
                       </StackPanel>
                     </Panel>

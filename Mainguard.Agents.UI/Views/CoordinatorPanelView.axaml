@@ -60,11 +60,19 @@
       <views:PlanGateView/>
     </ScrollViewer>
 
-    <Grid Grid.Row="3" ColumnDefinitions="*,Auto">
-      <TextBox Grid.Column="0" Text="{Binding ComposerText}" Watermark="Message the Coordinator…"
-               FontSize="12" AcceptsReturn="False"/>
-      <Button Grid.Column="1" Classes="Primary" Content="Send" FontSize="12" Margin="8,0,0,0"
-              Command="{Binding SendCommand}"/>
-    </Grid>
+    <StackPanel Grid.Row="3" Spacing="4">
+      <!-- A message that did not reach the coordinator, said where the message was typed. The composer is
+           cleared optimistically, so without this a failed send took the human's own words with it and
+           left nothing on screen to explain it. -->
+      <TextBlock IsVisible="{Binding HasSendError}" Text="{Binding SendErrorText}"
+                 FontSize="11" TextWrapping="Wrap"
+                 Foreground="{DynamicResource DangerBrush}"/>
+      <Grid ColumnDefinitions="*,Auto">
+        <TextBox Grid.Column="0" Text="{Binding ComposerText}" Watermark="Message the Coordinator…"
+                 FontSize="12" AcceptsReturn="False"/>
+        <Button Grid.Column="1" Classes="Primary" Content="Send" FontSize="12" Margin="8,0,0,0"
+                Command="{Binding SendCommand}"/>
+      </Grid>
+    </StackPanel>
   </Grid>
 </UserControl>
