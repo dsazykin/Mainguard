@@ -94,6 +94,9 @@ public static class StartupStatus
     /// <summary>Stage 2, after the budget lapses: naming which leg of the connect path is broken.</summary>
     public const string DiagnosingDaemon = "Checking why the Mainguard OS daemon didn't answer…";
 
+    /// <summary>Stage 2: another daemon holds the port and the user is being asked what to do.</summary>
+    public const string ResolvingPortConflict = "Another Mainguard daemon is using the port…";
+
     /// <summary>Stage 2: redeploying the bundled daemon over one too old to speak this build's mTLS.</summary>
     public const string RepairingDaemon = "Installing the matching Mainguard OS daemon…";
 
@@ -136,6 +139,21 @@ public interface IAppStartupEnvironment
     /// raw error rather than a guess.
     /// </summary>
     Task<DaemonConnectDiagnosis> DiagnoseDaemonConnectAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Offers the user the one-press fix for
+    /// <see cref="DaemonConnectStage.PortHeldByForeignDaemon"/>: another Mainguard daemon — usually one
+    /// orphaned by a deleted build — is holding the loopback port, and stopping it is all that stands
+    /// between the user and a working app.
+    ///
+    /// <para>Returns true only when the holder was actually stopped, so the caller may retry the
+    /// connect. Unlike <see cref="RepairDaemonAsync"/> this is never performed unasked: the app is
+    /// terminating a process the user did not name, and a default-false implementation means an
+    /// environment that has no surface for the question simply declines rather than silently killing
+    /// something.</para>
+    /// </summary>
+    Task<bool> ResolvePortConflictAsync(DaemonPortHolder holder, CancellationToken ct)
+        => Task.FromResult(false);
 
     /// <summary>
     /// Redeploys the daemon build this app ships into the VM and restarts the unit — the repair for
@@ -315,6 +333,29 @@ public sealed class AppStartupSequence
         Report(progress, StartupStage.ConnectDaemon, BootstrapStageState.Running, StartupStatus.DiagnosingDaemon);
         var diagnosis = await _env.DiagnoseDaemonConnectAsync(ct).ConfigureAwait(false);
         _env.Log($"startup: daemon unreachable within budget — {diagnosis.Stage}: {diagnosis.Detail}");
+
+        // A daemon squatting on the port is the one leg the USER can clear, so ask before degrading.
+        // Declining is a real answer — the banner then still names the pid, so the manual way out is
+        // never worse than it was.
+        if (diagnosis.IsResolvableByStoppingHolder && diagnosis.Holder is { } holder)
+        {
+            if (await _env.ResolvePortConflictAsync(holder, ct).ConfigureAwait(false))
+            {
+                _env.Log($"startup: stopped the daemon holding the port (pid {holder.Pid}); reconnecting");
+                Report(progress, StartupStage.ConnectDaemon, BootstrapStageState.Running, StartupStatus.ConnectingDaemon);
+                if (await ConnectDaemonAsync(progress, _reachableBudget, ct).ConfigureAwait(false))
+                {
+                    return null;
+                }
+
+                // Same discipline as the redeploy path: re-diagnose, because the pre-fix verdict is
+                // stale the moment the app changes the system.
+                return Degrade(progress, await _env.DiagnoseDaemonConnectAsync(ct).ConfigureAwait(false));
+            }
+
+            _env.Log($"startup: user declined to stop the daemon holding the port (pid {holder.Pid})");
+            return Degrade(progress, diagnosis);
+        }
 
         if (!diagnosis.IsRepairableByDaemonRefresh)
         {

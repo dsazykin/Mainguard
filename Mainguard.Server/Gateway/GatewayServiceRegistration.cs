@@ -534,6 +534,11 @@ public static class GatewayServiceRegistration
         // CLI bound to it for the idle allowance, is stopped through the ordinary Stop path. Before this,
         // only a human pressing Stop ever removed a jail.
         services.AddHostedService<Runtime.JailReaperHostedService>();
+        // The daemon is started DETACHED so it outlives the UI, which means nothing owns its lifetime
+        // once the launcher exits. That is correct for an installed daemon and a leak for one started
+        // out of a build tree that is later deleted: it holds the port and the data root forever while
+        // being invisible to every payload-scoped stop path. This stops such a daemon on its own.
+        services.AddHostedService<Runtime.StalePayloadShutdownHostedService>();
         // P2-13 carried-in from P2-12 (b): the external-PR intake poll loop runs from the daemon
         // scheduler. With IExternalPrIntake registered above (P2-47) it now runs the poll loop.
         services.AddHostedService<Runtime.PrIntakeHostedService>();

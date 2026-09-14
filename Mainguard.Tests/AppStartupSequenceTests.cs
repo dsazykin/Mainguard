@@ -84,6 +84,27 @@ public class AppStartupSequenceTests
                 DiagnoseCalls > 1 && DiagnosisAfterRepair is { } after ? after : Diagnosis);
         }
 
+        /// <summary>How many times the port-conflict offer was put to the user.</summary>
+        public int PortConflictOffers;
+
+        /// <summary>The user's answer to that offer.</summary>
+        public bool PortConflictAccepted;
+
+        /// <summary>When true, accepting the offer really frees the port — the effect of the stop.</summary>
+        public bool StopMakesReachable;
+
+        public Task<bool> ResolvePortConflictAsync(DaemonPortHolder holder, CancellationToken ct)
+        {
+            Calls.Add($"ResolvePortConflict:{holder.Pid}");
+            PortConflictOffers++;
+            if (PortConflictAccepted && StopMakesReachable)
+            {
+                Reachable = true;
+            }
+
+            return Task.FromResult(PortConflictAccepted);
+        }
+
         public Task<DaemonRepairOutcome> RepairDaemonAsync(CancellationToken ct)
         {
             Calls.Add("Repair");
@@ -419,5 +440,124 @@ public class AppStartupSequenceTests
 
         Assert.Equal(0, env.UpgradeCheckCalls);
         Assert.Equal(0, env.OfferCalls);
+    }
+
+    private static DaemonConnectDiagnosis PortHeld(int pid = 31319) =>
+        new(DaemonConnectStage.PortHeldByForeignDaemon, $"It is process {pid}, from a deleted build.")
+        {
+            Holder = new DaemonPortHolder(pid, $"/usr/local/share/dotnet/dotnet /gone/{DaemonPortHolder.DaemonAssemblyName}"),
+        };
+
+    /// <summary>
+    /// The whole point of the in-app fix: a daemon squatting on the port is put to the user, and
+    /// accepting ENDS UP CONNECTED with no degraded banner — not merely "we asked".
+    /// </summary>
+    [Fact]
+    public async Task APortHeldByAnotherDaemon_IsOfferedToTheUser_AndAcceptingReconnects()
+    {
+        var env = new FakeEnv
+        {
+            Reachable = false,
+            Diagnosis = PortHeld(),
+            PortConflictAccepted = true,
+            StopMakesReachable = true,
+        };
+        var rec = new Recorder();
+
+        var result = await Sequence(env).RunAsync(rec, CancellationToken.None);
+
+        Assert.Equal(1, env.PortConflictOffers);
+        Assert.True(result.DaemonReachable);
+        Assert.False(result.IsDegraded);
+        Assert.Null(result.DegradedBanner);
+        // The repair path is for a DIFFERENT leg and must not have been taken.
+        Assert.Equal(0, env.RepairCalls);
+    }
+
+    /// <summary>
+    /// Declining is a real answer. The app degrades rather than killing anything, and the banner still
+    /// names the pid so the manual way out is no worse than before the offer existed.
+    /// </summary>
+    [Fact]
+    public async Task DecliningToStopTheHolder_DegradesAndStillNamesThePid()
+    {
+        var env = new FakeEnv
+        {
+            Reachable = false,
+            Diagnosis = PortHeld(),
+            PortConflictAccepted = false,
+        };
+
+        var result = await Sequence(env).RunAsync(new Recorder(), CancellationToken.None);
+
+        Assert.Equal(1, env.PortConflictOffers);
+        Assert.False(result.DaemonReachable);
+        Assert.True(result.IsDegraded);
+        Assert.Contains("31319", result.DegradedBanner);
+        Assert.Contains("already using", result.DegradedBanner);
+    }
+
+    /// <summary>
+    /// Accepting, but the stop not actually freeing the port, must NOT report success. The verdict is
+    /// re-derived after the app changes the system — the same discipline the redeploy path follows.
+    /// </summary>
+    [Fact]
+    public async Task AcceptedButStillHeld_ReDiagnosesInsteadOfClaimingSuccess()
+    {
+        var env = new FakeEnv
+        {
+            Reachable = false,
+            Diagnosis = PortHeld(),
+            PortConflictAccepted = true,
+            StopMakesReachable = false,
+            DiagnosisAfterRepair = new DaemonConnectDiagnosis(
+                DaemonConnectStage.NotListening, "The call returned Unavailable."),
+        };
+
+        var result = await Sequence(env).RunAsync(new Recorder(), CancellationToken.None);
+
+        Assert.False(result.DaemonReachable);
+        Assert.True(result.IsDegraded);
+        // The banner describes what is true NOW, not the pre-fix verdict.
+        Assert.Contains("isn't accepting connections", result.DegradedBanner);
+        Assert.Equal(2, env.DiagnoseCalls);
+    }
+
+    /// <summary>A leg the user cannot clear must never reach the offer.</summary>
+    [Fact]
+    public async Task AnUnrelatedLeg_IsNeverOfferedThePortConflictFix()
+    {
+        var env = new FakeEnv
+        {
+            Reachable = false,
+            Diagnosis = new DaemonConnectDiagnosis(
+                DaemonConnectStage.DaemonProcessNotRunning, "no mainguardd process is running on this Mac."),
+        };
+
+        await Sequence(env).RunAsync(new Recorder(), CancellationToken.None);
+
+        Assert.Equal(0, env.PortConflictOffers);
+    }
+
+    /// <summary>
+    /// The offer is gated on the holder being identifiably OURS. A stage set without a recognisable
+    /// holder degrades rather than offering to terminate a stranger's process.
+    /// </summary>
+    [Fact]
+    public async Task APortHolderThatIsNotAMainguardDaemon_IsNotOfferedForTermination()
+    {
+        var env = new FakeEnv
+        {
+            Reachable = false,
+            Diagnosis = new DaemonConnectDiagnosis(
+                DaemonConnectStage.PortHeldByForeignDaemon, "something else is on the port.")
+            {
+                Holder = new DaemonPortHolder(999, "/usr/bin/some-other-server --port 5250"),
+            },
+        };
+
+        await Sequence(env).RunAsync(new Recorder(), CancellationToken.None);
+
+        Assert.Equal(0, env.PortConflictOffers);
     }
 }

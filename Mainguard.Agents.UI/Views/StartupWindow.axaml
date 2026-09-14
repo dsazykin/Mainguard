@@ -214,6 +214,51 @@
                     </StackPanel>
                     </StackPanel>
 
+                    <!-- PORT CONFLICT (another Mainguard daemon holds the loopback port) hosted inline,
+                         same shape as the tier-2 block above: IsVisible resolves against the
+                         StartupWindowViewModel (outer), the inner subtree rebinds to PendingPortConflict. -->
+                    <StackPanel IsVisible="{Binding IsResolvingPortConflict}">
+                    <StackPanel Spacing="12" x:CompileBindings="False" DataContext="{Binding PendingPortConflict}">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <PathIcon Data="{StaticResource WarningIcon}" Width="20" Height="20"
+                                      Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Center"/>
+                            <TextBlock Text="{Binding Headline}" FontSize="18" FontWeight="Bold"
+                                       Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+
+                        <Border Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8"
+                                Padding="14">
+                            <StackPanel Spacing="10">
+                                <TextBlock Text="{Binding Explanation}" FontSize="12" MaxWidth="420"
+                                           Foreground="{DynamicResource TextPrimary}" TextWrapping="Wrap"/>
+                                <SelectableTextBlock Text="{Binding PayloadPath}" FontSize="11" Classes="Mono"
+                                                     Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"
+                                                     IsVisible="{Binding PayloadIsGone}"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- A failed stop is reported here; the offer stays open so the manual way out
+                             (the command in ErrorText) is readable rather than replaced by a closed dialog. -->
+                        <Border Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8"
+                                Padding="14" IsVisible="{Binding HasError}">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <PathIcon Data="{StaticResource WarningIcon}" Width="16" Height="16"
+                                          Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Top"/>
+                                <SelectableTextBlock Text="{Binding ErrorText}" FontSize="12" MaxWidth="380"
+                                                     Foreground="{DynamicResource TextPrimary}" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </Border>
+
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10" Margin="0,8,0,0">
+                            <Button Content="Not now" Classes="Secondary" Padding="15,6"
+                                    Command="{Binding LaterCommand}"/>
+                            <Button Content="{Binding StopLabel}" Classes="Primary" Padding="15,6"
+                                    Command="{Binding StopCommand}"/>
+                        </StackPanel>
+                    </StackPanel>
+                    </StackPanel>
+
                 </Grid>
             </ScrollViewer>
         </Grid>

@@ -98,6 +98,30 @@ internal sealed class MacStartupEnvironment : IAppStartupEnvironment
             // Leg 1 — is the daemon process up on this host?
             if (!await _daemon.IsRunningAsync(payload, ct).ConfigureAwait(false))
             {
+                // Leg 1a — "not running" and "nothing is listening" are different facts, and conflating
+                // them is what let an orphaned daemon squat on the port for fifteen days. The liveness
+                // answer above is scoped to THIS payload and to the instance lock; a daemon started from
+                // a build that has since been deleted matches neither (its command line names a directory
+                // that no longer exists, and if it predates the lock it holds no lock file either). Ask
+                // the port, which is machine-scoped like the data root it guards, before concluding that
+                // nothing is there — otherwise the app starts a second daemon that dies on the bind, and
+                // the only visible symptom is a stack trace about an address already in use.
+                if (await DaemonPortHolder.FindAsync(DaemonPaths.DefaultLoopbackPort, ct)
+                        .ConfigureAwait(false) is { IsMainguardDaemon: true } holder)
+                {
+                    return new DaemonConnectDiagnosis(
+                        DaemonConnectStage.PortHeldByForeignDaemon,
+                        holder.PayloadIsGone
+                            ? $"It is process {holder.Pid}, started from '{holder.PayloadDllPath}' — a "
+                              + "build that no longer exists on disk, so nothing can restart, update or "
+                              + "stop it. It is safe to stop."
+                            : $"It is process {holder.Pid}, started from a different Mainguard build than "
+                              + "this one.")
+                    {
+                        Holder = holder,
+                    };
+                }
+
                 return new DaemonConnectDiagnosis(
                     DaemonConnectStage.DaemonProcessNotRunning,
                     File.Exists(Path.Combine(payload, "Mainguard.Server.dll"))
@@ -225,6 +249,40 @@ internal sealed class MacStartupEnvironment : IAppStartupEnvironment
 
     public Task<VmUpgradeDecision> OfferVmUpgradeAsync(VmUpgradeAvailability availability, CancellationToken ct)
         => Task.FromResult(VmUpgradeDecision.Declined);
+
+    /// <summary>
+    /// Hosts the port-conflict offer in the loading surface and stops the holder on an explicit press.
+    /// Returns true only once the port is actually free — the stop is verified by re-reading the port,
+    /// not assumed from the signal having been sent.
+    /// </summary>
+    public async Task<bool> ResolvePortConflictAsync(DaemonPortHolder holder, CancellationToken ct)
+    {
+        var host = Host;
+        if (host is null)
+        {
+            return false; // headless (no loading surface): decline rather than kill unasked
+        }
+
+        var conflict = new DaemonPortConflictViewModel(holder, async _ =>
+        {
+            await _daemon.StopAsync(MacDaemonController.DefaultPayloadDirectory(), ct).ConfigureAwait(false);
+
+            // Verify: "still listening?" is the question that matters, and it is cheap to ask.
+            return await DaemonPortHolder
+                .FindAsync(DaemonPaths.DefaultLoopbackPort, ct).ConfigureAwait(false) is null;
+        })
+        {
+            LogSink = message => Log(message),
+        };
+
+        var answered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        conflict.CloseAction = stopped => answered.TrySetResult(stopped);
+
+        await Dispatcher.UIThread.InvokeAsync(() => host.BeginPortConflict(conflict)).GetTask().ConfigureAwait(false);
+        var result = await answered.Task.ConfigureAwait(false);
+        await Dispatcher.UIThread.InvokeAsync(host.EndPortConflict).GetTask().ConfigureAwait(false);
+        return result;
+    }
 
     public async Task<System.Collections.Generic.IReadOnlyList<SandboxImageSpec>> ProbeSandboxImagesAsync(
         CancellationToken ct)
