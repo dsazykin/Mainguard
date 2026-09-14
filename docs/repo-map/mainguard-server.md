@@ -556,6 +556,16 @@
     method's reconcile deliberately refuses to walk the QUEUE's main backwards — leaving the mirror behind
     the queue with nothing to correct it. Only the merge-confirm path forces, where origin's main is
     authoritative by definition; unforced, git refuses the rewind and the human reads it as the error.
+  - **`Runtime/StalePayloadShutdownHostedService.cs`** (2026-09-15) — the daemon reaps ITSELF once the
+    build it was launched from is gone from disk. The daemon is started detached on purpose (it must
+    outlive the UI), so on POSIX it re-parents to init and nothing owns its lifetime; correct for an
+    installed daemon supervised by launchd, a leak for one running out of a deleted build tree, which
+    then holds the loopback port and the data root against every future daemon while being invisible to
+    every payload-scoped stop path. Checks its own entry-assembly location every `SweepInterval`, and
+    stops the host only after `RequiredConsecutiveMisses` (5 × 60 s) — long enough that
+    `MacDaemonUpdater` swapping the payload underneath a running daemon can never trip it, and any
+    single reappearance resets the count. A throwing probe never stops the daemon; an unknown assembly
+    location disables the watch rather than guessing a path.
   - **`Runtime/JailReaperHostedService.cs`** (2026-09-04, owner decision) — the jail reaper: every
     `CoordinatorLimits.JailReapSweepSeconds` it walks `AgentSessionStore.List()`, asks `JailReapPolicy`
     with the entry state, whether `TerminalSessionManager.TryGetBound` holds a live CLI, how long it

@@ -40,6 +40,14 @@ public enum DaemonConnectStage
     /// <summary>The daemon answered and refused this app's credentials.</summary>
     TokenRejected,
 
+    /// <summary>
+    /// The loopback port is held by another Mainguard daemon that this app cannot talk to — typically
+    /// one started from a build that has since been deleted, which no payload-scoped stop path can find.
+    /// The one connect verdict the user can resolve in-app, because the holder is identified by pid and
+    /// can be stopped on an explicit press.
+    /// </summary>
+    PortHeldByForeignDaemon,
+
     /// <summary>Nothing above matched; the raw failure is carried verbatim in the detail.</summary>
     Undiagnosed,
 }
@@ -56,6 +64,24 @@ public sealed record DaemonConnectDiagnosis(DaemonConnectStage Stage, string Det
 {
     /// <summary>The everything-answered verdict.</summary>
     public static DaemonConnectDiagnosis Reachable { get; } = new(DaemonConnectStage.Reachable, string.Empty);
+
+    /// <summary>
+    /// The process holding the loopback port, set only for
+    /// <see cref="DaemonConnectStage.PortHeldByForeignDaemon"/>. Carried on the verdict so the surface
+    /// that offers to stop it names the same pid the probe observed, rather than re-deriving it later
+    /// and possibly acting on a different process.
+    /// </summary>
+    public DaemonPortHolder? Holder { get; init; }
+
+    /// <summary>
+    /// True when the app can offer the user a one-press fix: a Mainguard daemon is squatting on the
+    /// port and we know its pid. Deliberately separate from
+    /// <see cref="IsRepairableByDaemonRefresh"/> — that one the app performs by itself, this one is
+    /// always the user's press, because terminating a process the user did not ask us to terminate is
+    /// not a decision this code makes on their behalf.
+    /// </summary>
+    public bool IsResolvableByStoppingHolder =>
+        Stage == DaemonConnectStage.PortHeldByForeignDaemon && Holder is { IsMainguardDaemon: true };
 
     /// <summary>True when the daemon answered.</summary>
     public bool IsReachable => Stage == DaemonConnectStage.Reachable;
@@ -96,6 +122,10 @@ public sealed record DaemonConnectDiagnosis(DaemonConnectStage Stage, string Det
         DaemonConnectStage.TokenRejected =>
             "The Mainguard OS daemon rejected this app's session credentials — it has probably restarted "
             + $"since they were read. {Detail}",
+
+        DaemonConnectStage.PortHeldByForeignDaemon =>
+            $"Another Mainguard daemon is already using 127.0.0.1:{DaemonPaths.DefaultLoopbackPort}, and "
+            + "this app cannot talk to it. " + Detail,
 
         _ => $"Mainguard OS daemon isn't reachable. {Detail}",
     };

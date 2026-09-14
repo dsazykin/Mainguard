@@ -762,7 +762,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       credentials-missing leg (a daemon predating MG-19's pinned mTLS, which publishes a token but no
       certificates) could never heal, since the tier-1 refresh that installs the matching daemon only
       runs AFTER a successful connect. `IsRepairableByDaemonRefresh` marks the one leg the app may
-      repair itself.)
+      repair itself. **2026-09-15:** `PortHeldByForeignDaemon` + the `Holder` property +
+      `IsResolvableByStoppingHolder` — the one leg the USER resolves, deliberately separate from the
+      app-performed repair because terminating an unnamed process is never done unasked.)
+    - `DaemonPortHolder.cs` (2026-09-15 — who holds the daemon's loopback port, found via `lsof`+`ps`
+      rather than by payload path. `MacDaemonController.IsInstanceLockHeld` already documented that
+      `pgrep -f <dll>` "cannot see a daemon started from a DIFFERENT payload directory … since the
+      shared state is the data root, not the payload" — F55 acted on that for the LIVENESS answer and
+      left the STOP path on pgrep, so a daemon from a deleted build was findable by nothing. One held
+      5250 for fifteen days after its worktree was removed. `IsMainguardDaemon` gates offering to stop
+      it; `PayloadIsGone` marks the unambiguously-stale case and FAILS SAFE — a path the parser cannot
+      read reads as "cannot prove stale", never as stale.)
     - `DaemonUpdater.cs` (the tier-1 daemon fast-path — the field-outage fix for the daemon baked into the
       MainguardOS tarball never advancing with the app, so every new RPC answered `Unimplemented`:
       `DaemonVersionInfo` (the proto-free `GetDaemonInfo` result), `DaemonUpdatePolicy` (pure skew

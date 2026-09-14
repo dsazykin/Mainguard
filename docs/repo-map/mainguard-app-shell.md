@@ -874,6 +874,13 @@
     fallback) — neither name is hardcoded anywhere, because the owner's repo is `master`. `RefreshAsync`
     re-MEASURES the repository through one `IGitService.ExecuteWithRepo` after every step, so a change
     made outside the app is visible on the next pass and no precondition is ever inferred),
+    `DaemonPortConflictViewModel` (2026-09-15 — the loading-screen offer to stop another Mainguard
+    daemon holding the loopback port, hosted inline by `StartupWindowViewModel.BeginPortConflict` /
+    `EndPortConflict` exactly like the tier-2 block below, and for the same reason: the app is about to
+    terminate a process the user did not name, so it is always an explicit press. Presents the
+    payload-is-gone case as safe to stop and a live-build holder as a choice with its consequence named;
+    a stop that does not free the port reports the failure and leaves the offer open with the manual
+    `kill <pid>` readable, rather than closing as though it worked),
     `VmUpgradeOfferViewModel` (the tier-2 upgrade
     offer/progress VM: starts in the consent state (`IsOffering`), `UpgradeCommand` runs the injected
     `IVmUpgradeOrchestrator` off the UI thread and advances the `VmUpgradePlan`-seeded
@@ -1425,7 +1432,12 @@
   `MacStartupEnvironment` — the macos-host `IAppStartupEnvironment`: "wake the VM" becomes
   "ensure the local mainguardd runs from the payload" (`MacDaemonController`), tier-1 refresh
   restarts that process (`MacDaemonUpdater`), tier-2 never offers (no OS to upgrade), and the
-  image probe/build runs against the host engine through `HostCommandRunner`;
+  image probe/build runs against the host engine through `HostCommandRunner`; **2026-09-15** its
+  connect diagnosis asks the PORT before concluding "no daemon" — leg 1 is scoped to this payload and
+  to the instance lock, so a daemon from a deleted build matches neither and the app used to start a
+  second one that died on the bind — and `ResolvePortConflictAsync` hosts
+  `DaemonPortConflictViewModel`, stopping the holder only on an explicit press and verifying the port
+  is really free rather than assuming the signal worked;
   `ProDesktopHost.CreateStartupWindow` selects it by platform, `DecideLaunchRoute` goes straight
   to the control center on macOS — the OOBE wizard is the WSL2 provisioning flow — and the VM
   stop / agent-CLI update-check paths no-op there), reseamed to reach the shell

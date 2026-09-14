@@ -76,6 +76,16 @@ public sealed partial class StartupWindowViewModel : ViewModelBase, IProgress<St
     /// <summary>True while the tier-2 upgrade offer/progress is hosted in the loading surface.</summary>
     public bool IsUpgrading => PendingUpgrade is not null;
 
+    /// <summary>The hosted "another daemon holds the port" offer while that phase is active; null
+    /// otherwise. Same inline-hosting shape as <see cref="PendingUpgrade"/>, because it is the same kind
+    /// of moment: startup is blocked on something only the user may authorise.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsResolvingPortConflict))]
+    private DaemonPortConflictViewModel? _pendingPortConflict;
+
+    /// <summary>True while the port-conflict offer is hosted in the loading surface.</summary>
+    public bool IsResolvingPortConflict => PendingPortConflict is not null;
+
     /// <summary>True once an essential step failed and the app is entering degraded (banner) mode —
     /// tints the status line so the honest failure reads as a failure, never colour alone.</summary>
     [ObservableProperty]
@@ -121,6 +131,16 @@ public sealed partial class StartupWindowViewModel : ViewModelBase, IProgress<St
 
     /// <summary>Tears down the hosted tier-2 surface once the upgrade phase resolves.</summary>
     public void EndVmUpgrade() => PendingUpgrade = null;
+
+    /// <summary>Hosts the "another daemon holds the port" offer in the loading surface (UI thread).</summary>
+    public void BeginPortConflict(DaemonPortConflictViewModel conflict)
+    {
+        PendingPortConflict = conflict;
+        StatusText = StartupStatus.ResolvingPortConflict;
+    }
+
+    /// <summary>Tears that surface down once the user has answered.</summary>
+    public void EndPortConflict() => PendingPortConflict = null;
 
     /// <summary>Sequence progress sink: marshals each tick onto the checklist row + status line.</summary>
     public void Report(StartupProgress value) => Dispatcher.UIThread.Post(() => Apply(value));

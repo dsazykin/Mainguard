@@ -114,23 +114,71 @@ public sealed class MacDaemonController
 
     /// <summary>SIGTERM the running daemon (if any), wait up to ~10 s, then SIGKILL as the last
     /// resort — graceful first so Kestrel and SQLite close cleanly, but never wedged behind a
-    /// hung process.</summary>
+    /// hung process.
+    ///
+    /// <para><b>Scoped by the port, not only by the payload.</b> <see cref="IsInstanceLockHeld"/> records
+    /// why <c>pgrep -f &lt;dll path&gt;</c> is the wrong key — it "cannot see a daemon started from a
+    /// DIFFERENT payload directory … since the shared state is the data root, not the payload" — and F55
+    /// acted on that for the LIVENESS answer while leaving this, the STOP path, on pgrep. The two halves
+    /// of one policy disagreed, so a daemon from a build you had since deleted could not be found by
+    /// anything: not by a later build's pgrep (its command line names a directory that no longer exists)
+    /// and not by the lock probe if it predates the lock. It simply held the port until someone found it
+    /// by hand. The payload match stays first — it is the precise answer when this build did start the
+    /// daemon — and the port holder is the fallback that makes "stop the daemon" mean the daemon that
+    /// actually owns the port.</para></summary>
     public async Task StopAsync(string payloadDirectory, CancellationToken ct)
     {
         var dll = DaemonDllPath(payloadDirectory);
-        var pid = await PgrepAsync(dll, ct).ConfigureAwait(false);
+        var pid = await PgrepAsync(dll, ct).ConfigureAwait(false)
+                  ?? await ForeignDaemonPidAsync(ct).ConfigureAwait(false);
         if (pid is null) return;
 
         await SignalAsync(pid.Value, "-TERM", ct).ConfigureAwait(false);
-        for (var i = 0; i < 20 && await PgrepAsync(dll, ct).ConfigureAwait(false) is not null; i++)
+
+        // Wait on THAT pid, not on another pgrep: the process we signalled is the one whose exit we are
+        // waiting for, and re-running the payload pgrep could neither see a foreign daemon nor tell a
+        // survivor apart from a replacement that started meanwhile.
+        for (var i = 0; i < 20 && await IsAliveAsync(pid.Value, ct).ConfigureAwait(false); i++)
         {
             await Task.Delay(500, ct).ConfigureAwait(false);
         }
 
-        if (await PgrepAsync(dll, ct).ConfigureAwait(false) is { } survivor)
+        if (await IsAliveAsync(pid.Value, ct).ConfigureAwait(false))
         {
-            await SignalAsync(survivor, "-KILL", ct).ConfigureAwait(false);
+            await SignalAsync(pid.Value, "-KILL", ct).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// The pid of a Mainguard daemon holding the loopback port that this payload's pgrep could not see —
+    /// one started from a different (often deleted) build. Null when the port is free, held by something
+    /// that is not ours, or unreadable.
+    /// </summary>
+    private static async Task<int?> ForeignDaemonPidAsync(CancellationToken ct)
+    {
+        var holder = await DaemonPortHolder
+            .FindAsync(Mainguard.Agents.Daemon.DaemonPaths.DefaultLoopbackPort, ct)
+            .ConfigureAwait(false);
+
+        return holder is { IsMainguardDaemon: true } ? holder.Pid : null;
+    }
+
+    /// <summary><c>kill -0</c>: does this pid still exist for this user?</summary>
+    private static async Task<bool> IsAliveAsync(int pid, CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo("/bin/kill")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("-0");
+        psi.ArgumentList.Add(pid.ToString(System.Globalization.CultureInfo.InvariantCulture));
+
+        using var probe = Process.Start(psi);
+        if (probe is null) return false;
+        await probe.WaitForExitAsync(ct).ConfigureAwait(false);
+        return probe.ExitCode == 0;
     }
 
     private static async Task SignalAsync(int pid, string signal, CancellationToken ct)
