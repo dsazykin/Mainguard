@@ -73,10 +73,83 @@ public sealed class JailReaperTests : IDisposable
         Assert.Null(store.Find(new AgentSessionKey(Repo, agentId)));
         Assert.Contains(session!.ContainerId!, _environment.RemovedContainers);
 
+        // Scoped to THIS agent: the audit log is db-backed under the suite's shared data root, so every
+        // other reap in the assembly lands in the same table and "the only reap event" was never the
+        // claim being made.
         var audited = Assert.Single(
-            _host.Services.GetRequiredService<IAuditLog>().Read(), e => e.Type == JailReaperHostedService.ReapedEvent);
+            _host.Services.GetRequiredService<IAuditLog>().Read(),
+            e => e.Type == JailReaperHostedService.ReapedEvent
+                 && string.Equals(e.Fields.GetValueOrDefault("agent"), agentId, StringComparison.Ordinal));
         Assert.Equal(agentId, audited.Fields["agent"]);
         Assert.Equal("IdleWithoutCli", audited.Fields["cause"]);
+    }
+
+    /// <summary>
+    /// B1, at the service tier: the adoption mark is NOT a blanket reprieve. It excuses a missing terminal
+    /// only for a jail whose entry the daemon still expects work from — an adopted jail with no
+    /// merge-queue entry at all (a coordinator, a repo with no queue) is the largest part of the
+    /// population the reaper exists for and is stopped at the allowance like any other.
+    /// </summary>
+    [Fact]
+    public async Task AnAdoptedJail_WithNoQueueEntry_IsStillReapedAtTheAllowance()
+    {
+        var spawns = _host.Services.GetRequiredService<AgentSpawnService>();
+        var store = _host.Services.GetRequiredService<AgentSessionStore>();
+        var agentId = await spawns.SpawnAsync(Repo, "claude-code", null, AgentRoles.Managed, CancellationToken.None);
+        var key = new AgentSessionKey(Repo, agentId);
+        store.MarkAdopted(key);
+        Assert.True(store.WasAdoptedWithoutTerminal(key));
+
+        _host.Services.GetRequiredService<TerminalSessionManager>().Release(key);
+
+        var t0 = new DateTimeOffset(2026, 9, 12, 12, 0, 0, TimeSpan.Zero);
+        Assert.Empty(await Reaper.SweepOnceAsync(t0));
+        Assert.Equal(new[] { agentId }, await Reaper.SweepOnceAsync(t0.AddMinutes(31)));
+        Assert.Null(store.Find(key));
+    }
+
+    /// <summary>
+    /// ...and the mark is spent the moment the daemon can see a terminal again. The blind spot it records
+    /// is "this daemon cannot observe that jail's CLI"; a bound CLI ends it, whether the bind came from a
+    /// re-bind on adoption or an ordinary re-spawn into the same jail. Without this the exemption would
+    /// outlive its own justification and keep the jail forever.
+    /// </summary>
+    [Fact]
+    public async Task TheAdoptionMark_IsClearedByTheFirstSweepThatSeesABoundCli()
+    {
+        var spawns = _host.Services.GetRequiredService<AgentSpawnService>();
+        var store = _host.Services.GetRequiredService<AgentSessionStore>();
+        var terminals = _host.Services.GetRequiredService<TerminalSessionManager>();
+        var agentId = await spawns.SpawnAsync(Repo, "claude-code", null, AgentRoles.Managed, CancellationToken.None);
+        var key = new AgentSessionKey(Repo, agentId);
+        store.MarkAdopted(key);
+
+        terminals.Release(key); // whatever the fixture bound, this test binds its own
+        using var cli = new QuietSession();
+        terminals.Bind(key, new BoundTerminalSession(agentId, cli));
+
+        Assert.Empty(await Reaper.SweepOnceAsync(new DateTimeOffset(2026, 9, 12, 12, 0, 0, TimeSpan.Zero)));
+
+        Assert.False(store.WasAdoptedWithoutTerminal(key));
+    }
+
+    /// <summary>A CLI that is simply alive: an empty output pipe the bound session's pump reads forever.</summary>
+    private sealed class QuietSession : ITerminalSession
+    {
+        private readonly System.IO.Pipelines.Pipe _output = new();
+        private readonly TaskCompletionSource<int> _exit = new();
+
+        public Stream IO => _output.Reader.AsStream();
+
+        public Task<int> ExitCode => _exit.Task;
+
+        public void Resize(int cols, int rows)
+        {
+        }
+
+        public void Kill() => _exit.TrySetResult(0);
+
+        public void Dispose() => _exit.TrySetResult(0);
     }
 
     public void Dispose()

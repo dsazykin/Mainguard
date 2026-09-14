@@ -20,8 +20,19 @@ namespace Mainguard.Server.Tests.Gateway;
 /// </summary>
 public sealed class GatewayListenerBindTests
 {
-    private static string TempToken() =>
-        System.IO.Path.Combine(System.IO.Path.GetTempPath(), "mg-gwtok-" + Guid.NewGuid().ToString("N"));
+    /// <summary>
+    /// A token path in its OWN directory — <c>TestDaemonHost.TempTokenPath</c>, not a bare file in the
+    /// system temp root.
+    ///
+    /// <para>This used to be <c>Path.Combine(GetTempPath(), "mg-gwtok-" + guid)</c>, i.e. a unique FILE
+    /// in a shared DIRECTORY. Everything the daemon puts "beside the session token" — the mTLS material,
+    /// the plan and held-task stores, the kill journal, the leader registry, the SQLite DB — therefore
+    /// landed in the system temp root, shared by every daemon this class starts and by anything else on
+    /// the box using it. The unique filename made only the token itself isolated. F55's single-instance
+    /// lock is what surfaced it: these daemons genuinely were several instances on one data root, which
+    /// is the exact condition the lock refuses.</para>
+    /// </summary>
+    private static string TempToken() => TestDaemonHost.TempTokenPath("mg-gwtok");
 
     // The default must remain exactly today's posture: loopback only, no gateway.
     [Fact]
