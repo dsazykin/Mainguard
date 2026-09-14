@@ -125,8 +125,15 @@ public sealed class SendPromptDeliveryTests
         await orchestrator.SendPromptAsync("agent-1", RealisticPrompt);
         started.Stop();
 
+        // The floor carries one timer quantum of slack. `Task.Delay(TerminatorSeparation)` completes on
+        // the runtime's timer wheel, which need not agree with a Stopwatch reading to the millisecond: the
+        // sibling assertion in Mainguard.Server.Tests/PromptDeliveryBinderTests read 50 ms for a 50 ms
+        // separation on CI and failed its own `>=` by under half a millisecond. What this distinguishes is
+        // "held back" from "issued back to back", and back to back is sub-millisecond, so 5 ms cannot mask
+        // it and does stop two clocks disagreeing over a correct run.
+        var floor = TerminalSubmit.TerminatorSeparation - TimeSpan.FromMilliseconds(5);
         Assert.True(
-            started.Elapsed >= TerminalSubmit.TerminatorSeparation,
+            started.Elapsed >= floor,
             $"the terminator followed the body after only {started.ElapsedMilliseconds}ms — with no "
             + "separation the PTY hands the CLI one read and the CR is swallowed as pasted content");
     }

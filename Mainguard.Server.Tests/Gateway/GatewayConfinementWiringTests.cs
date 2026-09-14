@@ -205,6 +205,31 @@ public sealed class GatewayConfinementWiringTests
     }
 
     /// <summary>
+    /// Audit B1 — the THIRD way, and the one nobody chose: the daemon could not resolve a bind address
+    /// at all. Same exposure again, but it is a defect rather than a setting (the shipped resolver
+    /// excluded an idle <c>docker0</c> and disabled the gateway on every normal Linux/WSL2 host), so it
+    /// is logged as an ERROR with its own remedy instead of reading like the deliberate `off`.
+    /// </summary>
+    [Fact]
+    public async Task WithABindThatResolvedToNothing_TheRawKeyStillGoesIn_AndIsReportedAsADefect()
+    {
+        using var rig = ConfinementRig.Create(gatewayEnabled: false, unintentionallyDisabled: true);
+
+        var agentId = await rig.SpawnAsync(RealKey);
+
+        Assert.Equal(RealKey, rig.Engine.LastSpawn!.Secrets.AgentEnv[ApiKeyVar]);
+
+        var error = Assert.Single(rig.Logs, l => l.Contains("confinement UNAVAILABLE", StringComparison.Ordinal));
+        Assert.Contains(agentId, error, StringComparison.Ordinal);
+        Assert.Contains("MAINGUARD_GATEWAY_BIND", error, StringComparison.Ordinal);
+        Assert.DoesNotContain(RealKey, error, StringComparison.Ordinal);
+
+        // And it is NOT reported as the operator's choice — that message would send them looking for a
+        // setting they never changed.
+        Assert.DoesNotContain(rig.Logs, l => l.Contains("confinement OFF", StringComparison.Ordinal));
+    }
+
+    /// <summary>
     /// The negative control, and the reason the key check comes FIRST in the launcher. An OAuth agent
     /// supplies no key, so nothing is exposed and there is nothing to warn about. Warning here would be
     /// worse than useless: it would fire on the most common spawn shape and train the operator to
@@ -264,7 +289,8 @@ public sealed class GatewayConfinementWiringTests
         /// branch ticket #52 is about.
         /// </param>
         /// <param name="gatewayEnabled">Whether the daemon's model gateway is configured at all.</param>
-        public static ConfinementRig Create(bool confinable = true, bool gatewayEnabled = true)
+        public static ConfinementRig Create(
+            bool confinable = true, bool gatewayEnabled = true, bool unintentionallyDisabled = false)
         {
             var root = Path.Combine(Path.GetTempPath(), "mg-gw-confine-" + Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(Path.Combine(root, "repos", RepoHandle)); // "provisioned"
@@ -296,7 +322,8 @@ public sealed class GatewayConfinementWiringTests
                 // the spawn path is in the posture where it is SUPPOSED to confine.
                 services.AddSingleton(gatewayEnabled
                     ? new GatewayConfinementOptions(GatewayBaseUrl, Enabled: true)
-                    : GatewayConfinementOptions.Disabled);
+                    : new GatewayConfinementOptions(
+                        null, Enabled: false, DisabledUnintentionally: unintentionallyDisabled));
 
                 // The CLI bind would otherwise try a real `docker exec` PTY against a fake container id.
                 services.AddSingleton(sp => new AgentCliBinder(

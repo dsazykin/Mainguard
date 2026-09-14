@@ -67,6 +67,35 @@ internal sealed class VtScreen
     private ParseState _state = ParseState.Ground;
     private readonly StringBuilder _params = new();
 
+    /// <summary>
+    /// The most CSI parameter characters one sequence may accumulate before the sequence is abandoned.
+    ///
+    /// <para><b>Why there is a cap.</b> OSC capture has been bounded at 100k since it was written; CSI was
+    /// not bounded at all. <c>ESC [</c> followed by digits and semicolons keeps <see cref="ProcessCsi"/>
+    /// appending until a final byte arrives, and <see cref="ApplyCsi"/> then calls <c>Split(';')</c> over
+    /// the result — so a jailed CLI that emits megabytes of digits grows a <see cref="StringBuilder"/> and
+    /// then allocates an array proportional to it, all on the UI thread, in the parser every interim-engine
+    /// terminal runs. It does not take malice: a corrupted stream or a binary file catted into the pane
+    /// produces the same bytes.</para>
+    ///
+    /// <para>The value is generous by two orders of magnitude against real terminal traffic — the longest
+    /// sequences anything actually emits are SGR runs of a few dozen parameters — so nothing legitimate is
+    /// ever truncated. Past it the sequence is abandoned rather than clamped: a CSI whose parameters were
+    /// cut in half is not the sequence the application sent, and executing a guess at it would move the
+    /// cursor or repaint the screen on made-up numbers. Abandoning drops one malformed control sequence and
+    /// the parser is back in Ground for the next byte.</para>
+    ///
+    /// <para>The bound belongs to the <b>interim</b> engine, which is the default
+    /// (<c>Mainguard.Server/Terminal/TerminalEngineConfig.cs</c>) and the one that parses client-side; the
+    /// libvterm path parses in the daemon and is bounded there. That file's <c>TerminalEngineKind.Interim</c>
+    /// documentation points here so the two are read together rather than the number living in two places.</para>
+    /// </summary>
+    internal const int CsiParamCapChars = 4096;
+
+    /// <summary>True while a CSI sequence has overflowed <see cref="CsiParamCapChars"/> — its remaining
+    /// parameter bytes are consumed and discarded until the final byte ends it.</summary>
+    private bool _csiOverflow;
+
     // OSC payload capture (OSC 52 clipboard only; DCS/PM/APC strings are consumed uncaptured).
     // Bounded so a malformed endless OSC can't grow memory; an overflowed payload is discarded whole.
     private const int OscCaptureCap = 100_000;
@@ -308,6 +337,7 @@ internal sealed class VtScreen
         {
             case '[':
                 _params.Clear();
+                _csiOverflow = false;
                 _state = ParseState.Csi;
                 break;
             case ']':
@@ -383,12 +413,32 @@ internal sealed class VtScreen
     {
         if ((c >= '0' && c <= '9') || c == ';' || c == '?' || c == ':')
         {
+            if (_params.Length >= CsiParamCapChars)
+            {
+                // Overflowed — see CsiParamCapChars. Keep consuming parameter bytes (so the sequence still
+                // ends where the application ended it, rather than the tail spilling onto the screen as
+                // text) but stop growing, and drop what was collected: a truncated parameter list is not
+                // this sequence.
+                _csiOverflow = true;
+                _params.Clear();
+                return;
+            }
+
             _params.Append(c);
             return;
         }
 
-        ApplyCsi(c, _params.ToString());
+        var overflowed = _csiOverflow;
+        _csiOverflow = false;
+        var parameters = _params.ToString();
+        _params.Clear();
         _state = ParseState.Ground;
+        if (overflowed)
+        {
+            return; // abandoned, never applied on partial parameters
+        }
+
+        ApplyCsi(c, parameters);
     }
 
     private void ApplyCsi(char final, string paramText)

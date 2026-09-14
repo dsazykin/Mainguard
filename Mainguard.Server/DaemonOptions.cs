@@ -82,6 +82,32 @@ public sealed record DaemonOptions
     public string? GatewayBindAddress { get; init; }
         = ResolveBindAddress(Environment.GetEnvironmentVariable("MAINGUARD_GATEWAY_BIND"));
 
+    /// <summary>
+    /// What the operator actually asked for (the raw <c>MAINGUARD_GATEWAY_BIND</c> / <c>--gateway-bind</c>
+    /// value), kept alongside the resolved address so the two reasons a gateway can be absent stay
+    /// distinguishable.
+    ///
+    /// <para><b>Why that distinction is load-bearing.</b> "Disabled" is a choice with a documented escape
+    /// hatch (<c>off</c>), and on that path a BYOK jail receiving the raw key is exactly what the operator
+    /// asked for. "Auto-resolution found nothing" is a DEFECT condition on any host that runs jails at
+    /// all, and it reaches the same code — the audit's B1 finding was precisely that: a resolver that
+    /// returned null on every normal Linux/WSL2 host disabled the gateway, and the raw provider key went
+    /// into every BYOK jail with nothing louder than a per-spawn warning that reads identically to the
+    /// deliberate case. <see cref="GatewayDisabledUnintentionally"/> separates them so the daemon can say
+    /// so at boot and the launcher can log the unintended one as an error.</para>
+    /// </summary>
+    public string? GatewayBindConfigured { get; init; }
+        = Environment.GetEnvironmentVariable("MAINGUARD_GATEWAY_BIND");
+
+    /// <summary>
+    /// True when there is no gateway and NOBODY ASKED for that — i.e. the bind auto-resolved to nothing.
+    /// Every BYOK spawn on such a daemon hands the jail the operator's raw provider key, so this is a
+    /// condition to report loudly rather than a posture to keep quietly.
+    /// </summary>
+    public bool GatewayDisabledUnintentionally =>
+        string.IsNullOrWhiteSpace(GatewayBindAddress)
+        && !string.Equals(GatewayBindConfigured?.Trim(), DisabledBind, StringComparison.OrdinalIgnoreCase);
+
     /// <summary>The sentinel meaning "pick a private host address the agents' egress proxy can reach".</summary>
     public const string AutoBind = "auto";
 
@@ -174,7 +200,13 @@ public sealed record DaemonOptions
                     // Routed through the same resolver as the environment variable so 'auto' and 'off'
                     // mean the same thing from either source — a flag that silently meant something
                     // different from the env var would be its own defect.
-                    options = options with { GatewayBindAddress = ResolveBindAddress(args[i + 1]) };
+                    options = options with
+                    {
+                        GatewayBindAddress = ResolveBindAddress(args[i + 1]),
+                        // Kept verbatim so `--gateway-bind off` stays distinguishable from an auto-resolve
+                        // that found nothing — see GatewayDisabledUnintentionally.
+                        GatewayBindConfigured = args[i + 1],
+                    };
                     i++;
                     break;
                 case "--gateway-port":

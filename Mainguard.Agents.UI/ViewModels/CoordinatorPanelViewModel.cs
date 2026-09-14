@@ -52,6 +52,14 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
     [ObservableProperty] private string _composerText = "";
     [ObservableProperty] private string _pressureText = "";
 
+    /// <summary>Why the last message did not reach the coordinator, or empty when sending works. The text
+    /// is back in the composer whenever this is set — see <see cref="SendAsync"/>.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasSendError))]
+    private string _sendErrorText = "";
+
+    public bool HasSendError => SendErrorText.Length > 0;
+
     /// <summary>The daemon's legible-stall line, e.g. "6 workers are waiting on your approval…".</summary>
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(HasGateContent))]
@@ -263,13 +271,41 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
         Refresh();
     }
 
+    /// <summary>
+    /// Sends the composer's contents to the coordinator.
+    ///
+    /// <para><b>The composer is cleared optimistically and restored on failure.</b> Clearing first is what
+    /// makes the box feel like a chat input, but the send is a network call, and it used to be made against
+    /// a service that swallowed every transport failure — so a message that never left simply vanished:
+    /// composer empty, transcript unchanged, nothing said. The human's own words are the one thing this
+    /// surface must not lose, so a failure puts them back exactly as typed and states why, and the
+    /// transcript is never re-read as if a turn had been added.</para>
+    /// </summary>
     [RelayCommand]
     private async Task SendAsync()
     {
         var text = ComposerText.Trim();
         if (text.Length == 0) return;
+
         ComposerText = "";
-        await _coordinator.SendAsync(text);
+        SendErrorText = "";
+        try
+        {
+            await _coordinator.SendAsync(text);
+        }
+        catch (Exception ex)
+        {
+            // Restored verbatim — retrying is one keystroke, retyping is not. Only when the composer has
+            // not been typed into since: overwriting what the human is now writing would be its own loss.
+            if (ComposerText.Length == 0)
+            {
+                ComposerText = text;
+            }
+
+            SendErrorText = $"Not sent — {ex.Message}. Your message is still in the box.";
+            return;
+        }
+
         Refresh();
     }
 }

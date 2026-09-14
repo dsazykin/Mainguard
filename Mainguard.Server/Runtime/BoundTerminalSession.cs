@@ -70,8 +70,11 @@ public sealed class BoundTerminalSession : IDisposable
     private readonly List<string> _pendingClipboard = new();
     private readonly VtermSession? _vterm;
     private readonly Func<bool>? _isInputLocked;
+    private readonly Func<bool>? _isInputPaused;
+    private readonly SemaphoreSlim _writeGate = new(1, 1);
     private int _replayBytes;
     private bool _completed;
+    private bool _inputClaimed;
     private int _disposed;
 
     /// <param name="isInputLocked">
@@ -81,17 +84,27 @@ public sealed class BoundTerminalSession : IDisposable
     /// channel to the host on a terminal the operator is only watching. Null (manual sessions) honors
     /// OSC 52 copies as before.
     /// </param>
+    /// <param name="isInputPaused">
+    /// Audit F7: the P2-09 <see cref="Mainguard.Agents.Agents.Orchestrator.SessionLeader"/> input gate,
+    /// evaluated live on every human keystroke. Until this parameter existed the gate was decorative —
+    /// <c>PauseInput</c>/<c>ResumeInput</c> had exactly one non-test reader, which was the kill switch
+    /// computing whether IT had been the one to close the gate, so the gateway's 429 / budget pause and
+    /// the yield window forwarded a flag that nothing consulted before writing bytes. Null (a session
+    /// with no leader) forwards as before.
+    /// </param>
     public BoundTerminalSession(
         string agentId,
         ITerminalSession session,
         TerminalEngineConfig? engine = null,
         int cols = 120,
         int rows = 32,
-        Func<bool>? isInputLocked = null)
+        Func<bool>? isInputLocked = null,
+        Func<bool>? isInputPaused = null)
     {
         AgentId = agentId ?? throw new ArgumentNullException(nameof(agentId));
         _session = session ?? throw new ArgumentNullException(nameof(session));
         _isInputLocked = isInputLocked;
+        _isInputPaused = isInputPaused;
         if ((engine ?? TerminalEngineConfig.Interim).Engine == TerminalEngineKind.Libvterm)
         {
             _vterm = new VtermSession(cols, rows);
@@ -197,11 +210,109 @@ public sealed class BoundTerminalSession : IDisposable
         return (snapshot, channel.Reader);
     }
 
-    /// <summary>Writes keystrokes/paste toward the CLI.</summary>
-    public async Task WriteInputAsync(ReadOnlyMemory<byte> data, CancellationToken ct)
+    /// <summary>
+    /// Writes keystrokes/paste toward the CLI — <b>unless the leader's input gate is closed</b>, in which
+    /// case the bytes are dropped.
+    ///
+    /// <para>Dropped, not buffered. The gate is closed for a rate-limited or budget-paused agent and for
+    /// the yield window; a keystroke held and replayed minutes later arrives in a CLI whose screen has
+    /// moved on, which is how an Enter lands on a permission dialog nobody was looking at. The operator's
+    /// terminal already shows the paused state — the honest behaviour is that typing into it does nothing
+    /// until it is resumed, which is what the flag has claimed all along.</para>
+    /// </summary>
+    public Task WriteInputAsync(ReadOnlyMemory<byte> data, CancellationToken ct) =>
+        WriteInputAsync(data, ct, bypassInputPause: false);
+
+    /// <param name="bypassInputPause">
+    /// True for the daemon's OWN sanctioned writes (the coordinator's <c>send_worker_prompt</c>), for the
+    /// same reason that channel does not consult the terminal input lock: the gate severs a HUMAN's
+    /// keyboard, and honouring it here would make the one channel through which a paused agent can be
+    /// told anything impossible exactly when it matters.
+    /// </param>
+    internal async Task WriteInputAsync(
+        ReadOnlyMemory<byte> data, CancellationToken ct, bool bypassInputPause)
     {
-        await _session.IO.WriteAsync(data, ct).ConfigureAwait(false);
-        await _session.IO.FlushAsync(ct).ConfigureAwait(false);
+        // F7: the input gate severs a HUMAN's keyboard. Checked BEFORE the write gate below, because a
+        // dropped keystroke never reaches the PTY and so has nothing to serialize against — taking the
+        // semaphore first would only make a paused session queue behind a live writer to do nothing.
+        if (!bypassInputPause && _isInputPaused?.Invoke() == true)
+        {
+            return;
+        }
+
+        // F64: write+flush is one indivisible act. `_session.IO` is a single Stream over the PTY master
+        // and Stream is not thread-safe; two attaches typing at once interleaved at the BYTE level, so a
+        // multi-byte escape sequence or a UTF-8 codepoint from one writer could be split by the other's
+        // keystroke. The gate below costs an uncontended semaphore per keystroke.
+        await _writeGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _session.IO.WriteAsync(data, ct).ConfigureAwait(false);
+            await _session.IO.FlushAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// F64: claims the exclusive right to TYPE into this session, or returns null when another attach
+    /// already holds it. Dispose the returned handle to release (the attach's <c>finally</c>).
+    ///
+    /// <para>Attaches fan out freely — any number of clients may watch — but exactly one may write. Two
+    /// concurrent writable attaches to one CLI is not a shared terminal, it is two people's keystrokes
+    /// arriving as one stream with no way to tell whose is whose; and on a coordinator-driven worker it
+    /// meant an operator could type into a session the coordinator was mid-turn on. The claim is per
+    /// attach and released on detach, so the terminal is handed over rather than locked forever.</para>
+    ///
+    /// <para>The daemon's own prompt delivery (<see cref="WriteInputAndAwaitOutputAsync"/>) does not take
+    /// this claim: it is the session's owner acting, not a viewer competing, and it must not be blocked
+    /// by whoever happens to have a terminal open. Its writes are still serialized by the gate above.</para>
+    /// </summary>
+    public IDisposable? TryClaimInput()
+    {
+        lock (_gate)
+        {
+            if (_inputClaimed)
+            {
+                return null;
+            }
+
+            _inputClaimed = true;
+        }
+
+        return new InputClaim(this);
+    }
+
+    /// <summary>Whether some attach currently holds the exclusive write claim.</summary>
+    public bool IsInputClaimed
+    {
+        get { lock (_gate) { return _inputClaimed; } }
+    }
+
+    private void ReleaseInputClaim()
+    {
+        lock (_gate)
+        {
+            _inputClaimed = false;
+        }
+    }
+
+    private sealed class InputClaim : IDisposable
+    {
+        private readonly BoundTerminalSession _owner;
+        private int _released;
+
+        public InputClaim(BoundTerminalSession owner) => _owner = owner;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) == 0)
+            {
+                _owner.ReleaseInputClaim();
+            }
+        }
     }
 
     /// <summary>
@@ -222,13 +333,18 @@ public sealed class BoundTerminalSession : IDisposable
     /// between the two; it is dropped again on every path.</para>
     /// </summary>
     /// <returns>True when the CLI produced output within the window.</returns>
-    public async Task<bool> WriteInputAndAwaitOutputAsync(
-        ReadOnlyMemory<byte> data, TimeSpan window, CancellationToken ct)
+    public Task<bool> WriteInputAndAwaitOutputAsync(
+        ReadOnlyMemory<byte> data, TimeSpan window, CancellationToken ct) =>
+        WriteInputAndAwaitOutputAsync(data, window, ct, bypassInputPause: false);
+
+    /// <param name="bypassInputPause">See <see cref="WriteInputAsync(ReadOnlyMemory{byte},CancellationToken,bool)"/>.</param>
+    internal async Task<bool> WriteInputAndAwaitOutputAsync(
+        ReadOnlyMemory<byte> data, TimeSpan window, CancellationToken ct, bool bypassInputPause)
     {
         var (_, live) = Subscribe(out var unsubscribe);
         try
         {
-            await WriteInputAsync(data, ct).ConfigureAwait(false);
+            await WriteInputAsync(data, ct, bypassInputPause).ConfigureAwait(false);
 
             using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
             deadline.CancelAfter(window);
@@ -286,7 +402,8 @@ public sealed class BoundTerminalSession : IDisposable
         CancellationToken ct)
     {
         var sinceBody = System.Diagnostics.Stopwatch.StartNew();
-        var echoed = await WriteInputAndAwaitOutputAsync(body, echoWindow, ct).ConfigureAwait(false);
+        var echoed = await WriteInputAndAwaitOutputAsync(body, echoWindow, ct, bypassInputPause: true)
+            .ConfigureAwait(false);
 
         // The separation is a FLOOR in every case, echo or no echo. It used to apply only when nothing
         // echoed, on the argument that an echo is causal — a CLI that repainted has read the body. But
@@ -308,7 +425,7 @@ public sealed class BoundTerminalSession : IDisposable
             await Task.Delay(TerminalSubmit.TerminatorSeparation, ct).ConfigureAwait(false);
         }
 
-        var reacted = await WriteInputAndAwaitOutputAsync(terminator, reactionWindow, ct)
+        var reacted = await WriteInputAndAwaitOutputAsync(terminator, reactionWindow, ct, bypassInputPause: true)
             .ConfigureAwait(false);
         return new SubmitObservation(echoed, reacted);
     }
@@ -558,6 +675,32 @@ public sealed class BoundTerminalSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// F59: releases the daemon-side half of this session — the pump, the streamer, the vterm and every
+    /// subscriber — <b>without killing the CLI</b>.
+    ///
+    /// <para>Used on daemon shutdown. The jail and the agent's worktree survive a restart by design; the
+    /// PTY this daemon opened does not, and cannot be reattached (the Docker API has no re-attach for a
+    /// running exec). But "the terminal is gone" and "SIGKILL the agent mid-task" are different acts, and
+    /// only the first is a consequence of the daemon stopping. <see cref="Dispose"/> — the explicit
+    /// StopAgent / teardown path — still kills, because there the kill is the request.</para>
+    ///
+    /// <para><b>The bug this used to be.</b> Both halves of teardown ended in
+    /// <c>ITerminalSession.Dispose</c>, and the production session is <see cref="PtySession"/>, whose
+    /// <c>Dispose</c> is a <c>Kill</c>. So detaching killed exactly what disposing killed and the F59
+    /// claim rested on a no-op. Detach now goes through <see cref="ITerminalSession.Release"/>, which
+    /// exists to be the difference.</para>
+    /// </summary>
+    public void Detach()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        TearDownDaemonSide(reapChild: false);
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -574,6 +717,16 @@ public sealed class BoundTerminalSession : IDisposable
             // Best-effort reap.
         }
 
+        TearDownDaemonSide(reapChild: true);
+    }
+
+    /// <summary>
+    /// The half of teardown that is the daemon's own state, shared by Dispose and Detach.
+    /// <paramref name="reapChild"/> chooses which half of the session contract ends the CLI's life:
+    /// <c>Dispose</c> reaps the child, <c>Release</c> lets go of it.
+    /// </summary>
+    private void TearDownDaemonSide(bool reapChild)
+    {
         _pumpCts.Cancel();
         try
         {
@@ -584,9 +737,22 @@ public sealed class BoundTerminalSession : IDisposable
             // Pump teardown races with PTY disposal.
         }
 
-        _session.Dispose();
+        if (reapChild)
+        {
+            _session.Dispose();
+        }
+        else
+        {
+            _session.Release();
+        }
+
         _streamer.Dispose();
         _pumpCts.Dispose();
+
+        // The write gate is deliberately NOT disposed: a keystroke racing teardown would then throw
+        // ObjectDisposedException out of WriteInputAsync instead of failing on the torn-down stream it
+        // is actually about. SemaphoreSlim only needs disposal when its AvailableWaitHandle was taken,
+        // and nothing here takes it.
         lock (_gate)
         {
             _vterm?.Dispose();

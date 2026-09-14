@@ -34,6 +34,17 @@ internal static class TestDataRootIsolation
     [ModuleInitializer]
     internal static void RedirectDataRootToTempDirectory()
     {
+        // Before the early return below, because it applies whether or not the root was pinned: the
+        // restart ledger is a process-wide singleton behind the human pause, the kill switch's
+        // containment, the pause axis, the conflict parking and the hand-back permit, and its production
+        // default is ONE JSON file under the data root that every test in this assembly would share. A
+        // FORGETTING ledger restores exactly the behaviour those ledgers had before they were durable —
+        // which is what every test predating them expects, and which a merely in-memory one would not,
+        // since these ledgers rehydrate in their constructors and would inherit each other's state. A
+        // test that is ABOUT restart survival builds its own JsonAgentRestartLedger over its own file.
+        Mainguard.Agents.Agents.Orchestrator.AgentRestartLedger.UseForTests(
+            Mainguard.Agents.Agents.Orchestrator.NullAgentRestartLedger.Instance);
+
         var existing = Environment.GetEnvironmentVariable(MainguardPaths.DataRootOverrideVariable);
         if (!string.IsNullOrWhiteSpace(existing))
         {

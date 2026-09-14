@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
+using Microsoft.Extensions.Logging;
 
 namespace Mainguard.Server.Runtime;
 
@@ -57,9 +59,22 @@ public sealed class TerminalSessionManager : IDisposable
     /// <summary>Poll cadence while waiting for a pending bind (a cheap concurrent-dictionary read).</summary>
     public static TimeSpan BindWaitPollInterval { get; set; } = TimeSpan.FromMilliseconds(150);
 
+    private readonly ILogger? _log;
+
     /// <summary>Default registration: no per-attach factory; only bound sessions stream a real PTY.</summary>
     public TerminalSessionManager()
     {
+    }
+
+    /// <summary>
+    /// The production registration. The logger exists for one reason: <see cref="DetachAllForShutdown"/>
+    /// must NAME the agents a daemon shutdown left running, so "your agents survived the restart, their
+    /// terminals did not" is a line in lifecycle.log rather than something the operator infers from a
+    /// terminal that has gone quiet (F59).
+    /// </summary>
+    public TerminalSessionManager(ILoggerFactory loggerFactory)
+    {
+        _log = loggerFactory?.CreateLogger(Logging.DaemonLogCategories.Lifecycle);
     }
 
     /// <summary>PTY-backed registration: <paramref name="factory"/> spawns the session for an agent id.</summary>
@@ -213,11 +228,59 @@ public sealed class TerminalSessionManager : IDisposable
         return found;
     }
 
-    public void Dispose()
+    /// <summary>
+    /// F59: the daemon is stopping — DETACH every bound session instead of killing it, and say which
+    /// agents were left running.
+    ///
+    /// <para>This used to be <see cref="Dispose"/>, i.e. <see cref="Release"/> per key, i.e.
+    /// <c>BoundTerminalSession.Dispose</c>, i.e. <c>ITerminalSession.Kill</c> on every live CLI. So an
+    /// upgrade, a launchd respawn or an operator restarting the app terminated every agent mid-task —
+    /// silently, with no operator prompt, and with the abandoned jail sitting idle until the reaper took
+    /// it half an hour later. Stopping the daemon is not a request to stop the agents; StopAgent is.</para>
+    ///
+    /// <para>What genuinely does not survive is the terminal: the CLI runs under a <c>docker exec -it</c>
+    /// whose daemon-side PTY belongs to this process, and Docker has no re-attach for a running exec. The
+    /// next attach says so (<c>TerminalGrpcService.DetachedNotice</c>) instead of dropping into a silent
+    /// echo. Re-binding a CLI on adoption is a separate, larger piece of work.</para>
+    /// </summary>
+    public void DetachAllForShutdown()
     {
+        var detached = new List<string>();
         foreach (var key in _bound.Keys)
         {
-            Release(key);
+            if (!_bound.TryRemove(key, out var session))
+            {
+                continue;
+            }
+
+            detached.Add(key.AgentId);
+            try
+            {
+                session.Detach();
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(
+                    "terminal detach failed for agent={Agent} during shutdown (non-fatal): {Message}",
+                    key.AgentId, ex.Message);
+            }
+        }
+
+        _bindPending.Clear();
+        if (detached.Count > 0)
+        {
+            _log?.LogWarning(
+                "daemon stopping — detached {Count} bound CLI terminal(s) WITHOUT killing them: {Agents}. "
+                + "Those agents keep running in their jails; their terminals cannot be reattached to this "
+                + "daemon's PTYs, so restart an agent if you need to type at it again.",
+                detached.Count, string.Join(", ", detached));
         }
     }
+
+    /// <summary>
+    /// Container disposal. Delegates to <see cref="DetachAllForShutdown"/>: disposing the manager is a
+    /// daemon-shutdown event, never an instruction to terminate the agents (F59). Killing a CLI stays an
+    /// explicit <see cref="Release"/>.
+    /// </summary>
+    public void Dispose() => DetachAllForShutdown();
 }

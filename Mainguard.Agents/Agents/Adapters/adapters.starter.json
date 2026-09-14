@@ -304,7 +304,22 @@
     "(AgentKickoffPrompt), from the agent's role and its shim path and nothing else -- the task the worker",
     "was spawned for is not in scope there and stays behind the plan gate. An unrecognised value is",
     "REFUSED at parse rather than defaulted, because degrading to 'no first turn' is the deadlock.",
-    "Only claude-code declares it; the other four are unchanged and a test asserts that."
+    "Only claude-code declares it; the other four are unchanged and a test asserts that.",
+    "",
+    "resumeArg is used on ONE path and one only: the adoption re-bind after a daemon restart. The daemon",
+    "PTY dies with the daemon, so an adopted agent's CLI is a brand-new docker exec -- but its jail is not",
+    "new. /workspace, the agent/<id> branch and the in-jail $HOME all survive, and claude-code keeps its",
+    "session store under that $HOME keyed by working directory, so the transcript is still on disk and the",
+    "only thing missing is the flag that opens it. Without it the re-bound CLI starts blank: a steerable",
+    "process at an empty input box with no idea what it was doing, which is a process re-bind and not a",
+    "loop that survived a restart.",
+    "",
+    "-c/--continue (continue the most recent conversation in the current directory) measured against the",
+    "claude-code CLI's own --help. It is NEVER on the spawn line -- a fresh jail has no conversation to",
+    "continue, and the first user turn is what starts one there. The same verify-against-the-pinned-binary",
+    "rule as preApprovedCommandArg applies: a flag a CLI does not know makes it exit on its own launch",
+    "line, and on the re-bind path that is an adopted agent that had a jail and now has nothing. An",
+    "adapter that declares nothing here re-binds exactly as it did before the field existed."
   ],
   "adapters": [
     {
@@ -315,6 +330,7 @@
       "preApprovedCommandArg": "--allowedTools",
       "preApprovedCommandFormat": "Bash({command}:*)",
       "initialPromptStyle": "first-positional",
+      "resumeArg": "--continue",
       "version": "2.1.218",
       "provenance": "npm-registry-signature",
       "sha256": "3a434c8bcb493e9ca87315d9aa6064835c5987e8fbc85c181bb76157dd5c45d8",

@@ -52,6 +52,13 @@ jobs:
       - name: Build pinned libvterm (P2-18 engine)
         run: bash build/libvterm/build.sh
 
+      # --blame-hang names the test instead of the job. On 2026-09-08 this step was CANCELLED at the
+      # 6-hour limit with `Mainguard.Server.Tests` silent after its 583rd result and ~40 classes never
+      # reported: a hang produces no failure, no output and no dump, so the only evidence a reviewer had
+      # was a six-hour job and a missing total. The timeout is per TEST and the slowest one in this suite
+      # is single-digit seconds, so 15 minutes cannot fire on a slow runner — it fires on a test that has
+      # stopped. When it does, the collector writes a hang dump and the sequence file naming the test that
+      # was running, which is the whole difference between "CI timed out" and "this test deadlocks".
       - name: Test
         env:
           MAINGUARD_LIBVTERM: ${{ github.workspace }}/build/libvterm/out/libvterm.so
@@ -70,7 +77,9 @@ jobs:
           # RefusesUnprotectedWrite is false and setting this would only REPLACE the platform-native
           # protector under test with the passphrase one.)
           MAINGUARD_KEYRING_PASSPHRASE: "ci-throwaway-not-a-secret"
-        run: dotnet test --no-build --configuration Release --verbosity normal
+        run: >
+          dotnet test --no-build --configuration Release --verbosity normal
+          --blame-hang --blame-hang-timeout 15m
 
   format:
     name: Format check
@@ -792,11 +801,20 @@ jobs:
       - name: Build
         run: dotnet build --no-restore --configuration Release
 
+      # --blame-hang, the same 15m per-TEST ceiling the Linux `build-and-test` leg carries (#369). The
+      # job's `timeout-minutes: 45` already bounds the damage, but a ceiling only tells you the JOB
+      # stopped; the collector tells you WHICH TEST stopped, and it writes a hang dump. These legs run
+      # the same two suites as the Linux leg, whose slowest test is single-digit seconds, so 15 minutes
+      # cannot fire on a slow runner — it fires on a test that has hung. (Deliberately NOT added to
+      # ci.yml's `sandbox-security` or `nightly-network`: the Docker suite's tests legitimately start
+      # containers and the nightly leg runs one named test under a 20m ceiling, so there a per-test
+      # hang timeout would be a false-positive risk for no naming benefit.)
       - name: Test — Mainguard.Tests (non-Docker)
         run: >
           dotnet test Mainguard.Tests/Mainguard.Tests.csproj
           --no-build --configuration Release --verbosity normal
           --filter "Category!=RequiresDocker"
+          --blame-hang --blame-hang-timeout 15m
 
       # `!cancelled()` is load-bearing, and its absence was a real defect in the first version of this
       # job: a failing step aborts the rest, so the FIRST run stopped at Mainguard.Tests and this step
@@ -808,6 +826,7 @@ jobs:
           dotnet test Mainguard.Server.Tests/Mainguard.Server.Tests.csproj
           --no-build --configuration Release --verbosity normal
           --filter "Category!=RequiresDocker"
+          --blame-hang --blame-hang-timeout 15m
 
   daemon-smoke:
     name: Daemon --local-dev smoke (Windows)

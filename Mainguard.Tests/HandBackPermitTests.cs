@@ -28,7 +28,7 @@ public class HandBackPermitTests
     private static (RebaseConflictParkingStore Store, Func<DateTimeOffset> Set) NewStore()
     {
         var now = Granted;
-        var store = new RebaseConflictParkingStore(() => now);
+        var store = new RebaseConflictParkingStore(clock: () => now);
         return (store, () => now);
     }
 
@@ -36,7 +36,7 @@ public class HandBackPermitTests
     public void AFreshHandBack_PermitsTheRewrite()
     {
         var now = Granted;
-        var store = new RebaseConflictParkingStore(() => now);
+        var store = new RebaseConflictParkingStore(clock: () => now);
         store.MarkHandedBack(Repo, Agent);
 
         Assert.True(store.IsHandedBack(Repo, Agent));
@@ -46,7 +46,7 @@ public class HandBackPermitTests
     public void AHandBackStillPermitsTheRewrite_RightUpToItsLifetime()
     {
         var now = Granted;
-        var store = new RebaseConflictParkingStore(() => now);
+        var store = new RebaseConflictParkingStore(clock: () => now);
         store.MarkHandedBack(Repo, Agent);
 
         now = Granted + RebaseConflictParkingStore.HandBackLifetime - TimeSpan.FromMinutes(1);
@@ -59,7 +59,7 @@ public class HandBackPermitTests
     public void AHandBackNobodyActedOn_StopsPermittingTheRewriteOnceItExpires()
     {
         var now = Granted;
-        var store = new RebaseConflictParkingStore(() => now);
+        var store = new RebaseConflictParkingStore(clock: () => now);
         store.MarkHandedBack(Repo, Agent);
 
         now = Granted + RebaseConflictParkingStore.HandBackLifetime + TimeSpan.FromMinutes(1);
@@ -72,7 +72,7 @@ public class HandBackPermitTests
     public void AHandBackGrantedAgainAfterAnExpiry_PermitsTheRewriteAgain()
     {
         var now = Granted;
-        var store = new RebaseConflictParkingStore(() => now);
+        var store = new RebaseConflictParkingStore(clock: () => now);
         store.MarkHandedBack(Repo, Agent);
 
         now = Granted + RebaseConflictParkingStore.HandBackLifetime + TimeSpan.FromHours(1);

@@ -121,6 +121,14 @@ jobs:
 
       # --filter "Category!=RequiresDocker" is what makes this a bounded leg rather than a second
       # full CI. Everything else runs, which is what gets the three [MacOnlyFact] tests executed.
+      # --blame-hang, the same 15m per-TEST ceiling the Linux `build-and-test` leg carries (#369). The
+      # job's `timeout-minutes: 45` already bounds the damage, but a ceiling only tells you the JOB
+      # stopped; the collector tells you WHICH TEST stopped, and it writes a hang dump. These legs run
+      # the same two suites as the Linux leg, whose slowest test is single-digit seconds, so 15 minutes
+      # cannot fire on a slow runner — it fires on a test that has hung. (Deliberately NOT added to
+      # ci.yml's `sandbox-security` or `nightly-network`: the Docker suite's tests legitimately start
+      # containers and the nightly leg runs one named test under a 20m ceiling, so there a per-test
+      # hang timeout would be a false-positive risk for no naming benefit.)
       - name: Test — Mainguard.Tests (non-Docker)
         env:
           MAINGUARD_LIBVTERM: ${{ github.workspace }}/build/libvterm/out/libvterm.dylib
@@ -129,6 +137,7 @@ jobs:
           dotnet test Mainguard.Tests/Mainguard.Tests.csproj
           --no-build --configuration Release --verbosity normal
           --filter "Category!=RequiresDocker"
+          --blame-hang --blame-hang-timeout 15m
 
       # The [MacOnlyFact] tests live here (Agents/AgentEnvironmentFactoryTests.cs,
       # Agents/SubstrateConformanceTests.cs). SubstrateConformanceTests is deliberately split in two
@@ -147,6 +156,7 @@ jobs:
           dotnet test Mainguard.Server.Tests/Mainguard.Server.Tests.csproj
           --no-build --configuration Release --verbosity normal
           --filter "Category!=RequiresDocker"
+          --blame-hang --blame-hang-timeout 15m
 
       - name: Daemon --local-dev smoke (macos-host substrate composition)
         if: ${{ !cancelled() }}

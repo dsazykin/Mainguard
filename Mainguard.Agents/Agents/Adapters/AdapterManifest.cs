@@ -306,7 +306,26 @@ public sealed record AdapterSpec(
     /// <para>Validated when present (plain relative path, real sha256) so a manifest cannot start
     /// naming files outside the channel directory the day the install side does read it.</para>
     /// </summary>
-    [property: JsonPropertyName("lockfile")] AdapterLockfile? Lockfile = null)
+    [property: JsonPropertyName("lockfile")] AdapterLockfile? Lockfile = null,
+    /// <summary>
+    /// The launch flag THIS CLI accepts to <b>continue its previous conversation in the working
+    /// directory</b> (<c>--continue</c> for claude-code). Used on exactly ONE path — the adoption
+    /// re-bind after a daemon restart (<c>SandboxAgentLauncher.BuildReattachLaunchArgv</c>) — and never
+    /// at spawn, where there is no conversation to continue.
+    ///
+    /// <para><b>What it is for.</b> The daemon's PTY dies with the daemon, so an adopted agent's CLI is a
+    /// new <c>docker exec</c>. The jail, its <c>/workspace</c>, its <c>agent/&lt;id&gt;</c> branch and its
+    /// in-jail <c>$HOME</c> all survive — and claude-code keeps its session store under that <c>$HOME</c>,
+    /// keyed by working directory — so the transcript is still on disk in the jail and the only thing
+    /// missing is the flag that tells the CLI to open it. Without this the re-bound process starts blank:
+    /// steerable, but with no idea what it was doing.</para>
+    ///
+    /// <para><b>Verify it against the PINNED binary before adding one</b>, exactly as with
+    /// <see cref="PreApprovedCommandArg"/>: a flag a CLI does not know is a CLI that exits on its own
+    /// launch line, which on the re-bind path is an adopted agent that had a jail and now has nothing.
+    /// A CLI that declares nothing here is re-bound exactly as it was before this field existed.</para>
+    /// </summary>
+    [property: JsonPropertyName("resumeArg")] string? ResumeArg = null)
 {
     /// <summary>The parsed <see cref="Provenance"/> rung. Only ever reached after
     /// <see cref="AdapterManifest.Parse"/> validated it, so an unrecognised value here is a bug, not a

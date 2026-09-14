@@ -381,8 +381,32 @@ public sealed class ExternalPrIntake : IExternalPrIntake
             return;
         }
 
-        // Existing PR: refresh the worktree head and detect a moved head (a force-push is just a head move
-        // whose old SHA disappears — edge row 1).
+        // Existing PR: detect a moved head (a force-push is just a head move whose old SHA disappears —
+        // edge row 1).
+        //
+        // F40 — COMPARE BEFORE DESTROYING. This used to fetch-and-`reset --hard` first and compare the
+        // result, which meant the worker's worktree was hard-reset on every poll of every tracked PR,
+        // whether or not anything had moved: an in-flight verification's uncommitted work was deleted
+        // once per interval, and the reset raced the worker's own git on `.git/index.lock`. The head is
+        // a property of the HOST, so it can be read from the host — `ls-remote`, which opens no
+        // repository, writes no ref and takes no lock — and an unchanged head then returns having
+        // touched nothing at all.
+        //
+        // Null is "the host did not advertise the ref", which is unknown rather than unchanged, so it
+        // falls through to the authoritative fetch. A fetcher with no peek capability (the intake's test
+        // doubles) does the same, which is exactly the previous behaviour — the ordering fix is an
+        // improvement where it applies and never a regression where it does not.
+        if (_fetcher is IPrHeadPeek peek)
+        {
+            var remoteHead = await peek
+                .PeekRemoteHeadAsync(source, target.RepoHash, agentId, pr.Number, ct)
+                .ConfigureAwait(false);
+            if (remoteHead is not null && string.Equals(remoteHead, seen, StringComparison.Ordinal))
+            {
+                return; // unchanged — and, unlike before, nothing in the worker's worktree was touched.
+            }
+        }
+
         var newHead = await _fetcher.FetchHeadAsync(source, target.RepoHash, agentId, pr.Number, ct).ConfigureAwait(false);
         if (string.Equals(newHead, seen, StringComparison.Ordinal))
         {
