@@ -143,11 +143,32 @@ internal static class AgentGitCommand
     /// <c>require_clean_work_tree()</c>, and <c>commit</c> only reaches a working-tree status on the
     /// "nothing to commit" arm — which both daemon callers gate behind a <c>status</c>/<c>diff</c> that
     /// already carries this flag.</para>
+    ///
+    /// <para><b><c>fetch</c> — the same shape, for the same reason, on the one subcommand that reaches a
+    /// nested repository over the network path.</b> <c>submodule.&lt;name&gt;.fetchRecurseSubmodules</c>
+    /// is a per-submodule key an agent can write into the repository config the daemon fetches in, and
+    /// <c>get_fetch_recurse_config()</c> documents it as overruling "everything except commandline".
+    /// Measured on git 2.55 against the audit's fixture (a populated gitlink, a <c>.gitmodules</c> entry,
+    /// <c>submodule.sub.fetchRecurseSubmodules=true</c> and a <c>remote.origin.uploadpack</c> payload in
+    /// the nested repository, which the enumeration never reads): with the key planted and NO pins the
+    /// payload runs, and it does NOT run when either <c>fetch.recurseSubmodules=false</c> or
+    /// <c>submodule.recurse=false</c> is pinned — <c>builtin/fetch.c</c> gates the whole of
+    /// <c>fetch_submodules()</c> on the merged value, so it never reaches the per-submodule lookup. The
+    /// pins therefore already held, and this flag is not a fix for a measured hole.</para>
+    ///
+    /// <para>It is here because the pins holding is a fact about one git's precedence order, and the
+    /// <c>--[no-]recurse-submodules</c> option is the form git's own documentation names as overriding
+    /// the per-submodule key. Carrying it makes the invariant independent of that precedence fact and
+    /// of the two config pins staying put: <c>AgentGitCommandHardeningTests</c> pins exactly that —
+    /// with both config pins removed, the flag alone keeps the nested payload from running. It costs an
+    /// argument and changes no behaviour (measured across the four fetch shapes the daemon issues,
+    /// including bare-mirror fetches).</para>
     /// </summary>
     private static readonly Dictionary<string, string> SubcommandHardeningFlag = new(StringComparer.Ordinal)
     {
         ["status"] = "--ignore-submodules=all",
         ["diff"] = "--ignore-submodules=all",
+        ["fetch"] = "--recurse-submodules=no",
     };
 
     /// <summary>
@@ -466,7 +487,25 @@ internal static class AgentGitCommand
         foreach (var raw in listing.Split('\0', StringSplitOptions.RemoveEmptyEntries))
         {
             var key = raw.Trim();
-            if (key.Length == 0 || !GitConfigExecutionSurface.IsCommandExecuting(key))
+            if (key.Length == 0)
+            {
+                continue;
+            }
+
+            // Checked BEFORE the command-executing test and outside the -c machinery, because this family
+            // is the one that cannot be neutralized by an empty value — see IsTransportRedirecting.
+            if (GitConfigExecutionSurface.IsTransportRedirecting(key))
+            {
+                throw new RepoProvisioningException(
+                    "W1-A: the repository config at '" + workingDir + "' declares the URL-rewriting key "
+                    + "'" + GitConfigExecutionSurface.Describe(key) + "', which silently redirects the "
+                    + "remote git contacts — including a fetch URL the daemon passes as an argument. It "
+                    + "cannot be overridden on the command line (an empty value matches every URL and "
+                    + "would rewrite all of them), so daemon-side git refuses to run against this "
+                    + "repository rather than fetching from a remote the repository chose.");
+            }
+
+            if (!GitConfigExecutionSurface.IsCommandExecuting(key))
             {
                 continue;
             }
@@ -536,7 +575,9 @@ internal static class GitConfigExecutionSurface
     /// the daemon never invokes anything but built-ins, so neutralizing them would forbid something
     /// that cannot happen. <c>include.path</c>/<c>includeIf.*</c> — not executable, and the enumeration
     /// this feeds already lists the keys an include pulled in. <c>http.*.proxy</c> — an exfiltration
-    /// question, not an execution one, and out of scope for this control.</para>
+    /// question, not an execution one, and out of scope for this control.
+    /// <c>url.&lt;base&gt;.insteadOf</c> executes nothing either, and it is handled separately by
+    /// <see cref="IsTransportRedirecting"/> because it cannot be neutralized, only refused.</para>
     /// </summary>
     internal static bool IsCommandExecuting(string key)
     {
@@ -585,6 +626,56 @@ internal static class GitConfigExecutionSurface
             "pager" => true,
             _ => false,
         };
+    }
+
+    /// <summary>
+    /// True iff <paramref name="key"/> silently REDIRECTS the URL git contacts —
+    /// <c>url.&lt;base&gt;.insteadOf</c> and <c>url.&lt;base&gt;.pushInsteadOf</c>.
+    ///
+    /// <para><b>The finding.</b> These execute nothing, so <see cref="IsCommandExecuting"/> correctly
+    /// says no about them — and that left the one daemon-side <c>fetch</c> whose URL is an ARGUMENT
+    /// rewritable from the repository config the agent writes. Measured: with the full pin set applied,
+    /// <c>git -c … fetch &lt;realUrl&gt; +&lt;ref&gt;</c> in a repository declaring
+    /// <c>url.&lt;decoy&gt;.insteadOf = &lt;realUrl&gt;</c> puts the DECOY's commit in <c>FETCH_HEAD</c>.
+    /// On <c>PrHeadFetcher.FetchHeadAsync</c> the next line is <c>reset --hard FETCH_HEAD</c>, so the
+    /// external-PR worker's worktree — and the head SHA the intake then records and audits as "PR #n" —
+    /// become bytes of the PR author's choosing rather than the head the host advertised. #363 closed the
+    /// PEEK half of this (<c>ls-remote</c> was moved to the daemon-owned mirror,
+    /// <c>PrHeadPeekOriginTests</c>); the authoritative fetch still ran on the agent's own config.</para>
+    ///
+    /// <para><b>Why a refusal and not an override.</b> Every other key here is neutralized with
+    /// <c>-c key=</c>, and for this family that is not merely useless but actively dangerous: the KEY
+    /// carries the replacement base and the VALUE carries the prefix to match, so an empty value is an
+    /// empty prefix — which matches EVERY url and would rewrite all of them to the agent's base. The
+    /// override would hand over exactly what it was trying to take away. git offers no "ignore rewrites"
+    /// option, so the honest answer is the one this file already gives an inexpressible key: refuse to run
+    /// git at all, loudly, and let the caller map it onto the refusal it already has.</para>
+    ///
+    /// <para><b>Not a regression for any legitimate repository.</b> The daemon writes seven repo-local
+    /// keys and none is in this family; <c>GIT_CONFIG_NOSYSTEM</c>/<c>GIT_CONFIG_GLOBAL</c> keep a
+    /// developer's own global rewrite out; and the repositories this runs against are daemon-created.
+    /// A <c>url.*</c> rewrite in one of them was put there by the agent.</para>
+    /// </summary>
+    internal static bool IsTransportRedirecting(string key)
+    {
+        if (string.IsNullOrEmpty(key))
+        {
+            return false;
+        }
+
+        var firstDot = key.IndexOf('.');
+        var lastDot = key.LastIndexOf('.');
+        if (firstDot <= 0 || lastDot >= key.Length - 1)
+        {
+            return false;
+        }
+
+        // The subsection is the replacement base — a URL, so it may hold dots, colons and slashes and is
+        // never interpreted here. Only the first and last segments are read, exactly as above. The
+        // subsection is NOT required: `url.insteadOf` is not a shape git honours, but refusing it too
+        // costs nothing and removes a spelling to argue about.
+        return string.Equals(key[..firstDot], "url", StringComparison.OrdinalIgnoreCase)
+            && key[(lastDot + 1)..].ToLowerInvariant() is "insteadof" or "pushinsteadof";
     }
 
     /// <summary>

@@ -195,6 +195,59 @@ public sealed class AgentGitCommandHardeningTests : IDisposable
         Assert.Null(Marker(sub, "clean"));
     }
 
+    /// <summary>
+    /// The fetch leg of the same hole, and the one per-submodule key the enumeration cannot reach.
+    ///
+    /// <para><c>submodule.&lt;name&gt;.fetchRecurseSubmodules</c> is a boolean, not a command, so
+    /// <see cref="GitConfigExecutionSurface.IsCommandExecuting"/> classifies it as inert and
+    /// <c>NeutralizingArgs</c> — which only neutralizes command-EXECUTING keys — never emits an override
+    /// for it. git's own <c>get_fetch_recurse_config()</c> says the key overrules "everything except
+    /// commandline". So the question this test answers is whether a fetch in a repository the agent
+    /// writes can be talked into spawning a child git inside a NESTED repository, whose config was never
+    /// enumerated and therefore never neutralized.</para>
+    ///
+    /// <para>The payload is <c>remote.origin.uploadpack</c> in the nested repository rather than a
+    /// <c>filter.*</c> driver, because a fetch converts no blobs: what a recursive fetch actually runs
+    /// from the child's un-enumerated config is the program it spawns — through a shell — to serve a
+    /// local-path fetch. Same class of defect, same trust boundary, the shape that really fires.</para>
+    ///
+    /// <para><b>What this measured.</b> With the daemon's pins in place the payload does not run — and it
+    /// does not run with EITHER <c>fetch.recurseSubmodules=false</c> or <c>submodule.recurse=false</c>
+    /// alone, because <c>builtin/fetch.c</c> gates the whole of <c>fetch_submodules()</c> on the merged
+    /// value and so never reaches the per-submodule lookup. The reported bypass was therefore already
+    /// closed. The <c>--recurse-submodules=no</c> flag was added anyway, and the third leg below is what
+    /// makes it worth its argument: it asserts the invariant survives BOTH config pins being removed, so
+    /// the property no longer depends on a precedence fact about one git version.</para>
+    /// </summary>
+    [Fact]
+    public void NestedRepositoryUploadPack_IsNotExecuted_WhenTheDaemonFetches()
+    {
+        var (parent, sub, upstream) = NestedFetchHostileRepo("nested-fetch");
+
+        // Non-vacuous: unhardened git honours the per-submodule override and spawns a child fetch inside
+        // the nested repository, which runs the command that repository's config names.
+        AgentTestGit.Run(parent, "fetch", upstream, "+refs/heads/*:refs/remotes/plain/*");
+        Assert.Equal("yes", Marker(sub, "fetch"));
+
+        ClearMarkers(sub);
+
+        // The daemon's own path must not — and must still do the fetch it was asked for.
+        Assert.Equal(0, AgentGitCommand.TryRun(parent, out _, "fetch", upstream, "+refs/heads/*:refs/remotes/daemon/*"));
+        Assert.Null(Marker(sub, "fetch"));
+        Assert.Contains(
+            "refs/remotes/daemon/",
+            AgentTestGit.RunChecked(parent, "for-each-ref", "--format=%(refname)"),
+            StringComparison.Ordinal);
+
+        // Why the flag earns its argument, stated as a measurement rather than as a claim. The first leg
+        // above is this one's negative control: the SAME unhardened git, the same repository, differing
+        // only by `--recurse-submodules=no` — and that one alone, with neither config pin in play, is
+        // enough. So the invariant no longer rests on git's config precedence order.
+        AgentTestGit.Run(
+            parent, "fetch", "--recurse-submodules=no", upstream, "+refs/heads/*:refs/remotes/flagonly/*");
+        Assert.Null(Marker(sub, "fetch"));
+    }
+
     /// <summary>The submodule pins must not have broken ordinary daemon git: a worktree with a REAL
     /// change still reads dirty through the same probe the rebaser gates its wip commit on.</summary>
     [Fact]
@@ -295,6 +348,79 @@ public sealed class AgentGitCommandHardeningTests : IDisposable
         Assert.Contains("cannot be overridden", ex.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// <c>url.&lt;base&gt;.insteadOf</c> — the key that redirects git's REMOTE rather than running a
+    /// command, and the half of this vector #363 left open.
+    ///
+    /// <para>#363 moved the head PEEK off the agent's worktree because one such key made
+    /// <c>ls-remote</c> answer from a remote of the agent's choosing (<c>PrHeadPeekOriginTests</c>). The
+    /// authoritative leg — <c>PrHeadFetcher.FetchHeadAsync</c>'s <c>fetch &lt;url&gt; +&lt;ref&gt;</c>,
+    /// followed by <c>reset --hard FETCH_HEAD</c> — still ran in the agent's own repository, and git
+    /// applies the rewrite to an explicit URL ARGUMENT. This test measures that first (unhardened git
+    /// really does fetch the decoy) and then requires the daemon's path to refuse.</para>
+    ///
+    /// <para>A refusal rather than a <c>-c</c> override, because for this family the key holds the
+    /// replacement and the value holds the prefix: <c>-c url.X.insteadOf=</c> is an EMPTY prefix, which
+    /// matches every URL. The neutralization would be the attack.</para>
+    /// </summary>
+    [Fact]
+    public void UrlInsteadOf_IsRefused_RatherThanLettingTheRepoChooseTheRemote()
+    {
+        var real = NewRepo("insteadof-real");
+        File.WriteAllText(Path.Combine(real, "f.txt"), "the real head\n");
+        AgentTestGit.RunChecked(real, "add", "-A");
+        AgentTestGit.RunChecked(real, "commit", "-q", "-m", "real");
+        var realHead = AgentTestGit.RunChecked(real, "rev-parse", "HEAD").Trim();
+
+        var decoy = NewRepo("insteadof-decoy");
+        File.WriteAllText(Path.Combine(decoy, "f.txt"), "attacker bytes\n");
+        AgentTestGit.RunChecked(decoy, "add", "-A");
+        AgentTestGit.RunChecked(decoy, "commit", "-q", "-m", "decoy");
+        var decoyHead = AgentTestGit.RunChecked(decoy, "rev-parse", "HEAD").Trim();
+        Assert.NotEqual(realHead, decoyHead);
+
+        var agent = NewRepo("insteadof-agent");
+        AgentTestGit.RunChecked(agent, "commit", "-q", "--allow-empty", "-m", "seed");
+        var head = AgentTestGit.RunChecked(real, "symbolic-ref", "--short", "HEAD").Trim();
+
+        // Non-vacuous, and the whole finding in one line: the rewrite redirects an explicit fetch URL.
+        AgentTestGit.RunChecked(agent, "config", "url." + decoy + ".insteadOf", real);
+        AgentTestGit.RunChecked(agent, "fetch", real, "+refs/heads/" + head);
+        Assert.Equal(decoyHead, AgentTestGit.RunChecked(agent, "rev-parse", "FETCH_HEAD").Trim());
+
+        // The daemon's path refuses instead — on the fetch, and on every other subcommand too, because a
+        // repository that declares one is a repository the daemon will not drive.
+        var ex = Assert.Throws<RepoProvisioningException>(
+            () => AgentGitCommand.Run(agent, "fetch", real, "+refs/heads/" + head));
+        Assert.Contains("URL-rewriting key", ex.Message, StringComparison.Ordinal);
+        Assert.Throws<RepoProvisioningException>(() => AgentGitCommand.Run(agent, "status", "--porcelain"));
+
+        // …and removing it restores an ordinary daemon fetch, which brings the REAL head.
+        AgentTestGit.RunChecked(agent, "config", "--unset", "url." + decoy + ".insteadOf");
+        AgentGitCommand.Run(agent, "fetch", real, "+refs/heads/" + head);
+        Assert.Equal(realHead, AgentGitCommand.Run(agent, "rev-parse", "FETCH_HEAD").Trim());
+    }
+
+    [Theory]
+    [InlineData("url.https://mirror.test/.insteadOf")]
+    [InlineData("url./tmp/decoy.git.insteadof")]
+    [InlineData("url.git@host:.pushInsteadOf")]
+    public void UrlRewritingKeys_AreClassifiedAsTransportRedirecting(string key)
+    {
+        Assert.True(GitConfigExecutionSurface.IsTransportRedirecting(key), key);
+        // They execute nothing, so the other classifier must keep saying no about them — the two
+        // questions are different, and conflating them is what would put an empty value on the wire.
+        Assert.False(GitConfigExecutionSurface.IsCommandExecuting(key), key);
+    }
+
+    [Theory]
+    [InlineData("remote.origin.url")]
+    [InlineData("url.https://mirror.test/.someOtherKey")]
+    [InlineData("core.hooksPath")]
+    [InlineData("")]
+    public void NonRewritingKeys_AreNotClassifiedAsTransportRedirecting(string key)
+        => Assert.False(GitConfigExecutionSurface.IsTransportRedirecting(key), key);
+
     /// <summary>The belt must not have made ordinary daemon git any less usable: a clean repository
     /// still stages, commits and reports through the same path.</summary>
     [Fact]
@@ -386,6 +512,64 @@ public sealed class AgentGitCommandHardeningTests : IDisposable
         File.WriteAllText(Path.Combine(sub, "f.txt"), "v2\n");
         ClearMarkers(sub);
         return (parent, sub);
+    }
+
+    /// <summary>
+    /// The fetch-path variant of <see cref="NestedHostileRepo"/>: a populated gitlink that is a REAL
+    /// submodule (named in <c>.gitmodules</c>, with a remote of its own), the per-submodule recursion
+    /// override in the superproject config, and the payload in the nested repository's
+    /// <c>remote.origin.uploadpack</c> — the command git spawns, through a shell, to serve a fetch from a
+    /// local path. Returns (parent worktree, nested repository, the upstream to fetch from).
+    ///
+    /// <para>The submodule is <c>clone</c>d rather than <c>submodule add</c>ed: modern git refuses a
+    /// <c>file://</c> submodule URL without <c>protocol.file.allow</c>, and the product never sets that
+    /// (it is a rejection trigger). The shape on disk is identical, which is all recursion looks at.</para>
+    ///
+    /// <para>The upstream is an exact copy of the parent — no new commits. With
+    /// <c>fetchRecurseSubmodules=true</c> the recursion is unconditional (<c>get_next_submodule()</c>
+    /// takes the <c>RECURSE_SUBMODULES_ON</c> arm without consulting <c>changed_submodule_names</c>), so a
+    /// no-op fetch still spawns the child. Measured, not assumed.</para>
+    /// </summary>
+    private (string Parent, string Sub, string Upstream) NestedFetchHostileRepo(string name)
+    {
+        var baseDir = Path.Combine(_root, name);
+        Directory.CreateDirectory(baseDir);
+
+        // The submodule's own upstream, so the child fetch has a remote to dial.
+        var nestedSource = Path.Combine(baseDir, "nested-source");
+        Directory.CreateDirectory(nestedSource);
+        AgentTestGit.RunChecked(nestedSource, "init", "-q");
+        AgentTestGit.SetIdentity(nestedSource);
+        File.WriteAllText(Path.Combine(nestedSource, "f.txt"), "v1\n");
+        AgentTestGit.RunChecked(nestedSource, "add", "-A");
+        AgentTestGit.RunChecked(nestedSource, "commit", "-q", "-m", "nested seed");
+        var nestedUpstream = Path.Combine(baseDir, "nested-upstream.git");
+        AgentTestGit.RunChecked(baseDir, "clone", "--bare", "-q", nestedSource, nestedUpstream);
+
+        var parent = NewRepo(Path.Combine(name, "parent"));
+        File.WriteAllText(Path.Combine(parent, "a.txt"), "parent\n");
+        AgentTestGit.RunChecked(parent, "add", "-A");
+        AgentTestGit.RunChecked(parent, "commit", "-q", "-m", "seed");
+
+        var sub = Path.Combine(parent, "sub");
+        AgentTestGit.RunChecked(parent, "clone", "-q", nestedUpstream, sub);
+        AgentTestGit.SetIdentity(sub);
+        AgentTestGit.RunChecked(sub, "config", "remote.origin.uploadpack", MarkerCommand("fetch"));
+
+        File.WriteAllText(
+            Path.Combine(parent, ".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = " + nestedUpstream.Replace('\\', '/') + "\n");
+        AgentTestGit.RunChecked(parent, "add", "-A");
+        AgentTestGit.RunChecked(parent, "commit", "-q", "-m", "embed");
+
+        // The key this test exists for. It is inert (a boolean), so the W1-A enumeration leaves it alone.
+        AgentTestGit.RunChecked(parent, "config", "submodule.sub.fetchRecurseSubmodules", "true");
+
+        var upstream = Path.Combine(baseDir, "upstream.git");
+        AgentTestGit.RunChecked(baseDir, "clone", "--bare", "-q", parent, upstream);
+
+        ClearMarkers(sub);
+        return (parent, sub, upstream);
     }
 
     /// <summary>The payload: a command git will spawn through a shell, whose only effect is a

@@ -161,9 +161,10 @@ public sealed class PrHeadFetcher : IPrHeadFetcher, IPrHeadPeek
             AgentGitCommand.RunWithEnv(dir, env, "fetch", fetchUrl, $"+{headRef}");
 
             // F40 — the reset is the destructive leg and the worker's git runs concurrently in the jail.
-            // Wait the worker's index.lock out on the SAME backoff every other daemon mutation uses, and
-            // refuse rather than race it. Refusing costs one poll interval (the caller audits it and the
-            // next cycle retries); forcing it costs the worker a corrupted index.
+            // Wait the worker's index.lock out on the SAME backoff every other daemon mutation uses
+            // rather than starting into a held one. Giving up costs one poll interval (the caller audits
+            // it and the next cycle retries). It is a narrowing and not a lock — see WaitForWorktreeLock
+            // for the residual race and what closing it would actually take.
             WaitForWorktreeLock(worktreePath);
             AgentGitCommand.RunWithEnv(dir, env, "reset", "--hard", "FETCH_HEAD");
             return AgentGitCommand.RunWithEnv(dir, env, "rev-parse", "HEAD").Trim();
@@ -184,6 +185,15 @@ public sealed class PrHeadFetcher : IPrHeadFetcher, IPrHeadPeek
     /// backoff schedule, or refuses. Deliberately NOT <c>RunGuarded</c>: that requires a yield token, and
     /// the intake has no yield relationship with the worker — it is a peer, not the arbiter. The lock
     /// wait is the part that applies; the token invariant is not this caller's to claim.
+    ///
+    /// <para><b>This is check-then-act, and it does not claim to be anything else.</b> The worker can
+    /// take the lock again between the final check here and the <c>reset --hard</c> below; what the wait
+    /// buys is that the reset does not START into a lock that is already held, which is the common case
+    /// (a worker mid-command when the poll fires) and the one that otherwise costs a poll interval on
+    /// every cycle. Losing the narrow race is not silent corruption — whichever git arrives second gets
+    /// <c>Unable to create '…/index.lock': File exists</c> and fails loudly. Closing the window properly
+    /// needs a protocol the WORKER honours (the P2-09 yield), and the intake deliberately has no such
+    /// relationship with a third party's PR jail; until it does, this is a narrowing, not a lock.</para>
     /// </summary>
     private static void WaitForWorktreeLock(string worktreePath)
     {

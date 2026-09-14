@@ -633,7 +633,25 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// <inheritdoc />
     public AgentBranchAlignment CheckAgentBranch(string repoHash, string agentId)
         => AgentBranchGuard.Probe(
-            WorktreePathFor(repoHash, agentId), _agentRepos.PathFor(repoHash, agentId), agentId);
+            WorktreePathFor(repoHash, agentId), TrustedRepoRootFor(repoHash, agentId), agentId);
+
+    /// <summary>
+    /// The repository this agent's worktree is legitimately linked off, computed by the daemon: the
+    /// per-agent repository since MG-3, and the shared mirror for a worktree made before it.
+    ///
+    /// <para>One greppable answer, because four places need it and one of them had a DIFFERENT one. The
+    /// three teardown paths already picked the mirror for a legacy worktree (that is what makes an
+    /// upgraded daemon able to remove one); <see cref="CheckAgentBranch"/> and <see cref="PinFor"/> named
+    /// the per-agent repository unconditionally, which for a legacy worktree is a path that does not
+    /// exist — so the layout resolution refused, the alignment probe reported <c>Unknown</c>, and
+    /// <c>CommitAgentWork</c> answered <c>RefusedBranch</c> for a shape the daemon documents as
+    /// supported. Existence of the per-agent repository is a daemon-owned fact about a daemon-owned
+    /// directory, never anything an agent writes.</para>
+    /// </summary>
+    private string TrustedRepoRootFor(string repoHash, string agentId)
+        => _agentRepos.Exists(repoHash, agentId)
+            ? _agentRepos.PathFor(repoHash, agentId)
+            : BareRepoPathFor(repoHash);
 
     /// <summary>
     /// Daemon-side identity for an agent's work commit. The agent id is IN the name, so a reader of the
@@ -755,18 +773,36 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// W1-A rework — the daemon's own answer to "which git layout backs this worktree", for the calls in
     /// this file that run with a LIVE agent's worktree as their working directory.
     ///
-    /// <para>Null is the pre-MG-3 / substrate-less shape (no per-agent repository, or a plain <c>.git</c>
-    /// directory) and means "run exactly as before"; a tampered linked worktree throws, and each caller
-    /// maps that onto the refusal it already has. The calls made at CREATION time
+    /// <para>Null is the substrate-less shape (a plain <c>.git</c> DIRECTORY — a main working tree, with
+    /// no pointer to subvert) and means "run exactly as before"; a tampered linked worktree throws, and
+    /// each caller maps that onto the refusal it already has. The calls made at CREATION time
     /// (<c>FinishWorktreeLocked</c>'s <c>remote remove</c>/<c>remote add</c>) deliberately do not use this:
     /// they run between <c>git worktree add</c> and the jail's first existence, so there is no agent yet
     /// to have written the pointers they would be validating.</para>
+    ///
+    /// <para><b>Which repository is the trusted root depends on which shape this worktree is, and the
+    /// first cut of this method got the legacy one backwards.</b> Since MG-3 the worktree is linked off
+    /// the per-agent repository, so THAT is the trusted root and the mirror is the forbidden
+    /// redirect-target — the audit's "plausible second vector". A worktree made BEFORE MG-3 is linked off
+    /// the mirror, legitimately, which is why <see cref="RemoveAgentWorktree"/> picks the mirror as its
+    /// teardown owner for exactly that case. Passing the mirror as <c>forbiddenCommonDir</c> for such a
+    /// worktree made <c>TryResolve</c> refuse every shape the method documents as supported: an upgraded
+    /// daemon could not commit a legacy agent's work and could not remove its worktree without
+    /// <c>force</c> — the removal path's own comment promises it can. So the legacy shape is pinned
+    /// AGAINST the mirror instead of away from it, which is also the stronger of the two resolutions
+    /// (daemon-computed roots rather than the worktree's own pointer).</para>
+    ///
+    /// <para>The branch is chosen by a daemon-owned fact — does this agent have a per-agent repository on
+    /// disk — not by anything the agent writes, and the mirror is mounted read-only into every jail, so
+    /// an agent cannot manufacture the legacy shape to be pinned at the mirror: with no
+    /// <c>&lt;mirror&gt;/worktrees/&lt;name&gt;</c> registration to be found, the resolution refuses.</para>
     /// </summary>
     private TrustedWorktreeLayout? PinFor(string repoHash, string agentId, string worktreePath)
         => TrustedWorktreeLayout.TryResolve(
             worktreePath,
-            _agentRepos.Exists(repoHash, agentId) ? _agentRepos.PathFor(repoHash, agentId) : null,
-            BareRepoPathFor(repoHash));
+            TrustedRepoRootFor(repoHash, agentId),
+            // The mirror is the forbidden redirect-target only where it is not also the legitimate root.
+            forbiddenCommonDir: _agentRepos.Exists(repoHash, agentId) ? BareRepoPathFor(repoHash) : null);
 
     /// <inheritdoc />
     public bool PublishAgentBranch(string repoHash, string agentId) => Publish(repoHash, agentId).Current;
@@ -868,7 +904,7 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         var branch = BranchFor(agentId);
         // The owner of the worktree metadata. A worktree made before MG-3 is still linked off the
         // mirror, so an upgraded daemon must be able to tear that one down too.
-        var owner = _agentRepos.Exists(repoHash, agentId) ? _agentRepos.PathFor(repoHash, agentId) : barePath;
+        var owner = TrustedRepoRootFor(repoHash, agentId);
 
         if (Directory.Exists(worktreePath))
         {
@@ -1011,7 +1047,7 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     {
         var barePath = BareRepoPathFor(repoHash);
         var worktreePath = WorktreePathFor(repoHash, agentId);
-        var owner = _agentRepos.Exists(repoHash, agentId) ? _agentRepos.PathFor(repoHash, agentId) : barePath;
+        var owner = TrustedRepoRootFor(repoHash, agentId);
 
         if (Directory.Exists(worktreePath))
         {
@@ -1071,7 +1107,7 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     private void ClearWorktreeResidue(string repoHash, string agentId, string barePath)
     {
         var worktreePath = WorktreePathFor(repoHash, agentId);
-        var owner = _agentRepos.Exists(repoHash, agentId) ? _agentRepos.PathFor(repoHash, agentId) : barePath;
+        var owner = TrustedRepoRootFor(repoHash, agentId);
 
         if (Directory.Exists(worktreePath))
         {

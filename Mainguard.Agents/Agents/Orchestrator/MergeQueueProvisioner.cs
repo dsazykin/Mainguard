@@ -1621,7 +1621,7 @@ public sealed class MergeQueueProvisioner
         // progress, and the whole point of the parking is that it stays that way until a human acts — but
         // an agent with a shell in that worktree can `git add` a path out of the unmerged set at any time,
         // so an answer taken at render time would drift from the answer the daemon blocked the entry on.
-        var conflicted = MeasureConflictedPaths(handoff.WorktreePath);
+        var conflicted = MeasureConflictedPaths(repoHandle, handoff.AgentId, handoff.WorktreePath);
         var parked = new ParkedRebaseConflict(
             handoff.AgentId, handoff.WorktreePath, handoff.MainBranch, conflicted, DateTimeOffset.UtcNow);
         ParkedConflicts.Park(repoHandle, parked);
@@ -1651,15 +1651,33 @@ public sealed class MergeQueueProvisioner
     /// git has just refused a rebase, so a rendered "no files conflict" would be a fabricated reassurance
     /// over a real conflict. Every surface treats the empty list as unknown.</para>
     /// </summary>
-    private static IReadOnlyList<string> MeasureConflictedPaths(string worktreePath)
+    private IReadOnlyList<string> MeasureConflictedPaths(
+        string repoHandle, string agentId, string worktreePath)
     {
         if (string.IsNullOrEmpty(worktreePath) || !System.IO.Directory.Exists(worktreePath))
         {
             return Array.Empty<string>();
         }
 
-        if (AgentGitCommand.TryRun(
-                worktreePath, out var output, "diff", "--name-only", "--diff-filter=U") != 0)
+        // W1-A: a read, but a read whose ANSWER is rendered to a human as "these files conflict" — so it
+        // must be a read of the repository the daemon provisioned, not of one the worktree's pointers
+        // name. A refused layout is "not measured", which is already how an empty list is read.
+        TrustedWorktreeLayout? layout;
+        try
+        {
+            layout = PinnedLayoutFor(repoHandle, agentId, worktreePath);
+        }
+        catch (RepoProvisioningException ex)
+        {
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} agent={agentId} conflicted-path measurement SKIPPED — the "
+                + $"worktree's git layout cannot be vouched for ({ex.Message})");
+            return Array.Empty<string>();
+        }
+
+        if (AgentGitCommand.TryRunWithEnv(
+                layout?.WorkTree ?? worktreePath, layout?.Env,
+                out var output, "diff", "--name-only", "--diff-filter=U") != 0)
         {
             return Array.Empty<string>();
         }
@@ -1668,6 +1686,26 @@ public sealed class MergeQueueProvisioner
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Distinct(StringComparer.Ordinal)
             .ToList();
+    }
+
+    /// <summary>
+    /// W1-A — the daemon-computed git layout for one agent's worktree, for the calls in THIS file that
+    /// run git with a live agent's worktree as their working directory.
+    ///
+    /// <para>The roots come from <see cref="LocateAgentWorktree"/>, which is the same pair
+    /// (<c>AgentRepoPath</c>, <c>BarePath</c>) the keep-alive cycle pins on. Null is the substrate-less /
+    /// pre-MG-3 shape and means "run exactly as before"; a tampered linked worktree THROWS, and each
+    /// caller maps that onto the refusal it already has.</para>
+    ///
+    /// <para>Deliberately not carried on <see cref="ConflictHandoff"/> or
+    /// <see cref="ParkedRebaseConflict"/>: a layout resolved when the conflict was parked and used when a
+    /// human later clicks abort would be a snapshot of pointers that may since have been rewritten. The
+    /// roots are cheap to recompute and the validation has to happen at use time anyway.</para>
+    /// </summary>
+    private TrustedWorktreeLayout? PinnedLayoutFor(string repoHandle, string agentId, string worktreePath)
+    {
+        var loc = LocateAgentWorktree(repoHandle, agentId);
+        return TrustedWorktreeLayout.TryResolve(worktreePath, loc?.AgentRepoPath, loc?.BarePath);
     }
 
     private static string DescribePaths(IReadOnlyList<string> paths) =>
@@ -1843,10 +1881,39 @@ public sealed class MergeQueueProvisioner
     /// container would <c>docker pause</c> a paused jail and be refused by the engine. So the jail is
     /// unpaused first, an ordinary yield is taken over it, and the token's own resume is what leaves the
     /// jail running at the end. The extra round trip buys the invariant instead of an exception to it.</para>
+    ///
+    /// <para><b>And it runs under the daemon's own layout.</b> <c>rebase --abort</c> moves a branch and
+    /// rewrites a working tree, in a directory the agent can write — the exact shape W1-A's second layer
+    /// exists for — and this path was reaching it through a plain <c>TryRun</c>, i.e. through whatever the
+    /// worktree's <c>.git</c> pointer and <c>commondir</c> said. The layout is resolved from
+    /// daemon-computed roots BEFORE anything is unpaused or yielded, so a tampered one is a refusal that
+    /// costs nothing rather than an abort aimed at a repository of the agent's choosing.</para>
     /// </summary>
     public async Task<ConflictActionResult> AbortParkedRebaseAsync(
         string repoHandle, string agentId, CancellationToken ct = default)
     {
+        // Resolved FIRST — ahead of the unpause, ahead of the yield, and ahead of TryOpenParkedConflict's
+        // own preconditions. Two reasons, and the second is the less obvious one. A refusal must leave the
+        // jail exactly as it found it, which is why KeepAliveRebaser resolves ahead of ITS yield. And
+        // "is the rebase still in progress" is itself a question answered by following the worktree's
+        // pointer chain (GitMutationGuard.Inspect), so on a redirected worktree that check reads a
+        // DIFFERENT repository, concludes the rebase is over, and clears the parking — a tampered
+        // worktree would silently discard the record of the conflict rather than being refused.
+        TrustedWorktreeLayout? layout = null;
+        if (ParkedConflicts.Find(repoHandle, agentId) is { } pending)
+        {
+            try
+            {
+                layout = PinnedLayoutFor(repoHandle, agentId, pending.WorktreePath);
+            }
+            catch (RepoProvisioningException ex)
+            {
+                return ConflictActionResult.Refused(
+                    $"the parked worktree's git layout cannot be vouched for ({ex.Message}) — nothing was "
+                    + "changed, the jail was not touched, and the parking is kept");
+            }
+        }
+
         if (!TryOpenParkedConflict(repoHandle, agentId, out var parked, out var queue, out var refusal))
         {
             return ConflictActionResult.Refused(refusal);
@@ -1899,7 +1966,8 @@ public sealed class MergeQueueProvisioner
             var exit = GitMutationGuard.RunGuarded(
                 token,
                 () => GitMutationGuard.IsIndexLockHeld(parked.WorktreePath),
-                () => AgentGitCommand.TryRun(parked.WorktreePath, out _, "rebase", "--abort"));
+                () => AgentGitCommand.TryRunWithEnv(
+                    layout?.WorkTree ?? parked.WorktreePath, layout?.Env, out _, "rebase", "--abort"));
 
             if (exit != 0)
             {

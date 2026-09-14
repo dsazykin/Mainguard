@@ -270,6 +270,26 @@ public static class ContainerSpecBuilder
     }
 
     /// <summary>
+    /// W1-A — the in-jail mount TARGETS of the three files that decide where daemon-side git writes:
+    /// the worktree's <c>.git</c> pointer, and the <c>commondir</c>/<c>gitdir</c> it leads to. Every one
+    /// of them is mounted read-only by <see cref="Build"/>.
+    ///
+    /// <para>Named here rather than composed at each use because there are two uses and they must not
+    /// drift: the create path mounts them, and <c>DockerSandboxEngine</c>'s REUSE path has to treat a
+    /// container that is missing any of them — or that has one read-write — as stale. Mounts are fixed at
+    /// container create, so a jail created after MG-3 but before W1-A satisfies every other reuse check
+    /// while keeping the whole redirect chain writable; recreating is the only way to change that, which
+    /// is exactly the argument <see cref="MirrorMountReadOnly"/> already makes for the mirror.</para>
+    /// </summary>
+    public static IReadOnlyList<string> LayoutPinMountTargets(string agentRepoPath, string worktreePath)
+    {
+        var targets = new List<string>(3) { WorkspaceGitPointerTarget };
+        // Target == Source for these two: they are named by absolute VM path from inside the repository.
+        targets.AddRange(WorktreeRegistrationFiles(agentRepoPath, worktreePath));
+        return targets;
+    }
+
+    /// <summary>
     /// MG-3 — whether the shared mirror's bind mount denies writes from inside the jail.
     ///
     /// <para>This is the single bit that closes MG-3, and it is a named constant so that "is the mirror

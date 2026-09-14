@@ -107,6 +107,79 @@ public sealed class GatewayUpstreamBindingTests
         Assert.False(capture.Request.Headers.Contains("authorization"));
     }
 
+    /// <summary>
+    /// The provider-host classification must be a DOMAIN test, not a string suffix.
+    ///
+    /// <para>Both selectors were a bare <c>EndsWith</c>, which has no notion of a label boundary:
+    /// <c>evilgoogleapis.com</c> ends with <c>googleapis.com</c> and <c>notanthropic.com</c> ends with
+    /// <c>anthropic.com</c>. Either one was therefore classified as first-party and handed the
+    /// daemon-held provider key in that provider's own header shape. The bound upstream is an adapter
+    /// manifest's <c>modelHost</c>, so a lookalike is a supplied string rather than a hypothetical. The
+    /// Google arm arrived with F46's gemini confinement; the Anthropic one predates the whole audit.</para>
+    ///
+    /// <para><b>What this test does and does not claim.</b> It pins the classification, not an egress
+    /// decision: an unrecognised upstream still gets the key as <c>Authorization: Bearer</c>, exactly as
+    /// every OpenAI-shaped provider does, and that is asserted below rather than glossed over. Deciding
+    /// which hosts may be BOUND at all belongs to the spawn path that reads the manifest, not to a
+    /// header-shape selector.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("evilgoogleapis.com")]
+    [InlineData("notgoogleapis.com")]
+    [InlineData("mygoogleapis.com.attacker.test")]
+    public async Task LookalikeGoogleHost_IsNotClassifiedAsGoogle(string lookalike)
+    {
+        var creds = new AgentGatewayCredentials();
+        var token = creds.Issue(Agent, GoogleKey, lookalike);
+        var capture = new CapturingHandler();
+
+        await InvokeAsync(creds, capture, token, tokenHeader: "x-goog-api-key");
+
+        Assert.Equal(lookalike, capture.Request!.RequestUri!.Host);
+        Assert.False(capture.Request.Headers.Contains("x-goog-api-key"));
+        // The residual, stated rather than hidden: an unrecognised upstream is treated as an
+        // OpenAI-shaped provider and still receives the key in the generic bearer header.
+        Assert.Equal("Bearer " + GoogleKey, capture.Request.Headers.GetValues("authorization").Single());
+    }
+
+    [Theory]
+    [InlineData("notanthropic.com")]
+    [InlineData("evilanthropic.com")]
+    [InlineData("anthropic.com.attacker.test")]
+    public async Task LookalikeAnthropicHost_IsNotClassifiedAsAnthropic(string lookalike)
+    {
+        var creds = new AgentGatewayCredentials();
+        var token = creds.Issue(Agent, RealKey, lookalike);
+        var capture = new CapturingHandler();
+
+        await InvokeAsync(creds, capture, token);
+
+        Assert.Equal(lookalike, capture.Request!.RequestUri!.Host);
+        Assert.False(capture.Request.Headers.Contains("x-api-key"));
+        Assert.Equal("Bearer " + RealKey, capture.Request.Headers.GetValues("authorization").Single());
+    }
+
+    /// <summary>The other half of the same fix: tightening the test must not stop recognising the hosts
+    /// the adapters really declare — the apex, and every label under it.</summary>
+    [Theory]
+    [InlineData("anthropic.com", "x-api-key")]
+    [InlineData("api.anthropic.com", "x-api-key")]
+    [InlineData("api.anthropic.com.", "x-api-key")]           // the absolute-FQDN spelling
+    [InlineData("googleapis.com", "x-goog-api-key")]
+    [InlineData("generativelanguage.googleapis.com", "x-goog-api-key")]
+    [InlineData("cloudcode-pa.googleapis.com", "x-goog-api-key")]
+    public async Task GenuineProviderHost_StillGetsTheProvidersOwnHeader(string host, string expected)
+    {
+        var creds = new AgentGatewayCredentials();
+        var token = creds.Issue(Agent, RealKey, host);
+        var capture = new CapturingHandler();
+
+        await InvokeAsync(creds, capture, token);
+
+        Assert.Equal(new[] { RealKey }, capture.Request!.Headers.GetValues(expected).ToArray());
+        Assert.False(capture.Request.Headers.Contains("authorization"));
+    }
+
     // The budget half: the ledger is actually written on the real path. This is the assertion that was
     // unreachable outside tests — AiGateway.Acquire/Settle had no production caller at all.
     [Fact]

@@ -69,6 +69,55 @@ public sealed class AgentWorktreeManagerTests
         Assert.NotEqual(0, AgentTestGit.Run(env.BarePath(hash), "rev-parse", "--verify", "--quiet", "refs/heads/agent/a1").Code);
     }
 
+    /// <summary>
+    /// W1-A — a PRE-MG-3 worktree, which is linked off the shared mirror, must still be operable by an
+    /// upgraded daemon.
+    ///
+    /// <para>MG-3 moved the worktree onto a per-agent repository and made the mirror the forbidden
+    /// redirect-target; <c>PinFor</c> then passed the mirror as <c>forbiddenCommonDir</c> for EVERY shape,
+    /// including the one whose common directory legitimately IS the mirror. For a legacy worktree that
+    /// turned the layout resolution into a "shared mirror" refusal, so <c>CommitAgentWork</c> failed and
+    /// <c>RemoveAgentWorktree(force: false)</c> threw before reaching the mirror-as-owner teardown its own
+    /// comment promises. A security control that refuses the shape it documents as supported is a
+    /// functional regression, not a tighter control.</para>
+    ///
+    /// <para>The fixture is the legacy shape verbatim: a mirror-linked worktree with NO per-agent
+    /// repository, which is exactly what an upgraded daemon finds on disk.</para>
+    /// </summary>
+    [Fact]
+    public void LegacyMirrorLinkedWorktree_IsStillCommittableAndRemovable_AfterTheUpgrade()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+        var worktree = env.Worktrees.WorktreePathFor(hash, "legacy");
+
+        // The pre-MG-3 provisioning, performed by hand: the branch and the worktree come off the MIRROR,
+        // and nothing creates an agents/ repository.
+        Directory.CreateDirectory(Path.GetDirectoryName(worktree)!);
+        AgentTestGit.RunChecked(bare, "branch", "agent/legacy", "HEAD");
+        AgentTestGit.RunChecked(bare, "worktree", "add", worktree, "agent/legacy");
+        AgentTestGit.SetIdentity(worktree);
+        Assert.False(
+            Directory.Exists(env.Worktrees.AgentRepoPathFor(hash, "legacy")),
+            "the fixture is only the legacy shape while there is no per-agent repository");
+
+        // (1) The daemon can still snapshot this agent's work.
+        File.WriteAllText(Path.Combine(worktree, "legacy-work.cs"), "public class Legacy { }\n");
+        var commit = env.Worktrees.CommitAgentWork(hash, "legacy", "feat: work in a legacy worktree");
+
+        Assert.Equal(AgentWorkCommitOutcome.Committed, commit.Outcome);
+        Assert.DoesNotContain("shared mirror", commit.Detail ?? string.Empty, System.StringComparison.Ordinal);
+        Assert.Equal(
+            commit.Sha,
+            AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/legacy").Trim());
+
+        // (2) …and can tear it down without being forced to pass `force`, which is what the removal
+        //     path's mirror-as-owner branch exists for.
+        env.Worktrees.RemoveAgentWorktree(hash, "legacy", force: false);
+        Assert.False(Directory.Exists(worktree));
+    }
+
     [Fact]
     public void Worktree_DuplicateAgentId_ThrowsTyped_NoResidue()
     {

@@ -947,14 +947,49 @@ public sealed class ModelProxyMiddleware
         || MainguardHeaders.Contains(name, StringComparer.OrdinalIgnoreCase)
         || HopByHopHeaders.Contains(name, StringComparer.OrdinalIgnoreCase);
 
-    private static bool IsAnthropicHost(string host) =>
-        host.EndsWith("anthropic.com", StringComparison.OrdinalIgnoreCase);
+    private static bool IsAnthropicHost(string host) => IsWithinDomain(host, "anthropic.com");
 
     /// <summary>Google's model endpoints — <c>generativelanguage.googleapis.com</c> is the one
     /// gemini-cli declares as its <c>modelHost</c>, and <c>cloudcode-pa.googleapis.com</c> is the other
     /// host in that adapter's egress set.</summary>
-    private static bool IsGoogleHost(string host) =>
-        host.EndsWith("googleapis.com", StringComparison.OrdinalIgnoreCase);
+    private static bool IsGoogleHost(string host) => IsWithinDomain(host, "googleapis.com");
+
+    /// <summary>
+    /// True iff <paramref name="host"/> IS <paramref name="domain"/>, or is a host UNDER it — the
+    /// suffix must start at a label boundary.
+    ///
+    /// <para><b>Why this is not a bare <c>EndsWith</c>, which is what both callers above used to be.</b>
+    /// A raw suffix test has no notion of a label: <c>evilgoogleapis.com</c> ends with
+    /// <c>googleapis.com</c> and <c>notanthropic.com</c> ends with <c>anthropic.com</c>, so either one
+    /// was classified first-party and handed the DAEMON-HELD provider key in the provider's own header
+    /// shape (<c>x-goog-api-key</c> / <c>x-api-key</c>). The host reaching here is the agent's
+    /// spawn-time upstream binding, which comes from an adapter manifest's <c>modelHost</c> rather than
+    /// from the exact-match legacy model-host list — so a lookalike is a string somebody can supply, not
+    /// a hypothetical. The Google arm arrived with F46; the Anthropic one had been there since MG-4.</para>
+    ///
+    /// <para>Requiring the boundary does not decide whether the key should travel to that host at all —
+    /// an unrecognised upstream still receives it as <c>Authorization: Bearer</c> a few lines above.
+    /// What it decides is that the classification is a real domain test, so a lookalike can no longer
+    /// impersonate a provider to the header-shape selector. Constraining WHICH hosts may be bound at all
+    /// is the binding path's job, not this selector's.</para>
+    ///
+    /// <para>A trailing dot is the absolute-FQDN spelling of the same name and is accepted;
+    /// <c>".googleapis.com"</c> with an empty first label is not a host and is refused.</para>
+    /// </summary>
+    private static bool IsWithinDomain(string host, string domain)
+    {
+        if (string.IsNullOrEmpty(host))
+        {
+            return false;
+        }
+
+        var name = host.EndsWith('.') ? host[..^1] : host;
+
+        return string.Equals(name, domain, StringComparison.OrdinalIgnoreCase)
+            || (name.Length > domain.Length + 1
+                && name[name.Length - domain.Length - 1] == '.'
+                && name.EndsWith(domain, StringComparison.OrdinalIgnoreCase));
+    }
 
     /// <summary>
     /// The Mainguard token the agent presents as its API key, in any of the header shapes the fronted

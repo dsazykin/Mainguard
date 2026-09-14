@@ -1558,6 +1558,40 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>
+    /// W1-A layer 2, on the conflict-abort path — the leg the layer did not reach.
+    ///
+    /// <para><c>rebase --abort</c> moves a branch and rewrites a working tree in a directory the agent
+    /// can write, which is the exact operation <see cref="TrustedWorktreeLayout"/> exists to pin, and this
+    /// action was running it through a plain unpinned call: a rewritten <c>.git</c> pointer would have
+    /// been followed, and the mirror every co-tenant reads is the obvious target.</para>
+    ///
+    /// <para>The refusal is taken BEFORE the jail is unpaused and before a yield is requested, so the
+    /// empty freeze log is the assertion that matters as much as the refusal itself — a tampered worktree
+    /// must cost nothing, not leave an agent running with its parking silently cleared.</para>
+    /// </summary>
+    [Fact]
+    public async Task AbortingTheParkedRebase_RefusesARedirectedWorktree_WithoutTouchingTheJail()
+    {
+        var (provisioner, _, engine, repoHash, _) = await ParkedConflictWithTipAsync();
+        engine.FreezeLog.Clear();
+
+        // What a jailed agent with a writable workspace can do in one line.
+        var manager = new WorktreeManager(_vmRoot);
+        var worktree = manager.WorktreePathFor(repoHash, SecondAgent);
+        File.WriteAllText(
+            Path.Combine(worktree, ".git"),
+            "gitdir: " + Path.Combine(manager.BareRepoPathFor(repoHash), "worktrees", "stolen") + "\n");
+
+        var result = await provisioner.AbortParkedRebaseAsync(repoHash, SecondAgent);
+
+        Assert.False(result.Done);
+        Assert.Contains("cannot be vouched for", result.Reason, StringComparison.Ordinal);
+        // Nothing was paused, unpaused or yielded, and the parking is still there for a second attempt.
+        Assert.Empty(engine.FreezeLog);
+        Assert.NotNull(provisioner.ParkedConflicts.Find(repoHash, SecondAgent));
+    }
+
+    /// <summary>
     /// The parking is a MEASUREMENT in memory and the worktree is on disk with an agent that has a shell
     /// in it. If the rebase ends by some other hand, both controls must refuse and forget the record —
     /// acting on a stale parking would run <c>rebase --abort</c> over whatever the worktree has become.

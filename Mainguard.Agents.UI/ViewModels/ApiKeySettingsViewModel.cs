@@ -115,7 +115,15 @@ public partial class ApiKeySettingsViewModel : ViewModelBase, ISettingsPage
             return forProvider.All(a =>
                 !string.IsNullOrWhiteSpace(a.BaseUrlEnvVar) && !string.IsNullOrWhiteSpace(a.ModelHost));
         }
-        catch (Exception e) when (e is InvalidOperationException or System.Text.Json.JsonException or ArgumentException)
+        // AdapterManifestException is the FIRST entry for a reason: it is the only exception
+        // AdapterManifest.Parse actually raises. It derives straight from Exception, and it wraps the
+        // JsonException a malformed document throws — so the three types this filter originally named
+        // caught nothing Parse can produce, and the documented nullable fallback was unreachable code.
+        // A malformed shipped manifest would have thrown out of a property getter while the provider
+        // settings page refreshed. The other three stay: they cover the surrounding LINQ and the
+        // provider-map lookup, which is what they were plausibly meant for.
+        catch (Exception e) when (e is AdapterManifestException or InvalidOperationException
+                                       or System.Text.Json.JsonException or ArgumentException)
         {
             return null;
         }
