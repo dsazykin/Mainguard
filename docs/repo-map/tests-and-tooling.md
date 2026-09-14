@@ -3350,6 +3350,58 @@
   rejected, so anything in `[1, 2^31-1]` reached `vterm_set_size`, whose upstream `alloc_buffer`
   multiplies `rows*cols` with no overflow or upper-bound check; clamping is applied in
   `BoundTerminalSession.Resize` too so the PTY and the grid are never driven to different sizes).
+  **W1-A daemon-git hardening (`Agents/AgentGitCommandHardeningTests.cs`, real git, no Docker):** plants
+  the audit's exact payload — a repo-local `filter.*`/`diff.*.textconv` driver plus the `.gitattributes`
+  line that assigns it — and measures whether the driver's command runs. Each execution test proves
+  itself non-vacuous first (an unhardened `git` runs the payload and the marker appears; the same repo
+  driven through `AgentGitCommand` leaves it absent) so it cannot pass by the attribute never matching.
+  The payload command is `git config` rather than a shell utility, so the proof does not depend on
+  `sh`/`touch` existing. Also pins `GitConfigExecutionSurface` family by family in both directions —
+  every command-executing key classified as such, every key the product itself writes left alone — and
+  the typed refusal for a key name (`filter."a=b".clean`) that `git -c` cannot express.
+  **Rework adds the nested-repository payload**: `git init sub` + a hostile clean filter + one
+  `.gitattributes` line + `git add sub` — no `.gitmodules` — and asserts, one subcommand at a time, that
+  no leg of the keep-alive cycle executes it, that a repo which re-enables submodule diffs
+  (`.gitmodules` + `submodule.sub.ignore=none`) still does not, that `add -A` still stages ordinary work,
+  and — stated as a test rather than a comment — that the price is daemon-side git no longer seeing
+  submodule pointer moves. Mutation-checked: reverting the pins fails all three; reverting only the
+  command-line `--ignore-submodules=all`, or only the gitlink pathspec exclusion, fails the override one.
+  **W1-A trusted git layout (`Agents/TrustedWorktreeLayoutTests.cs`, real git worktrees, no Docker):**
+  builds the production MG-3 shape (source → shared mirror → per-agent repo → linked worktree) and then
+  rewrites the worktree's `.git` pointer the way a jailed agent can. Pins: a real worktree resolves to the
+  daemon-computed repository; a pointer aimed at the shared mirror is refused by name; a pointer aimed at
+  any other repository is refused when the daemon knows the real one; a pointer with no
+  `…/worktrees/<name>` shape is refused rather than guessed at; a main working tree resolves to null
+  (= run unpinned, exactly as before); and end-to-end, a redirected worktree ends the keep-alive cycle as
+  `Skipped` **before the yield** — the yield protocol in that test throws if it is reached, which is the
+  assertion. These tests are also what caught the macOS symlink bug (`/var` → `/private/var`) that made
+  every legitimate worktree look like "a repository the agent chose".
+  **Rework — the fail-open bypass, and the measurement that explains it.** A payload written entirely
+  inside the per-agent repository (the tree the jail mounts read-write, with the `.git` pointer left
+  exactly as git wrote it): `worktrees/<n>/commondir` = the mirror, `…/HEAD` = `ref: refs/heads/<main>`,
+  `…/gitdir` blanked. Pins: it is a typed refusal and the cycle skips with the mirror's `main` unmoved;
+  the same payload without `agentRepoPath` is refused instead of returning null; every unusable `.git`
+  FILE (empty, no `gitdir:`, garbage, nowhere) is a refusal and never null. And
+  `GitCommonDirEnv_DoesNotGovernRefWrites_WhichIsWhyCommondirIsValidated` drives the layout by hand to
+  demonstrate the mechanism — with all three env pins correct, a commit still advances the MIRROR's
+  branch, because git's files ref backend resolves its common dir with `get_common_dir_noenv()`. That
+  test exists so a future change that drops the `commondir` validation as "redundant with
+  GIT_COMMON_DIR" fails with the reason. Mutation-checked in both directions.
+  **W1-A intake peek origin (`Agents/PrHeadPeekOriginTests.cs`, real git, no Docker):** the worker's
+  worktree config gets `url.<decoy>.insteadOf <real>`; asked from that worktree, `ls-remote` returns the
+  decoy's SHA (the non-vacuous leg), and `PrHeadFetcher.PeekRemoteHeadAsync` returns the real one — with a
+  mirror resolver and without one. Mutation-checked.
+  **F40 intake ordering (`Mainguard.Tests/ExternalPrIntakeHeadPeekTests.cs`):** ten polls of an unchanged
+  PR must make ZERO destructive fetches and ten peeks; a moved head still fetches and still invalidates;
+  a peek that cannot answer falls through to the authoritative fetch; and a fetcher with no peek
+  capability keeps the pre-F40 behaviour exactly.
+  **W1-A `.git` pointer mount (`Mainguard.Tests/ContainerSpecGitPointerMountTests.cs`):** the pointer file
+  is bind-mounted read-only at `/workspace/.git` while `/workspace` itself stays read-write, the mount is
+  absent when there is no per-agent repo (where `.git` is a directory and a file mount would fail the
+  create), and MG-3's two decisions — mirror read-only, per-agent repo read-write — are unchanged.
+  **Rework**: the two files the pointer leads to — `<agentRepo>/worktrees/<n>/{commondir,gitdir}` — are
+  bind-mounted read-only inside the still-read-write per-agent repo, absent with no per-agent repo, and
+  named from the worktree path's own last component (`WorktreeRegistrationFiles`, pinned separately).
   **P2-09 lifecycle suite (`Agents/`, real git over `DualRepoFixture`):** `KeepAliveRebaserTests`
   (clean rebase onto advanced main + wip commit + resume; agent mid-its-own-rebase → guard skip then
   next-cycle success; induced conflict → status `Conflict` routed to the T-04 resolver with the rebase

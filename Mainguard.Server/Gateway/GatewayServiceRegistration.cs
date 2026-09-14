@@ -201,6 +201,14 @@ public static class GatewayServiceRegistration
             locateAgentWorktree: (repoHash, agentId) =>
                 (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
                     ?.WorktreePathFor(repoHash, agentId),
+            // W1-A — the daemon's OWN answer to "which repository backs this worktree", so the cycle never
+            // learns that from the worktree's agent-writable `.git` pointer. Without it the cycle still
+            // refuses a pointer aimed at the shared mirror, but a redirect at some THIRD repository is
+            // caught only by the weaker round-trip check. A substrate with no per-agent repo answers
+            // empty, which the provisioner reads back as "none" rather than as a pin that never matches.
+            locateAgentRepo: (repoHash, agentId) =>
+                (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
+                    ?.AgentRepoPathFor(repoHash, agentId),
             // The run states the cycle transitions through — Yielding, Rebasing and, the one that needs a
             // human, Conflict. PtyAgentSupervisor writes them into the session store, which streams them
             // to clients as agent state changes; AgentRunState.Conflict had no production writer at all
@@ -590,10 +598,25 @@ public static class GatewayServiceRegistration
         // The PR-head materializer (P2-12 step 2): fetch pull/<n>/head into the agent worktree. The worktree
         // path comes from the substrate's own worktree manager so the fetch targets the real jail path.
         services.AddSingleton<IPrHeadFetcher>(sp =>
-            new PrHeadFetcher((repoHash, agentId) =>
-                (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)?.WorktreePathFor(repoHash, agentId)
-                    ?? throw new InvalidOperationException(
-                        "PR-head fetch requires a WorktreeManager-backed substrate worktree path.")));
+            new PrHeadFetcher(
+                (repoHash, agentId) =>
+                    (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)?.WorktreePathFor(repoHash, agentId)
+                        ?? throw new InvalidOperationException(
+                            "PR-head fetch requires a WorktreeManager-backed substrate worktree path."),
+                // W1-A — pins WHICH repository the fetch and hard reset land in. This one matters more than
+                // the keep-alive path: the worktree here holds a third party's PR, so its `.git` pointer is
+                // attacker-supplied by construction. Without this the repository is derived from that
+                // pointer's own shape and only round-trip-checked.
+                resolveAgentRepoPath: (repoHash, agentId) =>
+                    (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
+                        ?.AgentRepoPathFor(repoHash, agentId),
+                // W1-A rework — where the non-destructive "has the head moved?" peek runs. The daemon-owned
+                // mirror, never the worker's own worktree: on an external PR that worktree belongs to a
+                // third party whose jail can write its repository config, and one `url.<x>.insteadOf` there
+                // redirects the peek's `ls-remote` to a remote of their choosing — an answer of "unchanged"
+                // the intake would then believe forever.
+                resolveMirrorPath: repoHash =>
+                    sp.GetRequiredService<IAgentEnvironment>().Repos.BareRepoPathFor(repoHash)));
 
         services.AddSingleton<IExternalPrIntake>(sp =>
         {
