@@ -22,7 +22,6 @@ Mainguard.Server.Tests/AgentSessionStoreBackpressureTests.cs
 Mainguard.Server.Tests/Agents/CoordinatorSpawnGateTests.cs
 Mainguard.Server.Tests/EgressAuditActorTests.cs
 Mainguard.Server.Tests/Fixtures/MappedGrpcRpcs.cs
-Mainguard.Server.Tests/Gateway/GatewayBindPolicyTests.cs
 Mainguard.Server.Tests/Gateway/GatewayListenerBindTests.cs
 Mainguard.Server.Tests/HarvestCredentialsRpcTests.cs
 Mainguard.Server.Tests/KillContainmentTests.cs

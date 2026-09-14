@@ -258,6 +258,14 @@ FilterExtended On
 ConnectPort 443
 ConnectPort 80
 EOF
+        # F26 — note what these two lines do NOT do. ConnectPort bounds the CONNECT verb only, and the
+        # Filter above matches a destination HOSTNAME with no notion of a port. So allowlisting the
+        # model gateway's own host (which MG-4 must do, or a confined jail cannot reach it) leaves plain
+        # HTTP to any port on the daemon host wide open: `curl -x $HTTP_PROXY http://<gateway>:11434/`
+        # reaches a local Ollama, a dev server, or Docker's TCP API. tinyproxy cannot express that
+        # constraint, so it is enforced one layer down — the daemon renders OUTPUT rules into
+        # backstop.sh (step 3 below) that admit the gateway PORT at the gateway address and drop
+        # everything else to it. If you are looking for the port bound, it is there, not here.
         # P2-08 gateway fronting. The daemon renders the model-API `upstream` lines to their own artefact
         # (EgressProxyConfig.RenderTinyproxyUpstreams) and NOTHING used to load them: the file was written
         # on every push and read by no one, so fronting was inert — every model-API request went straight to
