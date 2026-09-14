@@ -1725,7 +1725,11 @@
   `continue-on-error` is fixing those tests — narrowing the `--filter` would recreate the blindness
   the job exists to end. Both test steps carry `if: !cancelled()`, because a failing step aborts the
   rest and the first run therefore never reached `Mainguard.Server.Tests` at all, i.e. never ran the
-  `[WindowsOnlyFact]` it was added for. The `sandbox-security` job's header now states the
+  `[WindowsOnlyFact]` it was added for. Both also carry **`--blame-hang --blame-hang-timeout 15m`**,
+  the same per-TEST ceiling #369 put on the Linux `build-and-test` leg: `timeout-minutes: 45` bounds
+  the damage of a hang but only reports that the JOB stopped, whereas the collector NAMES the test
+  and writes a hang dump — and telling a hang apart from the 93-failure backlog is exactly what this
+  advisory job exists to make possible. The `sandbox-security` job's header now states the
   **Linux-engine-only** limit of the `RequiresDocker` tier out loud — hosted macOS and Windows runners
   cannot run Linux containers, so that is a permanent gap needing a self-hosted/on-device matrix, not
   a job a later PR adds. Every Linux `dotnet test` step (`build-and-test`, `sandbox-security`, and
@@ -1758,7 +1762,14 @@
   the same species (`PromptDeliveryBinderTests.WhenTheEchoWaitReturnsInstantly_...`) and blocks
   anyway. Its later steps carry `if: !cancelled()`: a failing step aborts the rest, so that one flake
   stopped the first run before `Mainguard.Server.Tests`, which is where all three `[MacOnlyFact]`
-  tests live — the entire point of the promotion.
+  tests live — the entire point of the promotion. Both test steps carry **`--blame-hang
+  --blame-hang-timeout 15m`**, the same per-TEST ceiling #369 put on the Linux `build-and-test` leg.
+  `timeout-minutes: 45` already caps the 10x-billed minutes, but a cap only says the JOB stopped; the
+  collector says WHICH TEST stopped and writes a hang dump. The same suites run on the Linux leg and
+  their slowest test is single-digit seconds, so 15 minutes cannot fire on a slow runner. It is
+  deliberately NOT set on `ci.yml`'s `sandbox-security` (its tests legitimately start containers, so a
+  per-test hang timeout is a false-positive risk) or on `nightly-network.yml` (one named test under a
+  20-minute job ceiling, which already names it).
 - **`.github/workflows/nightly-network.yml`** — the nightly leg `RequiresNetworkFact` had always
   claimed and never had. It is the **only** place `MAINGUARD_NETWORK_TESTS=1` is set, so it is the
   only thing that runs `Rfc3161AnchorTests.AnchorRoundTrip_ShouldValidateAgainstRealTsa` — the sole
