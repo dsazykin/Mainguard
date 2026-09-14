@@ -914,7 +914,6 @@ public sealed class AgentSpawnService
                     agentId);
             }
 
-
             if (settings.Count > 0)
             {
                 _keys.RememberCliSettings(session.RepoHash ?? string.Empty, session.Kind, settings);
