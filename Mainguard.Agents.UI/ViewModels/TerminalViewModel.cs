@@ -44,6 +44,25 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
     // dropping it; AttachView flushes it into the real view once one exists.
     private readonly object _pendingOutputLock = new();
     private List<byte[]>? _pendingOutput = new();
+    private int _pendingOutputBytes;
+
+    /// <summary>
+    /// How much pre-attach output this VM will hold. <b>Bounded, and it was not.</b>
+    ///
+    /// <para>A view is not guaranteed to arrive. The coordinator terminal is rebuilt by
+    /// <c>ControlCenterViewModel.RefreshCoordinatorCli</c> on every projection refresh, whether or not its
+    /// section is the one on screen, and each of those opens a live daemon attach whose frames land here
+    /// with no <see cref="ITerminalView"/> to feed. A chatty CLI — a build log, a test run, anything that
+    /// streams — therefore accumulated its ENTIRE output in managed memory for as long as the pane stayed
+    /// off screen, which is unbounded in both size and time. <c>VtScreen</c> caps its own pre-geometry feed
+    /// at 2 MB for the same reason; this layer had no cap at all, so the engine's discipline was defeated
+    /// one level above it.</para>
+    ///
+    /// <para>Matched to <c>VtScreen.PendingFeedCapBytes</c> (2 MB) and comfortably above the daemon's
+    /// 512 KB replay ring (<c>BoundTerminalSession.ReplayCapBytes</c>), so a normal reattach still fits
+    /// whole and nothing a user would actually see is ever dropped.</para>
+    /// </summary>
+    internal const int PendingOutputCapBytes = 2 * 1024 * 1024;
 
     [ObservableProperty]
     private string _agentId = string.Empty;
@@ -86,6 +105,7 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
         {
             pending = _pendingOutput;
             _pendingOutput = null;
+            _pendingOutputBytes = 0;
         }
 
         if (pending is not null)
@@ -216,6 +236,18 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
             if (_pendingOutput is not null)
             {
                 _pendingOutput.Add(data.ToArray());
+                _pendingOutputBytes += data.Length;
+
+                // Oldest first, because a terminal's meaning is in its TAIL: what is on screen when the
+                // pane finally attaches is the last screenful, and the frames dropped here are scrollback
+                // the engine would have discarded at its own 10k-line cap anyway. Dropping newest instead
+                // would freeze the pane on stale output while the CLI kept talking.
+                while (_pendingOutputBytes > PendingOutputCapBytes && _pendingOutput.Count > 1)
+                {
+                    _pendingOutputBytes -= _pendingOutput[0].Length;
+                    _pendingOutput.RemoveAt(0);
+                }
+
                 return;
             }
         }
@@ -244,6 +276,14 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
         lock (_pendingOutputLock)
         {
             _pendingOutput = null;
+            _pendingOutputBytes = 0;
         }
+    }
+
+    /// <summary>Bytes currently held for a view that has not attached yet — the thing
+    /// <see cref="PendingOutputCapBytes"/> bounds. Test seam; nothing in the app reads it.</summary>
+    internal int PendingOutputBytes
+    {
+        get { lock (_pendingOutputLock) { return _pendingOutputBytes; } }
     }
 }
