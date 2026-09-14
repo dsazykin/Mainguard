@@ -152,10 +152,11 @@ public static class GatewayServiceRegistration
         // merge-queue RPC answered NOT_FOUND — the P2-10 guarantees were neither enforced nor bypassable,
         // they were simply not running. The provisioner builds a repo's queue on the events that make a repo
         // active (ProvisionRepo / CreateWorktree / a jailed spawn) over the SAME persisted stores, and — the
-        // load-bearing detail — the SAME IMergeLeaseStore singleton the foreground merge, BeginMerge and
-        // the boot MergeReconcileTask contend for, since the one-outstanding-merge-per-repo invariant only
-        // spans origins while they share one store (MG-23). (This list previously named MergeDispatch,
-        // which fix/audit-w2b-merge-and-verification deleted; the surviving contenders are the ones above.)
+        // load-bearing detail — the SAME IMergeLeaseStore singleton the foreground merge, BeginMerge,
+        // the external-PR merge path (which takes its lease over that same BeginMerge) and the boot
+        // MergeReconcileTask all contend for, since the one-outstanding-merge-per-repo invariant only spans
+        // origins while they share one store (MG-23). (This list previously named MergeDispatch, which
+        // this branch deleted; the surviving contenders are the ones above.)
         services.AddSingleton(sp =>
         {
             var provisioner = new MergeQueueProvisioner(

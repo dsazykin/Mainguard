@@ -29,7 +29,8 @@ public sealed record ExternalPrSource(string Host, string Owner, string Repo, st
 /// the ONE audited T-23 transport (<see cref="IPullRequestService"/>), materializes each new/updated PR
 /// head as an <c>agent/pr-&lt;n&gt;</c> merge-queue entry (<b>jail</b> → fetch → <c>Working</c>), and lets
 /// the P2-10 queue verify it exactly as a local agent. Merge is routed back through the host PR merge API
-/// by <see cref="MergeDispatch"/>, never a local foreground merge.
+/// through the host pull-request merge API (the client's external merge leg), never a local
+/// foreground merge.
 ///
 /// <para><b>The jail comes first, and nothing is materialized without one.</b> This used to create a
 /// worktree and an entry and spawn nothing, so an external entry could never leave <c>Working</c>:

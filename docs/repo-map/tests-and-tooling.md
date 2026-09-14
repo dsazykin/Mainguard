@@ -302,8 +302,12 @@
   `--ff-only` refusal that is NOT staleness must not be labelled staleness or invalidate the
   verification — with a control proving the same call merges once the lock clears),
   the always-`--ignore-scripts` poisoned-postinstall canary with an injected
-  EBUSY retry, and the RT-D1 `DaemonCrashMidMerge` committed-but-unconfirmed exactly-once +
-  never-committed release), `Integration/StaleCascadeTests` (two/three-worker cascade → re-verify →
+  EBUSY retry, the RT-D1 `DaemonCrashMidMerge` committed-but-unconfirmed exactly-once +
+  never-committed release, and the three W2-B/F39 checkout-damage tests —
+  `ForegroundMerge_MidRebase_IsRefused_AndMainNeverMoves` (parked by `rebase --exec false`, so
+  `status --porcelain` is EMPTY and the old clean-tree precondition waved it through),
+  `PostMergeRefresh_UsesTheManagerTheLockfileNames_NotNpm` (a `pnpm-lock.yaml` repo must not have `npm`
+  run in it), and `ForegroundMerge_StartedFromAnotherBranch_RestoresTheUsersCheckout`), `Integration/StaleCascadeTests` (two/three-worker cascade → re-verify →
   merge blocked until fresh; fail-after-rebase → Working), `Headless/MergeQueueRenderHarness` (the
   real-`MergeQueue` rail in every theme → `merge_queue_<Theme>.png`; note this renders
   `MergeQueueView`, which is **harness-only** — the shipped Control Center hosts `QueueRailView`),
@@ -1483,7 +1487,13 @@
   root for paths that CROSS the container boundary: macOS serves the temp dir behind `/var →
   /private/var`, host git canonicalizes its gitdir/alternates, and a jail has no `/var` symlink —
   so a fixture root in the raw spelling hands in-jail git a dangling pointer. Used by
-  `SandboxFixture` and the MG-3 mirror test; production roots (`~/mainguard`) are symlink-free.
+  `SandboxFixture`, the MG-3 mirror test, and — since verification gained a pre-run probe that asks
+  the JAIL's git whether the worktree is clean — `MergeQueueEndToEndDockerTests` and
+  `QueueEntryResumeDockerTests`, whose VM roots hold the agent repositories and worktrees those
+  pointers name. Those two were the last raw-`Path.GetTempPath()` holdouts, which made their whole
+  merge leg unrunnable on a Mac (every verification refused with "not a git repository") while CI
+  stayed green, since Linux's temp path is `/tmp` and no symlink serves it. Production roots
+  (`~/mainguard`) are symlink-free.
 - **`Mainguard.Server.Tests/Agents/AgentEnvironmentFactoryTests.cs`** — pins the composition-root
   substrate choice (macOS → `MacHostAgentEnvironment`, elsewhere → `Wsl2AgentEnvironment`), the
   macos-host sync-remote shape (`mainguard-local` + local bare path, SC-2), and the deliberate
@@ -2107,8 +2117,8 @@
   gateway-less constructor** to fall back to, Save/Subscribe go through `IPrIntakeGateway` and re-render
   from what came BACK, and a daemon refusal leaves `ErrorMessage` set and `StatusMessage` null rather
   than a silent success) and
-  `MergeDispatchTests` (the origin-routed merge step — local→foreground service, external→host merge
-  API, both fire `NotifyMainMoved`). **P2-14 governance tests (Core):** `TaskPlanSchemaTests` (the
+  (`MergeDispatchTests` was **deleted** with the never-wired `MergeDispatch` it covered; the shipped
+  origin routing is `DaemonBackedOrchestrator.ConfirmMergeAsync`). **P2-14 governance tests (Core):** `TaskPlanSchemaTests` (the
   schema corpus — valid + every invalid shape → exact error sets, unknown-field rejection, oversized
   guard), `PlanApprovalTests` (reject→nothing released/no residue; approve persists the
   daemon-derived identity + survives restart; the pressure signal and its coordinator scoping),
@@ -2517,7 +2527,16 @@
   a change there is a signal — and the gateway over that same stack delivers concurrent input
   byte-exact and in order. The frames are paste-sized because over the in-proc transport a small
   write completes before the next call starts and nothing overlaps; the deterministic version lives
-  in `Mainguard.Tests/TerminalInputSerializationTests`)**,
+  in `Mainguard.Tests/TerminalInputSerializationTests`. **The constraint test DRAINS the response
+  stream and carries a 60 s deadline** — added 2026-09-12, and it is what hung CI for six hours:
+  `Attach` is duplex and the daemon echoes, so 64 unread 64 KiB echoes filled the response pipe, the
+  server's write parked on `ResponseBodyPipeWriter.FlushAsync`, it stopped draining the request
+  stream, and the client's surviving `WriteAsync` parked on back-pressure with no deadline on either
+  end. It was a race — "a second write overlaps and throws" vs "enough bytes land to fill the pipe" —
+  so it usually passed in 9 s and, when it lost, took the whole assembly with it: the collection
+  runner waits forever, every later test is simply never reported (run 34259331113 stopped at 367 of
+  1011 results and was cancelled at the 6 h job timeout). Draining is also the honest shape — a real
+  client reads what it is sent — and the deadline makes a future regression fail rather than hang)**,
   **`TerminalDetachedAttachTests` (ISSUES-LOG #23 — an attach to a KNOWN agent with no bound CLI
   answers with `TerminalGrpcService.DetachedNotice` unprompted instead of falling silently into the
   echo, and discards input rather than reflecting it; the echo is still what an unknown id gets. The
@@ -3778,7 +3797,42 @@
   journal fallback used only for an entry that names this branch; an unreadable main read as undecidable
   rather than as "never committed"; the foreground merge consuming the ref it just fetched rather than a
   stale local `agent/<id>`, and refusing outright when neither is the sha the queue verified; and the
-  keep-alive guard re-reading the `GitDirState` it decided from after the `index.lock` backoff.
+  keep-alive guard re-reading the `GitDirState` it decided from after the `index.lock` backoff. **W2-B/F38
+  adds the pair that pins the reconcile to the tip the LEASE authorized:**
+  `ART_D1_Reconcile_IsUndecidable_WhenTheMergedTipIsNotTheOneTheLeaseAuthorized` (the worker pushes after
+  `BeginMerge`, a human merges the NEW tip by hand — main contains the authorized commit, so a name-based
+  containment test says "merged", and it is not: what landed is a superset nobody verified) and its
+  control `ART_D1_Reconcile_RecordsTheMerge_WhenTheAuthorizedTipIsWhatLanded`.
+- **`Mainguard.Tests/MergeQueueProvisionerTests.cs`** also carries the W2-B/F34–F35 evidence trio:
+  `ARefusedPreVerificationPublish_FailsTheRun_AndRecordsNothing` (the publish's answer was discarded, so a
+  refused non-fast-forward left `branchSha` on the OLD mirror tip while the command ran against the new
+  worktree — nothing executes and nothing is recorded),
+  `ADirtyJailWorktree_IsRefused_AndNothingIsRecordedVerified` (git ANSWERS `M feature.cs` in the jail; the
+  only exec is the probe), and
+  `AnArmThatThrows_LeavesTheGateClosed_AndDropsTheEarlierAcknowledgments` (a `SwitchableMergeDiff` that
+  starts failing on the second arm — the store is FORGOTTEN, so `CanMerge` answers the MG-40 default-DENY
+  rather than the previous tip's acknowledgments).
+  `MergeQueueStateMachineTests.Cancel_KeepsATerminalRow_AndStillForgetsALiveOne` pins F41.
+- **`Mainguard.Server.Tests/MergeConfirmGateTests.cs`** (MG-11 + W2-B/F36–F37) — every `ConfirmMerge`
+  refusal asserts its REASON, not merely that something was refused. Its `LandedMergeWorld` helper builds
+  a REAL checkout whose main was fast-forwarded onto the agent tip plus a bare mirror of it at the path
+  `IRepoProvisioner.BareRepoPathFor` names, because the F36 fix is "stop believing the caller and go and
+  look" and a fixture of literal sha constants can only exercise the refusal half:
+  `ConfirmMerge_WhenTheGateRefusesAndTheMergeCannotBeObserved_IsRefused` (the claim on its own is not the
+  proof; the lease stays outstanding for the reconcile),
+  `ConfirmMerge_WhenTheGateRefusesAndTheMergeIsObservedOnTheCheckout_RecordsItAsConfirmRpcLate` (asserting
+  the `MergeAuthorization.ConfirmRpcLateSource` the merge record lands under),
+  `ConfirmMerge_WhenMainAlreadyContainsTheAuthorizedTip_RecordsItAsMerged` (F37 — `--ff-only` of a
+  contained branch moves nothing, and the row could previously reach no terminal but Discard) and its
+  control `ConfirmMerge_WhenNothingMovedAndMainDoesNotContainTheBranch_IsStillRefused`.
+  `LandedMergeWorld.Build(fastForwardMain:)` also builds the UNMERGED world — the agent's commit on its
+  own branch, main left where it was — for `ConfirmMerge_ReportingTheVerifiedBranchTip_WithoutHavingMerged_IsRefused`,
+  the hole the ordinary-path belt closes: the daemon hands `ExpectedBranchSha` to the client at
+  `BeginMerge`, so reporting it back was the cheapest possible forgery and every check above the belt was
+  satisfied by it. Its positive control `ConfirmMerge_ReportingTheVerifiedBranchTip_Confirms` now builds a
+  real merged world and asserts the record lands under `MergeAuthorization.ConfirmRpcSource` (the ordinary
+  path), not the late one. The class removes every checkout it built in `Dispose` — they used to
+  accumulate one `mainguard-confirm-<guid>` directory per world, per run.
 Not in the solution (scratch/experiments, don't rely on them): `Mainguard.StyleConsole`, `Mainguard.StyleTests`, `Mainguard.AvaloniaTests`.
 
 ---

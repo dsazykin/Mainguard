@@ -44,11 +44,22 @@ public static class SandboxImageVersions
     public const string EgressProxyName = "mainguard-egress-proxy";
 
     /// <summary>Source hash of <c>images/mainguard-agent-base/</c> (curated input: Dockerfile).
-    /// Last moved by the audit F33 correction to the header's <c>/nix</c> description (comment-only —
-    /// no build step changed, but the hash is over the FILE, which is the point of hashing the file);
-    /// before that by the TARGETARCH parametrization (per-arch nix-installer/devbox pins for the
-    /// macos-host substrate's arm64 builds). Regenerated via the guard test's printed hash.</summary>
-    public const string AgentBase = "97a92bade4b4ce988bf2d9b97bb9fd70465f201ad749cc2e6441437b855b83f1";
+    ///
+    /// <para>Last moved by the system-scope <c>safe.directory /workspace</c> entry — a REAL build-step
+    /// change, unlike the two before it. The bind-mounted worktree is owned by the daemon's uid and
+    /// in-jail git runs as <c>agent</c> (uid 1000); those are never the same uid under userns-remap, so
+    /// git's ownership check refused every in-jail git with <c>fatal: detected dubious ownership in
+    /// repository at '/workspace'</c>. Each in-jail script used to add the exception for itself; the
+    /// daemon's verification probe spawns <c>git status</c> with no shell and no environment, so it
+    /// could not, and nine merge-queue E2E tests failed on exactly that. See the Dockerfile's comment
+    /// for why the SYSTEM scope is the one that may be relied on.</para>
+    ///
+    /// <para>Before that by the audit F33 correction to the header's <c>/nix</c> description
+    /// (comment-only — no build step changed, but the hash is over the FILE, which is the point of
+    /// hashing the file); and before that by the TARGETARCH parametrization (per-arch
+    /// nix-installer/devbox pins for the macos-host substrate's arm64 builds). Regenerated via the
+    /// guard test's printed hash.</para></summary>
+    public const string AgentBase = "ac958f91877ebecb05b0aab1d1870e6839ebc68f19e9d28565c3ff290cba0b40";
 
     /// <summary>Source hash of <c>images/mainguard-egress-proxy/</c> (curated inputs: Dockerfile,
     /// entrypoint.sh, reload.sh).

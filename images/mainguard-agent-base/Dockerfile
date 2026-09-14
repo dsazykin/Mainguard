@@ -137,6 +137,39 @@ RUN nix profile install --profile /opt/toolchain \
 # A missing mount (no CLIs installed) simply makes it an empty PATH entry — never an error.
 ENV PATH=/opt/mainguard/adapters/bin:/opt/toolchain/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
 
+# --- /workspace is a repository this image's git is allowed to open ------------------------------
+# The bind-mounted worktree is owned by the DAEMON's uid on the VM, and every git in here runs as
+# `agent` (uid 1000). Those are never the same uid — userns-remap shifts the container's 1000 to a
+# host subuid in production, and on the CI runner the daemon's uid is 1001 — so git's ownership check
+# fires and EVERY in-jail git dies:
+#
+#     fatal: detected dubious ownership in repository at '/workspace'
+#
+# That is not a hypothetical: it is what nine merge-queue E2E tests failed on, and until now the way
+# past it was for each in-jail script to run `git config --global --add safe.directory /workspace`
+# itself (CliSettingsRoundTripDockerTests does exactly that). A rule every caller has to remember is
+# a rule the daemon's own verification probe — which asks THIS git whether the worktree is clean
+# before it records a verification against a commit — did not remember, and could not: it spawns
+# `git status` directly, with no shell and no environment of its own.
+#
+# So the image states it once, in the one scope git actually honours. `safe.directory` is read from
+# PROTECTED configuration only; git documents that as "system or global config, not ... via the
+# command line option -c safe.directory=<path>, or in environment variables", and this repository has
+# measured that ignoring live (UncRemoteTrust's W4 note, git 2.45.1.windows.1 — "the obvious one-line
+# fix does nothing at all"). Measured again here on this image's own git 2.39.5, `-c` happens to be
+# honoured; that is precisely why it is not what is relied on. A pin whose correctness depends on a
+# behaviour git documents as unsupported would go silently wrong on the next base-image bump, and
+# "silently" here means every verification in the fleet refuses.
+#
+# It grants the agent nothing. The worktree is mounted read-write and the agent already owns every
+# byte of `/workspace/.git/config` (only the `.git`, `commondir` and `gitdir` POINTER files are
+# re-mounted read-only, W1-A); trusting the directory changes whether git will OPEN it, not what the
+# agent may write in it. The exception is this one absolute path, never `*`. And it is confined to
+# the container: daemon-side git on the host still runs with `GIT_CONFIG_NOSYSTEM=1` and
+# `GIT_CONFIG_SYSTEM=/dev/null` (AgentGitCommand.HardeningEnv), so it never reads this file and its
+# ownership check stays at its strictest, exactly as W1-A left it.
+RUN git config --system --add safe.directory /workspace
+
 # /workspace is the ext4 worktree bind target; /run/secrets is a tmpfs the daemon populates post-start.
 WORKDIR /workspace
 USER agent

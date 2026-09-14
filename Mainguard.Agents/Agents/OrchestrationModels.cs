@@ -57,7 +57,7 @@ public enum WorkerMergeState
 /// Where a merge-queue entry came from (P2-12). <see cref="Local"/> is a locally-spawned agent whose
 /// merge lands via the Windows foreground merge; <see cref="External"/> is an intake'd bot PR whose
 /// merge is pushed back through the host PR merge API. The queue persists this per (repo, agent) so the
-/// pluggable merge step (<c>MergeDispatch</c>) routes correctly after a daemon restart.
+/// merge step routes to the right transport after a daemon restart.
 /// </summary>
 public enum MergeEntryOrigin { Local, External }
 

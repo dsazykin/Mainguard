@@ -293,6 +293,36 @@ public class ReviewCockpitViewModelTests
         Assert.Equal("test command changed on this branch", vm.MergeReason);
     }
 
+    /// <summary>
+    /// The gate's OTHER item keeps its badge. Splitting the RT-D2 waiver in two gave the toolchain
+    /// declaration its own wire id (<c>changed-toolchain</c>); the panel's id→kind projection knew only
+    /// <c>changed-test-command</c>, so a branch whose TOOLCHAIN drifted — the half that decides what
+    /// actually runs the tests — arrived at the reviewer classified as an ordinary risk hunk, with the
+    /// glyph that says "a human must waive this" simply absent.
+    /// </summary>
+    [Fact]
+    public void LivePanel_ToolchainDrift_IsTheSameGateKindAsTestCommandDrift()
+    {
+        var source = new FakeFlaggedSource
+        {
+            Items =
+            {
+                new FlaggedItem(
+                    "changed-toolchain", "(verification toolchain)", "ExecutableConfig",
+                    "the toolchain changed on this branch vs main", false),
+            },
+            MergeAllowed = false,
+            MergeReason = "verification toolchain changed on this branch",
+        };
+
+        var vm = new ReviewCockpitViewModel(Context(new List<FilePatch>()), live: source);
+        var row = Assert.Single(vm.FlaggedPanel.Items);
+
+        Assert.Equal("changed-toolchain", row.ItemId);
+        Assert.Equal(Mainguard.Git.Review.FlaggedKind.ChangedTestCommand, row.Kind);
+        Assert.False(vm.CanMerge);
+    }
+
     [Fact]
     public void LivePanel_WhenTheGateIsUnreachable_SaysSo_AndOffersNoAckControl()
     {

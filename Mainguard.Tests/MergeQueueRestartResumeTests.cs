@@ -110,7 +110,15 @@ public sealed class MergeQueueRestartResumeTests : IDisposable
 
         // ...and it is a verification, not a state edit: the command really executed in the jail and the
         // immutable record was written against the queue's authoritative main.
-        Assert.Equal(new[] { "npm test" }, restartedJail.Commands.Select(c => string.Join(' ', c)));
+        Assert.Equal(
+            new[]
+            {
+                // The two pre-run evidence questions, then the command itself.
+                "git status --porcelain --untracked-files=no",
+                "git rev-parse HEAD",
+                "npm test",
+            },
+            restartedJail.Commands.Select(c => string.Join(' ', c)));
         Assert.Equal(ContainerId, restartedJail.LastContainerId);
         var record = _verifications.Latest(repoHash, AgentId);
         Assert.NotNull(record);
@@ -251,11 +259,24 @@ public sealed class MergeQueueRestartResumeTests : IDisposable
         var artifacts = NewDir("mainguard-resume-artifacts-");
         _artifactDirs.Add(artifacts);
 
+        // The jail answers HEAD with the commit it is supposed to be carrying, read from the mirror at
+        // probe time. The repo is only known once the provisioner resolves the jail for an agent, which
+        // it does immediately before probing, so that call is where the answer is bound.
+        var probeRepo = new string[1];
+        if (sandboxes is GatedSandboxEngine gated)
+        {
+            gated.JailHeadSha = () => AgentBranchTip(probeRepo[0]);
+        }
+
         return new MergeQueueProvisioner(
             registry: new MergeQueueRegistry(),
             repos: new RepoProvisioner(_vmRoot),
             leases: new InMemoryMergeLeaseStore(),
-            resolveContainerId: (_, agentId) => jailAlive && agentId == AgentId ? ContainerId : null,
+            resolveContainerId: (repoHash, agentId) =>
+            {
+                probeRepo[0] = repoHash;
+                return jailAlive && agentId == AgentId ? ContainerId : null;
+            },
             queueStore: _ => _rows,
             verificationStore: _ => _verifications,
             sandboxes: sandboxes,
@@ -279,6 +300,29 @@ public sealed class MergeQueueRestartResumeTests : IDisposable
 
     private Mainguard.Git.Models.MergeQueueRow Row(string repoHash)
         => _rows.LoadAll(repoHash).Single(r => r.AgentId == AgentId);
+
+    /// <summary>
+    /// The mirror's <c>agent/&lt;id&gt;</c> tip — what a jail that really carries the agent's committed
+    /// work answers to <c>git rev-parse HEAD</c>. Empty before the ref exists, which the probe reads as
+    /// the mirror's own "not measured" and does not pair against.
+    /// </summary>
+    private string AgentBranchTip(string? repoHash)
+    {
+        if (string.IsNullOrEmpty(repoHash))
+        {
+            return string.Empty;
+        }
+
+        var barePath = Path.Combine(_vmRoot, "repos", repoHash + ".git");
+        if (!Directory.Exists(barePath))
+        {
+            return string.Empty;
+        }
+
+        using var repo = new Repository(barePath);
+        return repo.Refs["refs/heads/agent/" + AgentId]?.ResolveToDirectReference()?.TargetIdentifier
+               ?? string.Empty;
+    }
 
     private string SeedAndProvision()
     {
@@ -365,6 +409,13 @@ public sealed class MergeQueueRestartResumeTests : IDisposable
         /// <summary>Completes when a command first reaches this jail.</summary>
         public Task Entered => _entered.Task;
 
+        /// <summary>
+        /// What <c>git rev-parse HEAD</c> answers inside this jail — wired by <c>NewDaemon</c> to the
+        /// mirror's <c>agent/&lt;id&gt;</c> tip, i.e. the production invariant that the jail carries the
+        /// commit being verified.
+        /// </summary>
+        public Func<string>? JailHeadSha { get; set; }
+
         public string? LastContainerId { get; private set; }
 
         public IReadOnlyList<IReadOnlyList<string>> Commands
@@ -381,6 +432,18 @@ public sealed class MergeQueueRestartResumeTests : IDisposable
             lock (_commands)
             {
                 _commands.Add(command);
+            }
+
+            // The daemon's two pre-run evidence questions (clean worktree, HEAD == the commit being
+            // verified) are answered as a jail that really carries the agent's committed work, and are
+            // NOT held at the gate: the gate exists to hold the VERIFICATION open across a simulated
+            // daemon kill, and blocking on a preflight probe would park the run before it ever started.
+            // Both now fail CLOSED, so silence is a refusal — the HEAD answer has to be a real sha.
+            if (command.Count > 0 && string.Equals(command[0], "git", StringComparison.Ordinal))
+            {
+                return command.Contains("rev-parse")
+                    ? new SandboxExecResult(0, (JailHeadSha?.Invoke() ?? string.Empty) + "\n", "")
+                    : new SandboxExecResult(0, "", "");
             }
 
             _entered.TrySetResult();

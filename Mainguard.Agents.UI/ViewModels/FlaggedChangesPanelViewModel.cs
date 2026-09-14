@@ -170,7 +170,13 @@ public partial class FlaggedChangesPanelViewModel : ViewModelBase
     /// </summary>
     private static FlaggedKind KindOf(string itemId, string category)
     {
-        if (string.Equals(itemId, LiveChangedTestCommandItemId, StringComparison.Ordinal))
+        // Both halves of the RT-D2 gate, not only the command one: the daemon split its single waiver
+        // into (command, toolchain) and gave the toolchain its own wire id, so an id-based test that
+        // named only the first sent a toolchain-only drift down the fallback path below — where it parsed
+        // as nothing and rendered as an ordinary risk hunk, losing the glyph that says a human must
+        // waive it.
+        if (string.Equals(itemId, LiveChangedTestCommandItemId, StringComparison.Ordinal)
+            || string.Equals(itemId, LiveChangedToolchainItemId, StringComparison.Ordinal))
         {
             return FlaggedKind.ChangedTestCommand;
         }
@@ -190,6 +196,9 @@ public partial class FlaggedChangesPanelViewModel : ViewModelBase
 
     /// <summary>The id the daemon's own <c>AcknowledgeFlaggedChange</c> accepts for the RT-D2 gate item.</summary>
     internal const string LiveChangedTestCommandItemId = "changed-test-command";
+
+    /// <summary>…and for its other item, the verification toolchain declaration (one waiver each).</summary>
+    internal const string LiveChangedToolchainItemId = "changed-toolchain";
 
     private async Task AcknowledgeLiveAsync(FlaggedItemRowViewModel row)
     {
@@ -229,18 +238,24 @@ public partial class FlaggedChangesPanelViewModel : ViewModelBase
                 AcknowledgeStoreItemAsync));
         }
 
-        // The RT-D2 changed-test-command item lives on its own gate (P2-10 owns it), rendered here.
+        // The RT-D2 drift items live on their own gate (P2-10 owns it), rendered here — one row per item
+        // and one waiver per row, matching the daemon-side projection. A single row cleared both, so
+        // "I read the new test command" also waived the toolchain that runs it.
         if (_changedTestCommand && _changedGate is not null)
         {
-            var acked = !_changedGate.IsUnacknowledged(_agentId);
-            Items.Add(new FlaggedItemRowViewModel(
-                LiveChangedTestCommandItemId,
-                "(verification command)",
-                RiskCategory.ExecutableConfig.ToString(),
-                "the test command changed on this branch vs main — a branch cannot self-green",
-                FlaggedKind.ChangedTestCommand,
-                acked,
-                AcknowledgeChangedTestCommandAsync));
+            foreach (var item in _changedGate.FlaggedItems(_agentId))
+            {
+                Items.Add(new FlaggedItemRowViewModel(
+                    item,
+                    item == ChangedTestCommandGate.ToolchainItem
+                        ? "(verification toolchain)"
+                        : "(verification command)",
+                    RiskCategory.ExecutableConfig.ToString(),
+                    $"the {item} changed on this branch vs main — a branch cannot self-green",
+                    FlaggedKind.ChangedTestCommand,
+                    !_changedGate.IsUnacknowledged(_agentId, item),
+                    AcknowledgeChangedTestCommandAsync));
+            }
         }
 
         UpdateTotals();
@@ -257,9 +272,11 @@ public partial class FlaggedChangesPanelViewModel : ViewModelBase
         return Task.CompletedTask;
     }
 
-    private Task AcknowledgeChangedTestCommandAsync(FlaggedItemRowViewModel _)
+    private Task AcknowledgeChangedTestCommandAsync(FlaggedItemRowViewModel row)
     {
-        _changedGate?.Acknowledge(_agentId);
+        // The row's id IS the gate item on this local branch (see RefreshLocal), so one click waives
+        // exactly the one item the human was shown.
+        _changedGate?.Acknowledge(_agentId, row.ItemId, null);
         Refresh();
         _onChanged?.Invoke();
         return Task.CompletedTask;

@@ -1130,9 +1130,25 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
     private static string Tree(string repo, string reference, string path)
         => AgentTestGit.Run(repo, "ls-tree", "-r", "--name-only", reference, "--", path).Out.Trim();
 
+    /// <summary>
+    /// Every directory this suite makes CROSSES the container boundary — the VM root holds the agent
+    /// repositories and worktrees whose <c>.git</c>/<c>commondir</c> pointers are written by HOST git and
+    /// then read by IN-JAIL git — so it is rooted at the symlink-resolved temp path
+    /// (<see cref="CanonicalTemp"/>) rather than at <see cref="Path.GetTempPath"/>.
+    ///
+    /// <para>On macOS the raw temp path is served from behind <c>/var → /private/var</c>: the mounts are
+    /// bound at the <c>/var/folders/…</c> spelling the daemon computed, while <c>git worktree add</c>
+    /// canonicalizes and writes <c>gitdir: /private/var/folders/…</c> into the worktree's <c>.git</c>. The
+    /// container has no <c>/var</c> symlink, so that pointer dangles and every in-jail git dies "not a git
+    /// repository" — which, since verification now asks the jail's git whether the worktree is clean
+    /// before it runs, REFUSES every verification in this suite. Starting canonical keeps host git, the
+    /// mount source, the mount target and the in-jail metadata in one namespace. A no-op on Linux (where
+    /// the temp path is <c>/tmp</c>, and where CI runs), and production never had the problem: the real
+    /// substrate root is <c>~/mainguard</c>, which no symlink serves.</para>
+    /// </summary>
     private string NewDir(string prefix)
     {
-        var path = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(CanonicalTemp.Root, prefix + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(path);
         _dirs.Add(path);
         return path;

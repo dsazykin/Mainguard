@@ -41,7 +41,7 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
     private readonly MergeGateCheck? _canMerge;
     private readonly Action<string, string>? _onMerged;
     private readonly Action<string, string>? _onStaleOverride;
-    private readonly Func<string, IReadOnlyList<string>, int> _depsRefreshRunner;
+    private readonly Func<string, string, IReadOnlyList<string>, int> _depsRefreshRunner;
 
     /// <param name="environment">Substrate facade — resolves the SC-2 sync remote name (never a literal).</param>
     /// <param name="journal">The T-19 operation journal (the merge is one undoable op).</param>
@@ -50,7 +50,9 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
     /// ungated — which is only ever correct for a caller that has no queue at all.</param>
     /// <param name="onMerged">Fired after a confirmed merge: (agentId, newMainSha) → daemon <c>ConfirmHumanMerge</c>/<c>NotifyMainMoved</c>.</param>
     /// <param name="onStaleOverride">Fired when the loud override path is used: (agentId, reason) → <c>stale_override_used</c> audit.</param>
-    /// <param name="depsRefreshRunner">Runs the post-merge dependency refresh (workingDir, args) → exit; default uses the package manager.</param>
+    /// <param name="depsRefreshRunner">Runs the post-merge dependency refresh (workingDir, <b>the package
+    /// manager the repo's lockfile named</b>, args) → exit. The manager is a parameter and not a constant
+    /// because the default runner used to hardcode <c>npm</c> while the caller detected pnpm/yarn.</param>
     public ForegroundMergeService(
         IAgentEnvironment environment,
         IOperationJournal journal,
@@ -58,7 +60,7 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         MergeGateCheck? canMerge = null,
         Action<string, string>? onMerged = null,
         Action<string, string>? onStaleOverride = null,
-        Func<string, IReadOnlyList<string>, int>? depsRefreshRunner = null)
+        Func<string, string, IReadOnlyList<string>, int>? depsRefreshRunner = null)
         : this(
             (environment ?? throw new ArgumentNullException(nameof(environment))).ResolveSyncRemote,
             journal,
@@ -90,7 +92,9 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
     /// enforced daemon-side (<c>BeginMerge</c> refuses an ungated branch before it ever grants a lease).</param>
     /// <param name="onMerged">Fired after a confirmed merge: (agentId, newMainSha) → daemon <c>ConfirmHumanMerge</c>/<c>NotifyMainMoved</c>.</param>
     /// <param name="onStaleOverride">Fired when the loud override path is used: (agentId, reason) → <c>stale_override_used</c> audit.</param>
-    /// <param name="depsRefreshRunner">Runs the post-merge dependency refresh (workingDir, args) → exit; default uses the package manager.</param>
+    /// <param name="depsRefreshRunner">Runs the post-merge dependency refresh (workingDir, <b>the package
+    /// manager the repo's lockfile named</b>, args) → exit. The manager is a parameter and not a constant
+    /// because the default runner used to hardcode <c>npm</c> while the caller detected pnpm/yarn.</param>
     public ForegroundMergeService(
         Func<string, SyncRemote> resolveSyncRemote,
         IOperationJournal journal,
@@ -98,7 +102,7 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         MergeGateCheck? canMerge = null,
         Action<string, string>? onMerged = null,
         Action<string, string>? onStaleOverride = null,
-        Func<string, IReadOnlyList<string>, int>? depsRefreshRunner = null)
+        Func<string, string, IReadOnlyList<string>, int>? depsRefreshRunner = null)
     {
         _resolveSyncRemote = resolveSyncRemote ?? throw new ArgumentNullException(nameof(resolveSyncRemote));
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
@@ -227,6 +231,20 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
                 "the working tree has uncommitted changes — commit or stash them, then merge");
         }
 
+        // (1b) A repository in the MIDDLE of an operation. `status --porcelain` is empty during a rebase
+        // that has stopped without conflicts (an `edit`/`break` stop, or a `--exec` that failed), so the
+        // clean-tree check above says yes and everything after it proceeds: the checkout at (3) rewrites
+        // HEAD out from under the in-flight sequence, the merge at (6) lands on main, and the user comes
+        // back to a repository whose rebase state describes a branch it is no longer on. Git's own
+        // refusal would be "cannot rebase: you have unstaged changes" — a sentence about the wrong thing
+        // — so the state is asked about directly and named.
+        if (InProgressOperation(request.RepoPath) is { } inProgress)
+        {
+            return new ForegroundMergeResult(false, null, CasLost: false,
+                $"this repository is in the middle of {inProgress} — finish or abort it, then merge. "
+                + "Merging now would switch branches underneath the operation in progress.");
+        }
+
         // (2) SC-2: the sync remote name is always resolved, never a hardcoded "mainguard-vm" literal.
         // A failed fetch is fatal, not cosmetic: whatever agent/<id> happens to be in this repo is then
         // an unknown-age copy, and merging it would land work the queue never verified.
@@ -240,8 +258,13 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         }
 
         // (3) Ensure HEAD is on the main branch so the ff-only merge advances refs/heads/main.
-        var currentBranch = RevParse(request.RepoPath, "--abbrev-ref", "HEAD");
-        if (!string.Equals(currentBranch, request.MainBranch, StringComparison.Ordinal))
+        //
+        // Borrowed, not taken: whatever branch the user was on is restored at (7). This used to be a
+        // one-way trip — a merge started from a feature branch left the checkout parked on main, so the
+        // user's next edit and commit landed on the wrong branch, with nothing having said so.
+        var originalBranch = RevParse(request.RepoPath, "--abbrev-ref", "HEAD");
+        var borrowedCheckout = !string.Equals(originalBranch, request.MainBranch, StringComparison.Ordinal);
+        if (borrowedCheckout)
         {
             var (checkoutCode, _, checkoutErr) = GitService.RunGit(request.RepoPath, "checkout", request.MainBranch);
             if (checkoutCode != 0
@@ -253,6 +276,28 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
             }
         }
 
+        try
+        {
+            return MergeOnMain(request, syncRemote);
+        }
+        finally
+        {
+            // Give the checkout back, on EVERY exit — a refused merge source, a lost CAS, a failing
+            // `--ff-only`, a success, or a throw. Best-effort: the merge (or its absence) is already the
+            // caller's answer, and a restore that cannot run must not turn a landed merge into an error.
+            if (borrowedCheckout)
+            {
+                GitService.RunGit(request.RepoPath, "checkout", originalBranch);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Steps (4)–(7) of <see cref="PerformJournaledMerge"/>, split out only so its caller can restore the
+    /// user's branch in one <c>finally</c> instead of at every <c>return</c>.
+    /// </summary>
+    private ForegroundMergeResult MergeOnMain(ForegroundMergeRequest request, SyncRemote syncRemote)
+    {
         // (4) Resolve what the merge will consume. The queue's input is refs/heads/agent/<id> in the mirror;
         // in THIS repo that commit is reachable either as a local branch or — with the sync remote's default
         // refspec — only as refs/remotes/<sync>/agent/<id>. `git merge agent/<id>` does NOT fall back to the
@@ -483,18 +528,96 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         // EVERY package-manager invocation is script-free: "--ignore-scripts" is always present, so a
         // poisoned dependency lifecycle hook in an agent branch never executes on the user's host (the canary).
         var args = new List<string> { "install", "--ignore-scripts" };
-        _ = manager; // the manager selects the binary in the runner; the args are identical + script-free.
 
-        WithNtfsRetry(() => _depsRefreshRunner(repoPath, args));
+        // The DETECTED manager reaches the runner. It used to be detected and then thrown away — the
+        // comment said "the manager selects the binary in the runner" and the runner hardcoded `npm` —
+        // so a merge in a pnpm or yarn repository ran `npm install` in the user's checkout: npm writes a
+        // `package-lock.json` the repo does not use and lays down a differently-resolved `node_modules`,
+        // immediately after a precondition that refused to proceed on an unclean tree.
+        WithNtfsRetry(() => _depsRefreshRunner(repoPath, manager, args));
     }
 
+    /// <summary>
+    /// Which package manager this repository actually uses, decided by the lockfile that is present.
+    /// First match wins and the order is deliberate: a repo carrying both a <c>pnpm-lock.yaml</c> and a
+    /// stale <c>package-lock.json</c> is a pnpm repo with a leftover file.
+    /// </summary>
     private static (string Manager, bool Present) DetectPackageManager(string repoPath)
     {
         if (File.Exists(Path.Combine(repoPath, "pnpm-lock.yaml"))) return ("pnpm", true);
         if (File.Exists(Path.Combine(repoPath, "yarn.lock"))) return ("yarn", true);
+        if (File.Exists(Path.Combine(repoPath, "bun.lockb")) ||
+            File.Exists(Path.Combine(repoPath, "bun.lock"))) return ("bun", true);
         if (File.Exists(Path.Combine(repoPath, "package-lock.json")) ||
             File.Exists(Path.Combine(repoPath, "npm-shrinkwrap.json"))) return ("npm", true);
         return (string.Empty, false);
+    }
+
+    /// <summary>
+    /// The name of the sequencing operation this repository is in the middle of, or null when it is idle.
+    ///
+    /// <para>Asked of the git directory's own state files, because <c>status --porcelain</c> cannot answer
+    /// it: a rebase stopped at an <c>edit</c> or <c>break</c> step, or one whose <c>--exec</c> failed, has
+    /// a perfectly clean tree. Git's own paths are used (<c>rev-parse --git-path</c>) rather than
+    /// <c>.git/…</c> literals so this is right in a worktree, a submodule and a repo with a
+    /// <c>.git</c> file.</para>
+    /// </summary>
+    private static string? InProgressOperation(string repoPath)
+    {
+        // Ordered most-specific first: an interactive rebase has BOTH rebase-merge and (historically)
+        // a sequencer directory, and naming the rebase is what the human can act on.
+        if (GitPathExists(repoPath, "rebase-merge") || GitPathExists(repoPath, "rebase-apply"))
+        {
+            return "a rebase";
+        }
+
+        if (GitPathExists(repoPath, "MERGE_HEAD"))
+        {
+            return "a merge";
+        }
+
+        if (GitPathExists(repoPath, "CHERRY_PICK_HEAD"))
+        {
+            return "a cherry-pick";
+        }
+
+        if (GitPathExists(repoPath, "REVERT_HEAD"))
+        {
+            return "a revert";
+        }
+
+        if (GitPathExists(repoPath, "BISECT_LOG"))
+        {
+            return "a bisect";
+        }
+
+        return null;
+    }
+
+    // `git rev-parse --git-path <name>` resolves a path INSIDE this working tree's git directory,
+    // whatever shape it has. A git that cannot answer reports nothing in progress: this guard refuses a
+    // merge, and refusing one on an unreadable probe would make an unrelated git failure look like a
+    // stuck rebase.
+    private static bool GitPathExists(string repoPath, string name)
+    {
+        var (code, output, _) = GitService.RunGit(repoPath, "rev-parse", "--git-path", name);
+        if (code != 0)
+        {
+            return false;
+        }
+
+        var path = output.Trim();
+        if (path.Length == 0)
+        {
+            return false;
+        }
+
+        if (!Path.IsPathRooted(path))
+        {
+            path = Path.Combine(repoPath, path);
+        }
+
+        return File.Exists(path) || Directory.Exists(path);
     }
 
     // Retries the NTFS-flaky file operation on EPERM/EBUSY (surfaced as IOException /
@@ -525,15 +648,16 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         }
     }
 
-    private static int DefaultDepsRefreshRunner(string workingDir, IReadOnlyList<string> args)
+    private static int DefaultDepsRefreshRunner(string workingDir, string manager, IReadOnlyList<string> args)
     {
         // The refresh runs the package manager on the user's host. Best-effort: a missing manager must
-        // not fail the merge. The first arg selects the binary family; here we default to npm.
+        // not fail the merge. The BINARY is the one the repository's own lockfile named — running npm in
+        // a pnpm repo does not refresh anything, it rewrites the dependency tree.
         try
         {
             var psi = new System.Diagnostics.ProcessStartInfo
             {
-                FileName = "npm",
+                FileName = manager,
                 WorkingDirectory = workingDir,
                 UseShellExecute = false,
                 CreateNoWindow = true,

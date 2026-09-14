@@ -21,6 +21,17 @@ public interface IVerificationStore
     /// <summary>The id of the most recent stored row for an agent (for the queue's persisted pointer), or null.</summary>
     long? LastId(string repoHash, string agentId);
 
+    /// <summary>
+    /// The record a queue row's persisted pointer names, or null when there is no such row in this repo.
+    ///
+    /// <para>The counterpart to <see cref="LastId"/>, and the reason that pointer is worth persisting: on
+    /// restart the queue must rehydrate <b>the record its state was settled from</b>, not merely the
+    /// newest record the agent has. Those differ whenever a row was written and a later verification
+    /// landed without the row moving — at which point <see cref="Latest"/> would re-attach a different
+    /// verdict to a state that was decided by another one.</para>
+    /// </summary>
+    VerificationRecord? ById(string repoHash, long id);
+
     /// <summary>Every record for an agent, oldest first (immutability assertions read the full history).</summary>
     IReadOnlyList<VerificationRecord> History(string repoHash, string agentId);
 }
@@ -58,6 +69,17 @@ public sealed class InMemoryVerificationStore : IVerificationStore
         {
             var ids = _rows.Where(r => r.RepoHash == repoHash && r.Record.AgentId == agentId).Select(r => r.Id).ToList();
             return ids.Count == 0 ? null : ids.Max();
+        }
+    }
+
+    public VerificationRecord? ById(string repoHash, long id)
+    {
+        lock (_gate)
+        {
+            return _rows
+                .Where(r => r.Id == id && r.RepoHash == repoHash)
+                .Select(r => r.Record)
+                .FirstOrDefault();
         }
     }
 
@@ -129,6 +151,16 @@ public sealed class DbVerificationStore : IVerificationStore
                 .Select(v => v.Id)
                 .ToList();
             return ids.Count == 0 ? null : ids.Max();
+        }
+    }
+
+    public VerificationRecord? ById(string repoHash, long id)
+    {
+        lock (_gate)
+        {
+            using var db = _contextFactory();
+            var row = db.VerificationRows.FirstOrDefault(v => v.Id == id && v.RepoHash == repoHash);
+            return row is null ? null : Map(row);
         }
     }
 

@@ -202,7 +202,7 @@ public sealed class LockfileAdvisoryCockpitTests : IDisposable
             LockfileAdvisoryCockpitTests test, OsvSnapshot snapshot, string branchLockfile)
         {
             var repoHash = test.SeedAndProvision();
-            test.CommitOnAgentBranch(repoHash, branchLockfile);
+            var branchSha = test.CommitOnAgentBranch(repoHash, branchLockfile);
 
             var daemon = new DaemonFixture();
             _ = daemon.Token; // force one synchronous host build before the pumps race on it
@@ -212,7 +212,7 @@ public sealed class LockfileAdvisoryCockpitTests : IDisposable
 
             // The production provisioner, registering into the DAEMON'S OWN registry and sharing its lease
             // singleton — so what the RPCs serve is the queue this built, not a stand-in beside it.
-            var provisioner = test.NewProvisioner(daemon, snapshot);
+            var provisioner = test.NewProvisioner(daemon, snapshot, branchSha);
             var context = provisioner.EnsureQueue(repoHash)
                 ?? throw new InvalidOperationException("the provisioner built no queue for the seeded mirror");
 
@@ -321,11 +321,15 @@ public sealed class LockfileAdvisoryCockpitTests : IDisposable
         return new RepoProvisioner(_vmRoot).Provision(_source).RepoHash;
     }
 
-    /// <summary>Lands the agent's work — a rewritten lockfile — on <c>agent/&lt;id&gt;</c>.</summary>
-    private void CommitOnAgentBranch(string repoHash, string branchLockfile)
+    /// <summary>
+    /// Lands the agent's work — a rewritten lockfile — on <c>agent/&lt;id&gt;</c>, and hands back the commit
+    /// it landed at: that sha is what the jail's <c>git rev-parse HEAD</c> has to answer now that the
+    /// daemon's pre-run evidence probe fails closed on a jail whose git cannot say where it is.
+    /// </summary>
+    private string CommitOnAgentBranch(string repoHash, string branchLockfile)
     {
         var worktree = new WorktreeManager(_vmRoot).CreateAgentWorktree(repoHash, AgentId);
-        WriteAndCommit(worktree, LockfilePath, branchLockfile, "bump dependencies");
+        return WriteAndCommit(worktree, LockfilePath, branchLockfile, "bump dependencies");
     }
 
     /// <summary>
@@ -333,14 +337,14 @@ public sealed class LockfileAdvisoryCockpitTests : IDisposable
     /// <paramref name="snapshot"/> is a test input; every other argument is what
     /// <c>GatewayServiceRegistration</c> passes.
     /// </summary>
-    private MergeQueueProvisioner NewProvisioner(DaemonFixture daemon, OsvSnapshot snapshot) => new(
+    private MergeQueueProvisioner NewProvisioner(DaemonFixture daemon, OsvSnapshot snapshot, string headSha) => new(
         registry: (MergeQueueRegistry)daemon.Services.GetRequiredService<IMergeQueueRegistry>(),
         repos: new RepoProvisioner(_vmRoot),
         leases: daemon.Services.GetRequiredService<IMergeLeaseStore>(),
         resolveContainerId: (_, _) => ContainerId,
         queueStore: _ => new InMemoryMergeQueueStore(),
         verificationStore: _ => new InMemoryVerificationStore(),
-        sandboxes: new PassingSandboxEngine(),
+        sandboxes: new PassingSandboxEngine(headSha),
         artifactDirectory: _artifacts,
         mergeDiff: new MergeBranchDiffService(
             new RepoProvisioner(_vmRoot),
@@ -349,7 +353,7 @@ public sealed class LockfileAdvisoryCockpitTests : IDisposable
         checkAgentBranch: (repoHash, agentId) => new WorktreeManager(_vmRoot).CheckAgentBranch(repoHash, agentId),
         osvSnapshot: snapshot);
 
-    private static void WriteAndCommit(string repoPath, string relPath, string content, string message)
+    private static string WriteAndCommit(string repoPath, string relPath, string content, string message)
     {
         var full = Path.Combine(repoPath, relPath);
         Directory.CreateDirectory(Path.GetDirectoryName(full)!);
@@ -357,7 +361,7 @@ public sealed class LockfileAdvisoryCockpitTests : IDisposable
         using var repo = new Repository(repoPath);
         Commands.Stage(repo, relPath);
         var sig = new Signature("test-user", "test@mainguard.local", DateTimeOffset.Now);
-        repo.Commit(message, sig, sig);
+        return repo.Commit(message, sig, sig).Sha;
     }
 
     private static async Task<bool> WaitUntilAsync(Func<bool> condition)
@@ -406,10 +410,24 @@ public sealed class LockfileAdvisoryCockpitTests : IDisposable
     }
 
     /// <summary>Reports a clean container-runtime exit — pass/fail is never what these tests are about.</summary>
-    private sealed class PassingSandboxEngine : ISandboxEngine
+    private sealed class PassingSandboxEngine(string headSha) : ISandboxEngine
     {
         public Task<SandboxExecResult> ExecAsync(string containerId, IReadOnlyList<string> command, CancellationToken ct = default)
-            => Task.FromResult(new SandboxExecResult(0, "output", ""));
+        {
+            // The daemon's pre-run evidence probes answer for a jail that carries exactly the commit being
+            // verified: `git status --porcelain` says nothing (clean), `git rev-parse HEAD` names the tip
+            // the agent branch was committed at. Both now fail CLOSED, so a double that answers neither —
+            // or answers the blanket "output" below, which reads as permanent local edits — refuses every
+            // run before the lockfile review these tests are about could be reached.
+            if (command.Count > 0 && string.Equals(command[0], "git", StringComparison.Ordinal))
+            {
+                return Task.FromResult(command.Contains("rev-parse")
+                    ? new SandboxExecResult(0, headSha + "\n", "")
+                    : new SandboxExecResult(0, "", ""));
+            }
+
+            return Task.FromResult(new SandboxExecResult(0, "output", ""));
+        }
 
         public Task<SandboxHandle> SpawnAsync(SandboxSpawnRequest request, CancellationToken ct = default) => throw new NotSupportedException();
         public Task PauseAsync(string containerId, CancellationToken ct = default) => Task.CompletedTask;

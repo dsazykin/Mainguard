@@ -261,8 +261,10 @@ public sealed class MergeAuditRpcTests : IDisposable
             host.Services.GetRequiredService<IAuditLog>().Read(),
             e => e.Type == MergeQueue.MergedEvent && e.Fields.GetValueOrDefault("agent") == _agentId);
 
+        // Per item: the waiver is per drift item now, so the evidence line states each item's own state
+        // rather than one verdict standing for every item the gate happened to be holding.
         Assert.Contains(
-            "changed-test-command: test command changed vs main — acknowledged",
+            "changed-test-command: test command (acknowledged) changed vs main",
             merged.Fields["gates"], StringComparison.Ordinal);
     }
 
