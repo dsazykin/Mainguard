@@ -67,10 +67,13 @@ public sealed class TerminalInputSerializationRpcTests : IClassFixture<DaemonFix
                 {
                 }
             }
-            catch (Exception)
+            catch (OperationCanceledException) when (drain.IsCancellationRequested)
             {
-                // The call is torn down at the end of the test (dispose, deadline or cancellation); how
-                // the read loop learns that is not what this test measures.
+                // The only expected end: the test finished and cancelled the drain itself.
+            }
+            catch (RpcException rpc) when (rpc.StatusCode == StatusCode.Cancelled && drain.IsCancellationRequested)
+            {
+                // Same ending, surfaced through gRPC because the call was torn down under it.
             }
         });
 
@@ -101,6 +104,12 @@ public sealed class TerminalInputSerializationRpcTests : IClassFixture<DaemonFix
             ex is InvalidOperationException && ex.Message.Contains("previous write is in progress"));
 
         drain.Cancel();
+
+        // Assert the DRAIN's outcome too. Swallowing every exception here let a broken Attach/echo path
+        // look like a clean drain: the writer raises "previous write is in progress" on the client side
+        // all by itself, so the assertion above would still pass while the back-pressure protection this
+        // test exists to hold was never exercised. Only the test's own cancellation is an expected end;
+        // anything else now fails the test rather than being discarded.
         await reader.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
