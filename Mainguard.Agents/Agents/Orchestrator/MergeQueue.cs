@@ -792,7 +792,10 @@ public sealed class MergeQueue : IMergeQueue
             // against an older observed tip would then refuse a genuinely fresh run.
             if (movedMidRun)
             {
-                _branchTip[agentId] = during;
+                // `during` is the value the TryGetValue above produced: movedMidRun is only true
+                // when that lookup succeeded, and _tipDuringRun holds non-null shas. Nullable flow
+                // analysis cannot carry that fact across the bool, hence the assertion.
+                _branchTip[agentId] = during!;
             }
             else if (!string.IsNullOrEmpty(record.BranchSha))
             {

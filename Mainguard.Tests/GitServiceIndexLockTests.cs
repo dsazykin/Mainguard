@@ -1,6 +1,6 @@
 using System;
 using System.IO;
-using System.Threading.Tasks;
+using System.Threading;
 using Mainguard.Agents.Services;
 using Mainguard.Git.Exceptions;
 using Mainguard.Git.Services;
@@ -21,24 +21,42 @@ public class GitServiceIndexLockTests
     private static string LockPath(string repoPath) => Path.Combine(repoPath, ".git", "index.lock");
 
     [Fact]
-    public async Task StageFile_WhenIndexLockClearsDuringBackoff_SucceedsSilently()
+    public void StageFile_WhenIndexLockClearsDuringBackoff_SucceedsSilently()
     {
         using var fx = new TempRepoFixture();
         fx.CommitFile("a.txt", "one\n", "seed");
         fx.WriteFile("a.txt", "two\n");
 
-        // Simulate a concurrent tool: the lock exists when we start and clears ~60 ms in —
-        // inside the retry window (25+50+100 ms of backoff across four attempts).
+        // Simulate a concurrent tool: the lock exists when we start and clears ~60 ms in — after the
+        // first attempt has certainly failed, and well inside the retry window (25+50+100 ms of
+        // backoff across four attempts).
+        //
+        // The releaser is a DEDICATED THREAD, and staging does not begin until it is running. This
+        // used to be `Task.Run(async () => { await Task.Delay(60); … })`, which made the release
+        // depend on the thread pool: on a loaded CI runner — the whole suite plus several daemon
+        // hosts racing for ports — a queued continuation can be starved past the retry's entire
+        // 175 ms budget. All four attempts then still see the lock and this test lands on the
+        // WEDGED-lock path it is not about, which is exactly how it failed in CI. A dedicated thread
+        // is scheduled by the OS rather than by a saturated pool, so 60 ms means 60 ms.
         File.WriteAllText(LockPath(fx.RepoPath), "");
-        var releaser = Task.Run(async () =>
+
+        using var releaserRunning = new ManualResetEventSlim(false);
+        var releaser = new Thread(() =>
         {
-            await Task.Delay(60);
+            releaserRunning.Set();
+            Thread.Sleep(60);
             File.Delete(LockPath(fx.RepoPath));
-        });
+        })
+        {
+            IsBackground = true,
+            Name = "index.lock releaser",
+        };
+        releaser.Start();
+        releaserRunning.Wait();
 
         var git = new GitService();
         git.StageFile(fx.RepoPath, "a.txt"); // must not throw
-        await releaser;
+        releaser.Join();
 
         var staged = git.GetRepositoryStatus(fx.RepoPath);
         Assert.Contains(staged, s => s.FilePath == "a.txt");
