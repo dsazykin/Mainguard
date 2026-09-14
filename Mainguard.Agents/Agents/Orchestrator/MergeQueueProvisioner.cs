@@ -903,7 +903,7 @@ public sealed class MergeQueueProvisioner
             // creates its worktree inside the launcher rather than through the RepoSync RPC, so returning
             // early here would also skip registering the queue, the main-sha reconcile and the restart
             // resume for the whole repository. Gating a row is not a reason to stop governing a repo.
-            EnsureQueue(repoHandle);
+            EnsureQueue(repoHandle ?? string.Empty);
 
             _log?.Invoke(
                 $"merge queue repo={repoHandle} agent={agentId} — no queue row yet: {reason}");

@@ -69,7 +69,9 @@ public sealed class QueueProjectionRenderingTests
 
     private sealed class TwoVerifiedStub : IMergeQueueService
     {
-        public event Action? Changed;
+        // Never raised: this stub is a fixed projection, so the seam's event exists only to
+        // satisfy the interface — an accessor pair rather than a field-like event says so.
+        public event Action? Changed { add { } remove { } }
 
         public string MainSha => "abc123";
 

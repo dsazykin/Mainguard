@@ -479,7 +479,9 @@ public class QueueEntryLifecycleRenderHarness
     /// fixture, kept separate so the main stub keeps its realistic two-file conflict.</summary>
     private sealed class UnmeasuredConflictStub : IMergeQueueService
     {
-        public event Action? Changed;
+        // Never raised: this stub is a fixed projection, so the seam's event exists only to
+        // satisfy the interface — an accessor pair rather than a field-like event says so.
+        public event Action? Changed { add { } remove { } }
 
         public string MainSha => "a1b2c3d4e5";
 
@@ -605,7 +607,9 @@ public class QueueEntryLifecycleRenderHarness
     /// </summary>
     private sealed class StubQueue : IMergeQueueService
     {
-        public event Action? Changed;
+        // Never raised: this stub is a fixed projection, so the seam's event exists only to
+        // satisfy the interface — an accessor pair rather than a field-like event says so.
+        public event Action? Changed { add { } remove { } }
 
         public List<string> Discarded { get; } = new();
 

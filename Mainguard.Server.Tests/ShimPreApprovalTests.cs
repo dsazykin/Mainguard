@@ -133,7 +133,8 @@ public sealed class ShimPreApprovalTests
         var argv = SandboxAgentLauncher.ApplyShimPreApproval(
             existing, ClaudeCode(), "/ipc", AgentIpcEndpointRole.Coordinator);
 
-        Assert.Equal(existing, argv!.Take(existing.Length));
+        Assert.NotNull(argv);
+        Assert.Equal(existing, argv.Take(existing.Length));
         Assert.Equal(existing.Length + 2, argv.Count);
     }
 
