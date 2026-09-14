@@ -90,6 +90,48 @@ public sealed class DaemonBackedOrchestrator :
     internal Func<CancellationToken, Task<IReadOnlyList<Proto.AgentInfo>>>? AgentListOverride { get; set; }
 
     /// <summary>
+    /// Test seam: the spend stream <see cref="SpendPumpAsync"/> subscribes to — the exact analogue of
+    /// <see cref="AgentEventStreamOverride"/>. Never set in production, where it is
+    /// <c>DaemonClient.StreamSpendAsync</c>.
+    ///
+    /// <para>The property under test is that a SECOND subscription does not double the totals. The daemon
+    /// replays the whole spend ledger on every <c>StreamSpend</c> subscribe (GatewayGrpcService), and this
+    /// client accumulates — so before the reset in <see cref="SpendPumpAsync"/>, every daemon restart,
+    /// dropped HTTP/2 stream or tier-1 update added one full ledger to the Resources rail and to every
+    /// per-agent figure. Unobservable through the real client, whose transport loop only returns on a
+    /// terminal status or cancellation.</para>
+    /// </summary>
+    internal Func<CancellationToken, IAsyncEnumerable<Proto.SpendSample>>? SpendStreamOverride { get; set; }
+
+    /// <summary>
+    /// The five legs of one human merge — the RT-D1 conversation's three RPCs and the two transports that
+    /// can perform step 2 — as test seams, in the same spirit as <see cref="SpendStreamOverride"/> and
+    /// never set in production.
+    ///
+    /// <para><b>What they exist to assert.</b> Which token each leg runs under, and which legs run at all,
+    /// is the whole of <see cref="ConfirmMergeAsync(string, CancellationToken)"/>'s honesty: a merge that
+    /// LANDED must still be recorded even though the caller stopped waiting, and must never be abandoned
+    /// or described as not having happened. Every one of those is a statement about ordering and
+    /// cancellation between the legs, and none of it is observable through the real transport — the RPCs
+    /// need a live daemon and step 2 needs a real checkout with a real remote and a real host API. So the
+    /// legs are injected and the SHIPPED method is driven; what a test replaces is who answers, never
+    /// what the method does with the answer.</para>
+    /// </summary>
+    internal Func<string, string, CancellationToken, Task<Proto.BeginMergeResponse>>? BeginMergeOverride { get; set; }
+
+    /// <inheritdoc cref="BeginMergeOverride"/>
+    internal Func<string, string, string, string, CancellationToken, Task<bool>>? RecordMergeOverride { get; set; }
+
+    /// <inheritdoc cref="BeginMergeOverride"/>
+    internal Func<string, string, string, string, CancellationToken, Task<bool>>? AbandonMergeOverride { get; set; }
+
+    /// <inheritdoc cref="BeginMergeOverride"/>
+    internal Func<string, Mainguard.Agents.Services.IJournaledMergeExecutor>? MergeExecutorOverride { get; set; }
+
+    /// <inheritdoc cref="BeginMergeOverride"/>
+    internal Func<string, Mainguard.Agents.Services.IExternalPrMergeExecutor>? ExternalMergeExecutorOverride { get; set; }
+
+    /// <summary>
     /// How often the login-harvest pump sweeps every live agent's CLI login state into the host OS
     /// keychain. A minute is a compromise: each sweep is one <c>ListAgents</c> plus one read-only
     /// <c>HarvestAgentCredentials</c> per agent (a <c>base64</c> of a few small files inside the jail),
@@ -414,6 +456,13 @@ public sealed class DaemonBackedOrchestrator :
             _gate_.Clear();
             _origins.Clear();
             _mainSha = string.Empty;
+
+            // The mirror-freshness pair is part of the same projection and was being left behind: after
+            // detaching, the rail went on reporting "mirror main refreshed 2 minutes ago" — or the PREVIOUS
+            // repo's refresh error — about a repository this adapter is no longer bound to. An age stamp
+            // that survives the thing it describes is a fact about nothing.
+            _mirrorMainRefreshedAt = null;
+            _mirrorMainRefreshError = null;
         }
 
         RaiseIsolated(() => Changed?.Invoke());
@@ -511,15 +560,68 @@ public sealed class DaemonBackedOrchestrator :
         }, ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// The spend pump. <b>Zeroes the accumulators once per subscription, on its first sample</b>, and that
+    /// reset is the whole correctness of this surface.
+    ///
+    /// <para><b>Why.</b> <c>StreamSpend</c> is a REPLAY stream, not a delta stream: the daemon walks the
+    /// repo's whole spend ledger from the beginning for each subscriber, then follows it live. This client
+    /// ACCUMULATES what arrives (<see cref="ApplySpendSample"/> adds into <c>_totalUsdMicros</c> /
+    /// <c>_totalTokens</c> / <c>_agentSpend</c>), which is right for one subscription and wrong for two.
+    /// The pump re-subscribes on every dropped stream — a daemon restart, a tier-1 auto-update bouncing
+    /// <c>mainguardd</c>, an HTTP/2 stream reset — and each of those therefore added ONE FULL LEDGER to
+    /// the Resources rail's running total and to every per-agent row. A long session on a flaky daemon
+    /// reported a multiple of what was actually spent, with no way for the human to tell.</para>
+    ///
+    /// <para>The reset belongs here rather than in the applier because the ledger's identity is the
+    /// SUBSCRIPTION: everything one subscription delivers is the complete history as of that moment, so
+    /// the totals it builds replace the previous subscription's rather than extending them. It is deferred
+    /// to that subscription's FIRST sample so that a reconnect ATTEMPT — of which there is one every
+    /// <see cref="ReconnectDelay"/> while the daemon is down — never blanks a ledger it has nothing to
+    /// replace with. See the body.</para>
+    /// </summary>
     private async Task SpendPumpAsync(CancellationToken ct)
     {
+        var stream = SpendStreamOverride ?? (token => _client.StreamSpendAsync(token));
         await ReconnectLoopAsync(async token =>
         {
-            await foreach (var sample in _client.StreamSpendAsync(token).ConfigureAwait(false))
+            // The reset is LAZY — it fires on the first sample a subscription actually delivers, never on
+            // the ATTEMPT to open one. Zeroing up front emptied `_agentSpend` the moment the daemon went
+            // away and kept it empty for every retry of the reconnect loop, while `Current` went on
+            // returning the last sample it had: during an outage the Resources rail showed a non-zero
+            // fleet total with $0.00 against every agent in it, which is two readings of the same ledger
+            // that cannot both be true. The previous subscription's totals now stand, unchanged and
+            // correct-as-of-last-contact, until the replacement has something to replace them with.
+            var replaced = false;
+            await foreach (var sample in stream(token).ConfigureAwait(false))
             {
+                if (!replaced)
+                {
+                    ResetSpendAccumulators();
+                    replaced = true;
+                }
+
                 ApplySpendSample(sample);
             }
         }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Runs the spend pump against <paramref name="ct"/> for a test, so the per-subscription
+    /// reset is asserted without <see cref="Start"/>'s once-per-process guard or the five other pumps.</summary>
+    internal Task RunSpendPumpForTestAsync(CancellationToken ct) => SpendPumpAsync(ct);
+
+    /// <summary>Zeroes the spend accumulators ahead of a fresh <c>StreamSpend</c> subscription — see
+    /// <see cref="SpendPumpAsync"/> for why a re-subscribe must replace the totals rather than add to
+    /// them. Deliberately does NOT raise <see cref="Sampled"/>: the replay that follows arrives within
+    /// milliseconds, and a raise here would blink the rail through zero.</summary>
+    private void ResetSpendAccumulators()
+    {
+        lock (_gate)
+        {
+            _totalUsdMicros = 0;
+            _totalTokens = 0;
+            _agentSpend.Clear();
+        }
     }
 
     private async Task ResourcePumpAsync(CancellationToken ct)
@@ -596,15 +698,26 @@ public sealed class DaemonBackedOrchestrator :
         {
             await foreach (var update in stream(repoHandle, token).ConfigureAwait(false))
             {
-                ApplyQueueUpdate(update);
+                // Tagged with the handle this pump subscribed for, so the projection can refuse an update
+                // that outlived its binding — see ApplyQueueUpdate.
+                ApplyQueueUpdate(update, repoHandle);
             }
         }, ct).ConfigureAwait(false);
     }
 
     /// <summary>Runs the merge-queue pump against <paramref name="ct"/> for a test, so its reconnect
-    /// property is asserted without going through <see cref="SetActiveRepo"/>'s binding bookkeeping.</summary>
+    /// property is asserted without going through <see cref="SetActiveRepo"/>'s binding bookkeeping.
+    /// The handle is bound the way <see cref="SetActiveRepo"/> would bind it, because the pump's updates
+    /// are now scoped against that binding.</summary>
     internal Task RunQueuePumpForTestAsync(string repoHandle, CancellationToken ct)
-        => QueuePumpAsync(repoHandle, ct);
+    {
+        lock (_gate)
+        {
+            _repoHandle = repoHandle;
+        }
+
+        return QueuePumpAsync(repoHandle, ct);
+    }
 
     /// <summary>Runs a single-shot stream body, reconnecting with a fixed delay on any fault (an
     /// unreachable daemon, a NOT_FOUND queue, a dropped stream) until cancelled. This is what makes an
@@ -827,10 +940,36 @@ public sealed class DaemonBackedOrchestrator :
         }
     }
 
-    internal void ApplyQueueUpdate(Proto.QueueUpdate update)
+    /// <summary>Applies an update that carries no producing handle — the direct-call test path. Production
+    /// always goes through <see cref="QueuePumpAsync"/>, which tags every update with its subscription's
+    /// handle.</summary>
+    internal void ApplyQueueUpdate(Proto.QueueUpdate update) => ApplyQueueUpdate(update, sourceHandle: null);
+
+    /// <summary>
+    /// Folds one merge-queue push into the projection, <b>scoped to the repo handle it was produced for</b>.
+    ///
+    /// <para><b>Why the scope.</b> <see cref="SetActiveRepo"/> swaps repos by cancelling the old pump and
+    /// starting a new one, but a cancel does not unwind an update the old pump has ALREADY dequeued: that
+    /// last message lands after the swap and rewrites the whole projection — <c>_queue</c>, <c>_gate_</c>,
+    /// <c>_origins</c>, <c>_mainSha</c> — with the previous repository's rows. Nothing wrong then lands in
+    /// git (the daemon holds the lease against the handle and refuses a merge for an entry that is not
+    /// its repo's), but the rail LIES: it shows the old repo's branches, gate reasons and main sha under
+    /// the new repo's name until the next push overwrites them, and on a quiet queue that is indefinitely.
+    /// Refusing the stale update costs nothing — the new pump's own snapshot is already on its way.</para>
+    /// </summary>
+    /// <param name="sourceHandle">The handle whose subscription produced this update, or null for the
+    /// unscoped direct-call path.</param>
+    private void ApplyQueueUpdate(Proto.QueueUpdate update, string? sourceHandle)
     {
         lock (_gate)
         {
+            if (sourceHandle is not null
+                && !string.Equals(_repoHandle, sourceHandle, StringComparison.Ordinal))
+            {
+                // Produced for a repo this adapter is no longer bound to. Dropped, not applied.
+                return;
+            }
+
             _mainSha = update.MainSha ?? string.Empty;
             _mirrorMainRefreshedAt = DateTimeOffset.TryParse(
                 update.MirrorMainRefreshedAt, System.Globalization.CultureInfo.InvariantCulture,
@@ -935,7 +1074,9 @@ public sealed class DaemonBackedOrchestrator :
         RaiseIsolated(() => Changed?.Invoke());
     }
 
-    private void ApplyPlanUpdate(Proto.PlanUpdate update)
+    /// <remarks>Internal, like every other applier here, so a test can drive one push directly — the
+    /// property being pinned is that a throwing subscriber never escapes back into the pump.</remarks>
+    internal void ApplyPlanUpdate(Proto.PlanUpdate update)
     {
         lock (_gate)
         {
@@ -982,10 +1123,14 @@ public sealed class DaemonBackedOrchestrator :
             _planMode = new PlanModeView(update.PlanModeEnabled, update.PlanModeSummary);
         }
 
-        Changed?.Invoke();
+        // Isolated for the reason RaiseIsolated documents: this raise runs ON the plan pump thread, so an
+        // exception out of any subscriber propagated into the `await foreach`, ended the stream, and cost
+        // every plan update until the reconnect delay elapsed — with the projection already committed.
+        RaiseIsolated(() => Changed?.Invoke());
     }
 
-    private void ApplyConversationUpdate(Proto.ConversationUpdate update)
+    /// <remarks>Internal for the same reason as <see cref="ApplyPlanUpdate"/>.</remarks>
+    internal void ApplyConversationUpdate(Proto.ConversationUpdate update)
     {
         lock (_gate)
         {
@@ -998,10 +1143,13 @@ public sealed class DaemonBackedOrchestrator :
             }
         }
 
-        Changed?.Invoke();
+        // Isolated like every other applier's raise — on the conversation pump thread, one throwing
+        // subscriber would otherwise tear the coordinator transcript stream down.
+        RaiseIsolated(() => Changed?.Invoke());
     }
 
-    private void ApplySpendSample(Proto.SpendSample sample)
+    /// <remarks>Internal for the same reason as <see cref="ApplyPlanUpdate"/>.</remarks>
+    internal void ApplySpendSample(Proto.SpendSample sample)
     {
         lock (_gate)
         {
@@ -1016,7 +1164,9 @@ public sealed class DaemonBackedOrchestrator :
             AppendSampleLocked();
         }
 
-        Sampled?.Invoke();
+        // Isolated like every other applier's raise — on the spend pump thread; a throwing telemetry
+        // subscriber would otherwise end the spend stream and, with it, every later figure.
+        RaiseIsolated(() => Sampled?.Invoke());
     }
 
     /// <summary>
@@ -1024,7 +1174,7 @@ public sealed class DaemonBackedOrchestrator :
     /// purpose: an agent that has gone away must lose its numbers rather than keep showing its last ones
     /// forever, which would be a stale reading presented as a live one.
     /// </summary>
-    private void ApplyResourceSnapshot(Proto.AgentResourcesSnapshot snapshot)
+    internal void ApplyResourceSnapshot(Proto.AgentResourcesSnapshot snapshot)
     {
         lock (_gate)
         {
@@ -1045,7 +1195,9 @@ public sealed class DaemonBackedOrchestrator :
             AppendSampleLocked();
         }
 
-        Sampled?.Invoke();
+        // Isolated like every other applier's raise — on the resource pump thread; the monitor is the
+        // surface most likely to have a subscriber that throws, and it must not cost the stream.
+        RaiseIsolated(() => Sampled?.Invoke());
     }
 
     /// <summary>
@@ -1237,15 +1389,41 @@ public sealed class DaemonBackedOrchestrator :
 
     public event Action<AgentEvent>? EventReceived;
 
+    /// <summary>
+    /// Stops one agent — and <b>throws when the daemon did not stop it</b>.
+    ///
+    /// <para><b>Why this throws.</b> It used to swallow every exception on the theory that a down daemon is
+    /// already reported by <c>ConnectionState</c>. That is true of the CONNECTION and false of the ACT: a
+    /// <c>StopAgent</c> can fail while the daemon is perfectly reachable (the session is unknown, the jail
+    /// is mid-teardown, the kill switch is engaged, the RPC deadline passes), and swallowing it made three
+    /// separate surfaces report a stop that never happened. The escalated-worker card's error branch was
+    /// structurally unreachable while the worker kept its slot against the worker cap; the exit leg of
+    /// "Stop agents and Mainguard OS on exit" logged a clean sweep over jails still running; and Restart
+    /// went straight on to a spawn the daemon then refused under the one-coordinator cap, with nothing
+    /// anywhere saying the stop had failed. Every one of those is the app telling a human an agent stopped
+    /// when it did not — the single thing a stop control must never do.</para>
+    ///
+    /// <para>Callers own the surfacing, and all four now do: the escalated card states it on the card, the
+    /// Resources row toasts it, the coordinator Stop/Restart puts it on the coordinator card AND aborts the
+    /// restart's spawn, and the exit sweep names the agents it could not stop.</para>
+    /// </summary>
+    /// <exception cref="Exception">Whatever the transport or the daemon raised — the message is the reason
+    /// to show. The agent is still running in every one of those cases.</exception>
     public async Task EndAgentAsync(string agentId)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var outcome = await _client.StopAgentAsync(agentId, cts.Token).ConfigureAwait(false);
+
+        // The stop landed; persisting what it harvested is bookkeeping ON TOP of that, and a keyring that
+        // refuses must not turn a successful stop into a reported failure.
         try
         {
-            var outcome = await _client.StopAgentAsync(agentId, cts.Token).ConfigureAwait(false);
             PersistHarvestedLogin(outcome);
         }
-        catch (Exception) { /* daemon unreachable — surfaced via ConnectionState, not an app crash. */ }
+        catch (Exception)
+        {
+            // The login simply is not persisted — the CLI asks again next launch (the pre-vault behavior).
+        }
     }
 
     /// <summary>
@@ -1304,18 +1482,24 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>Folds the login-state files a stop harvested from the jail into the host OS
-    /// keychain (<c>cli_login_&lt;kind&gt;</c>) — the durable half of the login round-trip; the
-    /// next spawn of this kind restores them so the CLI boots signed in.</summary>
+    /// keychain (<c>cli_login_&lt;kind&gt;_&lt;repoScope&gt;</c>) — the durable half of the login
+    /// round-trip; the next spawn of this kind IN THIS REPOSITORY restores them so the CLI boots
+    /// signed in.
+    ///
+    /// <para>The repo comes from the outcome, never from whichever repository happens to be open —
+    /// the same rule, and the same reason, as the settings sibling below: the harvest sweep walks
+    /// every agent on the daemon. A harvest with no repo handle is dropped rather than filed under a
+    /// blank scope (F2: the unscoped entry is what let one repo's login reach another's jail).</para></summary>
     private void PersistHarvestedLogin(AgentStopOutcome outcome)
     {
         PersistHarvestedSettings(outcome);
 
-        if (outcome.CliCredentials.Count == 0 || string.IsNullOrWhiteSpace(outcome.AgentKind))
+        if (outcome.CliCredentials.Count == 0
+            || CliLoginVault.KeystoreKeyFor(outcome.AgentKind, outcome.RepoHandle) is not { } keystoreKey)
         {
             return;
         }
 
-        var keystoreKey = CliLoginVault.KeystoreKeyFor(outcome.AgentKind);
         if (CliLoginVault.MergeAndSerialize(_keystoreLookup(keystoreKey), outcome.CliCredentials) is { } vault)
         {
             _keystoreSave(keystoreKey, vault);
@@ -1359,7 +1543,17 @@ public sealed class DaemonBackedOrchestrator :
             return true;
         }
 
-        if (!string.IsNullOrEmpty(_keystoreLookup(CliLoginVault.KeystoreKeyPrefix + cli.Id)))
+        // F2: asked against THIS repository's entry, because that is the one a spawn here will
+        // restore. A login saved while working on another repository is not this repo's credential and
+        // reporting it as one would put the "already signed in" badge on a jail that will prompt.
+        string? openRepoHandle;
+        lock (_gate)
+        {
+            openRepoHandle = _repoHandle;
+        }
+
+        if (CliLoginVault.KeystoreKeyFor(cli.Id, openRepoHandle) is { } loginKey
+            && !string.IsNullOrEmpty(_keystoreLookup(loginKey)))
         {
             return true;
         }
@@ -1735,7 +1929,27 @@ public sealed class DaemonBackedOrchestrator :
     /// already phrased for display. Queue state is unchanged in every one of those cases.</exception>
     /// <returns>What the merge did — the origin whose transport landed it, and the sha main really moved
     /// to. Only a merge that reached RT-D1 step 3 returns; every other path throws.</returns>
-    public async Task<MergeOutcome> ConfirmMergeAsync(string agentId)
+    public Task<MergeOutcome> ConfirmMergeAsync(string agentId)
+        => ConfirmMergeAsync(agentId, CancellationToken.None);
+
+    /// <summary>
+    /// The cancellable form of <see cref="ConfirmMergeAsync(string)"/> — same conversation, plus a token
+    /// the SURFACE owns.
+    ///
+    /// <para><b>Why it exists.</b> The merge used to run on a token linked only to this adapter's lifetime
+    /// token, which is cancelled exactly once: at app exit. The middle leg is real network work (an
+    /// <c>ExternalPrMergeService</c> fetch of a pull-request head, or a <c>git fetch</c> over the sync
+    /// remote), so a host that hangs held the repository's ONE merge lease with no way for the human who
+    /// pressed the button to take it back — the Merge button stayed spinning and the queue stayed
+    /// unmergeable until the app was closed. A lease the operator cannot release is worse than a refusal;
+    /// a refusal at least says something. With a caller token, cancelling runs the ordinary
+    /// <see cref="TryAbandonAsync"/> arm and the lease comes back.</para>
+    ///
+    /// <para>Cancellation is not a merge outcome and never fabricates one: nothing is confirmed, the lease
+    /// is handed back, and the <see cref="OperationCanceledException"/> reaches
+    /// <see cref="MergeActionRunner"/>, which says the merge was cancelled.</para>
+    /// </summary>
+    public async Task<MergeOutcome> ConfirmMergeAsync(string agentId, CancellationToken ct)
     {
         string? repoHandle;
         string? repoPath;
@@ -1764,11 +1978,14 @@ public sealed class DaemonBackedOrchestrator :
                 + "can register the sync remote, then merge.");
         }
 
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        // Linked to BOTH: the adapter's lifetime (app exit) and the surface's own token, so the human who
+        // started this merge can also stop waiting on it. See the overload's remarks.
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, ct);
 
         // RT-D1 step 1 — the daemon's lease. BeginMerge is also where CanMerge is enforced, UNDER the
         // lease (MG-11), so a refusal here is the gate speaking and nothing has been touched.
-        var begun = await _client.BeginMergeAsync(repoHandle!, agentId, cts.Token).ConfigureAwait(false);
+        var begun = await (BeginMergeOverride ?? ((handle, id, token) => _client.BeginMergeAsync(handle, id, token)))(
+            repoHandle!, agentId, cts.Token).ConfigureAwait(false);
         if (!begun.Granted)
         {
             throw new InvalidOperationException($"Can't merge — {begun.Reason}.");
@@ -1821,10 +2038,30 @@ public sealed class DaemonBackedOrchestrator :
                     () => CreateMergeExecutor(syncRemote).PerformJournaledMerge(mergeRequest, lease),
                     cts.Token).ConfigureAwait(false);
         }
+        catch (OperationCanceledException ex) when (origin == MergeEntryOrigin.External)
+        {
+            // AMBIGUOUS BY CONSTRUCTION, so it must not be reported as either outcome. The only awaits the
+            // external leg cancels at are the host's own read and merge calls, and an HTTP request whose
+            // CLIENT stopped waiting may still have been served: the pull request can be merged upstream
+            // right now. Abandoning here and letting MergeActionRunner say "nothing was merged and the
+            // queue is unchanged" would be a confident false report about a merge that may have happened —
+            // the exact failure this path exists to prevent. So: no abandon (the lease names work whose
+            // fate is unknown, and the RT-D1 boot reconcile settles it against the host), and a sentence
+            // that says what is actually known.
+            var pullRequest = Mainguard.Agents.Services.ExternalPrMergeService.PrNumberFor(agentId) is int number
+                ? $"pull request #{number}"
+                : "the pull request";
+            throw new InvalidOperationException(
+                $"Stopped waiting while {pullRequest} was being merged on its host — Mainguard can't tell "
+                + "whether the host merged it. Check the pull request before merging again.", ex);
+        }
         catch (Exception ex)
         {
-            // The merge threw rather than refusing. Hand the lease back before surfacing it, or this repo
-            // stays unmergeable until the daemon restarts.
+            // The merge threw rather than refusing. On the local path this is the only shape a cancel can
+            // take too: Task.Run throws for a delegate that never STARTED, and once PerformJournaledMerge
+            // is running it ignores the token and returns a real result — so nothing landed, and the lease
+            // goes back. Hand it back before surfacing, or this repo stays unmergeable until the daemon
+            // restarts.
             await TryAbandonAsync(repoHandle!, agentId, begun.LeaseId, ex.Message).ConfigureAwait(false);
             throw;
         }
@@ -1842,8 +2079,32 @@ public sealed class DaemonBackedOrchestrator :
         // RT-D1 step 3 — record the outcome against the sha main REALLY moved to. The daemon re-checks the
         // gate and the CAS under its queue lock before it writes anything (MG-11), so a race lost between
         // the two legs is refused there rather than papered over here.
-        await _client.ConfirmMergeAsync(repoHandle!, agentId, begun.LeaseId, result.NewMainSha!, cts.Token)
-            .ConfigureAwait(false);
+        //
+        // ON `_cts.Token`, NOT `cts.Token` — the SURFACE's token ends at step 2 and must not reach here.
+        // Past this line the merge has LANDED: main has moved in the user's own checkout, or the pull
+        // request is merged upstream. A caller who stops waiting is asking to stop WAITING; they cannot
+        // ask for a merge that already happened to go unrecorded, and running step 3 on their token made
+        // exactly that reachable — the recording was skipped, the daemon kept the lease until the next
+        // BeginMerge reconciled it, and the raw `Status(StatusCode="Cancelled")` was toasted at a human
+        // whose git history already contained the merge. Only the app's own lifetime bounds this leg.
+        try
+        {
+            await (RecordMergeOverride ?? ((handle, id, leaseId, sha, token)
+                    => _client.ConfirmMergeAsync(handle, id, leaseId, sha, token)))(
+                repoHandle!, agentId, begun.LeaseId, result.NewMainSha!, _cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The merge landed and the daemon did not record it — app exit, or an unreachable daemon. The
+            // two things that must NOT happen here are an abandon (the lease names a merge that really
+            // occurred) and any sentence implying nothing was merged. Say both halves: what git now holds,
+            // and what the queue does not yet know. The RT-D1 boot reconcile settles the entry against git
+            // on the next connect.
+            throw new InvalidOperationException(
+                $"{MergeLandedSentence(origin, agentId, result.NewMainSha!)} Mainguard couldn't record it "
+                + $"with the daemon ({ex.Message}), so the queue entry still shows it as unmerged — it "
+                + "settles itself once the daemon is reachable again.", ex);
+        }
 
         // The origin that actually ran the merge, reported with the sha main really moved to. It is the
         // SAME `origin` the transport was chosen by above — read once, under the lock — so what the human
@@ -1852,11 +2113,33 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>
+    /// What step 2 did, in the terms of the origin that did it — the opening half of the sentence a human
+    /// reads when the merge LANDED but step 3 could not record it. Kept in the origin's own vocabulary for
+    /// the same reason <see cref="MergeActionRunner.Confirmation"/> is: an upstream pull request wearing
+    /// the local fast-forward's wording describes something that did not happen.
+    /// </summary>
+    private static string MergeLandedSentence(MergeEntryOrigin origin, string agentId, string newMainSha)
+    {
+        var shortSha = newMainSha.Length <= 7 ? newMainSha : newMainSha[..7];
+        if (origin == MergeEntryOrigin.External)
+        {
+            var pullRequest = Mainguard.Agents.Services.ExternalPrMergeService.PrNumberFor(agentId) is int number
+                ? $"Pull request #{number}"
+                : "The pull request";
+            return $"{pullRequest} IS merged upstream and {MainBranchName} fast-forwarded onto {shortSha}.";
+        }
+
+        return $"agent/{agentId} IS merged into {MainBranchName} ({shortSha}).";
+    }
+
+    /// <summary>
     /// The host-side merge leg, bound to this repo's SC-2 sync remote and the app's T-19 journal.
     /// Built per merge because the sync-remote binding is per active repo.
     /// </summary>
     private Mainguard.Agents.Services.IJournaledMergeExecutor CreateMergeExecutor(string syncRemoteName)
-        => new Mainguard.Agents.Services.ForegroundMergeService(
+        => MergeExecutorOverride is { } make
+        ? make(syncRemoteName)
+        : new Mainguard.Agents.Services.ForegroundMergeService(
             resolveSyncRemote: _ => new Mainguard.Agents.Agents.SyncRemote(syncRemoteName, string.Empty),
             journal: _journalFactory(),
             leases: null); // the lease is the daemon's; see the ctor doc on why this must not be a store.
@@ -1869,22 +2152,42 @@ public sealed class DaemonBackedOrchestrator :
     /// is compare-and-swapped against.
     /// </summary>
     private Mainguard.Agents.Services.IExternalPrMergeExecutor CreateExternalMergeExecutor(string syncRemoteName)
-        => new Mainguard.Agents.Services.ExternalPrMergeService(
+        => ExternalMergeExecutorOverride is { } make
+        ? make(syncRemoteName)
+        : new Mainguard.Agents.Services.ExternalPrMergeService(
             resolveSyncRemote: _ => new Mainguard.Agents.Agents.SyncRemote(syncRemoteName, string.Empty),
             host: _hostPullRequests.Value,
             journal: _journalFactory());
 
     /// <summary>
+    /// How long the lease hand-back may take. Deliberately short: this runs on the failure/cancel arm of a
+    /// merge, which means it can run while the app is closing (the adapter's token cancelling the merge IS
+    /// one of the ways to get here), and the caller — a <c>[RelayCommand]</c> body on the UI thread — is
+    /// awaiting it. It used to be 10 s on an unrelated token, so a wedged daemon could hold the exit for
+    /// ten seconds on top of <see cref="Dispose"/>'s own budget. Three seconds is enough for a healthy
+    /// loopback RPC and short enough not to be felt; a lease that outlives it is swept by the RT-D1 boot
+    /// reconcile anyway.
+    /// </summary>
+    private static readonly TimeSpan AbandonBudget = TimeSpan.FromSeconds(3);
+
+    /// <summary>
     /// Hands a granted lease back after a merge that did not land. Best-effort by construction: it is the
     /// cleanup arm of a failure the caller is already reporting, so a transport fault here must not replace
     /// that reason with a worse one. A lease that survives this is still swept by the RT-D1 boot reconcile.
+    ///
+    /// <para><b>Bounded by its own clock, not by <c>_cts</c>, and that is deliberate.</b> Shutdown
+    /// cancelling the merge is precisely when the lease most needs handing back, so linking this to the
+    /// token that just cancelled the merge would guarantee it never ran. It is bounded by
+    /// <see cref="AbandonBudget"/> instead, so being unlinked cannot turn into an unbounded wait.</para>
     /// </summary>
     private async Task TryAbandonAsync(string repoHandle, string agentId, string leaseId, string reason)
     {
         try
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-            await _client.AbandonMergeAsync(repoHandle, agentId, leaseId, reason, cts.Token).ConfigureAwait(false);
+            using var cts = new CancellationTokenSource(AbandonBudget);
+            await (AbandonMergeOverride ?? ((handle, id, lease, why, token)
+                    => _client.AbandonMergeAsync(handle, id, lease, why, token)))(
+                repoHandle, agentId, leaseId, reason, cts.Token).ConfigureAwait(false);
         }
         catch (Exception)
         {
@@ -2146,7 +2449,11 @@ public sealed class DaemonBackedOrchestrator :
         var cli = installed.FirstOrDefault(c => string.Equals(c.Id, agentKind, StringComparison.Ordinal));
         var provider = ApiKeyProviderMap.ProviderForEnvVar(cli?.ApiKeyEnvVar ?? string.Empty);
         var key = provider is null ? null : _keystoreLookup(ApiKeyProviderMap.KeystoreKeyFor(provider));
-        var savedLogin = CliLoginVault.Parse(_keystoreLookup(CliLoginVault.KeystoreKeyFor(agentKind)));
+        // F2: this repository's saved login, by the same rule as its saved settings below. The vault
+        // key carries the repo scope, so a login performed in another repository is not readable here.
+        var savedLogin = CliLoginVault.KeystoreKeyFor(agentKind, repoHandle) is { } loginKey
+            ? CliLoginVault.Parse(_keystoreLookup(loginKey))
+            : Array.Empty<CliLoginFile>();
 
         // Same provision chain as a fresh spawn (toolchain build included), so the same silence-bounded
         // wait rather than a flat deadline that a cold first build outruns.
@@ -2286,11 +2593,21 @@ public sealed class DaemonBackedOrchestrator :
 
     public event Action? Changed;
 
+    /// <summary>
+    /// Sends one human turn to the coordinator — and <b>throws when it did not go</b>.
+    ///
+    /// <para>It used to swallow, on the same "ConnectionState covers it" reasoning as
+    /// <see cref="EndAgentAsync"/>, and with the same defect: the composer is cleared BEFORE the await, so
+    /// a send that failed took the human's typed message with it and left a transcript that simply never
+    /// showed the turn. A banner about the connection does not tell anyone which sentence was lost. The
+    /// composer VM catches this, puts the text back, and says why.</para>
+    /// </summary>
+    /// <exception cref="Exception">Whatever the transport or the daemon raised; the coordinator never
+    /// received the message.</exception>
     public async Task SendAsync(string text)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-        try { await _client.SendCoordinatorMessageAsync(DefaultCoordinatorId, text, cts.Token).ConfigureAwait(false); }
-        catch (Exception) { /* daemon unreachable — surfaced via ConnectionState. */ }
+        await _client.SendCoordinatorMessageAsync(DefaultCoordinatorId, text, cts.Token).ConfigureAwait(false);
     }
 
     public IReadOnlyList<WorkerPlanCard> GetWorkerPlans()
@@ -2414,7 +2731,10 @@ public sealed class DaemonBackedOrchestrator :
 
         // The CLI's saved login state (host OS keychain → jail tmpfs $HOME), so an interactive
         // login performed in an earlier session survives into this one instead of prompting again.
-        var savedLogin = CliLoginVault.Parse(_keystoreLookup(CliLoginVault.KeystoreKeyFor(cli.Id)));
+        // Scoped to THIS repository (F2), exactly like the settings loaded just below it.
+        var savedLogin = CliLoginVault.KeystoreKeyFor(cli.Id, repoHandle) is { } loginKey
+            ? CliLoginVault.Parse(_keystoreLookup(loginKey))
+            : Array.Empty<CliLoginFile>();
 
         // THIS repository's saved settings — the commands the user already approved here. Loaded by
         // repo handle, so an approval made in another repository is not in this list at all.
@@ -2598,15 +2918,51 @@ public sealed class DaemonBackedOrchestrator :
     public event Action? DeployChanged { add { } remove { } }
     public Task PublishAsync() => Task.CompletedTask;
 
+    /// <summary>
+    /// Tears the adapter down. <b>Never blocks the calling thread</b> — see the remarks.
+    ///
+    /// <para><b>Why it must not.</b> The only production caller is
+    /// <c>ControlCenterViewModel.Dispose</c>, which runs on the UI thread while the window is closing. The
+    /// two waits here — up to <see cref="ShutdownHarvestBudget"/> for the final login harvest, plus two
+    /// seconds draining the pumps — therefore froze the UI for as much as seven seconds against a daemon
+    /// that had stopped answering, which is exactly the machine state that makes both waits run long. A
+    /// frozen window during close reads as a hang, and on macOS long enough to draw the spinning cursor.</para>
+    ///
+    /// <para>The teardown itself is unchanged and still runs to completion, on a background thread; the
+    /// harvest keeps its budget, the pumps keep their drain. What changed is who waits. Nothing downstream
+    /// depended on the wait: the harvest is best-effort by construction (its whole point is that the
+    /// periodic sweep already keeps the keychain warm), and the pump drain is hygiene — the pumps are
+    /// already cancelled, and disposal of the CTS is sequenced AFTER the drain here just as before.</para>
+    /// </summary>
     public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
+        {
+            return;
+        }
+
+        // Gated on there being a real Avalonia application as well as on the thread, so a plain unit test
+        // — no AppBuilder, hence no meaningful "UI thread" — keeps the deterministic synchronous teardown
+        // its `using` expects, while the shipped app never waits on the daemon to close a window.
+        if (Avalonia.Application.Current is not null
+            && Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+        {
+            _ = Task.Run(DisposeCore);
+            return;
+        }
+
+        DisposeCore();
+    }
+
+    private int _disposeStarted;
+
+    private void DisposeCore()
     {
         // The LAST harvest, BEFORE anything is cancelled — this is the app-close leg of the login
         // round-trip. Closing Mainguard with agents still running used to lose every login performed in
         // this session (the jail's $HOME is tmpfs and dies with the VM/containers), so the sweep runs
         // once more here on its OWN token: _cts is cancelled immediately below, and a harvest bound to
-        // it would be cancelled before it could issue a single RPC. Bounded by ShutdownHarvestBudget and
-        // run off the calling thread, so a wedged daemon delays the exit by seconds rather than hanging
-        // the UI thread on a sync-over-async wait.
+        // it would be cancelled before it could issue a single RPC. Bounded by ShutdownHarvestBudget.
         try
         {
             using var shutdownHarvest = new CancellationTokenSource(ShutdownHarvestBudget);

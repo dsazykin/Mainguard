@@ -24,12 +24,43 @@ namespace Mainguard.Server.Gateway;
 /// <see cref="SwarmReconciler"/> (run through the RT-D1 ordered <see cref="DaemonBootSequence"/>). All
 /// persistence is best-effort: if the daemon SQLite DB cannot be opened/migrated the stack falls back
 /// to in-memory stores so the daemon still starts (the gRPC surface must never fail to bind on a DB
-/// hiccup).
+/// hiccup). The ONE exception is the audit key ring's posture — see <see cref="RegisterAuditLog"/>,
+/// which throws <see cref="AuditPersistenceUnavailableException"/> rather than pretend.
+///
+/// <para><b>How that refusal coexists with the F55 instance-lock refusal.</b> Both are boot-sequence
+/// refusals and neither may swallow the other. This method runs from <c>ConfigureServices</c>, i.e.
+/// strictly before <c>DaemonHost.Build</c>'s Kestrel options callback takes the data root's
+/// <c>DaemonInstanceLock</c>, so on paper the key-ring check gets first refusal. In the case that
+/// matters — a second daemon started against a data root another daemon already owns — it does not
+/// fire at all, and by construction: <see cref="ClearStaleMigrationLock"/> fails to take the very same
+/// instance lock, <see cref="TryPrepareDatabase"/> returns false, <c>dbFactory</c> is null, and
+/// <see cref="RegisterAuditLog"/> takes its no-db branch, which never opens a key ring. The loser
+/// therefore reaches the Kestrel callback and exits through <c>DaemonExitCodes.RefusedStart()</c> with
+/// the winner's credentials, key ring and migration lock untouched. A key-ring refusal (exit 78,
+/// EX_CONFIG) means what it says: this machine's key ring cannot hold the audit master key.</para>
 /// </summary>
 public static class GatewayServiceRegistration
 {
+    /// <param name="logError">
+    /// Degraded or refused persistence, reported at ERROR rather than as a milestone (#360). Optional
+    /// for the same reason <paramref name="log"/> is: the unit tests drive this path without a host.
+    /// </param>
+    /// <param name="lockDirectory">
+    /// F55: the DATA ROOT this daemon's <c>Runtime.DaemonInstanceLock</c> guards — which is not
+    /// necessarily <paramref name="dbPath"/>'s directory, because <c>--data-path</c> can point the DB
+    /// somewhere else. Passed in rather than derived so the guard around
+    /// <see cref="ClearStaleMigrationLock"/> can never end up locking a directory no daemon holds (which
+    /// would clear a LIVE daemon's row) or one it never uses (which would skip the clear forever).
+    /// Null falls back to the DB's own directory, which is the correct answer in every configuration
+    /// that does not split the two.
+    /// </param>
     public static void Register(
-        WebApplicationBuilder builder, string dbPath, Action<string>? log = null, DaemonOptions? options = null)
+        WebApplicationBuilder builder,
+        string dbPath,
+        Action<string>? log = null,
+        DaemonOptions? options = null,
+        Action<string, Exception?>? logError = null,
+        string? lockDirectory = null)
     {
         var services = builder.Services;
 
@@ -43,7 +74,7 @@ public static class GatewayServiceRegistration
         IBudgetStore budgetStore;
         IMergeLeaseStore mergeLeaseStore;
         Func<AppDbContext>? dbFactory = null;
-        if (TryPrepareDatabase(dbPath, out var factory, log: log))
+        if (TryPrepareDatabase(dbPath, out var factory, log: log, lockDirectory: lockDirectory))
         {
             dbFactory = factory;
             spendStore = new DbSpendStore(factory);
@@ -63,7 +94,7 @@ public static class GatewayServiceRegistration
         // EAGERLY (it needs no DI) so a store problem surfaces here in migration.log rather than as
         // a mid-flight RPC failure; on any failure the daemon still starts, on the in-memory
         // journal — which is exactly the pre-P2-15 behavior, now with the loss stated out loud.
-        RegisterAuditLog(services, dbFactory, dbPath, log);
+        RegisterAuditLog(services, dbFactory, dbPath, log, logError);
 
         // The P2-10 queue-state + immutable-verification stores follow the same posture as the gateway
         // stores above: SQLite when the daemon DB opened, in-memory otherwise so the daemon always starts.
@@ -121,9 +152,11 @@ public static class GatewayServiceRegistration
         // merge-queue RPC answered NOT_FOUND — the P2-10 guarantees were neither enforced nor bypassable,
         // they were simply not running. The provisioner builds a repo's queue on the events that make a repo
         // active (ProvisionRepo / CreateWorktree / a jailed spawn) over the SAME persisted stores, and — the
-        // load-bearing detail — the SAME IMergeLeaseStore singleton the foreground merge, BeginMerge and
-        // the external-PR merge path contend for, since the one-outstanding-merge-per-repo invariant only
-        // spans origins while they share one store (MG-23).
+        // load-bearing detail — the SAME IMergeLeaseStore singleton the foreground merge, BeginMerge,
+        // the external-PR merge path (which takes its lease over that same BeginMerge) and the boot
+        // MergeReconcileTask all contend for, since the one-outstanding-merge-per-repo invariant only spans
+        // origins while they share one store (MG-23). (This list previously named MergeDispatch, which
+        // this branch deleted; the surviving contenders are the ones above.)
         services.AddSingleton(sp =>
         {
             var provisioner = new MergeQueueProvisioner(
@@ -196,6 +229,14 @@ public static class GatewayServiceRegistration
             locateAgentWorktree: (repoHash, agentId) =>
                 (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
                     ?.WorktreePathFor(repoHash, agentId),
+            // W1-A — the daemon's OWN answer to "which repository backs this worktree", so the cycle never
+            // learns that from the worktree's agent-writable `.git` pointer. Without it the cycle still
+            // refuses a pointer aimed at the shared mirror, but a redirect at some THIRD repository is
+            // caught only by the weaker round-trip check. A substrate with no per-agent repo answers
+            // empty, which the provisioner reads back as "none" rather than as a pin that never matches.
+            locateAgentRepo: (repoHash, agentId) =>
+                (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
+                    ?.AgentRepoPathFor(repoHash, agentId),
             // The run states the cycle transitions through — Yielding, Rebasing and, the one that needs a
             // human, Conflict. PtyAgentSupervisor writes them into the session store, which streams them
             // to clients as agent state changes; AgentRunState.Conflict had no production writer at all
@@ -425,7 +466,11 @@ public static class GatewayServiceRegistration
         // MAINGUARD_GATEWAY_BIND=off), or a host with no private address, still yields the old posture.
         services.AddSingleton(new GatewayConfinementOptions(
             BaseUrl: BuildGatewayBaseUrl(options),
-            Enabled: options is not null && !string.IsNullOrWhiteSpace(options.GatewayBindAddress)));
+            Enabled: options is not null && !string.IsNullOrWhiteSpace(options.GatewayBindAddress),
+            // Audit B1: a gateway that is absent because the bind auto-resolved to NOTHING is a defect,
+            // not a posture, and every BYOK spawn on such a daemon leaks the raw key into its jail. The
+            // launcher says so at error level rather than with the same warning a deliberate `off` gets.
+            DisabledUnintentionally: options is not null && options.GatewayDisabledUnintentionally));
 
         // Phase 2's automatic verification trigger. Until now the ONLY production callers of
         // MergeQueue.RunVerificationAsync were the human Verify button, the restart resume and the stale
@@ -525,9 +570,13 @@ public static class GatewayServiceRegistration
             // decide which copy wins.
             queues: sp.GetRequiredService<IMergeQueueRegistry>(),
             // An adopted jail still has its IPC directory mounted (the server no longer deletes it on
-            // shutdown); this re-binds the listener at that same path so the adopted agent's shim works.
+            // shutdown); this re-binds the listener at that same path so the adopted agent's shim works —
+            // AND starts a fresh CLI in the surviving jail under a new daemon-side PTY, which is the half
+            // that did not exist (audit F6): the old CLI was a `docker exec` child of the dead daemon's
+            // PTY, so an adopted agent had a re-bound endpoint and no process behind it.
             // Resolved lazily, at call time, because AgentSpawnService sits above this in the graph.
-            onAdopted: session => sp.GetRequiredService<Runtime.AgentSpawnService>().TryReattachEndpoint(session)));
+            onAdopted: session =>
+                sp.GetRequiredService<Runtime.AgentSpawnService>().TryReattachAdoptedAgent(session)));
         services.AddHostedService<Runtime.AgentSessionReconcilerService>();
     }
 
@@ -581,10 +630,25 @@ public static class GatewayServiceRegistration
         // The PR-head materializer (P2-12 step 2): fetch pull/<n>/head into the agent worktree. The worktree
         // path comes from the substrate's own worktree manager so the fetch targets the real jail path.
         services.AddSingleton<IPrHeadFetcher>(sp =>
-            new PrHeadFetcher((repoHash, agentId) =>
-                (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)?.WorktreePathFor(repoHash, agentId)
-                    ?? throw new InvalidOperationException(
-                        "PR-head fetch requires a WorktreeManager-backed substrate worktree path.")));
+            new PrHeadFetcher(
+                (repoHash, agentId) =>
+                    (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)?.WorktreePathFor(repoHash, agentId)
+                        ?? throw new InvalidOperationException(
+                            "PR-head fetch requires a WorktreeManager-backed substrate worktree path."),
+                // W1-A — pins WHICH repository the fetch and hard reset land in. This one matters more than
+                // the keep-alive path: the worktree here holds a third party's PR, so its `.git` pointer is
+                // attacker-supplied by construction. Without this the repository is derived from that
+                // pointer's own shape and only round-trip-checked.
+                resolveAgentRepoPath: (repoHash, agentId) =>
+                    (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
+                        ?.AgentRepoPathFor(repoHash, agentId),
+                // W1-A rework — where the non-destructive "has the head moved?" peek runs. The daemon-owned
+                // mirror, never the worker's own worktree: on an external PR that worktree belongs to a
+                // third party whose jail can write its repository config, and one `url.<x>.insteadOf` there
+                // redirects the peek's `ls-remote` to a remote of their choosing — an answer of "unchanged"
+                // the intake would then believe forever.
+                resolveMirrorPath: repoHash =>
+                    sp.GetRequiredService<IAgentEnvironment>().Repos.BareRepoPathFor(repoHash)));
 
         services.AddSingleton<IExternalPrIntake>(sp =>
         {
@@ -615,10 +679,15 @@ public static class GatewayServiceRegistration
     /// <summary>
     /// The base URL a confined jail's CLI is pointed at, or null when the gateway is disabled.
     ///
-    /// <para>The address is the daemon's own gateway bind address — MEASURED to be reachable from a jail
-    /// only via that jail's egress proxy, never directly (a container on an <c>Internal=true</c> network
-    /// can reach its own bridge's host-side address and nothing else; see
-    /// <c>docs/design/oauth-budgeting.md</c> for the measurements). Plain <c>http</c> is deliberate: the
+    /// <para>The address is the daemon's own gateway bind address, translated by
+    /// <see cref="GatewayBindPolicy.ProxyReachableHostFor"/> into the form a container can dial — MEASURED
+    /// to be reachable from a jail only via that jail's egress proxy, never directly. A container on an
+    /// <c>Internal=true</c> network has no default route, so it cannot reach <c>docker0</c> or anything
+    /// off-subnet, but its OWN segment's bridge address is on-link and does answer. That is precisely why
+    /// the gateway binds <c>docker0</c> and never a segment's bridge: binding a segment bridge would let
+    /// that segment's jail dial the gateway directly, bypassing tinyproxy and with it both the egress
+    /// allowlist and the budget metering. See <c>docs/design/oauth-budgeting.md</c> for the measurements.
+    /// Plain <c>http</c> is deliberate: the
     /// hop is jail → its own segment proxy → daemon, entirely inside the VM's private networking, and
     /// the credential it carries is a Mainguard session token rather than a provider key. The TLS that
     /// matters is the daemon → provider leg, which the forwarder establishes.</para>
@@ -633,11 +702,17 @@ public static class GatewayServiceRegistration
     /// configured so the address the jail is pointed at and the address the proxy is told to permit cannot
     /// drift apart; a drift there would be invisible until a confined agent silently lost its egress.
     /// Null when the gateway is disabled.
+    ///
+    /// <para>The bind address is translated through <see cref="GatewayBindPolicy.ProxyReachableHostFor"/>
+    /// first. On macOS and Windows the gateway binds loopback, which a container cannot dial by that
+    /// literal — it has its own loopback — so the proxy-reachable form is the host alias instead. Skipping
+    /// the translation points both the jail's base URL and the proxy's allowlist entry at
+    /// <c>127.0.0.1</c> and confinement silently fails.</para>
     /// </summary>
     public static string? BuildGatewayUpstream(DaemonOptions? options) =>
         options is null || string.IsNullOrWhiteSpace(options.GatewayBindAddress)
             ? null
-            : $"{options.GatewayBindAddress}:{options.GatewayPort}";
+            : $"{GatewayBindPolicy.ProxyReachableHostFor(options.GatewayBindAddress)}:{options.GatewayPort}";
 
     /// <summary>
     /// Where the P2-10 verification log artifacts land: beside the daemon DB, so the in-proc test tier's
@@ -658,9 +733,22 @@ public static class GatewayServiceRegistration
     /// the AES-GCM master key lives in a <see cref="Mainguard.Git.Security.SecureKeyring"/> rooted
     /// beside it too — production puts both under the data root, in-proc test hosts under their
     /// isolated token directory, with no extra knob to drift.
+    ///
+    /// <para><b>A key-ring posture failure is FATAL, not a fallback.</b> The in-memory journal exists
+    /// for the one thing it can honestly stand in for: a daemon DB that would not open, where the
+    /// alternative is a daemon that never binds and a user with no app at all. It is NOT a stand-in
+    /// for a key ring that refuses to hold the audit master key, because there the daemon comes up
+    /// looking healthy, answers <c>VerifyAudit</c> with <c>persistent=false</c>, and loses every
+    /// audit event at shutdown — a security store that silently stops storing. That was exactly the
+    /// "carries on looking healthy" failure this work set out to remove, so it now refuses to boot
+    /// and the message names both remedies.</para>
     /// </summary>
-    private static void RegisterAuditLog(
-        IServiceCollection services, Func<AppDbContext>? dbFactory, string dbPath, Action<string>? log)
+    internal static void RegisterAuditLog(
+        IServiceCollection services,
+        Func<AppDbContext>? dbFactory,
+        string dbPath,
+        Action<string>? log,
+        Action<string, Exception?>? logError = null)
     {
         if (dbFactory is not null)
         {
@@ -670,9 +758,24 @@ public static class GatewayServiceRegistration
                 var keyringDir = string.IsNullOrEmpty(directory)
                     ? "audit-keyring"
                     : Path.Combine(directory, "audit-keyring");
+                var keyring = new Mainguard.Git.Security.SecureKeyring(keyringDir);
+
+                // Posture, stated at boot whatever it is: a protector that only covers keys generated
+                // from now on is a protector an upgraded install does not have, and B2's re-wrap
+                // outcome (or its failure) is exactly the thing no caller surfaced before.
+                var posture = keyring.DescribeProtection();
+                if (keyring.IsUnprotected || keyring.Ring.MasterKeyUnavailable)
+                {
+                    logError?.Invoke(posture, null);
+                }
+                else
+                {
+                    log?.Invoke(posture);
+                }
+
                 var chained = new ChainedAuditLog(
                     dbFactory,
-                    new AuditCrypto(new Mainguard.Git.Security.SecureKeyring(keyringDir)),
+                    new AuditCrypto(keyring),
                     new AuditFileMirror(dbPath + ".audit-mirror"));
                 services.AddSingleton<IAuditLog>(chained);
                 services.AddSingleton<IChainedAuditLog>(chained);
@@ -682,25 +785,44 @@ public static class GatewayServiceRegistration
                 log?.Invoke("audit chain ready (db-backed, mirror recovered)");
                 return;
             }
+            catch (Exception ex) when (IsKeyringPosture(ex))
+            {
+                logError?.Invoke("audit chain refused: " + ex.Message, ex);
+                throw new AuditPersistenceUnavailableException(ex);
+            }
             catch (Exception ex)
             {
-                log?.Invoke($"audit chain unavailable → in-memory journal (EVENTS WILL NOT SURVIVE RESTART): {ex.Message}");
+                logError?.Invoke(
+                    $"audit chain unavailable → in-memory journal (EVENTS WILL NOT SURVIVE RESTART): {ex.Message}",
+                    ex);
             }
         }
         else
         {
-            log?.Invoke("audit chain on in-memory journal (no daemon db) — EVENTS WILL NOT SURVIVE RESTART");
+            logError?.Invoke("audit chain on in-memory journal (no daemon db) — EVENTS WILL NOT SURVIVE RESTART", null);
         }
 
         services.AddSingleton<IAuditLog, InMemoryAuditLog>();
     }
+
+    /// <summary>
+    /// The failures that are about the KEY RING's posture rather than about the store: the audit
+    /// master key cannot be stored safely, cannot be read back, or would be re-minted under a
+    /// protector this process cannot use. Each has a named remedy and none of them is survivable by
+    /// dropping to a journal that forgets everything at shutdown.
+    /// </summary>
+    internal static bool IsKeyringPosture(Exception ex)
+        => ex is Mainguard.Git.Security.UnprotectedKeyringException
+            or Mainguard.Git.Security.KeyringUnreadableException
+            or Mainguard.Git.Security.KeyringProtectorUnavailableException;
 
     /// <summary>How long <see cref="TryPrepareDatabase"/> lets a migration run before falling back
     /// to in-memory stores. Generous — a real migration is sub-second; only a hang exceeds this.</summary>
     private static readonly TimeSpan MigrationWatchdog = TimeSpan.FromSeconds(60);
 
     internal static bool TryPrepareDatabase(
-        string dbPath, out Func<AppDbContext> factory, TimeSpan? watchdog = null, Action<string>? log = null)
+        string dbPath, out Func<AppDbContext> factory, TimeSpan? watchdog = null, Action<string>? log = null,
+        string? lockDirectory = null)
     {
         var effectiveWatchdog = watchdog ?? MigrationWatchdog;
         try
@@ -712,7 +834,16 @@ public static class GatewayServiceRegistration
                 Directory.CreateDirectory(dir);
             }
 
-            ClearStaleMigrationLock(dbPath, log);
+            if (!ClearStaleMigrationLock(dbPath, lockDirectory ?? Path.GetDirectoryName(dbPath), log))
+            {
+                // F55: another daemon owns this data root. Do not migrate a database that is not ours —
+                // and do not spend the watchdog's 60 s discovering that EF cannot take a lock the live
+                // daemon is holding. This process is about to be refused by the instance lock anyway;
+                // the in-memory fallback keeps that refusal fast and leaves the other daemon's DB alone.
+                log?.Invoke("another daemon owns this data root → in-memory fallback (this instance will not start)");
+                factory = null!;
+                return false;
+            }
 
             // Migrate under a watchdog. A daemon killed mid-migration (e.g. a WSL idle-stop of the
             // whole distro) orphans EF's __EFMigrationsLock row, and EF retries acquiring it forever
@@ -746,34 +877,80 @@ public static class GatewayServiceRegistration
     }
 
     /// <summary>
-    /// The daemon is this DB's only writer (one systemd instance per VM; test hosts isolate their
-    /// own paths), so a migration-lock row present at boot was orphaned by a previous instance that
-    /// died mid-migration — clear it so <c>Migrate()</c> doesn't wait on a holder that no longer
-    /// exists. Best-effort: on a fresh DB or a pre-lock EF schema the table is absent and the delete
-    /// simply fails, leaving Migrate() + the watchdog to decide.
+    /// Clears an orphaned EF <c>__EFMigrationsLock</c> row so <c>Migrate()</c> doesn't wait forever on a
+    /// holder that no longer exists — but only while this process can prove no other daemon is running.
+    ///
+    /// <para><b>F55, the second leg.</b> This method's premise used to be an ASSUMPTION: "the daemon is
+    /// this DB's only writer, so a lock row at boot was orphaned". It runs from
+    /// <see cref="Register"/> during <c>ConfigureServices</c>, long before the port bind, so a second
+    /// daemon started against the same data root deleted the LIVE daemon's row on its way to discovering
+    /// it had lost — the same defect, and the same window, as the session-token and mTLS rotation that
+    /// moved behind the bind. The row is EF's own mutual exclusion during a migration; deleting it under
+    /// a daemon that is mid-migration is exactly what it exists to prevent.</para>
+    ///
+    /// <para><b>The premise is now enforced instead of assumed.</b> The delete happens only while this
+    /// process holds the data root's <c>DaemonInstanceLock</c>, taken transiently and released
+    /// immediately. Holding it at the moment of the delete is precisely the property required: if nobody
+    /// else holds the data root, no live daemon owns that row, so the row IS orphaned. A daemon that
+    /// starts after the release is a new daemon that will take the lock itself and re-migrate — the gap
+    /// cannot reintroduce the defect, because the defect is "delete while another daemon is live" and
+    /// that is the one state the lock excludes.</para>
+    ///
+    /// <para>Skipping is always safe, which is why <c>TryAcquire</c> rather than <c>Acquire</c>: a
+    /// refused lock means a daemon IS live, and a live daemon's row is not stale. Left in place, EF
+    /// waits on it and the migration watchdog in <see cref="TryPrepareDatabase"/> turns that wait into
+    /// the in-memory fallback — noisy, recoverable, and vastly better than corrupting a running
+    /// migration.</para>
+    ///
+    /// <para>Still best-effort in every other respect: on a fresh DB or a pre-lock EF schema the table is
+    /// absent and the delete simply fails, leaving Migrate() + the watchdog to decide.</para>
     /// </summary>
-    private static void ClearStaleMigrationLock(string dbPath, Action<string>? log = null)
+    /// <returns>
+    /// False when another daemon owns this data root — the caller must then neither clear nor migrate.
+    /// True in every other case, including "there was nothing to clear".
+    /// </returns>
+    private static bool ClearStaleMigrationLock(string dbPath, string? lockDirectory, Action<string>? log = null)
     {
-        try
+        // No data root to reason about (an in-memory or relative DB path in a unit test): fall through to
+        // the historical behaviour rather than refusing, since there is no daemon to protect either.
+        Mainguard.Server.Runtime.DaemonInstanceLock? guard = null;
+        if (!string.IsNullOrEmpty(lockDirectory))
         {
-            if (!File.Exists(dbPath))
+            guard = Mainguard.Server.Runtime.DaemonInstanceLock.TryAcquire(lockDirectory);
+            if (guard is null)
             {
-                log?.Invoke("no lock table (fresh db)");
-                return;
+                log?.Invoke(
+                    "another daemon holds this data root — leaving its migration lock alone "
+                    + "(a live daemon's lock row is not stale)");
+                return false;
             }
+        }
 
-            using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}");
-            connection.Open();
-            using var command = connection.CreateCommand();
-            command.CommandText = "DELETE FROM \"__EFMigrationsLock\";";
-            var rows = command.ExecuteNonQuery();
-            log?.Invoke(rows > 0 ? "stale migration lock cleared" : "no stale migration lock");
-        }
-        catch (Exception)
+        using (guard)
         {
-            // Absent table / unreadable file — nothing to clear.
-            log?.Invoke("no lock table");
+            try
+            {
+                if (!File.Exists(dbPath))
+                {
+                    log?.Invoke("no lock table (fresh db)");
+                    return true;
+                }
+
+                using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}");
+                connection.Open();
+                using var command = connection.CreateCommand();
+                command.CommandText = "DELETE FROM \"__EFMigrationsLock\";";
+                var rows = command.ExecuteNonQuery();
+                log?.Invoke(rows > 0 ? "stale migration lock cleared" : "no stale migration lock");
+            }
+            catch (Exception)
+            {
+                // Absent table / unreadable file — nothing to clear.
+                log?.Invoke("no lock table");
+            }
         }
+
+        return true;
     }
 
     /// <summary>

@@ -256,13 +256,24 @@ public static class PackageCachePolicy
 
     /// <summary>
     /// The mode the per-agent cache LEAF carries under <paramref name="grant"/>: <c>2775</c> for
-    /// <see cref="PackageCacheGrant.SharedJailGroup"/>, <c>2777</c> for
+    /// <see cref="PackageCacheGrant.SharedJailGroup"/>, <c>3777</c> for
     /// <see cref="PackageCacheGrant.ModeOnly"/>. setgid in both cases, so whatever group the leaf has
     /// keeps propagating to the package directories the jail creates under it.
+    ///
+    /// <para><b>Audit F33 — the sticky bit on the fallback rung.</b> When the jail group is absent the
+    /// leaf has to be world-writable or the remapped jail uid cannot write its cache at all, and that is
+    /// the trade this rung exists to make. What it does NOT have to be is world-<i>destructible</i>: a
+    /// bare <c>2777</c> lets any local account rename or delete another agent's cached packages, which
+    /// is the classic shared-directory hazard <c>/tmp</c> solved decades ago with the sticky bit. With
+    /// <c>t</c> set, only a file's owner (or the directory's) may unlink or rename it, so the jail keeps
+    /// exactly the write it needs and loses the reach into everybody else's entries. It costs nothing —
+    /// the jail creates and owns everything it writes — and it changes nothing on the
+    /// <see cref="PackageCacheGrant.SharedJailGroup"/> rung, which is not world-writable in the first
+    /// place.</para>
     /// </summary>
     public static UnixFileMode LeafMode(PackageCacheGrant grant)
         => ParentMode | (grant == PackageCacheGrant.ModeOnly
-            ? UnixFileMode.OtherWrite
+            ? UnixFileMode.OtherWrite | UnixFileMode.StickyBit
             : UnixFileMode.None);
 
     /// <summary>

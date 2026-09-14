@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace Mainguard.Agents.Agents.Orchestrator;
 
@@ -15,11 +16,20 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// one log line, neither of which any surface reads. So the card told a person to resolve a conflict
 /// without telling them what conflicted, and offered no operation that could act on it.</para>
 ///
-/// <para><b>Deliberately NOT persisted</b>, for the reason <c>MergeQueue</c>'s working reasons are not: it
-/// is a measurement of one worktree at one instant, and a measurement written to SQLite outlives its own
-/// truth. A daemon restart re-measures — the parked rebase is still on disk, and the swarm reconciler is
-/// what re-establishes whether its jail survived at all. The durable record of the handoff is the audit
-/// event, which is written on the same code path and is not replaced by this.</para>
+/// <para><b>Persisted, having originally not been</b> — and the original reasoning is worth stating because
+/// it was half right. It said: this is a measurement of one worktree at one instant, a daemon restart
+/// re-measures, the durable record is the audit event. The first two clauses are the mistake. Nothing
+/// re-measures: the parking is written by the keep-alive cascade's conflict arm, which runs when a rebase
+/// conflicts, and a restart is not a rebase. The parked worktree really is still on disk, the jail really
+/// is still frozen — and with this record gone, Resolve and Abort both answered "no rebase parked", the
+/// hand-back had no permit to grant, and a <c>Stop</c> force-removed the mid-rebase worktree (audit F3).
+/// The audit event is a record for a human reading a log, not one any operation can act on.</para>
+///
+/// <para>What the original note was right about is the <i>content</i>: <see cref="ConflictedPaths"/> is a
+/// measurement and can go stale. It is carried across a restart anyway, because a possibly-stale list of
+/// conflicted files is strictly more use to the human being asked to resolve them than no list at all, and
+/// because the alternative on offer was not a fresh measurement but a card that denied the conflict
+/// existed.</para>
 /// </summary>
 /// <param name="AgentId">The entry whose branch is parked.</param>
 /// <param name="WorktreePath">
@@ -61,11 +71,60 @@ public sealed class RebaseConflictParkingStore
     private readonly ConcurrentDictionary<(string Repo, string Agent), ParkedRebaseConflict> _parked =
         new();
 
+    private readonly IAgentRestartLedger _persist;
+
+    /// <summary>
+    /// The daemon's store, written through to the durable restart ledger.
+    /// </summary>
+    /// <param name="persist">The restart store, or null for the process-wide one. The test seam.</param>
+    /// <param name="clock">Injected so the hand-back expiry is testable without waiting a day out.</param>
+    public RebaseConflictParkingStore(
+        IAgentRestartLedger? persist = null,
+        Func<DateTimeOffset>? clock = null)
+    {
+        // Before the restore loop: it stamps hand-back permits with this clock.
+        _clock = clock ?? (() => DateTimeOffset.UtcNow);
+        _persist = persist ?? AgentRestartLedger.Process;
+        foreach (var record in _persist.LoadAll())
+        {
+            foreach (var parked in record.Parked)
+            {
+                _parked[(parked.RepoHash, record.AgentId)] = new ParkedRebaseConflict(
+                    record.AgentId, parked.WorktreePath, parked.MainBranch,
+                    parked.ConflictedPaths, parked.ParkedAt);
+            }
+
+            foreach (var repo in record.HandedBackRepos)
+            {
+                // KNOWN GAP, stated rather than hidden: the persisted record carries the repo list
+                // only, not the grant stamp, so a permit restored after a restart comes back without
+                // its original expiry. Stamping it with restore time keeps it usable — which is the
+                // whole point of persisting it, since the rewrite it authorises may well arrive after
+                // the restart — and keeps it expiring, at the cost that a restart refreshes the 24h
+                // lifetime. The alternative, dropping the stamp's absence to "expired", would delete
+                // every permit on every restart and reinstate the bug the durability fixed. Carrying
+                // the stamp through `RestartAgentRecord` is the real fix and wants a ledger schema
+                // change.
+                _handedBack[(repo, record.AgentId)] = _clock();
+            }
+        }
+    }
+
     /// <summary>Records (or replaces) the parking for one entry.</summary>
     public void Park(string repoHandle, ParkedRebaseConflict conflict)
     {
         ArgumentNullException.ThrowIfNull(conflict);
-        _parked[(repoHandle ?? string.Empty, conflict.AgentId)] = conflict;
+        var repo = repoHandle ?? string.Empty;
+        _parked[(repo, conflict.AgentId)] = conflict;
+        _persist.Update(conflict.AgentId, record => record with
+        {
+            Parked = record.Parked
+                .Where(p => !string.Equals(p.RepoHash, repo, StringComparison.Ordinal))
+                .Append(new RestartParkedConflict(
+                    repo, conflict.WorktreePath, conflict.MainBranch,
+                    conflict.ConflictedPaths.ToList(), conflict.ParkedAt))
+                .ToList(),
+        });
     }
 
     /// <summary>The parking for one entry, or null when this entry is not parked mid-rebase.</summary>
@@ -81,8 +140,23 @@ public sealed class RebaseConflictParkingStore
     /// back to finish. It is deliberately NOT called on a successful later rebase cycle: that cycle parks
     /// or clears through the same two entry points, and a third writer is how a stale record survives.</para>
     /// </summary>
-    public bool Clear(string repoHandle, string agentId) =>
-        _parked.TryRemove((repoHandle ?? string.Empty, agentId ?? string.Empty), out _);
+    public bool Clear(string repoHandle, string agentId)
+    {
+        var repo = repoHandle ?? string.Empty;
+        var id = agentId ?? string.Empty;
+        if (!_parked.TryRemove((repo, id), out _))
+        {
+            return false;
+        }
+
+        _persist.Update(id, record => record with
+        {
+            Parked = record.Parked
+                .Where(p => !string.Equals(p.RepoHash, repo, StringComparison.Ordinal))
+                .ToList(),
+        });
+        return true;
+    }
 
     // ---- the hand-back mark ----------------------------------------------------------------------
     //
@@ -91,19 +165,97 @@ public sealed class RebaseConflictParkingStore
     // so without this mark the handed-back branch was refused on every sweep, forever, and the card's
     // promise of automatic re-verification was false. The mark is the human's authorisation for ONE such
     // rewrite: set by the hand-back, consumed by the first publish it lets through, keyed like the parking.
-    private readonly ConcurrentDictionary<(string Repo, string Agent), byte> _handedBack = new();
+    //
+    // AUDIT F44 (residual): the mark used to be a bare presence flag, and both halves of "ONE rewrite"
+    // were untrue of it. It had no expiry, so an authorisation granted on Monday still permitted a
+    // rewrite on Friday against a mirror the human had never seen; and it was consumed only by a publish
+    // that took the REWRITE path, so an ordinary fast-forward publish of the same branch left it armed
+    // for whatever came next. Both are fixed here, beside the grant, because the mediator cannot know
+    // when the grant was made and the fix belongs where the fact is.
+    private readonly ConcurrentDictionary<(string Repo, string Agent), DateTimeOffset> _handedBack = new();
 
-    /// <summary>Records that a human handed this entry's conflict back to its agent to finish the rebase.</summary>
-    public void MarkHandedBack(string repoHandle, string agentId) =>
-        _handedBack[(repoHandle ?? string.Empty, agentId ?? string.Empty)] = 0;
+    private readonly Func<DateTimeOffset> _clock;
 
-    /// <summary>True while a hand-back is outstanding — the mediator may accept one rewrite of this branch.</summary>
-    public bool IsHandedBack(string repoHandle, string agentId) =>
-        _handedBack.ContainsKey((repoHandle ?? string.Empty, agentId ?? string.Empty));
+    /// <summary>
+    /// How long a hand-back authorisation stays valid.
+    ///
+    /// <para>The grant describes a decision a human took about a conflict they were looking at, so it has
+    /// to outlive the work it authorises and not much else. A worker finishing a rebase takes minutes to
+    /// hours, and a person who steps away mid-afternoon should not have to click again; a person who
+    /// comes back the next morning is looking at a different mirror, and re-deciding is the correct cost.
+    /// Expiring is safe in the direction that matters: the branch is refused with rule 2's own message
+    /// and the card offers the hand-back again, which is a visible no rather than a silent yes.</para>
+    /// </summary>
+    public static readonly TimeSpan HandBackLifetime = TimeSpan.FromHours(24);
+
+    /// <summary>Records that a human handed this entry's conflict back to its agent to finish the rebase.
+    ///
+    /// <para>Stamped, so the permit expires (F44): the grant is an authorisation for ONE rewrite taken by
+    /// a human looking at one mirror, and it should not still be good next week.</para>
+    ///
+    /// <para>Durable, so the permit survives a restart (F3): the rewrite it authorises arrives whenever
+    /// the agent finishes — minutes later, across a restart as easily as not. A permit lost with the
+    /// daemon leaves the handed-back branch refused on every sweep, forever, which is precisely the
+    /// failure the permit was introduced to fix. The two are independent and both hold: the in-memory
+    /// entry carries the grant stamp, the ledger carries the fact that a grant exists.</para></summary>
+    public void MarkHandedBack(string repoHandle, string agentId)
+    {
+        var repo = repoHandle ?? string.Empty;
+        var id = agentId ?? string.Empty;
+        _handedBack[(repo, id)] = _clock();
+        _persist.Update(id, record => record.HandedBackRepos.Contains(repo, StringComparer.Ordinal)
+            ? record
+            : record with { HandedBackRepos = record.HandedBackRepos.Append(repo).ToList() });
+    }
+
+    /// <summary>
+    /// True while a hand-back is outstanding AND still inside <see cref="HandBackLifetime"/> — the
+    /// mediator may accept one rewrite of this branch.
+    ///
+    /// <para>An expired mark is removed on the way past rather than left to accumulate: this is the only
+    /// read path, so it is the only place that can notice, and a permit that has expired should stop
+    /// existing rather than keep answering "no" forever.</para>
+    ///
+    /// <para>It is removed from the durable ledger too, not just from memory. The ledger does not carry
+    /// the grant stamp, so a restart re-stamps what it restores — leave an expired permit in there and
+    /// the next restart resurrects it, which would make the lifetime unenforceable by the one gesture
+    /// most likely to happen overnight. Expiring is a decision, so it is written down like one.</para>
+    /// </summary>
+    public bool IsHandedBack(string repoHandle, string agentId)
+    {
+        var key = (repoHandle ?? string.Empty, agentId ?? string.Empty);
+        if (!_handedBack.TryGetValue(key, out var granted))
+        {
+            return false;
+        }
+
+        if (_clock() - granted < HandBackLifetime)
+        {
+            return true;
+        }
+
+        ClearHandedBack(key.Item1, key.Item2);
+        return false;
+    }
 
     /// <summary>Consumes the mark: the rewrite it authorised has reached the mirror (or the entry is gone).</summary>
-    public bool ClearHandedBack(string repoHandle, string agentId) =>
-        _handedBack.TryRemove((repoHandle ?? string.Empty, agentId ?? string.Empty), out _);
+    public bool ClearHandedBack(string repoHandle, string agentId)
+    {
+        var repo = repoHandle ?? string.Empty;
+        var id = agentId ?? string.Empty;
+        if (!_handedBack.TryRemove((repo, id), out _))
+        {
+            return false;
+        }
+
+        _persist.Update(id, record => record with
+        {
+            HandedBackRepos = record.HandedBackRepos
+                .Where(r => !string.Equals(r, repo, StringComparison.Ordinal))
+                .ToList(),
+        });
+        return true;
+    }
 }
 
 /// <summary>

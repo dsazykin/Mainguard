@@ -22,12 +22,10 @@ Mainguard.Server.Tests/AgentSessionStoreBackpressureTests.cs
 Mainguard.Server.Tests/Agents/CoordinatorSpawnGateTests.cs
 Mainguard.Server.Tests/EgressAuditActorTests.cs
 Mainguard.Server.Tests/Fixtures/MappedGrpcRpcs.cs
-Mainguard.Server.Tests/Gateway/GatewayBindPolicyTests.cs
 Mainguard.Server.Tests/Gateway/GatewayListenerBindTests.cs
 Mainguard.Server.Tests/HarvestCredentialsRpcTests.cs
 Mainguard.Server.Tests/KillContainmentTests.cs
 Mainguard.Server.Tests/MergeConfirmGateTests.cs
-Mainguard.Server.Tests/MergeQueueWiringTests.cs
 Mainguard.Server.Tests/SandboxSecretsMappingTests.cs
 Mainguard.Server.Tests/SpawnErrorMappingTests.cs
 Mainguard.Server.Tests/TerminalSessionManagerTests.cs
@@ -38,8 +36,6 @@ Mainguard.Tests/AdapterChannelTests.cs
 Mainguard.Tests/AdapterManifestTests.cs
 Mainguard.Tests/AdapterPinOverrideStoreTests.cs
 Mainguard.Tests/AgentCliUpdateServiceTests.cs
-Mainguard.Tests/AgentIpcProtocolTests.cs
-Mainguard.Tests/AppShutdownSequenceTests.cs
 Mainguard.Tests/AppStartupSequenceTests.cs
 Mainguard.Tests/BlameEntryPointTests.cs
 Mainguard.Tests/BranchTreeBuilderTests.cs
@@ -49,7 +45,6 @@ Mainguard.Tests/CheckStatusServiceTests.cs
 Mainguard.Tests/ChecksViewModelTests.cs
 Mainguard.Tests/CliLoginVaultTests.cs
 Mainguard.Tests/ContainerReadinessTests.cs
-Mainguard.Tests/CoordinatorCliStartTests.cs
 Mainguard.Tests/DaemonTokenLocatorTests.cs
 Mainguard.Tests/DeepLinkTests.cs
 Mainguard.Tests/DetectDistroStepTests.cs

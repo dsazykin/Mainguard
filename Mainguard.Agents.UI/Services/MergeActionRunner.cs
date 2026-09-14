@@ -37,16 +37,44 @@ public static class MergeActionRunner
     /// <param name="queue">The merge-queue seam (the shipped daemon-backed adapter in the real app).</param>
     /// <param name="agentId">The agent whose <c>agent/&lt;id&gt;</c> branch is merged.</param>
     /// <param name="report">(message, isWarning) sink; defaults to the shell's toast stack. Injected by tests.</param>
+    /// <param name="ct">
+    /// The SURFACE's token, so the human who pressed Merge can stop waiting on it. The daemon-backed
+    /// adapter's merge does real network work (a host PR fetch, a <c>git fetch</c> over the sync remote)
+    /// while holding the repository's one merge lease, and before this the only token that could end it
+    /// was the adapter's own — cancelled at app exit and nowhere else.
+    /// <para><b>It bounds the WAIT, not the merge.</b> Cancelling before the merge lands runs the adapter's
+    /// ordinary abandon arm, so the lease comes back and the sentence below is true. Cancelling after it
+    /// lands cannot un-land it: the adapter records the merge regardless and throws a reason that SAYS the
+    /// merge happened, which arrives at the generic catch as a warning rather than here. That split is the
+    /// whole point — see <c>DaemonBackedOrchestrator.ConfirmMergeAsync</c>'s step 3.</para>
+    /// <para>Only the daemon-backed adapter can honour it; every other <see cref="IMergeQueueService"/>
+    /// (the mock, the harness fakes) has no cancellable form, and passing a token those cannot observe
+    /// would be a control that looks live and is not. The token is checked before the call either way, so
+    /// a cancel that arrives first is still respected.</para>
+    /// </param>
     public static async Task RunAsync(
-        IMergeQueueService queue, string agentId, Action<string, bool>? report = null)
+        IMergeQueueService queue, string agentId, Action<string, bool>? report = null,
+        System.Threading.CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(queue);
         var sink = report ?? DefaultReport;
 
         try
         {
-            var outcome = await queue.ConfirmMergeAsync(agentId).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            var outcome = queue is DaemonBackedOrchestrator daemon
+                ? await daemon.ConfirmMergeAsync(agentId, ct).ConfigureAwait(false)
+                : await queue.ConfirmMergeAsync(agentId).ConfigureAwait(false);
             sink(Confirmation(outcome), false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // The human cancelled the wait BEFORE anything landed — the only way a cancel reaches here,
+            // since the adapter turns a cancel observed after the merge landed into a reason that says so
+            // rather than an OperationCanceledException. Said, because a Merge button that goes quiet is
+            // the exact "nothing visibly happened" this class exists to prevent — and because the lease
+            // was handed back, so the entry really is mergeable again.
+            sink("Merge cancelled — nothing was merged and the queue is unchanged.", true);
         }
         catch (OperationCanceledException)
         {

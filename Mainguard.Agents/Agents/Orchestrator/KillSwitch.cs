@@ -402,7 +402,28 @@ public sealed class KillSwitch
         Func<TimeSpan>? rttBudget = null,
         Func<DateTimeOffset>? clock = null,
         Action<string>? onRttSpike = null)
+        : this(gate, target, journal, audit, rttBudget, clock, onRttSpike, null)
     {
+    }
+
+    /// <param name="restartLedger">
+    /// The durable ledger the epoch is rehydrated from, or null for the process-wide one. Deliberately NOT
+    /// an optional argument on the public constructor: <see cref="WiredOptionalControls"/> is the
+    /// composition root's assertion that every optional argument is stated there, and an eighth optional
+    /// the daemon does not pass would quietly falsify that claim. This is a test seam, and the daemon uses
+    /// the process ledger — the same one <c>SandboxKillTarget</c> writes.
+    /// </param>
+    internal KillSwitch(
+        KillSwitchGate gate,
+        IKillTarget target,
+        IKillJournal? journal,
+        IAuditLog? audit,
+        Func<TimeSpan>? rttBudget,
+        Func<DateTimeOffset>? clock,
+        Action<string>? onRttSpike,
+        IAgentRestartLedger? restartLedger)
+    {
+        _restart = restartLedger ?? AgentRestartLedger.Process;
         _gate = gate ?? throw new ArgumentNullException(nameof(gate));
         _target = target ?? throw new ArgumentNullException(nameof(target));
         _journal = journal ?? new InMemoryKillJournal();
@@ -425,6 +446,76 @@ public sealed class KillSwitch
         if (clock is not null) { wired.Add(nameof(clock)); }
         if (onRttSpike is not null) { wired.Add(nameof(onRttSpike)); }
         WiredOptionalControls = wired;
+
+        RehydrateEpoch();
+    }
+
+    // ---- Restart survival (audit F3) --------------------------------------------------------------
+    //
+    // The ledger above is in-memory, and the jails it is about are not: `docker pause` outlives the
+    // daemon by design. So an emergency stop followed by a restart — which is the ordinary sequence,
+    // since an emergency stop is what people press before restarting things — left every frozen jail with
+    // nothing in the app entitled to wake it. Resume released nothing ("the fan-out ledger is empty") and
+    // the documented exit was a raw `docker unpause` from a terminal.
+    private readonly IAgentRestartLedger _restart;
+
+    /// <summary>
+    /// Recovers the outstanding kill epoch so Resume still means something after a restart.
+    ///
+    /// <para><b>The agent set comes from the TARGET's causation ledger, not from a copy of this one.</b>
+    /// <c>SandboxKillTarget</c> records, per agent, which containers it was the party that froze; that
+    /// record is both durable and strictly more precise than "every id the fan-out touched", because the
+    /// release is entitled to reverse only what the kill switch actually caused. Two writers for one fact
+    /// is how one of them becomes decorative, so this reads the same flag rather than persisting a second
+    /// list beside it.</para>
+    ///
+    /// <para><b>The epoch id comes from the ledger, and failing that from the journal.</b>
+    /// <see cref="IKillJournal.ReadAll"/> had no production caller at all — the journal's own doc comment
+    /// calls a write-only journal "the defect, not a design choice" — and this is the read that makes it
+    /// load-bearing: the snapshot written before the kill returned is exactly the durable record of which
+    /// epoch the surviving containment belongs to. It is consulted only when jails are still held, so a
+    /// resume that completed before the restart cannot resurrect its own closed epoch.</para>
+    /// </summary>
+    private void RehydrateEpoch()
+    {
+        List<string> held;
+        try
+        {
+            held = _restart.LoadAll().Where(r => r.KillContained).Select(r => r.AgentId).ToList();
+        }
+        catch (Exception)
+        {
+            return; // RT-D3 posture: an unreadable store never blocks or breaks the kill switch.
+        }
+
+        if (held.Count == 0)
+        {
+            return;
+        }
+
+        string? epoch;
+        try
+        {
+            epoch = _restart.KillEpochId;
+            if (string.IsNullOrEmpty(epoch))
+            {
+                var snapshots = _journal.ReadAll();
+                epoch = snapshots.Count > 0 ? snapshots[^1].KillEpochId : null;
+            }
+        }
+        catch (Exception)
+        {
+            epoch = null;
+        }
+
+        lock (_epochGate)
+        {
+            _fannedOutTo = held;
+            // A null epoch is honest: the containment is real and which stop caused it is unknown. Resume
+            // still releases it — the release is keyed on the agents, never on the epoch, and refusing to
+            // recover because a label is missing would restore the very defect this recovers from.
+            _engagedEpochId = epoch;
+        }
     }
 
     /// <summary>True while the queue is frozen (the kill switch is engaged).</summary>
@@ -505,6 +596,10 @@ public sealed class KillSwitch
                 .ToList();
         }
 
+        // Durable, so a restart between the stop and the release still knows which epoch is outstanding.
+        // Best-effort like every other store touch on this path (RT-D3): a kill never blocks on a store.
+        try { _restart.SetKillEpochId(epochId); } catch (Exception) { /* RT-D3 */ }
+
         // ---- Step 3: journal snapshot written BEFORE returning ----
         var states = _target.CaptureStates();
         var agentStates = results
@@ -577,6 +672,10 @@ public sealed class KillSwitch
             _fannedOutTo = stillHeld;
             _engagedEpochId = stillHeld.Count > 0 ? epochId : null;
         }
+
+        // Closed durably too, or the next daemon would rehydrate an epoch whose jails are all awake. The
+        // per-agent containment flag is cleared by the TARGET as each release confirms — one writer.
+        try { _restart.SetKillEpochId(stillHeld.Count > 0 ? epochId : null); } catch (Exception) { /* RT-D3 */ }
 
         TryAuditResume(epochId, results);
 

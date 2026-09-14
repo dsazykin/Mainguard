@@ -2,6 +2,7 @@ using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using Mainguard.Git.Exceptions;
 
 namespace Mainguard.Agents.Agents;
 
@@ -446,10 +447,29 @@ public static class AgentBranchGuard
                 Detail: $"there is no worktree at '{worktreePath}'");
         }
 
+        // W1-A rework — this probe decides whether an agent's work is on the branch the merge queue
+        // reads, and it runs with the agent's worktree as its working directory while the agent is live.
+        // Unpinned, an agent could aim the answer at a different repository's HEAD and have work committed
+        // somewhere else reported as aligned. The pin is resolved from the daemon's own roots; a refusal
+        // is `Unknown`, which every caller already treats as "not evidence of alignment".
+        TrustedWorktreeLayout? layout;
+        try
+        {
+            layout = TrustedWorktreeLayout.TryResolve(worktreePath, agentRepoPath);
+        }
+        catch (RepoProvisioningException ex)
+        {
+            return new AgentBranchAlignment(
+                AgentBranchAlignmentState.Unknown, expected, Detail: ex.Message);
+        }
+
+        var dir = layout?.WorkTree ?? worktreePath;
+        var env = layout?.Env;
+
         // `symbolic-ref --short HEAD` answers "which branch", and FAILS (rather than lying) on a detached
         // HEAD — which is the distinction that matters here, so it is preferred over `rev-parse
         // --abbrev-ref HEAD`, whose answer for a detached HEAD is the string "HEAD".
-        var onBranch = AgentGitCommand.TryRun(worktreePath, out var branchOut, "symbolic-ref", "--quiet", "--short", "HEAD") == 0;
+        var onBranch = AgentGitCommand.TryRunWithEnv(dir, env, out var branchOut, "symbolic-ref", "--quiet", "--short", "HEAD") == 0;
         var actualBranch = branchOut.Trim();
 
         if (onBranch && string.Equals(actualBranch, expected, StringComparison.Ordinal))
@@ -457,8 +477,8 @@ public static class AgentBranchGuard
             return new AgentBranchAlignment(AgentBranchAlignmentState.OnAgentBranch, expected, actualBranch);
         }
 
-        var headSha = RevParse(worktreePath, "HEAD");
-        var agentSha = RevParse(agentRepoPath, AgentRepoLayout.RefFor(agentId));
+        var headSha = RevParse(dir, env, "HEAD");
+        var agentSha = RevParse(agentRepoPath, null, AgentRepoLayout.RefFor(agentId));
 
         if (!onBranch && headSha.Length == 0)
         {
@@ -474,8 +494,8 @@ public static class AgentBranchGuard
         bool? ancestor = null;
         if (headSha.Length > 0 && agentSha.Length > 0)
         {
-            ancestor = AgentGitCommand.TryRun(
-                worktreePath, out _, "merge-base", "--is-ancestor", agentSha, headSha) == 0;
+            ancestor = AgentGitCommand.TryRunWithEnv(
+                dir, env, out _, "merge-base", "--is-ancestor", agentSha, headSha) == 0;
         }
 
         return new AgentBranchAlignment(
@@ -487,10 +507,11 @@ public static class AgentBranchGuard
             ancestor);
     }
 
-    private static string RevParse(string gitDir, string reference)
+    private static string RevParse(
+        string gitDir, System.Collections.Generic.IReadOnlyDictionary<string, string>? env, string reference)
         => !Directory.Exists(gitDir)
             ? string.Empty
-            : AgentGitCommand.TryRun(gitDir, out var output, "rev-parse", "--verify", "--quiet", reference) == 0
+            : AgentGitCommand.TryRunWithEnv(gitDir, env, out var output, "rev-parse", "--verify", "--quiet", reference) == 0
                 ? output.Trim()
                 : string.Empty;
 

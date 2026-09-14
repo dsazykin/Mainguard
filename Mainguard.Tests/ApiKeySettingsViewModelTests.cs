@@ -207,4 +207,47 @@ public class ApiKeySettingsViewModelTests
         Assert.False(dialogShown);
         Assert.True(vm.IsCliOAuthEnabled);
     }
+
+    // ---- F51: the page says where an unconfinable provider's key ends up ------------------------
+
+    /// <summary>
+    /// The finding: a CLI that declares no base-URL variable cannot be pointed at Mainguard's model
+    /// gateway, so its BYOK key is written into the jail as-is and its spend is not metered — and the
+    /// only place that was ever said was a daemon log line. Anthropic and Google declare both halves in
+    /// the shipped manifest; OpenAI's codex declares neither, which is the case the user was never told
+    /// about on the page that took the key.
+    /// </summary>
+    [Theory]
+    [InlineData("anthropic", true)]
+    [InlineData("google", true)]
+    [InlineData("openai", false)]
+    public void ProviderConfinability_ComesFromTheShippedManifest(string provider, bool confinable)
+    {
+        Assert.Equal(confinable, ApiKeySettingsViewModel.ProviderCanBeGatewayConfined(provider));
+        Assert.Equal(confinable, ApiKeySettingsViewModel.ConfinementNoticeFor(provider) is null);
+    }
+
+    /// <summary>The notice reaches the surface a user actually reads: the stored-key row. Only for a
+    /// key that exists — an unconfinable provider with no key has nothing to warn about yet.</summary>
+    [Fact]
+    public void TheStoredKeyRow_WarnsOnlyForAnUnconfinableProviderThatHasAKey()
+    {
+        using var dir = new TempDir();
+        ISecureKeyStore keyring = new SecureKeyring(dir.Path);
+        keyring.Set("llm_openai", "sk-openai-key");
+
+        var vm = new ApiKeySettingsViewModel(keyring);
+
+        var openai = vm.Providers.Single(r => r.Provider == "openai");
+        Assert.True(openai.ShowsConfinementNotice);
+        Assert.Contains("not metered", openai.ConfinementNotice, StringComparison.Ordinal);
+
+        // A confinable provider says nothing, even once it has a key.
+        var anthropic = vm.Providers.Single(r => r.Provider == "anthropic");
+        Assert.False(anthropic.ShowsConfinementNotice);
+
+        // An unconfinable provider with no key stored has nothing to warn about yet.
+        var google = vm.Providers.Single(r => r.Provider == "google");
+        Assert.False(google.ShowsConfinementNotice);
+    }
 }

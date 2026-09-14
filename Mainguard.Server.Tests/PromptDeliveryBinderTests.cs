@@ -39,6 +39,33 @@ public sealed class PromptDeliveryBinderTests : IDisposable
         "Add one more assertion to test.js covering the empty-input case, then re-run the suite and "
         + "record the result in your mainguard-plan commit.";
 
+    /// <summary>
+    /// Slack for the fact that <c>Task.Delay</c> is not a hard floor: it is free to complete a timer
+    /// tick EARLY relative to the clock the write stamps are taken from, so a 50 ms separation is
+    /// routinely observed as 49.x ms. <c>BoundTerminalSession</c> separates the two writes with
+    /// <c>Task.Delay(TerminatorSeparation)</c>, which completes on the runtime's timer wheel, while
+    /// <see cref="RawModeCliDouble"/> stamps each write with <c>DateTime.UtcNow</c>; the two need not
+    /// agree to the millisecond, and CI read <b>50 ms</b> for a 50 ms separation and failed the
+    /// <c>&gt;=</c> by less than half a millisecond. That is the assertion breaking at its own floor,
+    /// not the code failing to separate anything.
+    ///
+    /// <para>It is slack for the CLOCK, not for the guard: half a millisecond is far below anything a
+    /// PTY can coalesce, while a regression that drops the separation altogether reports a gap of ~0 ms
+    /// — as the mutation check confirms when the fallback is deleted from
+    /// <c>SubmitLineAndAwaitOutputAsync</c> — and still fails. Widening this past a tick would start
+    /// accepting real defects.</para>
+    ///
+    /// <para>Only the completed-stream test sits exactly ON the separation; the other two paths have
+    /// already spent the 250 ms echo window and clear the bar by an order of magnitude. The floor is
+    /// nonetheless expressed once and used by all three, so no assertion is left sitting on a bound it
+    /// cannot honestly measure.</para>
+    /// </summary>
+    private static readonly TimeSpan TimerGranularity = TimeSpan.FromMilliseconds(2);
+
+    /// <summary>The separation floor as an assertion can honestly measure it — see <see cref="TimerGranularity"/>.</summary>
+    private static readonly TimeSpan MeasurableSeparationFloor =
+        TerminalSubmit.TerminatorSeparation - TimerGranularity;
+
     public PromptDeliveryBinderTests()
     {
         Directory.CreateDirectory(_root);
@@ -162,7 +189,7 @@ public sealed class PromptDeliveryBinderTests : IDisposable
         Assert.Equal(2, writes.Count);
         var gap = writes[1].At - writes[0].At;
         Assert.True(
-            gap >= TerminalSubmit.TerminatorSeparation,
+            gap >= MeasurableSeparationFloor,
             $"Enter followed the body after only {gap.TotalMilliseconds:0}ms with no echo to separate "
             + "them — the PTY would hand the CLI a single read and the CR would be swallowed as content");
 
@@ -188,25 +215,35 @@ public sealed class PromptDeliveryBinderTests : IDisposable
 
         cli.Kill(); // completes the output stream: the echo wait now returns false with no delay at all
 
-        var started = System.Diagnostics.Stopwatch.StartNew();
         var delivery = await _binder.TrySendPromptAsync(_key, RealisticSteer, CancellationToken.None);
-        started.Stop();
 
         Assert.True(delivery.Submitted);
         Assert.False(delivery.Echoed);
 
-        // It returned fast, so the echo window did NOT lapse — and the writes were separated anyway.
-        Assert.True(
-            started.Elapsed < AgentCliBinder.PromptEchoWindow,
-            "the echo wait was expected to return instantly on a completed stream");
-
+        // BOTH halves are read off the interval BETWEEN THE TWO WRITES, which is the only interval either
+        // half is about. An outer stopwatch around the whole call also times the reaction wait, the
+        // fixture and every scheduling stall on the machine, and that is what made this test fail on a
+        // loaded CI runner — inside a jail, four xUnit threads deep — while the code path it exists to pin
+        // was exactly right. Timing the call to conclude something about one leg of it was the defect in
+        // the assertion, not a tolerance that needed widening.
         var writes = cli.Writes;
         Assert.Equal(2, writes.Count);
         var gap = writes[1].At - writes[0].At;
+
+        // (1) The writes were separated at all — the property under test.
         Assert.True(
-            gap >= TerminalSubmit.TerminatorSeparation,
+            gap >= MeasurableSeparationFloor,
             $"the terminator followed the body after {gap.TotalMilliseconds:0}ms with nothing separating "
             + "them — one read at the CLI, and the CR is content rather than Enter");
+
+        // (2) And it was the FALLBACK that separated them, not a lapsed echo window — without which this
+        // test would pass on the 250 ms window alone and say nothing about the fallback being a guard
+        // rather than dead code. A lapsed window cannot produce a gap below its own length.
+        Assert.True(
+            gap < AgentCliBinder.PromptEchoWindow,
+            $"the two writes were {gap.TotalMilliseconds:0}ms apart, which is the echo window rather than "
+            + "the fallback — the stream was expected to be completed, so the echo wait should have "
+            + "returned instantly and this test proves nothing about the fallback");
     }
 
     /// <summary>
@@ -232,7 +269,7 @@ public sealed class PromptDeliveryBinderTests : IDisposable
         Assert.Equal(2, writes.Count);
         var gap = writes[1].At - writes[0].At;
         Assert.True(
-            gap >= TerminalSubmit.TerminatorSeparation,
+            gap >= MeasurableSeparationFloor,
             $"Enter followed the body after only {gap.TotalMilliseconds:0}ms because an unsolicited frame "
             + "counted as the echo — the PTY would hand the CLI a single read and the CR would be swallowed");
         Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));

@@ -357,12 +357,24 @@ public sealed class SandboxAgentLauncher
             // invoked, so every BYOK jail received the raw provider key.
             var confinement = await TryConfineToGatewayAsync(agentId, modelApiKey, adapter, ct)
                 .ConfigureAwait(false);
-            var secrets = BuildSecrets(modelApiKey, adapter, extraEnv, cliCredentials, confinement);
+            var secrets = BuildSecrets(modelApiKey, adapter, extraEnv, cliCredentials, confinement, _log);
             handle = await _environment.Sandboxes.SpawnAsync(new SandboxSpawnRequest(
                 RepoHash: repoHandle,
                 AgentId: agentId,
                 WorktreePath: worktreePath,
                 ImageRef: spawnImageRef,
+                // Audit F28, launcher side: this IS the current ceiling. `JailLimitsSettings.Current` is
+                // read live at every spawn, so an operator who lowers the per-jail memory/CPU ceiling
+                // reaches every jail created after the change, and the argument is not decorative here.
+                //
+                // What it does not reach is a REUSED jail: `DockerSandboxEngine.SpawnAsync` decides reuse
+                // on mounts, DNS, network, secret layout and image digest and never on the limits, so a
+                // running jail keeps the ceiling it was born with — and a pre-MG-26 jail is reused with no
+                // CPU cap at all. That check belongs in the engine's reuse decision, next to the other
+                // eight, and re-deciding it here would be a second copy of a rule (MG-12) that could only
+                // disagree with the first. It is being fixed there by PR #368, which re-applies memory,
+                // CPU and pids in place on the live cgroup rather than recreating the jail and losing the
+                // agent's session; this line is what feeds it the value to apply.
                 Limits: _jailLimits?.Current ?? SandboxLimits.Default,
                 Secrets: secrets,
                 AgentUid: AgentUid,
@@ -462,6 +474,38 @@ public sealed class SandboxAgentLauncher
                 // The jail is real and about to be forgotten by everything that could stop it later.
                 try { await _environment.Sandboxes.RemoveAsync(handle.ContainerId, CancellationToken.None).ConfigureAwait(false); }
                 catch (Exception removeEx) { _log.LogWarning(removeEx, "rollback: could not remove jail {Container}", handle.ContainerId); }
+            }
+
+            // Audit F27 — the grant that had no release on this path. The MG-36 per-agent network segment
+            // is created BEFORE `SpawnAsync`, so it exists for every failure from the image pull onwards,
+            // and this rollback removed the container and the worktree and left it. Only a clean teardown
+            // reclaimed one. Docker's default local address pool is about 32 networks, so a few dozen
+            // failed spawns exhaust it and every subsequent spawn fails at network creation — on a machine
+            // with no running agents, which is what makes the cause unguessable from the symptom.
+            //
+            // Ordered AFTER the container removal, exactly as in `TeardownAsync`: Docker refuses to delete
+            // a network that still has a live endpoint on it. Unconditional on `handle`, because the
+            // segment is created before the container and the failures that leak it are precisely the ones
+            // where no handle exists. `CancellationToken.None` for the F19 reason — a rollback that gives
+            // up half way leaves residue nothing else will collect.
+            if (!string.IsNullOrEmpty(repoHandle))
+            {
+                try
+                {
+                    await _environment.Egress
+                        .RemoveAgentSegmentAsync(repoHandle, agentId, CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception segmentEx)
+                {
+                    // Reported, not swallowed silently: this is the one line that says a segment may have
+                    // leaked, and `SandboxSegmentReaper` is the backstop rather than the plan.
+                    _log.LogWarning(
+                        segmentEx,
+                        "rollback: could not release the network segment for repo={Repo} agent={Agent} — "
+                        + "it may be leaked until the segment reaper sweeps it",
+                        repoHandle, agentId);
+                }
             }
 
             if (withoutRepositoryAccess)
@@ -626,7 +670,14 @@ public sealed class SandboxAgentLauncher
     /// segment, then its worktree. Never throws.</summary>
     public async Task TeardownAsync(string? repoHash, string agentId, string containerId, CancellationToken ct = default)
     {
-        try { await _environment.Sandboxes.RemoveAsync(containerId, ct).ConfigureAwait(false); }
+        // Audit F19, the second line of defence. `ct` stays in the signature because every caller has one
+        // and passes it, but teardown does NOT honour it: past this point the session record is already
+        // gone, so a cancelled removal leaves a running container nothing in the app can see, sitting on a
+        // worktree this same call is about to delete. The `catch` above makes that silent, which is what
+        // turned a client disconnect mid-Stop into an unowned jail. The caller side is fixed too
+        // (`AgentSpawnService.StopAsync` passes `CancellationToken.None`); this is the place that cannot
+        // be got wrong by the next caller.
+        try { await _environment.Sandboxes.RemoveAsync(containerId, CancellationToken.None).ConfigureAwait(false); }
         catch { /* never fail a stop from teardown */ }
 
         if (!string.IsNullOrEmpty(repoHash))
@@ -647,7 +698,16 @@ public sealed class SandboxAgentLauncher
             // default), so a segment leaked per agent would eventually make spawning fail with an
             // address-pool exhaustion error that reads like anything but the cause. Ordered AFTER the
             // container removal because Docker refuses to delete a network with a live endpoint.
-            try { await _environment.Egress.RemoveAgentSegmentAsync(repoHash, agentId, ct).ConfigureAwait(false); }
+            // Not on `ct` either, and for a sharper reason than the container removal: a leaked segment is
+            // never reclaimed by anything, and Docker's local bridge address pool is ~32 networks, so a
+            // cancelled stop per agent walks the daemon into an address-pool exhaustion that reads like
+            // anything but its cause.
+            try
+            {
+                await _environment.Egress
+                    .RemoveAgentSegmentAsync(repoHash, agentId, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
             catch { /* never fail a stop from teardown */ }
 
             if (publish is Mainguard.Agents.Agents.AgentRefPublishOutcome.RefusedNonFastForward
@@ -728,6 +788,24 @@ public sealed class SandboxAgentLauncher
         // — codex, qwen-code and opencode expose no base-URL environment variable at all).
         if (_credentials is null || _gatewayOptions is not { } gateway || !gateway.CanConfine)
         {
+            // Audit B1 — the two ways to arrive here are not the same event. `--gateway-bind off` is an
+            // operator's choice and a warning states it; a bind that AUTO-RESOLVED TO NOTHING is a defect
+            // that silently turns into a credential leak, which is exactly how a resolver bug (docker0
+            // filtered out for being carrier-down) shipped as "every BYOK jail gets the raw key". That one
+            // is an error, and it names the remedy.
+            if (_gatewayOptions is { DisabledUnintentionally: true })
+            {
+                _log.LogError(
+                    "gateway confinement UNAVAILABLE: agent={Agent} adapter={Adapter} supplied a BYOK "
+                    + "provider key, but the daemon could not resolve a gateway bind address (nobody asked "
+                    + "for the gateway to be off), so THE RAW KEY IS INJECTED INTO THE JAIL under {KeyVar}. "
+                    + "MG-4 is not in effect for this agent and its model spend is not metered. Set "
+                    + "MAINGUARD_GATEWAY_BIND (or --gateway-bind) to the Docker bridge address, or to 'off' "
+                    + "if that is genuinely intended.",
+                    agentId, adapter?.Id ?? "<unknown>", adapter?.ApiKeyEnvVar ?? LegacyApiKeyEnvVar);
+                return null;
+            }
+
             _log.LogWarning(
                 "gateway confinement OFF: agent={Agent} adapter={Adapter} supplied a BYOK provider key, but "
                 + "the model gateway is disabled, so THE RAW KEY IS INJECTED INTO THE JAIL under {KeyVar}. "
@@ -768,6 +846,31 @@ public sealed class SandboxAgentLauncher
 
         // The one lookup that answers BOTH "who is calling" and "where does it go": the token the jail
         // receives resolves, gateway-side, to this agent id, its budget, and this upstream host.
+        //
+        // ── Scheduled token rotation, and why AgentGatewayCredentials.TokenDelivery is NOT wired here ──
+        //
+        // The gateway can rotate an agent's mg_sess_ token on an interval (AgentGatewayCredentials.
+        // RotateStale), and it refuses to unless a TokenDelivery hook confirms the jail received the
+        // replacement. Wiring that hook was handed to this line. It is deliberately still unwired, and
+        // this is the finding rather than an omission:
+        //
+        //   THERE IS NO DELIVERY CHANNEL TO A RUNNING CLI. The token reaches the jail in
+        //   /run/secrets/agent/agent.env, and SandboxCliLaunch.WrapperScript sources that file ONCE and
+        //   then `exec`s the CLI ("set -a; . <file>; set +a; ... exec \"$@\""). A process's environment
+        //   is fixed at exec, so rewriting the file reaches the NEXT process in that jail and no other.
+        //   A hook that rewrote agent.env and reported success would therefore rotate the daemon's idea
+        //   of the token while the live CLI kept presenting the old one — which keeps working for the
+        //   overlap window (5 minutes) and then stops. The agent does not fail mid-request; it fails
+        //   permanently, an hour after it started, with a 401 nobody can explain.
+        //
+        //   Rewriting the file and reporting FAILURE (so the old token is kept) is safe but is exactly
+        //   the inert behaviour that exists today, plus a write.
+        //
+        // What would close it: a credential channel the CLI re-reads per request rather than at exec —
+        // claude-code's `apiKeyHelper` is one, but it is adapter-specific, and it is a settings key this
+        // batch deliberately stops carrying between jails (F45). So it needs a decision about a
+        // per-adapter delivery, not a hook call. Until then a token's exposure is bounded by the jail's
+        // lifetime, which is what it was before rotation existed.
         var token = _credentials.Issue(agentId, modelApiKey, upstreamHost);
         _log.LogInformation(
             "gateway confinement issued: agent={Agent} upstream={Upstream} baseUrlVar={Var}",
@@ -792,11 +895,15 @@ public sealed class SandboxAgentLauncher
     /// The user's custom <paramref name="extraEnv"/> entries (llm_env_* — multi-provider CLIs like
     /// opencode) ride the same env-file; on a name collision the adapter's declared key wins.
     /// </summary>
+    /// <param name="log">Where the credential filter reports the unreviewed key NAMES it carried
+    /// (<see cref="LogUnreviewedCredentialKeys"/>). Optional so the many tests that call this for its env
+    /// mapping stay as they are; the production spawn passes the daemon's logger.</param>
     internal static SandboxSecrets BuildSecrets(
         string? modelApiKey, InstalledAdapterMarker? adapter,
         IReadOnlyDictionary<string, string>? extraEnv = null,
         IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
-        GatewayConfinement? gateway = null)
+        GatewayConfinement? gateway = null,
+        ILogger? log = null)
     {
         var agentEnv = new Dictionary<string, string>(StringComparer.Ordinal);
         if (extraEnv is not null)
@@ -836,7 +943,7 @@ public sealed class SandboxAgentLauncher
 
         var oobKey = new byte[32];
         RandomNumberGenerator.Fill(oobKey);
-        return new SandboxSecrets(agentEnv, oobKey, FilterCliCredentials(cliCredentials, adapter));
+        return new SandboxSecrets(agentEnv, oobKey, FilterCliCredentials(cliCredentials, adapter, log));
     }
 
     /// <summary>
@@ -845,9 +952,24 @@ public sealed class SandboxAgentLauncher
     /// the home-relative shape gate. The client names paths on the wire, so without this filter a
     /// compromised client could write arbitrary agent-home files at spawn; with it the surface is
     /// exactly the vendor-declared login files. No marker / no declared paths ⇒ nothing is restored.
+    ///
+    /// <para><b>F2 — the cap and the scrub apply on the way IN too.</b> Same argument the settings leg
+    /// makes in <see cref="FilterCliSettings"/>: scrubbing only the harvest would fix nothing already
+    /// on the owner's disk, because a poisoned entry keeps being restored until some later attended
+    /// stop overwrites it. Scrubbing the restore neutralises every stored file immediately, with no
+    /// migration. The size ceiling is re-applied here for the same reason it exists at all — the store
+    /// this reads from was written by a jail.</para>
+    ///
+    /// <para><b>F2, the last clause.</b> Every credential file — settings-shaped or not — goes through
+    /// <see cref="CarryCredentialContent"/>, which removes the keys that name a program. These files
+    /// used to be carried byte-identical in both directions, and <c>.claude.json</c> /
+    /// <c>.gemini/settings.json</c> both carry <c>mcpServers</c> command definitions: a jail naming the
+    /// programs the NEXT jail's CLI will launch. A blob already sitting in the owner's keychain from
+    /// before that existed is filtered HERE, on its way into a jail — the half that needs no
+    /// migration.</para>
     /// </summary>
     internal static IReadOnlyList<SandboxCredentialFile>? FilterCliCredentials(
-        IReadOnlyList<SandboxCredentialFile>? supplied, InstalledAdapterMarker? adapter)
+        IReadOnlyList<SandboxCredentialFile>? supplied, InstalledAdapterMarker? adapter, ILogger? log = null)
     {
         if (supplied is not { Count: > 0 } || adapter?.CredentialPaths is not { Count: > 0 } declared)
         {
@@ -856,10 +978,151 @@ public sealed class SandboxAgentLauncher
 
         var allowed = new HashSet<string>(
             declared.Where(AdapterManifest.IsHomeRelativeFilePath), StringComparer.Ordinal);
-        var kept = supplied
-            .Where(f => f.Content is { Length: > 0 } && allowed.Contains(f.HomeRelativePath))
-            .ToArray();
-        return kept.Length > 0 ? kept : null;
+        var kept = new List<SandboxCredentialFile>();
+        foreach (var file in supplied)
+        {
+            if (file.Content is not { Length: > 0 }
+                || !allowed.Contains(file.HomeRelativePath)
+                || file.Content.Length > AdapterCredentialPolicy.MaxBytesFor(file.HomeRelativePath))
+            {
+                continue;
+            }
+
+            var carried = CarryCredentialContent(
+                file.HomeRelativePath, file.Content, "restore", adapter.Id, log,
+                reportWhatWasFiltered: false);
+
+            if (carried is { Length: > 0 })
+            {
+                kept.Add(ReferenceEquals(carried, file.Content) ? file : file with { Content = carried });
+            }
+        }
+
+        return kept.Count > 0 ? kept : null;
+    }
+
+    /// <summary>
+    /// <b>The one filter every credential file passes through, on BOTH legs</b> — out of a jail on an
+    /// attended stop, and back into the next jail of that repository. Returns the bytes to carry, or
+    /// null when the file must not cross at all.
+    ///
+    /// <para><b>Why one function and not a branch per leg.</b> The two legs must agree exactly: harvest
+    /// stops the vault ACQUIRING something, restore stops an already-stored copy DELIVERING it, and a
+    /// rule applied on only one of them is a rule that holds only for installs that have no history.
+    /// They were two copies of the same branch and they had already drifted — which is how the
+    /// settings-shaped files ended up with half the filter.</para>
+    ///
+    /// <para><b>Both filters, composed, for the settings-shaped files.</b>
+    /// <c>.gemini/settings.json</c> and <c>.qwen/settings.json</c> are declared as credential paths (see
+    /// <see cref="AdapterCredentialPolicy.IsSettingsShaped"/>) and got only
+    /// <see cref="CliSettingsGrantScrub.Scrub"/> — the daemon-owned IPC mount removed and nothing else.
+    /// But <c>~/.gemini/settings.json</c> is exactly where gemini-cli defines <c>mcpServers</c> (and, in
+    /// recent releases, <c>hooks</c>): an agent in an attended gemini jail could write
+    /// <c>mcpServers: { x: { command: … } }</c>, the harvest kept it, and it was restored into every
+    /// later Managed worker of that repository — a jail launched with a terminal nobody is watching.
+    /// That is the original finding, still live for two of the three named files.</para>
+    ///
+    /// <para><b>Why not <see cref="CliSettingsGrantScrub.CarryOnly"/> there.</b> That allowlist is shaped
+    /// for claude-code's settings file and would drop <c>selectedAuthType</c> — the key that says which
+    /// login the user chose — so it would cost a real sign-in to close a program-definition hole.
+    /// <see cref="CliSettingsGrantScrub.StripExecutableConfig"/> exists for precisely this case: a
+    /// different vendor's schema, from which only the keys that name a program are removed. Composed
+    /// AFTER the mount scrub, because the scrub is the one that can refuse the file outright.</para>
+    /// </summary>
+    /// <param name="leg">"harvest" or "restore" — log text only.</param>
+    /// <param name="reportWhatWasFiltered">Whether to log the two "this file changed" lines. True on the
+    /// harvest, where each one describes something a jail just did and fires once per stop. False on the
+    /// restore, where the same file is filtered again on EVERY spawn for as long as the stored blob keeps
+    /// its program definitions — one line per spawn, forever, saying what the harvest line already said.
+    /// A refusal is logged on both legs regardless: that one means a file did not travel.</param>
+    private static byte[]? CarryCredentialContent(
+        string homeRelativePath, byte[] content, string leg, string agentKind, ILogger? log,
+        bool reportWhatWasFiltered)
+    {
+        var carried = content;
+
+        // D5b, applied where the file actually sits. A settings file declared under credentialPaths is
+        // still a settings file: it can carry a rule naming the daemon-owned IPC mount, and it is
+        // restored into every later jail of this repo just like the real ones. An unparseable one that
+        // names the mount does not travel at all.
+        if (AdapterCredentialPolicy.IsSettingsShaped(homeRelativePath))
+        {
+            var scrubbed = CliSettingsGrantScrub.Scrub(carried);
+            if (scrubbed is null)
+            {
+                log?.LogWarning(
+                    "cli credential {Leg} refused (settings-shaped, names {Mount} and could not be "
+                    + "scrubbed): kind={Kind} path={Path}",
+                    leg, CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind, homeRelativePath);
+                return null;
+            }
+
+            if (reportWhatWasFiltered && !ReferenceEquals(scrubbed, carried))
+            {
+                log?.LogInformation(
+                    "cli credential {Leg} scrubbed a role-scoped grant for {Mount}: kind={Kind} path={Path}",
+                    leg, CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind, homeRelativePath);
+            }
+
+            carried = scrubbed;
+        }
+
+        // The strip is targeted rather than an allowlist because these are the files that say the user is
+        // logged in, and the keys removed are by definition not credentials.
+        var stripped = CliSettingsGrantScrub.StripExecutableConfig(carried, out var unreviewed);
+        if (stripped is null)
+        {
+            log?.LogWarning(
+                "cli credential {Leg} refused (names an executable-config key and could not be read, or "
+                + "held nothing but program definitions): kind={Kind} path={Path}",
+                leg, agentKind, homeRelativePath);
+            return null;
+        }
+
+        if (reportWhatWasFiltered && !ReferenceEquals(stripped, carried))
+        {
+            log?.LogInformation(
+                "cli credential {Leg} stripped executable configuration: kind={Kind} path={Path}",
+                leg, agentKind, homeRelativePath);
+        }
+
+        // Reported on BOTH legs, deliberately: a vendor's new executable key can reach an install through
+        // a stored blob just as well as through a jail, and the file it arrives in is the same file.
+        if (AdapterCredentialPolicy.ReportsUnreviewedKeys(homeRelativePath))
+        {
+            LogUnreviewedCredentialKeys(log, leg, homeRelativePath, unreviewed);
+        }
+
+        return stripped.Length > 0 ? stripped : null;
+    }
+
+    /// <summary>
+    /// Reports the top-level keys of a credential file that nobody has reviewed — the standing answer to
+    /// "a denylist rots as the vendor adds keys". A new executable key surfaces in the daemon log instead
+    /// of passing silently, on both legs, which is what makes
+    /// <see cref="CliSettingsGrantScrub.ExecutableConfigKeys"/> maintainable at all.
+    ///
+    /// <para><b>Names only.</b> The list arrives already reduced to plain identifiers by the filter, and
+    /// nothing here adds a value, a length or a prefix of one. The path is the adapter's own DECLARED
+    /// home-relative path, so it is vendor text rather than anything the jail chose.</para>
+    ///
+    /// <para><b>Not asked for every file</b> — see <see cref="AdapterCredentialPolicy.ReportsUnreviewedKeys"/>.
+    /// A file whose top-level keys are provider ids or a whole vendor preference schema has no inventory to
+    /// be unreviewed against, so it reported its every ordinary key on every harvest and every restore.
+    /// That is a line people learn to skip, which costs more than the two files buy.</para>
+    /// </summary>
+    private static void LogUnreviewedCredentialKeys(
+        ILogger? log, string leg, string path, IReadOnlyList<string> keys)
+    {
+        if (log is null || keys.Count == 0)
+        {
+            return;
+        }
+
+        log.LogInformation(
+            "cli credential {Leg} carried unreviewed top-level key(s) (names only): path={Path} keys={Keys}. "
+            + "One that names a program belongs in CliSettingsGrantScrub.ExecutableConfigKeys.",
+            leg, path, string.Join(", ", keys));
     }
 
     /// <summary>
@@ -893,7 +1156,7 @@ public sealed class SandboxAgentLauncher
             .Where(f => f.Content is { Length: > 0 }
                         && f.Content.Length <= AdapterSettingsPolicy.MaxFileBytes
                         && allowed.Contains((f.Root, f.RelativePath)))
-            .Select(f => CliSettingsGrantScrub.Scrub(f.Content) is { Length: > 0 } clean
+            .Select(f => CliSettingsGrantScrub.CarryOnly(f.Content) is { Length: > 0 } clean
                 ? f with { Content = clean }
                 : null)
             .Where(f => f is not null)
@@ -1148,6 +1411,64 @@ public sealed class SandboxAgentLauncher
     /// today, and exactly the kind of latent grant that stops being harmless the day something else is
     /// mounted at that path. No dir, no shim, no grant.</para>
     /// </summary>
+    /// <summary>
+    /// The launch line for a CLI being <b>re-bound into a jail that is already running</b> — the adoption
+    /// path, after a daemon restart. Null when this daemon has no installed adapter for the kind, which is
+    /// the honest answer: there is no CLI to start.
+    ///
+    /// <para><b>What it deliberately omits is the first user turn.</b> <see cref="BuildLaunchArgv"/> puts
+    /// <see cref="AgentKickoffPrompt"/> first on the line so a fresh jail's CLI does something instead of
+    /// idling at an empty input box. An adopted agent has already had that turn — days ago, possibly —
+    /// and re-issuing it would tell a worker halfway through a task to go and ask the daemon what it is
+    /// here to plan. The role's operating instructions and the shim pre-approval ARE re-applied, because
+    /// both are properties of the process being started rather than of the conversation: this is a new
+    /// <c>docker exec</c>, so it has neither until it is given them.</para>
+    ///
+    /// <para><b>What it asks the CLI to restore is the conversation</b>, when that CLI declares a way to
+    /// (<see cref="InstalledAdapterMarker.ResumeArg"/> — <c>--continue</c> for claude-code). The exec'd
+    /// CLI died with the daemon's PTY, but the jail did not: the same workspace, the same
+    /// <c>agent/&lt;id&gt;</c> branch and the same in-jail <c>$HOME</c> are all still there, and a vendor
+    /// CLI that keeps a per-directory session store keeps it under that <c>$HOME</c>. So the transcript is
+    /// on disk in the jail and the flag is what opens it. The daemon still does not own that session and
+    /// makes no claim about what came back — a CLI that declares no resume flag, or whose store was
+    /// pruned, is re-bound blank, which is the pre-existing behaviour and is still steerable.</para>
+    /// </summary>
+    /// <param name="agentKind">The CLI kind, off the adopted jail's own <c>mainguard.kind</c> label.</param>
+    /// <param name="role">The IPC endpoint role the re-bound endpoint was given.</param>
+    /// <param name="ipcDirPath">The re-bound endpoint's directory, or null when this agent has none —
+    /// which suppresses the shim pre-approval, exactly as it does at spawn.</param>
+    /// <param name="planMode">The mode the re-bound endpoint's instructions were rendered for; the same
+    /// value, so the two deliveries of one jail's briefing cannot disagree (defect G2).</param>
+    internal IReadOnlyList<string>? BuildReattachLaunchArgv(
+        string agentKind,
+        AgentIpcEndpointRole role,
+        string? ipcDirPath,
+        Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode planMode)
+    {
+        var adapter = _adapters.TryGet(agentKind);
+        var launchCommand = adapter?.Launch;
+        if (launchCommand is not { Count: > 0 })
+        {
+            return null;
+        }
+
+        // The RESUME flag, and it is the difference between re-binding a process and re-binding an agent.
+        // Placed immediately after the binary and before everything the daemon appends, for the reason
+        // BuildLaunchArgv places the first turn there: `--allowedTools` is variadic and swallows what
+        // follows it, so anything that must be read as its own argument goes ahead of it.
+        if (adapter?.ResumeArg is { Length: > 0 } resumeArg)
+        {
+            launchCommand = launchCommand.Append(resumeArg).ToList();
+        }
+
+        if (adapter?.SystemPromptArg is { Length: > 0 } promptArg)
+        {
+            launchCommand = launchCommand.Append(promptArg).Append(InstructionsFor(role, planMode)).ToList();
+        }
+
+        return ApplyShimPreApproval(launchCommand, adapter, ipcDirPath, role);
+    }
+
     internal static IReadOnlyList<string>? ApplyShimPreApproval(
         IReadOnlyList<string>? launchCommand,
         InstalledAdapterMarker? adapter,
@@ -1243,11 +1564,17 @@ public sealed class SandboxAgentLauncher
                 // anything in the next one — and a coordinator's `Bash(<its shim> *)`, persisted per REPO,
                 // is one role's tool grant queued up for every later jail of that repository. An
                 // unparseable file that names the mount is dropped whole rather than carried unread.
-                var scrubbed = CliSettingsGrantScrub.Scrub(content);
+                //
+                // F45: and the same call now also reduces the file to the keys a settings file may
+                // carry at all. Everything else — hooks, apiKeyHelper, statusLine, mcpServers, env,
+                // permissions.defaultMode — is executable configuration that was crossing between jails
+                // byte-identical, into workers whose terminals nobody is watching.
+                var scrubbed = CliSettingsGrantScrub.CarryOnly(content);
                 if (scrubbed is null)
                 {
                     _log.LogWarning(
-                        "cli settings harvest refused (names {Mount} and could not be scrubbed): kind={Kind} root={Root} path={Path}",
+                        "cli settings harvest refused (nothing carriable survived the allowlist, or it names "
+                        + "{Mount} and could not be scrubbed): kind={Kind} root={Root} path={Path}",
                         CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind,
                         AdapterSettingsPath.SpellRoot(root), entry.Path);
                     continue;
@@ -1256,7 +1583,8 @@ public sealed class SandboxAgentLauncher
                 if (scrubbed.Length != content.Length)
                 {
                     _log.LogInformation(
-                        "cli settings harvest scrubbed a role-scoped grant for {Mount}: kind={Kind} root={Root} path={Path}",
+                        "cli settings harvest carried only the allowlisted keys (and no {Mount} rule): "
+                        + "kind={Kind} root={Root} path={Path}",
                         CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind,
                         AdapterSettingsPath.SpellRoot(root), entry.Path);
                 }
@@ -1284,6 +1612,27 @@ public sealed class SandboxAgentLauncher
     /// would otherwise evaporate. Files come out base64 over the exec pipe (binary-safe through the
     /// string plumbing); a missing file is skipped, and any exec failure yields an empty result —
     /// harvesting must never block a stop.
+    ///
+    /// <para><b>WHETHER this may run at all is the caller's decision, not this method's</b> — see
+    /// <c>CliHarvestPolicy</c>. These files are agent-writable, so what comes back is "whatever is in
+    /// the jail", not "what a human logged in as".</para>
+    ///
+    /// <para><b>F2 — the two protections the settings leg had and this one did not.</b> A file over
+    /// <see cref="AdapterCredentialPolicy.MaxFileBytes"/> is REFUSED rather than truncated, and the
+    /// check happens in the shell so an oversized file is never read into the daemon's memory at all —
+    /// exactly as <see cref="HarvestCliSettingsAsync"/> does it. And a declared credential path that is
+    /// really a settings file (gemini-cli's and qwen-code's <c>settings.json</c>, which sit in this
+    /// field for migration reasons the manifest explains) is put through
+    /// <see cref="CliSettingsGrantScrub"/> and held to the settings cap where it sits, so those two
+    /// files stop being the hole in the middle of both.</para>
+    ///
+    /// <para><b>F2's last clause — the programs a jail names.</b> <c>.claude.json</c> AND the
+    /// settings-shaped <c>settings.json</c> files all hold <c>mcpServers</c> command definitions: one jail
+    /// naming the programs the next jail's CLI will launch. Every declared credential file, of either
+    /// shape, now goes through <see cref="CarryCredentialContent"/> — the same function the restore leg
+    /// calls — ending in <see cref="CliSettingsGrantScrub.StripExecutableConfig"/>, a targeted removal of
+    /// the keys that name a program with every other key untouched, which is the one shape of this filter
+    /// that cannot break a login.</para>
     /// </summary>
     public async Task<IReadOnlyList<SandboxCredentialFile>> HarvestCliCredentialsAsync(
         string containerId, string agentKind, CancellationToken ct = default)
@@ -1303,15 +1652,34 @@ public sealed class SandboxAgentLauncher
         var harvested = new List<SandboxCredentialFile>();
         foreach (var relative in declared.Where(AdapterManifest.IsHomeRelativeFilePath))
         {
+            var maxBytes = AdapterCredentialPolicy.MaxBytesFor(relative);
             try
             {
                 // Runs as the container's default user — the agent uid — so its own 0600 files read
-                // fine. Path is positional ("$1"), never interpolated into script text.
+                // fine. Path is positional ("$1"), never interpolated into script text. The size check
+                // happens in the shell so an oversized file is never read into the daemon's memory at
+                // all — the same three-line script the settings harvest uses, for the same reason.
                 var result = await _environment.Sandboxes.ExecAsync(containerId, new[]
                 {
-                    "sh", "-c", "[ -f \"$1\" ] && base64 \"$1\"", "sh",
+                    "sh", "-c",
+                    "[ -f \"$1\" ] || exit 1\n"
+                    + "[ \"$(wc -c < \"$1\" | tr -d ' ')\" -le \"$2\" ] || exit 2\n"
+                    + "base64 \"$1\"\n",
+                    "sh",
                     ContainerSpecBuilder.AgentHome + "/" + relative,
+                    maxBytes.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 }, ct).ConfigureAwait(false);
+
+                if (result.ExitCode == 2)
+                {
+                    // Refused, not truncated: half a credential file is a corrupt one, and it would
+                    // REPLACE the good copy in the vault (a harvested path always wins). Keeping the
+                    // last known-good login is the better failure.
+                    _log.LogWarning(
+                        "cli credential harvest refused (over {Max} bytes): kind={Kind} path={Path}",
+                        maxBytes, agentKind, relative);
+                    continue;
+                }
 
                 if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(result.Stdout))
                 {
@@ -1320,7 +1688,20 @@ public sealed class SandboxAgentLauncher
 
                 var content = Convert.FromBase64String(
                     string.Concat(result.Stdout.Where(c => !char.IsWhiteSpace(c))));
-                if (content.Length > 0)
+
+                // The same filter the restore leg runs, from the same function: the mount scrub where the
+                // file is settings-shaped, then the executable-config strip on everything. A rule applied
+                // on only one leg holds only for an install with no history.
+                var filtered = CarryCredentialContent(
+                    relative, content, "harvest", agentKind, _log, reportWhatWasFiltered: true);
+                if (filtered is null)
+                {
+                    continue;
+                }
+
+                content = filtered;
+
+                if (content.Length is > 0 && content.Length <= maxBytes)
                 {
                     harvested.Add(new SandboxCredentialFile(relative, content));
                 }

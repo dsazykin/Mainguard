@@ -91,6 +91,7 @@ public sealed class MergeQueueProvisioner
     private readonly Func<string, ApprovedWork?>? _resolveApprovedWork;
     private readonly Func<string, IYieldProtocol>? _yieldFor;
     private readonly Func<string, string, string?>? _locateAgentWorktree;
+    private readonly Func<string, string, string?>? _locateAgentRepo;
     private readonly IAgentSupervisor _agentStates;
     private readonly Func<string, string, bool>? _publishRebasedAgentRef;
     private readonly OsvSnapshot _osv;
@@ -206,6 +207,15 @@ public sealed class MergeQueueProvisioner
     /// target and the verification baseline cannot drift apart — which they silently would if two callers
     /// each answered "what is main" for the same repo.</para>
     /// </param>
+    /// <param name="locateAgentRepo">
+    /// W1-A — (repoHash, agentId) → the daemon-computed per-agent repository backing that worktree, or
+    /// null when this substrate has none. Supplied, it turns the keep-alive cycle's layout derivation
+    /// from a <i>check</i> into a <i>pin</i>: the worktree's agent-writable <c>.git</c> pointer can no
+    /// longer decide WHICH repository the daemon's <c>add</c>/<c>commit</c>/<c>rebase</c> land in, and a
+    /// mismatch becomes a typed refusal. Omitted, the repository is still derived from the pointer's own
+    /// shape and round-trip-checked, which refuses a redirect at the mirror but catches a redirect to a
+    /// third repository only by that weaker check.
+    /// </param>
     /// <param name="publishRebasedAgentRef">
     /// (repoHash, agentId) → carry the branch the keep-alive rebase just REPARENTED into the mirror.
     /// Distinct from <paramref name="publishAgentRef"/> and not optional in spirit: a rebase is never a
@@ -273,6 +283,7 @@ public sealed class MergeQueueProvisioner
         Func<string, string, AgentBranchAlignment>? checkAgentBranch = null,
         Func<string, IYieldProtocol>? yieldProtocolFor = null,
         Func<string, string, string?>? locateAgentWorktree = null,
+        Func<string, string, string?>? locateAgentRepo = null,
         IAgentSupervisor? agentStates = null,
         Func<string, string, bool>? publishRebasedAgentRef = null,
         OsvSnapshot? osvSnapshot = null,
@@ -298,6 +309,7 @@ public sealed class MergeQueueProvisioner
         _checkAgentBranch = checkAgentBranch;
         _yieldFor = yieldProtocolFor;
         _locateAgentWorktree = locateAgentWorktree;
+        _locateAgentRepo = locateAgentRepo;
         _agentStates = agentStates ?? NullAgentSupervisor.Instance;
         _publishRebasedAgentRef = publishRebasedAgentRef;
         _osv = osvSnapshot ?? OsvSnapshot.Default;
@@ -315,6 +327,7 @@ public sealed class MergeQueueProvisioner
         if (checkAgentBranch is not null) { wired.Add(nameof(checkAgentBranch)); }
         if (yieldProtocolFor is not null) { wired.Add(nameof(yieldProtocolFor)); }
         if (locateAgentWorktree is not null) { wired.Add(nameof(locateAgentWorktree)); }
+        if (locateAgentRepo is not null) { wired.Add(nameof(locateAgentRepo)); }
         if (agentStates is not null) { wired.Add(nameof(agentStates)); }
         if (publishRebasedAgentRef is not null) { wired.Add(nameof(publishRebasedAgentRef)); }
         if (osvSnapshot is not null) { wired.Add(nameof(osvSnapshot)); }
@@ -1409,7 +1422,28 @@ public sealed class MergeQueueProvisioner
         }
 
         var barePath = _repos.BareRepoPathFor(repoHandle);
-        return new AgentWorktreeLocation(worktree, barePath, ResolveDefaultBranch(barePath));
+
+        // W1-A: supplying the per-agent repository pins WHICH repository the cycle operates on, so the
+        // worktree's agent-writable `.git` pointer cannot redirect the daemon's add/commit/rebase at a
+        // repository of the agent's choosing. Empty reads as "this substrate has none" (the interface
+        // default), which must stay null rather than become an empty-path pin that never matches.
+        string? agentRepoPath = null;
+        try
+        {
+            agentRepoPath = _locateAgentRepo?.Invoke(repoHandle, agentId);
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} agent-repo lookup FAILED ({ex.Message})");
+            return null;
+        }
+
+        if (string.IsNullOrEmpty(agentRepoPath))
+        {
+            agentRepoPath = null;
+        }
+
+        return new AgentWorktreeLocation(worktree, barePath, ResolveDefaultBranch(barePath), agentRepoPath);
     }
 
     /// <summary>

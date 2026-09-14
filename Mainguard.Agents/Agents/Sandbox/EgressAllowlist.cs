@@ -53,6 +53,95 @@ public sealed record EgressAllowlistEntry(string Name, string HostPattern, Egres
 }
 
 /// <summary>
+/// F31 — the grammar an allowlist host pattern must satisfy BEFORE it is stored, and therefore before
+/// it is rendered into a tinyproxy regex, a dnsmasq directive, or an iptables destination.
+///
+/// <para><b>The finding.</b> Nothing validated these strings. <c>EgressProxyConfig.RenderHostPattern</c>
+/// escapes only the dot, so every other regex metacharacter reached tinyproxy's extended-regex filter
+/// verbatim, and dnsmasq's config is line- and slash-delimited. Three concrete consequences, all from
+/// one unprivileged "add this host" call:</para>
+/// <list type="bullet">
+///   <item><c>a|.*</c> renders as <c>^a|.*$</c> — an alternation whose right branch matches every
+///   hostname there is. Default-deny becomes allow-all, and the UI still lists one innocuous entry.</item>
+///   <item><c>(</c> renders as an unbalanced group. tinyproxy fails to compile the filter, and a proxy
+///   with no usable filter is a fleet-wide egress outage.</item>
+///   <item>a pattern containing <c>/</c> (or a newline) breaks out of <c>server=/host/resolver</c> and
+///   injects arbitrary dnsmasq directives — including ones that restore a default upstream, which is
+///   precisely the DNS-exfiltration channel <c>no-resolv</c> exists to close.</item>
+/// </list>
+///
+/// <para>The rule is the one a hostname already has to satisfy to be resolvable, so nothing legitimate
+/// is refused: an optional <c>*.</c> wildcard prefix, then dot-separated LDH labels. IPv4 literals pass
+/// (all-digit labels), which matters because the model gateway's own address is allowlisted as one.</para>
+/// </summary>
+public static class EgressHostPattern
+{
+    /// <summary>The longest a DNS name may be.</summary>
+    public const int MaxLength = 253;
+
+    /// <summary>True iff <paramref name="pattern"/> is safe to store and render.</summary>
+    public static bool IsValid(string? pattern)
+    {
+        if (string.IsNullOrWhiteSpace(pattern))
+        {
+            return false;
+        }
+
+        var value = pattern.Trim();
+        if (value.Length > MaxLength)
+        {
+            return false;
+        }
+
+        if (value.StartsWith("*.", StringComparison.Ordinal))
+        {
+            value = value[2..];
+        }
+
+        if (value.Length == 0 || value.EndsWith('.'))
+        {
+            return false;
+        }
+
+        foreach (var label in value.Split('.'))
+        {
+            if (!IsLabel(label))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>The refusal reason for an invalid pattern — user-facing, and it never echoes anything
+    /// but the value the caller already sent.</summary>
+    public static string Reason(string? pattern) =>
+        $"'{pattern}' is not a valid host pattern. Use a hostname, an IPv4 literal, or a '*.' wildcard "
+        + "(letters, digits and hyphens in dot-separated labels).";
+
+    private static bool IsLabel(string label)
+    {
+        // RFC 1035 LDH: 1-63 chars, alphanumeric at both ends, hyphens allowed inside. Everything a
+        // regex or a dnsmasq config line could treat as syntax is excluded by construction.
+        if (label.Length is 0 or > 63 || label[0] == '-' || label[^1] == '-')
+        {
+            return false;
+        }
+
+        foreach (var c in label)
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && c != '-')
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+
+/// <summary>
 /// Where the user's allowlist edits are kept so they survive a restart. Injected rather than assumed
 /// so tests (and a future per-repo scope) can substitute a store without touching a real path.
 /// </summary>
@@ -112,10 +201,24 @@ public sealed class EgressAllowlist
         return _entries.Any(e => HostMatches(e.HostPattern, h));
     }
 
-    /// <summary>Adds an entry and emits the change event; a duplicate (by host) is a no-op.</summary>
+    /// <summary>
+    /// Adds an entry and emits the change event; a duplicate (by host) is a no-op.
+    ///
+    /// <para>F31: an invalid host pattern throws rather than being stored. This is the LAST gate, not
+    /// the first — <c>EgressGrpcService</c> refuses one with a typed <c>InvalidArgument</c> before it
+    /// gets here — but it is the one that cannot be routed around, and a hostile pattern that reaches
+    /// the persisted allowlist is a permanent fleet-wide defect (it is re-rendered on every push, and it
+    /// survives a restart).</para>
+    /// </summary>
+    /// <exception cref="ArgumentException">The host pattern is not a valid hostname/wildcard.</exception>
     public void Add(EgressAllowlistEntry entry, string who)
     {
         ArgumentNullException.ThrowIfNull(entry);
+        if (!EgressHostPattern.IsValid(entry.HostPattern))
+        {
+            throw new ArgumentException(EgressHostPattern.Reason(entry.HostPattern), nameof(entry));
+        }
+
         if (_entries.Any(e => string.Equals(e.HostPattern, entry.HostPattern, StringComparison.OrdinalIgnoreCase)))
             return;
         _entries.Add(entry);
@@ -231,7 +334,11 @@ public sealed class EgressAllowlist
         var additions = new List<EgressAllowlistEntry>();
         foreach (var raw in extraHosts)
         {
-            if (string.IsNullOrWhiteSpace(raw)) continue;
+            // F31: an adapter's declared host and the gateway's own address arrive here as strings from
+            // outside this type. A bad one is DROPPED rather than thrown on — this is a render-time
+            // union on the spawn path, and refusing to build a proxy config because one CLI declared a
+            // malformed host would take the whole fleet's egress down over one manifest typo.
+            if (!EgressHostPattern.IsValid(raw)) continue;
             var host = raw.Trim();
             if (present.Add(host.ToLowerInvariant()))
             {
@@ -255,8 +362,14 @@ public sealed class EgressAllowlist
         string json, IAuditLog audit, IEgressAllowlistStore? store = null)
     {
         var persisted = JsonSerializer.Deserialize<List<PersistedEntry>>(json) ?? new List<PersistedEntry>();
-        var entries = persisted.Select(p =>
-            new EgressAllowlistEntry(p.Name, p.HostPattern, Enum.Parse<EgressEntryKind>(p.Kind)));
+        var entries = persisted
+            // F31: the file is on disk beside the worktrees; a pattern that predates validation (or that
+            // was written there by something other than this daemon) is dropped, not loaded. Dropping is
+            // the safe direction — the entry stops being allowed — and it must not throw, because
+            // LoadOrDefaults treats a throw as "corrupt, use the defaults" and would silently discard
+            // every VALID entry alongside the one bad one.
+            .Where(p => EgressHostPattern.IsValid(p.HostPattern))
+            .Select(p => new EgressAllowlistEntry(p.Name, p.HostPattern, Enum.Parse<EgressEntryKind>(p.Kind)));
         return new EgressAllowlist(entries, audit, store);
     }
 

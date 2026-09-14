@@ -40,6 +40,58 @@ public sealed class RequiresDockerDaemonFactAttribute : FactAttribute
 }
 
 /// <summary>
+/// A <see cref="RequiresDockerFactAttribute"/> for a claim that is only TRUE on Docker Desktop — i.e.
+/// macOS and Windows, where the engine runs in its own VM and <c>host-gateway</c> routes to the host's
+/// loopback stack.
+///
+/// <para>It exists because the alternative is a test that fails on the Linux runner by design. On Linux
+/// Docker Engine <c>host-gateway</c> is the docker0 address and a host listener bound to
+/// <c>127.0.0.1</c> is simply not reachable from a container, so asserting the Docker Desktop property
+/// unconditionally is asserting something false. The Linux half of the same contract is asserted by its
+/// own test through <see cref="RequiresLinuxDockerEngineFactAttribute"/> — the point is that both
+/// platforms are covered, not that one of them is skipped.</para>
+/// </summary>
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class RequiresDockerDesktopFactAttribute : FactAttribute
+{
+    public RequiresDockerDesktopFactAttribute()
+    {
+        if (!DockerAvailability.IsReady)
+        {
+            Skip = DockerAvailability.SkipReason;
+        }
+        else if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsWindows())
+        {
+            Skip = "Docker Desktop only: on Linux Docker Engine host-gateway is the docker0 address, so a "
+                 + "loopback-bound host listener is genuinely unreachable from a container.";
+        }
+    }
+}
+
+/// <summary>
+/// The mirror of <see cref="RequiresDockerDesktopFactAttribute"/>: a claim that only holds on native
+/// Linux Docker Engine — where the gateway binds the <c>docker0</c> address rather than loopback. This
+/// is the production Linux/WSL2 path (the Pro daemon on Windows runs inside the WSL2 VM), so it is the
+/// one the PR-blocking Linux CI leg actually exercises.
+/// </summary>
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class RequiresLinuxDockerEngineFactAttribute : FactAttribute
+{
+    public RequiresLinuxDockerEngineFactAttribute()
+    {
+        if (!DockerAvailability.IsReady)
+        {
+            Skip = DockerAvailability.SkipReason;
+        }
+        else if (!OperatingSystem.IsLinux())
+        {
+            Skip = "Native Linux Docker Engine only: elsewhere the engine is in a VM and the daemon does "
+                 + "not bind a bridge address at all.";
+        }
+    }
+}
+
+/// <summary>
 /// MG-43 — a <see cref="RequiresDockerFactAttribute"/> that ALSO requires <c>MAINGUARD_VERIFY_E2E=1</c>.
 ///
 /// <para>It gates the one test that runs a repository's real <c>.mainguard/verify</c> end to end inside

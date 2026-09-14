@@ -28,27 +28,43 @@ public sealed record AgentStopResult(
     string RepoHandle = "");
 
 /// <summary>
-/// May the settings a jail holds — the CLI's approved-command list — flow back OUT to the host store
-/// that seeds every later agent in this repository?
+/// May what a jail holds — the CLI's approved-command list, and its login-state files — flow back OUT
+/// to the host stores that seed every later agent in this repository?
 ///
 /// <para>This is the escalation direction and it is deliberately narrower than the restore direction.
-/// The settings file is agent-writable by construction (the CLI must be able to record a new
-/// approval), so Mainguard cannot tell "the human answered yes" from "the agent wrote the file". What
-/// it CAN tell is whether a human was in a position to answer at all:</para>
+/// The files are agent-writable by construction (the CLI must be able to record a new approval, and to
+/// write the tokens its own login produced), so Mainguard cannot tell "the human did this" from "the
+/// agent wrote the file". What it CAN tell is whether a human was in a position to act at all:</para>
 /// <list type="bullet">
 ///   <item>a <see cref="AgentRoles.Managed"/> worker's terminal is daemon-locked read-only (P2-14), so
-///   nobody typed an approval into it — anything found there was written by the agent, and the
-///   external-PR intake's untrusted worker is Managed by construction;</item>
+///   nobody typed an approval or a login into it — anything found there was written by the agent, and
+///   the external-PR intake's untrusted worker is Managed by construction;</item>
 ///   <item>every other session (manual, coordinator) is a terminal the user drives, which is exactly
-///   where the owner's approvals are made and therefore the only place worth harvesting.</item>
+///   where the owner's approvals and logins are made and therefore the only place worth harvesting.</item>
 /// </list>
-/// <para>Restore stays wider on purpose: a Managed worker SHOULD inherit the repo's approvals so it
-/// does not stall on prompts nobody can answer. Grants flow in from a human-managed source and never
-/// back out of an unattended one.</para>
+/// <para>Restore stays wider on purpose: a Managed worker SHOULD inherit the repo's approvals and its
+/// login so it does not stall on prompts nobody can answer. Grants and credentials flow in from a
+/// human-managed source and never back out of an unattended one.</para>
+///
+/// <para><b>F2 — why this now gates credentials as well as settings.</b> It was written for settings
+/// alone, and the credential harvest beside it had no trust gate at all. That was not a theoretical
+/// gap: a coordinator's shim spawns its workers as <see cref="AgentRoles.Managed"/> running real
+/// adapter kinds, so every one of them WAS harvested — the daemon read the CLI login files back out of
+/// an unattended jail, on the word of the only party in it, and filed them in the host's durable
+/// credential store. The asymmetry made no sense in either direction it was argued: a file naming
+/// approved commands was judged untrustworthy from an unattended jail, while a file carrying an OAuth
+/// refresh token from the same jail was taken at face value. The refresh token is the more dangerous
+/// of the two — it mints access tokens for the user's whole provider account — so it gets the same
+/// gate, evaluated in the same place.</para>
+///
+/// <para>What a refused harvest costs: nothing durable. The jail keeps the files it wrote for as long
+/// as it lives; they simply never reach the host store, so the next Managed worker starts from the
+/// login the HUMAN performed rather than from one an unattended agent produced.</para>
 /// </summary>
-public static class CliSettingsHarvestPolicy
+public static class CliHarvestPolicy
 {
-    /// <summary>True when a session of this role is human-attended, so its settings may be persisted.</summary>
+    /// <summary>True when a session of this role is human-attended, so its settings and its CLI login
+    /// state may be persisted to the host.</summary>
     public static bool MayHarvest(string? role) =>
         !string.Equals(role, AgentRoles.Managed, StringComparison.Ordinal);
 }
@@ -527,9 +543,24 @@ public sealed class AgentSpawnService
     /// "cannot reach the Mainguard daemon" about a daemon that was up. Returns false for a session that
     /// never had an endpoint (a manual agent, an external-PR head, a worker the plan gate does not hold).</para>
     /// </summary>
-    internal bool TryReattachEndpoint(AgentSession session)
+    internal bool TryReattachAdoptedAgent(AgentSession session)
     {
         ArgumentNullException.ThrowIfNull(session);
+        var endpoint = TryReattachEndpoint(session);
+        var cli = TryRebindCli(session, endpoint);
+        return endpoint.Dir is not null || cli;
+    }
+
+    /// <summary>What the endpoint half decided: the role, the plan mode its instructions were rendered
+    /// for, and the directory it re-bound at — null when this session has no endpoint (a manual agent, an
+    /// external-PR head, a worker the plan gate does not hold) or the re-bind failed.</summary>
+    private readonly record struct ReattachedEndpoint(
+        Mainguard.Agents.Agents.Ipc.AgentIpcEndpointRole Role,
+        Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode PlanMode,
+        string? Dir);
+
+    private ReattachedEndpoint TryReattachEndpoint(AgentSession session)
+    {
         Mainguard.Agents.Agents.Ipc.AgentIpcEndpointRole role;
         AgentIpcHandler handler;
         Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode planMode;
@@ -549,7 +580,12 @@ public sealed class AgentSpawnService
         }
         else
         {
-            return false;
+            // No endpoint for this session — but the CLI re-bind below still runs, with the worker role's
+            // instructions and no shim grant. An adopted manual agent has a terminal to restore too.
+            return new ReattachedEndpoint(
+                Mainguard.Agents.Agents.Ipc.AgentIpcEndpointRole.Worker,
+                Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Gated,
+                null);
         }
 
         try
@@ -563,7 +599,7 @@ public sealed class AgentSpawnService
                 ["role"] = role.ToString(),
                 ["repo_hash"] = session.RepoHash ?? string.Empty,
             }));
-            return true;
+            return new ReattachedEndpoint(role, planMode, dir);
         }
         catch (Exception ex)
         {
@@ -574,8 +610,119 @@ public sealed class AgentSpawnService
                 ["role"] = role.ToString(),
                 ["reason"] = ex.Message,
             }));
+            return new ReattachedEndpoint(role, planMode, null);
+        }
+    }
+
+    /// <summary>The audit type for a CLI re-bound into an adopted jail.</summary>
+    public const string CliReattachedEvent = "cli_reattached";
+
+    /// <summary>The audit type for an adopted jail whose CLI could NOT be re-bound, with the reason.</summary>
+    public const string CliReattachSkippedEvent = "cli_reattach_skipped";
+
+    /// <summary>
+    /// <b>Audit F6 — the half that did not exist.</b> Adoption re-bound the IPC endpoint and nothing
+    /// re-bound the CLI, because <see cref="AgentCliBinder.TryBind"/> had exactly one caller and it was on
+    /// the spawn path. The exec'd CLI was a <c>docker exec</c> child of the dead daemon's PTY and died
+    /// with it, so an adopted coordinator had four re-bound tools and no process to call them, every
+    /// adopted worker answered "no live CLI to steer", and the reaper counted them all as idle.
+    ///
+    /// <para><b>A real re-bind, not an exemption.</b> The alternative on the table was to stop the reaper
+    /// counting adopted jails as idle, which would have kept the jail alive and left it just as
+    /// unsteerable — an agent nobody can talk to, billed for, indefinitely. This starts a fresh CLI in the
+    /// surviving jail under a new daemon-side PTY: the same <c>docker exec</c> the spawn path performs,
+    /// against the same workspace and branch. It is also what closes PR #366's stated residual — the
+    /// reaper no longer reaps a jail with an in-flight entry for idleness, so the population that keeps an
+    /// in-flight entry because nobody could observe its CLI exit needed something to restore the daemon's
+    /// ability to observe it. This is that.</para>
+    ///
+    /// <para><b>A frozen jail is skipped, not failed.</b> <c>docker exec</c> into a SIGSTOPped container
+    /// blocks; the pause axis is checked first and the re-bind is left for the pass that thaws it, which
+    /// is the same reconciler calling the same hook on its paused → running correction.</para>
+    /// </summary>
+    private bool TryRebindCli(AgentSession session, ReattachedEndpoint endpoint)
+    {
+        var key = session.Key;
+        if (session.ContainerId is not { Length: > 0 } containerId)
+        {
+            return false; // session-only record — there is no jail to exec into
+        }
+
+        if (_binder.IsBound(key))
+        {
+            return false; // already steerable; a second exec would race the first for one workspace
+        }
+
+        string? skipped = null;
+        if (_store.FrozenReason(key) is { Length: > 0 } frozen)
+        {
+            skipped = $"the jail is frozen ({frozen}) — a paused container accepts no exec";
+        }
+        else if (_killGate.IsFrozen)
+        {
+            skipped = "the kill switch is engaged — every jail is frozen";
+        }
+
+        IReadOnlyList<string>? launch = null;
+        if (skipped is null)
+        {
+            launch = _launcher.BuildReattachLaunchArgv(
+                session.Kind, endpoint.Role, endpoint.Dir, endpoint.PlanMode);
+            if (launch is not { Count: > 0 })
+            {
+                skipped = $"this daemon has no installed adapter for '{session.Kind}'";
+            }
+        }
+
+        if (skipped is not null)
+        {
+            _spawnLog.LogInformation(
+                "cli re-bind skipped agent={Agent} repo={Repo}: {Reason}", session.Id, session.RepoHash, skipped);
+            _audit.Append(new AuditEvent(CliReattachSkippedEvent, new Dictionary<string, string>
+            {
+                ["agent_id"] = session.Id,
+                ["repo_hash"] = session.RepoHash ?? string.Empty,
+                ["reason"] = skipped,
+            }));
             return false;
         }
+
+        var bound = _binder.TryBind(
+            new AgentCliLaunchSpec(session.Id, session.RepoHash ?? string.Empty, containerId, launch!));
+        if (!bound)
+        {
+            // TryBind already audited cli_bind_failed with the spawn failure; this says which population
+            // it happened in, because an adopted agent that cannot be re-bound is the one the reaper will
+            // eventually stop and the operator needs to be able to tell those apart.
+            _audit.Append(new AuditEvent(CliReattachSkippedEvent, new Dictionary<string, string>
+            {
+                ["agent_id"] = session.Id,
+                ["repo_hash"] = session.RepoHash ?? string.Empty,
+                ["reason"] = "the docker exec under a new PTY could not be started",
+            }));
+            return false;
+        }
+
+        _spawnLog.LogInformation(
+            "cli re-bound after adoption agent={Agent} repo={Repo} container={Container} kind={Kind}",
+            session.Id, session.RepoHash, containerId, session.Kind);
+        _audit.Append(new AuditEvent(CliReattachedEvent, new Dictionary<string, string>
+        {
+            ["agent_id"] = session.Id,
+            ["repo_hash"] = session.RepoHash ?? string.Empty,
+            ["container_id"] = containerId,
+            ["agent_kind"] = session.Kind,
+            ["role"] = session.Role,
+        }));
+
+        if (session.Role == AgentRoles.Managed)
+        {
+            // A managed worker's terminal is read-only (P2-14) — a role property, so it is re-applied on
+            // re-bind exactly as it is applied on spawn. The lock is id-keyed and idempotent.
+            _locks.Lock(session.Id);
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -603,8 +750,7 @@ public sealed class AgentSpawnService
                 session?.RepoHash ?? string.Empty);
         }
 
-        var credentials = await _launcher.HarvestCliCredentialsAsync(
-            containerId, session.Kind, ct).ConfigureAwait(false);
+        var credentials = await HarvestCredentialsIfAttendedAsync(session, containerId, ct).ConfigureAwait(false);
         var settings = await HarvestSettingsIfAttendedAsync(session, containerId, ct).ConfigureAwait(false);
         if (settings.Count > 0)
         {
@@ -628,8 +774,29 @@ public sealed class AgentSpawnService
     }
 
     /// <summary>
+    /// Harvests a session's CLI LOGIN STATE — or refuses to, and says why. Same gate, same reasoning
+    /// and the same call sites as <see cref="HarvestSettingsIfAttendedAsync"/>: see
+    /// <see cref="CliHarvestPolicy"/> for why an unattended jail's credential files are no more
+    /// trustworthy than its approved-command list, and for what a refusal does and does not cost.
+    /// </summary>
+    private async Task<IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>>
+        HarvestCredentialsIfAttendedAsync(AgentSession session, string containerId, CancellationToken ct)
+    {
+        if (!CliHarvestPolicy.MayHarvest(session.Role))
+        {
+            _spawnLog.LogInformation(
+                "cli credential harvest skipped: agent={Agent} role={Role} — an unattended jail's login "
+                + "files are agent-authored and never flow back to the host credential store.",
+                session.Id, session.Role);
+            return Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>();
+        }
+
+        return await _launcher.HarvestCliCredentialsAsync(containerId, session.Kind, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Harvests a session's CLI settings — or refuses to, and says why. The gate is
-    /// <see cref="CliSettingsHarvestPolicy"/>: only a human-attended session's approvals may flow back
+    /// <see cref="CliHarvestPolicy"/>: only a human-attended session's approvals may flow back
     /// out to the store that seeds every later agent in the repository. A Managed worker (the
     /// external-PR intake's untrusted jail included) has a daemon-locked read-only terminal, so nothing
     /// in its settings file was approved by a person — persisting it would let an agent write its own
@@ -638,7 +805,7 @@ public sealed class AgentSpawnService
     private async Task<IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>>
         HarvestSettingsIfAttendedAsync(AgentSession session, string containerId, CancellationToken ct)
     {
-        if (!CliSettingsHarvestPolicy.MayHarvest(session.Role))
+        if (!CliHarvestPolicy.MayHarvest(session.Role))
         {
             _spawnLog.LogInformation(
                 "cli settings harvest skipped: agent={Agent} role={Role} — an unattended jail's "
@@ -669,6 +836,12 @@ public sealed class AgentSpawnService
     public async Task<AgentStopResult> StopAsync(AgentSessionKey key, CancellationToken ct)
     {
         var agentId = key.AgentId;
+
+        // Audit F14: opened BEFORE the record is removed and held until the container is gone. Between
+        // those two moments the jail is live with no session behind it, which is exactly the shape the
+        // reconciler adopts — it would resurrect a session that nothing removes and that then refuses
+        // the entry's Resume for the half hour it takes the reaper to clear it.
+        using var teardown = _store.BeginTeardown(key);
 
         // Capture the session (with its container id/repo hash) BEFORE removing it, so a real jail +
         // worktree can be torn down after the record is gone.
@@ -713,11 +886,34 @@ public sealed class AgentSpawnService
             Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>();
         if (stopped && session?.ContainerId is { Length: > 0 } containerId)
         {
-            credentials = await _launcher.HarvestCliCredentialsAsync(
-                containerId, session.Kind, ct).ConfigureAwait(false);
-            // The approvals the user gave in this jail, on their way to the per-repo host store — but
-            // only from a session a human could actually approve in (see the policy type).
-            settings = await HarvestSettingsIfAttendedAsync(session, containerId, ct).ConfigureAwait(false);
+            // Audit F19. The harvests may honour the RPC's token — they are best-effort reads, and a
+            // client that hangs up has stopped waiting for its credentials. The TEARDOWN may not: past
+            // this point the session record is already gone, so a cancellation that skipped it would
+            // leave a running container nothing in the app can see, on a worktree the same stop is about
+            // to want removed. The spawn-failure path got this right (`CancellationToken.None`); this one
+            // took `ct` all the way down, and the disconnect that reaches it is the ordinary case — a
+            // user closing the window on a stop that is taking a few seconds.
+            try
+            {
+                // The login the user performed in this jail, on its way to the host keychain — but only
+                // from a session a human could actually have logged in from (see the policy type). A
+                // coordinator's workers are Managed, so this is the path that used to harvest them.
+                // Keep this ATTENDANCE-GATED: harvesting an unattended Managed jail ungated is what
+                // fed an untrusted worker's credentials into the vault every later jail of that kind
+                // restores from. The F19 try/catch wraps the gate; it never replaces it.
+                credentials = await HarvestCredentialsIfAttendedAsync(session, containerId, ct).ConfigureAwait(false);
+                // The approvals the user gave in this jail, on their way to the per-repo host store — but
+                // only from a session a human could actually approve in (see the policy type).
+                settings = await HarvestSettingsIfAttendedAsync(session, containerId, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                _spawnLog.LogWarning(
+                    "stop: agent={Agent} harvest cancelled (the caller disconnected) — tearing the jail "
+                    + "down anyway; its CLI login is not carried back to the keychain this time",
+                    agentId);
+            }
+
             if (settings.Count > 0)
             {
                 _keys.RememberCliSettings(session.RepoHash ?? string.Empty, session.Kind, settings);
@@ -728,7 +924,45 @@ public sealed class AgentSpawnService
             // loop) boots with the login the user just performed in the stopped jail. A session with no
             // repo hash caches nothing rather than leaking into a repo-less bucket (MG-6).
             _keys.RememberCliCredentials(session.RepoHash ?? string.Empty, session.Kind, credentials);
-            await _launcher.TeardownAsync(session.RepoHash, agentId, containerId, ct).ConfigureAwait(false);
+            await _launcher.TeardownAsync(session.RepoHash, agentId, containerId, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+
+        // F50: the daemon's custody of this repo ends when its last session does. Evaluated AFTER the
+        // harvest above, because that harvest is the thing that legitimately refreshes the cache —
+        // dropping first would throw away the login the user just performed, then re-add it.
+        //
+        // Two scopes, because the cache has two, and the WIDE one is the unconditional rule: when the
+        // repository has no sessions left at all, everything held for it goes — every kind's credentials
+        // plus the repo-level custom env entries, which are not per kind. That is the gesture F50 is
+        // about ("stop all agents" should mean the machine is holding nothing), and it needs no
+        // reasoning about roles: with nothing running, nothing can spawn.
+        //
+        // The narrow per-(repo, kind) eviction is the one that has to be argued for, and the argument is
+        // narrower than it first looked. The cache exists so a COORDINATOR-initiated worker (no client in
+        // the loop) inherits the repo's credentials — and `SpawnWorkerAsync` takes the kind from the
+        // shim, so a coordinator may spawn a worker of ANY installed kind, not only its own. "No session
+        // of this kind survives, therefore nobody can ask for this kind again" is true only when the
+        // coordinator's kind equals the worker's kind. Without the coordinator guard below, a user who
+        // ran one codex session in a repo and stopped it would leave the live claude-code coordinator's
+        // every later codex worker booting with no provider key and no login — a flow that worked, for
+        // the daemon's lifetime, before F50 existed.
+        //
+        // So: drop a kind only when no session of that kind survives AND no coordinator survives in the
+        // repo to spawn one. A surviving coordinator is precisely the thing that can still legitimately
+        // consume this entry.
+        if (session?.RepoHash is { Length: > 0 } stoppedRepo)
+        {
+            var live = _store.List().Where(s => string.Equals(s.RepoHash, stoppedRepo, StringComparison.Ordinal)).ToArray();
+            if (live.Length == 0)
+            {
+                _keys.ForgetRepo(stoppedRepo);
+            }
+            else if (!live.Any(s => string.Equals(s.Kind, session.Kind, StringComparison.Ordinal))
+                     && !live.Any(s => string.Equals(s.Role, AgentRoles.Coordinator, StringComparison.Ordinal)))
+            {
+                _keys.Forget(stoppedRepo, session.Kind);
+            }
         }
 
         // MG-10 corollary: a stopped session's jail is gone, but nothing about that touches MergeQueue

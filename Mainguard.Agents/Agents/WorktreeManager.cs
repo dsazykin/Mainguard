@@ -693,19 +693,27 @@ public sealed class WorktreeManager : IAgentWorktreeManager
 
         try
         {
+            // W1-A rework — this is a MUTATION in a directory the live agent can write, so it runs under
+            // the daemon's own layout rather than whatever the worktree's pointers say. A refusal comes
+            // back as Failed through the catch below, which is the same terminus every other git failure
+            // here already has.
+            var layout = PinFor(repoHash, agentId, worktreePath);
+            var dir = layout?.WorkTree ?? worktreePath;
+            var env = layout?.Env;
+
             // `add -A` honours the agent repository's local info/exclude, which is where the daemon's own
             // droppings in /workspace are listed (the CLI's settings file and the operating-instructions
             // file). That is not incidental: this method is what would otherwise commit them, and the
             // exclusion and this call ship together for exactly that reason.
-            AgentGitCommand.Run(worktreePath, "add", "-A");
+            AgentGitCommand.RunWithEnv(dir, env, "add", "-A");
 
             // Ask git whether there is anything staged BEFORE committing, so "nothing to commit" is an
             // outcome rather than a swallowed non-zero exit that also hides real failures.
-            if (AgentGitCommand.TryRun(worktreePath, out _, "diff", "--cached", "--quiet") == 0)
+            if (AgentGitCommand.TryRunWithEnv(dir, env, out _, "diff", "--cached", "--quiet") == 0)
             {
                 return new AgentWorkCommitResult(
                     AgentWorkCommitOutcome.NothingToCommit, branch,
-                    Sha: HeadShaOrNull(worktreePath),
+                    Sha: HeadShaOrNull(dir, env),
                     Detail: "the worktree is clean — there is no change to record.");
             }
 
@@ -718,9 +726,9 @@ public sealed class WorktreeManager : IAgentWorktreeManager
             // agent's commit depends on a config key nobody set deliberately. The text was normalised
             // and judged before this point; git is asked to record it and nothing else.
             args.AddRange(new[] { "commit", "--cleanup=verbatim", "-m", message });
-            AgentGitCommand.Run(worktreePath, args.ToArray());
+            AgentGitCommand.RunWithEnv(dir, env, args.ToArray());
 
-            var sha = HeadShaOrNull(worktreePath);
+            var sha = HeadShaOrNull(dir, env);
 
             // NOT published here, and that is load-bearing rather than an omission. AgentRefWatcher's
             // sweep raises `Advanced` only for an outcome of `Published` — a publish that already happened
@@ -737,10 +745,28 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         }
     }
 
-    private static string? HeadShaOrNull(string worktreePath) =>
-        AgentGitCommand.TryRun(worktreePath, out var sha, "rev-parse", "HEAD") == 0
+    private static string? HeadShaOrNull(
+        string worktreePath, IReadOnlyDictionary<string, string>? env) =>
+        AgentGitCommand.TryRunWithEnv(worktreePath, env, out var sha, "rev-parse", "HEAD") == 0
             ? sha.Trim() is { Length: > 0 } trimmed ? trimmed : null
             : null;
+
+    /// <summary>
+    /// W1-A rework — the daemon's own answer to "which git layout backs this worktree", for the calls in
+    /// this file that run with a LIVE agent's worktree as their working directory.
+    ///
+    /// <para>Null is the pre-MG-3 / substrate-less shape (no per-agent repository, or a plain <c>.git</c>
+    /// directory) and means "run exactly as before"; a tampered linked worktree throws, and each caller
+    /// maps that onto the refusal it already has. The calls made at CREATION time
+    /// (<c>FinishWorktreeLocked</c>'s <c>remote remove</c>/<c>remote add</c>) deliberately do not use this:
+    /// they run between <c>git worktree add</c> and the jail's first existence, so there is no agent yet
+    /// to have written the pointers they would be validating.</para>
+    /// </summary>
+    private TrustedWorktreeLayout? PinFor(string repoHash, string agentId, string worktreePath)
+        => TrustedWorktreeLayout.TryResolve(
+            worktreePath,
+            _agentRepos.Exists(repoHash, agentId) ? _agentRepos.PathFor(repoHash, agentId) : null,
+            BareRepoPathFor(repoHash));
 
     /// <inheritdoc />
     public bool PublishAgentBranch(string repoHash, string agentId) => Publish(repoHash, agentId).Current;
@@ -846,7 +872,9 @@ public sealed class WorktreeManager : IAgentWorktreeManager
 
         if (Directory.Exists(worktreePath))
         {
-            if (!force && IsDirty(worktreePath))
+            // W1-A rework — pinned: this decides whether a teardown is allowed to discard an agent's work,
+            // and an unpinned `status` could be aimed at a clean repository to make a dirty one removable.
+            if (!force && IsDirty(worktreePath, PinFor(repoHash, agentId, worktreePath)))
             {
                 throw new AgentWorktreeConflictException(
                     $"Worktree for agent '{agentId}' has uncommitted changes; pass force to discard them.");
@@ -1153,8 +1181,10 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     private static bool BranchExists(string barePath, string branch)
         => AgentGitCommand.TryRun(barePath, out _, "rev-parse", "--verify", "--quiet", "refs/heads/" + branch) == 0;
 
-    private static bool IsDirty(string worktreePath)
-        => AgentGitCommand.Run(worktreePath, "status", "--porcelain").Trim().Length > 0;
+    private static bool IsDirty(string worktreePath, TrustedWorktreeLayout? layout)
+        => AgentGitCommand
+            .RunWithEnv(layout?.WorkTree ?? worktreePath, layout?.Env, "status", "--porcelain")
+            .Trim().Length > 0;
 
     private static string DefaultBranch(string barePath)
     {

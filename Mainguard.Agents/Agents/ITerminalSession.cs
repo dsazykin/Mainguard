@@ -24,4 +24,24 @@ public interface ITerminalSession : IDisposable
 
     /// <summary>Force-terminates the child. Safe to call repeatedly.</summary>
     void Kill();
+
+    /// <summary>
+    /// Releases the DAEMON's half of this session — the event hook and the streams — and leaves the
+    /// child process alone. The opposite of <see cref="IDisposable.Dispose"/>, which reaps it.
+    ///
+    /// <para><b>F59, and why the interface needs both.</b> Daemon shutdown has to let go of a session
+    /// without killing the agent inside it, and "let go" and "reap" were the same call: every teardown
+    /// path ended in <c>Dispose</c>, and <see cref="PtySession.Dispose"/> is a <c>Kill</c>. So the
+    /// shutdown path that claimed to detach still SIGKILLed the CLI child of every bound session, and
+    /// the claim was prose. A session type that does not terminate anything on
+    /// <see cref="IDisposable.Dispose"/> needs nothing here, which is why the default is to dispose;
+    /// <see cref="PtySession"/> overrides it, because it is the one that kills.</para>
+    ///
+    /// <para><b>What it does not promise.</b> Releasing closes the PTY master, and a child whose
+    /// controlling terminal is hung up may still be signalled by the kernel. What it removes is the
+    /// daemon's own deliberate SIGKILL; for the jail case the agent survives because the process is the
+    /// container engine's, not this one's. Safe to call repeatedly, and mutually exclusive with
+    /// <see cref="IDisposable.Dispose"/> — whichever lands first wins.</para>
+    /// </summary>
+    void Release() => Dispose();
 }

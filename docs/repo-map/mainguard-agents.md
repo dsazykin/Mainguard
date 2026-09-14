@@ -118,11 +118,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     verdict;
     timer-threaded — consumers marshal). Also `PtyProcessShim.cs` (P2-03): the real cross-platform PTY
     shim — `PtySession` (bidirectional `IO` stream, `Resize`/`Kill`/`ExitCode`, idempotent dispose that
-    reaps the child) + `PtyProcessShim.Spawn` (ConPTY on Windows / forkpty on Linux via the `Porta.Pty`
+    reaps the child, plus **`Release()` — F59's release-without-kill**: unhooks `ProcessExited`, completes
+    the exit waiter and disposes the streams, with no `Kill` and no `IPtyConnection.Dispose`, so daemon
+    shutdown can let go of a CLI instead of SIGKILLing it. Until it existed, every teardown path ended in
+    `Dispose`, i.e. in `Kill`, and "a restart no longer kills bound CLIs" was prose) + `PtyProcessShim.Spawn` (ConPTY on Windows / forkpty on Linux via the `Porta.Pty`
     package; execs `command`+`args` directly — never a shell wrapper) + the internal `PtyDuplexStream`
     adapter. `isatty()` is true inside; Ctrl+C (0x03) reaches the foreground process. **PR3:**
-  - `ITerminalSession.cs` — the engine-agnostic live-terminal seam (`IO`/`Resize`/`Kill`/`ExitCode`)
-    `PtySession` implements, so the daemon's CLI binding is testable with duplex-pipe fakes;
+  - `ITerminalSession.cs` — the engine-agnostic live-terminal seam (`IO`/`Resize`/`Kill`/`ExitCode`, plus
+    **`Release()`** — let go of the child without reaping it, defaulting to `Dispose` so only a session
+    type that actually kills needs to implement it) `PtySession` implements, so the daemon's CLI binding
+    is testable with duplex-pipe fakes;
   - `AgentRoles.cs` — the shared role-string contract (""/`coordinator`/`managed`) for
     `SpawnAgentRequest.role`; and `Agents/Ipc/` — the coordinator→daemon spawn channel's pure pieces:
     `AgentIpcProtocol.cs` (fixed in-jail layout `AgentIpcPaths` — `/opt/mainguard/ipc` read-only mount
@@ -316,6 +321,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     so the obvious spelling of this fix ships the fix and keeps the bug. Gated on `ipcDirPath` like the
     pre-approval beside it, and an unreadable style is REFUSED at parse (`BadInitialPrompt`) rather than
     defaulted, because degrading to "no first turn" is the deadlock).
+    **The fourth per-adapter field, `resumeArg`** (claude-code: `--continue`, measured against the CLI's own
+    `--help`), is the mirror image and is used on exactly ONE path — `BuildReattachLaunchArgv`, the adoption
+    re-bind after a daemon restart. The daemon's PTY dies with the daemon so the adopted agent's CLI is a
+    new `docker exec`, but its jail is not new: `/workspace`, the `agent/<id>` branch and the in-jail `$HOME`
+    all survive, and a CLI that keeps a per-directory session store keeps it under that `$HOME` — so the
+    transcript is still on disk and the flag is what opens it. Without it the re-bind restored a *process*,
+    not a loop: a steerable CLI at an empty input box with no idea what it was doing. Never on the spawn
+    line (a fresh jail has no conversation to continue), placed before the variadic `--allowedTools` for the
+    same reason the first turn is, and subject to the same rule as `preApprovedCommandArg` — verify the flag
+    against the PINNED binary, because a flag a CLI does not know makes it exit on its own launch line, and
+    on the re-bind path that is an adopted agent that had a jail and now has nothing. An adapter that
+    declares none re-binds exactly as it did before the field existed.
   - **`Agents/` (P2-06 repo provisioner — daemon-side, no UI).**
     - `RepoPathHasher.cs` (pure: a normalized Windows repo path → a stable lowercase-hex SHA-256;
       case-folds + unifies slashes + strips the trailing separator so `C:\Repo\` and `c:/repo` map to one
@@ -370,8 +387,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       shell with no exec bit to check. `AgentBranchGuard.Probe` + `AgentBranchAlignment` are the
       backstop — measured `symbolic-ref`/`rev-parse`/`merge-base --is-ancestor`, never a guess, with
       `Unknown` deliberately distinct from "aligned"; `Describe` is the operator report naming the actual
-      branch, the expected branch and a recovery that was actually computed. Auto-recovery is
-      **rejected** — see `docs/design/agent-branch-confinement.md` §4).
+      branch, the expected branch and a recovery that was actually computed. **W1-A rework**: `Probe` runs
+      those three commands under a `TrustedWorktreeLayout` pinned from `agentRepoPath`, because it decides
+      whether an agent's work is on the branch the merge queue reads and it runs in a live agent's
+      worktree; a refused layout is `Unknown`, which every caller already treats as "not evidence of
+      alignment". Auto-recovery is **rejected** — see `docs/design/agent-branch-confinement.md` §4).
     - `AgentRefMediator.cs` (**MG-3 stage 2** — the ONE path by which anything an agent produced reaches
       the shared mirror, and the reason the design chose daemon-FETCH over push-to-daemon: with a push
       model the agent proposes `old new refname` triples the daemon must validate forever and correctly,
@@ -448,7 +468,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       distinct from `Committed` so a clean tree is never reported as recorded work, and pointedly NOT
       publishing —
       `AgentRefWatcher` raises `Advanced` only on `Published`, so an eager publish here would disarm
-      `WorkerReadinessTrigger` for the very commit it exists to react to);
+      `WorkerReadinessTrigger` for the very commit it exists to react to. **W1-A rework**: those git calls
+      — and `RemoveAgentWorktree`'s dirty check — run under a `TrustedWorktreeLayout` from the private
+      `PinFor(repoHash, agentId, worktreePath)`; the CREATION-time `remote remove`/`remote add` in
+      `FinishWorktreeLocked` deliberately do not, because they run between `worktree add` and the jail's
+      first existence, when there is no agent yet to have written the pointers they would validate);
       `RemoveAgentWorktree(force)` (dirty non-force → typed refusal; force → `remove --force`, then
       `ReapBranch` — `branch -D` **only when `AgentRefMediator.MayReap` proves the delete destroys
       nothing**, i.e. the tip is already contained in the mirror's integration branch — then delete the
@@ -531,9 +555,60 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the shared mirror is now read-only to every jail, so its `config`/`hooks` are no longer an attack
       surface at all, and what remains to defend is the per-agent repo + worktree, which the daemon also
       runs git against). All git routes through `GitService.RunGit`; the only process spawn here is the
-      injectable pnpm runner. `RunWithEnv` is the one env-accepting overload — extra env merged UNDER
-      the hardening pins (re-applied last, so a caller cannot un-pin them) — added for the queue
-      seeder's scratch `GIT_INDEX_FILE` plumbing.
+      injectable pnpm runner. `RunWithEnv`/`TryRunWithEnv` are the env-accepting overloads — extra env
+      merged UNDER the hardening pins (re-applied last, so a caller cannot un-pin them) — added for the
+      queue seeder's scratch `GIT_INDEX_FILE` plumbing and reused by the W1-A pinned-layout callers.
+      **W1-A closed the `filter.*` concession**: MG-1's fixed `-c` list cannot express a wildcard family,
+      so `filter.<d>.clean|smudge|process`, `diff.<d>.command|textconv`, `merge.<d>.driver` and friends
+      used to be written off as "confined to the per-agent repo" — confined in location, not execution,
+      since the keep-alive rebaser and the PR head fetcher run git there as the daemon user on the host.
+      Every invocation now ENUMERATES the target repository's effective config
+      (`git config --list --name-only -z`, which executes nothing) and emits `-c <key>=` for every key in
+      a command-executing family (empty is git's own "no driver"); a key whose name cannot be expressed
+      on the command line — a subsection containing `=`/whitespace — is a typed refusal, never a silently
+      misapplied override. The always-on pin list gained exactly ONE key, `safe.directory=` (the
+      protected-scope reset that makes git's ownership check provably strict on agent-owned paths), plus
+      `GIT_EDITOR`/`GIT_SEQUENCE_EDITOR=:` in the env. It deliberately stops there: pinning the other
+      fixed-name knobs empty was tried and `-c diff.external=` broke every CLEAN repository — git reads an
+      empty `diff.external`/`diff.<d>.command`/`diff.<d>.textconv` as a command to RUN, not as "none", so
+      the daemon's `git diff` died with `error: cannot run :` and the merge queue's flagged-change gate
+      silently took `CanMerge` false (caught by `MergeQueueProvisionerTests`; pinned now by
+      `CleanRepository_StillProducesARealDiff_ThroughTheDaemonPath`). "Empty means disabled" is a per-key
+      fact, not a rule, so it is only relied on where the enumerator has seen the key actually declared —
+      there the worst case is a loud failure on a repository that planted an executable value.
+      **W1-A rework — the enumeration reads ONE repository and git does not stay in one.** `status`/`diff`
+      call `is_submodule_modified()` for every POPULATED gitlink (mode 160000 whose `<path>/.git` exists —
+      no `.gitmodules` needed), which spawns `git status --porcelain=2` inside a repository whose
+      `filter.<d>.clean` was never enumerated and whose `GIT_DIR` pin `prepare_submodule_repo_env()` drops;
+      `fetch` defaults to `fetch.recurseSubmodules=on-demand`. So recursion is now pinned off at the source
+      (`-c diff.ignoreSubmodules=all -c submodule.recurse=false -c fetch.recurseSubmodules=false
+      -c status.submoduleSummary=false`), with `--ignore-submodules=all` injected AFTER the subcommand for
+      `status`/`diff` — not redundant: the config pin is a default that
+      `set_diffopt_flags_from_submodule_config()` clears for a repo declaring `submodule.<n>.ignore`, and
+      only the CLI option also sets `override_submodule_config`. `git add` has no such option and
+      `builtin/add.c` never loads `git_diff_ui_config`, so `GitlinkExclusions` reads the index
+      (`ls-files --stage -z` — no child git, no filter) and appends `:(exclude,literal)<path>` for every
+      populated gitlink. Measured cost, tested: daemon-side git stops SEEING submodule pointer moves (the
+      agent's own in-jail git still records them). `gpg.ssh.defaultKeyCommand` joined the classifier —
+      `commit.gpgsign=true` + `gpg.format=ssh` + no `user.signingkey` runs it through a shell on every
+      commit the daemon makes and every one a rebase replays.
+    - `GitConfigExecutionSurface` (same file) — the **pure** classifier for "config keys git will spawn a
+      command from", unit-pinned family by family so the list is a tested artifact. Deliberately excludes
+      `alias.*` (a git alias cannot shadow a built-in and the daemon invokes nothing else).
+    - `TrustedWorktreeLayout` (same file) — W1-A layer 2. Resolves an agent worktree's git layout from
+      DAEMON-computed roots and validates it, instead of letting git discover it from the agent-writable
+      `.git` pointer file and `commondir`. When the caller knows `AgentRepoLayout.AgentRepoPath` the layout
+      is COMPUTED (`GIT_DIR = <agentRepo>/worktrees/<the daemon's own worktree directory name>`) and the
+      pointer is read back only as a tamper alarm; without it the pointer selects the repository and is
+      shape-checked, mirror-checked and round-trip-checked. **Rework: it fails CLOSED.** Null now means
+      only "there is no linked-worktree indirection here" (a real `.git` DIRECTORY, or none at all) — once
+      `.git` is a FILE every exit is a validated layout or a typed refusal. It used to return null on any
+      validation failure and both callers read null as "run unpinned", so blanking
+      `worktrees/<n>/gitdir` was the whole exploit. **And the pin alone is not sufficient**: git's files
+      ref backend builds its common dir with `get_common_dir_noenv()`, so `GIT_COMMON_DIR` does not reach
+      it and the `commondir` FILE does — measured, a commit with every pin correct still advanced the
+      MIRROR's `refs/heads/main`. `AssertCommondirFileAgrees` therefore reads that file, only ever to
+      refuse, and `ContainerSpecBuilder` re-mounts it (and `gitdir`) read-only in the jail.
   - **`Agents/Bootstrap/`** (P2-05 MainguardOS bootstrapper — client-side; gets a WSL2-enabled
     Windows machine to a health-checked `mainguardd`).
     - `WslConfigMerger.cs` (the **pure**, IO-free INI merge for `%UserProfile%\.wslconfig`: adds only
@@ -551,14 +626,52 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       caller reaching for one is a composition bug. `-u root` runs as the current user.)
     - `MacDaemonController.cs` (lifecycle of the LOCAL mainguardd on macos-host: idempotent start
       from the app payload through the dotnet muxer — never the payload apphost, which current
-      macOS SIGKILLs outside its first-run location — pgrep-by-payload-dll discovery, and
-      SIGTERM-then-SIGKILL stop.)
+      macOS SIGKILLs outside its first-run location — and SIGTERM-then-SIGKILL stop.
+      **F55:** liveness is now `IsInstanceLockHeld()` — an exclusive open of `<data root>/daemon.lock`,
+      the daemon's own single-instance lock — instead of `pgrep -f <payload dll>`, which was a
+      check-then-act with a multi-second window and could not see a daemon started from a *different*
+      payload directory, i.e. exactly the second instance that does the damage. `pgrep` survives only as
+      the fallback when no lock file exists at all (a pre-F55 daemon mid-upgrade). `InstanceLockFileName`
+      mirrors `Mainguard.Server.Runtime.DaemonInstanceLock.FileName`, which this assembly cannot
+      reference; `DaemonSecondInstanceTests` pins the two equal.
+      **F63(a):** `TryResolveAbsoluteMuxerPath()` resolves an ABSOLUTE dotnet (DOTNET_HOST_PATH →
+      DOTNET_ROOT → the official installer → both Homebrew prefixes → `~/.dotnet`, symlinks resolved) or
+      returns null; `DotnetMuxerPath()` keeps the bare-name fallback for interactive children only.)
     - `MacDaemonUpdater.cs` (the macos-host `IDaemonUpdater`: the daemon runs OFF the payload the
-      app ships, so tier-1 refresh is stop + start from it — no staging copy, no systemd, no VM.)
+      app ships, so tier-1 refresh is stop + start from it — no staging copy, no systemd, no VM.
+      **F55/F63:** when the LaunchAgent is installed, launchd performs the restart rather than this
+      updater. The old unconditional stop+start fought the job: `KeepAlive` respawned the daemon the
+      instant SIGTERM landed, and the "start" then raced that respawn into two daemons contending for the
+      port. **B2:** the refresh now stages into `daemon-payload.new` and CHECKS the result — a null is a
+      refusal that leaves the running daemon alone — then `RestartOntoStagedPayloadAsync` boots the job
+      out, renames the staged directory into place while nothing executes from it, and brings the job
+      back. Previously it re-staged in place (deleting the directory the daemon was running from) and
+      kickstarted whatever the copy did, so a half-copied payload produced a daemon crashing on a missing
+      assembly and `Crashed:true` respawning it every 30 s forever.)
     - `MacDaemonLaunchAgent.cs` (optional launchd integration — "keep the agent platform running
-      at login": a per-user LaunchAgent starting mainguardd from the app payload with KeepAlive,
-      installed/booted via `launchctl bootstrap gui/<uid>`, nothing elevated; with it installed a
-      refresh degenerates to "stop and let launchd respawn from the same payload dir".)
+      at login": a per-user LaunchAgent installed/booted via `launchctl bootstrap gui/<uid>`, nothing
+      elevated, plus `KickstartAsync` for the updater. **F63** fixed five defects in the plist:
+      (a) an absolute dotnet muxer, and a refusal to install without one — launchd's PATH has neither
+      `/usr/local/share/dotnet` nor Homebrew, so a bare `dotnet` was a job that could not exec;
+      (b) `KeepAlive` is a `{ Crashed, SuccessfulExit:false }` dict with a `ThrottleInterval`, not an
+      unconditional `<true/>` that respawned a permanently-failing job forever;
+      (c) every interpolated value goes through `SecurityElement.Escape` — an `&` in a home directory
+      produced a plist `launchctl bootstrap` silently refused;
+      (d) `StandardOutPath`/`StandardErrorPath` under `~/.mainguard/logs`, so a crash BEFORE the
+      daemon's own logging pipeline exists leaves something behind, plus an `EnvironmentVariables` PATH
+      carrying Homebrew and the muxer's own directory, and (**N6**) `MAINGUARD_SUPERVISOR=launchd` — the
+      variable `DaemonExitCodes.RefusedStart()` reads so a second instance refusing a data root another
+      daemon holds exits 0 under the job instead of asking `SuccessfulExit:false` to exec it again every
+      30 s (`SupervisorVariable` is mirrored across the assembly boundary and pinned by a test);
+      (e) the payload is STAGED to `~/.mainguard/daemon-payload/` and the job runs from there, never from
+      inside the `.app` bundle — a bundle replaced in place gives a lazily-loading daemon a mix of old
+      and new assemblies. **B2:** staging is two phases — `StageIncomingPayload` copies to
+      `daemon-payload.new` beside the live copy (returning null, a refusal, when the copy fails or has no
+      `Mainguard.Server.dll`) and `CommitStagedPayload` rename-swaps it into place, called only while the
+      job is booted out (`InstallAsync`, `RestartOntoStagedPayloadAsync`). The first version deleted and
+      rewrote the directory the running daemon was executing from, reintroducing (e)'s own defect at
+      every refresh. `RenderPlist`/`StageIncomingPayload`/`CommitStagedPayload` are internal so
+      `MacLaunchAgentPlistTests` can assert the document and the swap without touching launchd.)
     - `MacOobeState.cs` (the macos-host first-run marker — deliberately simpler than the WSL OOBE's
       staged machine: no reboot-resume, no elevation, no VM import, so "completed once" is the only
       stage worth persisting; deleting `macos-oobe.json` re-runs the flow.)
@@ -767,7 +880,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       digest would prove nothing; an untrusted chain is EXPECTED for a self-signed key, a bad digest never
       is) and `PinnedThumbprintSignatureVerifier` (on a signing-enabled build an unsigned covered artifact
       is `Rejected`, never `NotAvailable`). `PayloadSignature` now selects its default from the build's
-      own configuration, so no entry point opts in. Packaging: the Pro head's
+      own configuration, so no entry point opts in. **Audit F57** adds two things on top:
+      `PayloadSignatureGate` in `PayloadSignature.cs` — the one shared "must this refuse?" decision, which
+      makes `NotAvailable` FATAL for a pin-covered kind once the build can actually check (pins
+      configured, or stamped `MainguardAttestedRelease`), so a missing/unusable `wintrust.dll` is no
+      longer a cheaper bypass than forging a signature; and the `MainguardRequirePinsOnReleaseBuild`
+      MSBuild target in `Mainguard.Agents.csproj` (error `MG0057`), which FAILS a build stamped as a
+      release that set no pins — the property defaults empty, so before this a release shipping the
+      never-Rejecting unsigned verifier was indistinguishable at runtime from a dev build.
+      `Mainguard.Tests/ReleaseBuildCarriesPinsTests.cs` pins both halves (the runtime implication
+      attested ⇒ usable pins, and the csproj guard's own existence). Packaging: the Pro head's
       `StageElevatedComponentsToPublish` target self-contained-publishes the helper into `elevated-stage/`
       at PUBLISH (never on a dev build) — an EMPTY stage is now an `<Error>`, not a `<Warning>` buried in
       the publish log, since it means the packaged app silently falls back to the per-user helper, i.e.
@@ -787,6 +909,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       path outside the install root, compared segment-wise so `Mainguard-evil\` fails against
       `Mainguard\`; applied in the schtasks **builder** rather than at the call sites so no caller can
       forget it. Syntactic and platform-independent on purpose — the Windows cases run on Linux CI.)
+      `TrustedResultPath.cs` (**audit F58** — the WRITE-side twin: the elevated helper validated
+      `--resume-target` and not `--result`, although both arrive on the same argv and the second is
+      opened for writing AS ADMINISTRATOR with content that echoes the caller's own string back. Reuses
+      `TrustedExecutablePath`'s normalisation (absolute, canonical, no traversal/UNC/device/ADS/quoting
+      metacharacters) and adds two rules: the file must be named `elevated-result.json` — the one name
+      both production callers pass — and its directory must be a Mainguard data root, either this
+      process's own or a directory named `Mainguard`/`.mainguard` so over-the-shoulder elevation by a
+      second account still works. Pure and injectable; `Mainguard.Tests/TrustedResultPathTests.cs`.)
   - **`Agents/Sandbox/`** (P2-07 sandbox hardening + default-deny egress — daemon-side, no UI; the
     launch-tier prompt-injection exfiltration control). Adds `Docker.DotNet` to `Mainguard.Agents`
     (never referenced from `Mainguard.App.Shell` — G-18). **Pure, unit-tested heart:**
@@ -796,7 +926,20 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       is the persisted document clamped over `SandboxLimits.Default`, `Set` clamps to [512 MiB, 64 GiB] ×
       [0.5, 64] CPUs, persists, audits `jail_limits_changed` and answers AS PERSISTED. Read-side clamp too,
       so a hand-edited zero is never a ceiling of zero. Defaults kept at 2 GiB / 2 CPUs; no fleet cap.)
-    - `ContainerSpecBuilder.cs` (**macOS agent-IPC fix**: `IpcOutboxPath` adds a READ-WRITE mount at
+    - `ContainerSpecBuilder.cs` (**W1-A**: `WorktreeGitPointer(worktreePath)` + `WorkspaceGitPointerTarget`
+      re-mount the worktree's `.git` POINTER FILE **read-only at `/workspace/.git`**, nested inside the
+      still-read-write workspace. `git worktree add` writes that one line once and nothing ever writes it
+      again, but it lives in the agent's workspace and it is the first thing any git run there reads —
+      including the daemon's, outside the jail; aiming it at the read-only shared mirror was the audit's
+      "plausible second vector". Travels with `AgentRepoPath`, which is what makes `.git` a file at all.
+      **W1-A rework**: `WorktreeRegistrationFiles(agentRepoPath, worktreePath)` re-mounts the two files the
+      pointer LEADS to — `<agentRepo>/worktrees/<name>/{commondir,gitdir}` — read-only on top of the
+      read-write per-agent repo, for the same reason and with the same "written once by `worktree add`"
+      justification. `commondir` is the one that matters most: git's files ref backend resolves it with
+      `get_common_dir_noenv()`, so it follows that FILE even when the daemon pinned `GIT_COMMON_DIR`
+      elsewhere — rewriting one line there put daemon ref writes into the shared mirror with every pin
+      correct. Everything else in the registration (HEAD, index, logs, refs) stays writable.
+      **macOS agent-IPC fix**: `IpcOutboxPath` adds a READ-WRITE mount at
       `/opt/mainguard/ipc/outbox`, **nested inside** the read-only IPC mount so the shim and the operating
       instructions stay the daemon's files. It is the coordinator jail's only writable bind mount, so the
       guard is exact rather than shaped — the source must be the `outbox/` child of THIS request's IPC dir
@@ -843,6 +986,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `EgressAllowlist.cs` (model + JSON persistence + `allowlist_changed` audit events; `DefaultEntries`
       = model APIs + package registries with **no git host** (A6);
       `EgressAllowlistEntry.DefeatsA6`/`LooksLikeGitHost` flag a git-host entry).
+      **F31 — `EgressHostPattern` lives here and nothing stores an unvalidated pattern any more.** The
+      grammar is the one a resolvable hostname already satisfies (an optional `*.` prefix, then
+      dot-separated LDH labels, ≤253 chars; IPv4 literals pass, which matters because the gateway's own
+      address is allowlisted as one). Nothing validated these before, and they are rendered into a
+      tinyproxy extended regex that escapes only the dot, and into a line-and-slash-delimited dnsmasq
+      config: `a|.*` became `^a|.*$`, an alternation matching every hostname there is (default-deny
+      turned allow-all while the UI still listed one innocuous entry); `(` made the filter uncompilable,
+      i.e. a fleet-wide egress outage; a `/` or a newline injected dnsmasq directives that can restore
+      the default upstream `no-resolv` exists to remove, re-opening DNS exfiltration. `Add` now throws
+      on an invalid pattern (the LAST gate — `EgressGrpcService` refuses one first), while
+      `FromPersistedForm` and `CombinedWith` DROP one instead of throwing: a corrupt file, or one
+      malformed adapter-declared host, must not cost the user every valid entry or take the fleet's
+      egress down.
       **Edits are now DURABLE.** `ToPersistedForm`/`FromPersistedForm` had no production callers on
       either side: `Wsl2AgentEnvironment` built `WithDefaults(audit)` on every daemon start, so an
       `EgressGrpcService` add/remove mutated an in-memory list that was audited, re-rendered onto the
@@ -857,7 +1013,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       render-time union with installed CLIs' auto-permitted hosts, not a user edit. Pinned by
       `Mainguard.Tests/EgressAllowlistPersistenceTests.cs`.
     - `EgressProxyConfig.cs` (pure renderer: tinyproxy allow-filter + dnsmasq pinned-DNS + iptables
-      backstop from the allowlist. The backstop is rendered as a complete `*filter` table piped to
+      backstop from the allowlist. **F31: every render path filters through `EgressHostPattern.IsValid`**
+      — the last line of defence, since this is the function whose output becomes a regex and a config
+      directive. **F26: `RenderIptablesScript` now takes the gateway's `host:port` and emits `OUTPUT`
+      rules bounding the daemon host to the GATEWAY PORT alone** (plus DNS), dropping everything else to
+      that address. tinyproxy's `Filter` matches a hostname and has no notion of a port (`ConnectPort`
+      bounds only CONNECT), so the MG-4 allowlist entry that makes the gateway reachable also handed
+      every jail a plain-HTTP proxy to *any* TCP port on the daemon host — a local Ollama, a dev server,
+      Docker's TCP API. The address is resolved by `getent` inside the script at apply time (the gateway
+      is a name Docker put in `/etc/hosts`), and `RenderGatewayOutputPrelude` refuses to interpolate
+      anything that is not a validated host plus a 1-65535 port, because that line runs as root in the
+      proxy. Still ONE `iptables-restore`, so the atomicity argument below is intact.
+      The backstop is rendered as a complete `*filter` table piped to
       **`iptables-restore`**, i.e. applied in ONE netlink transaction: it used to be `iptables -F` plus
       ~13 `iptables -A` processes, and measured on a live proxy the chain immediately after the flush is
       `-P INPUT DROP` with **zero rules** — a total blackhole including ESTABLISHED traffic — for the 131
@@ -900,8 +1067,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `/workspace` workdir, and a fixed argv-safe `sh -c` wrapper that sources
       `CredTmpfsSpec.DefaultCredentialPath` — `/run/secrets/agent/agent.env`, spelled through the constant
       because the wrapper's `[ -r … ]` guard makes a stale copy of the path fail SILENTLY — and puts the
-      IPC mount on PATH before `exec "$@"`). **Engine-agnostic seams (no Docker.DotNet in the
-      signature):**
+      IPC mount on PATH before `exec "$@"`). The same file now carries `TrustedDockerBinary` (**audit
+      F54**): every daemon-side docker invocation used the bare name `"docker"`, resolved against the
+      daemon's INHERITED `PATH` — so whoever controlled the environment the daemon was started with chose
+      the program that creates every jail. It resolves to an absolute path from a fixed list of
+      system-owned directories (deliberately excluding the same-user-writable `~/.docker/bin`), with no
+      environment override, and `TrustedChildPath` is the matching fixed `PATH` handed to the child
+      instead of ours (`AgentCliBinder.BuildPtyLaunch`). Nothing found ⇒ the first candidate, so the
+      answer is always absolute and the spawn fails with a plain ENOENT — the degrade `TryBind` already
+      audits. **Engine-agnostic seams (no Docker.DotNet in the signature):**
     - `ISandboxEngine.cs` (`SpawnAsync`/`ExecAsync`/`PauseAsync`/`UnpauseAsync` (P2-09 yield-timeout
       `docker pause`/`unpause`)/`StopAsync`/`RemoveAsync`/`ImageExistsAsync` (the v1 spawn-preflight image
       probe; defaults true — an engine/fake with no separate image store has nothing to preflight, the
@@ -981,6 +1155,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       adds `staleSecretLayout` to the reuse staleness list, because tmpfs entries are fixed at create and
       reusing a pre-upgrade jail would exec a non-root owner into a directory that does not exist —
       resurrecting the same EPERM for every container that outlived the upgrade.
+      **F24 — the reuse path now writes the jail's SECRETS too** (`agent.env` + `oob.key`, before the
+      restores below it). Both live on tmpfs, which Docker recreates EMPTY on `docker start`, and the
+      launcher mints a fresh gateway token every launch while `Issue` retires the previous one — so a
+      resumed jail came back either with no token or with one the daemon had already replaced (every
+      model call 401s, and the OOB supervisor has no key at all). Written UNCONDITIONALLY, unlike the
+      write-if-absent restores beside them: those carry the user's state and a live jail may hold a
+      fresher copy, while these carry THIS launch's secrets, which the launch has already replaced
+      daemon-side. Pinned by `GatewayConfinementDockerTests.ResumedJail_…`.
       `RestoreCliCredentialsAsync`/**`RestoreCliSettingsAsync`** run on BOTH the create and the reuse
       paths, write-if-absent as the AGENT uid over exec stdin — `docker cp` would write UNDER the tmpfs
       `$HOME` and report success while the container sees nothing, and write-if-absent stops the host's
@@ -997,7 +1179,23 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       filename: the union is `SandboxAgentLauncher.DeclaredWorkspaceIgnorePaths`. The instructions half
       was found in production — `git check-ignore CLAUDE.md` answered rc=1 in a live worker jail and the
       worker's own report flagged the stray `?? CLAUDE.md`. The exclude file lives in the per-agent repo
-      the daemon deletes at teardown, so nothing tracked is touched and no state outlives the agent) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
+      the daemon deletes at teardown, so nothing tracked is touched and no state outlives the agent.
+      **Audit F28 — `InspectPostureAsync` + `RetightenCeilingAsync`,** the two questions the reuse path
+      never asked: does this jail still carry today's hardening set, and today's ceiling?
+      `ContainerSpecBuilder.InspectPosture` splits the answer — hardening is fixed at create and joins
+      the recreate set, a ceiling is writable on a live cgroup and is re-applied in place, because an
+      operator moving a slider must not kill every running session. **The update sends `Memory` and
+      `MemorySwap` as the pair they are:** moby validates a memory update against the memory+swap total
+      the request carries and falls back to the container's existing one, so a Memory-only raise past
+      2x the created ceiling was rejected 409 on every reuse — the Settings page reading 8 GiB and the
+      jail sitting at 2 GiB indefinitely — while a lowering "worked" and left the old swap headroom
+      behind. `ContainerSpecBuilder` therefore states `MemorySwap` explicitly at create (the same
+      `Memory * 2` moby would have filled in, so no jail's posture moves) and `InspectPosture` compares
+      it. Both best-effort paths take the engine's `log` sink rather than swallowing: a refused ceiling
+      update, and an inspect that could not answer, each say so with the jail named — a tolerated
+      failure with no diagnostic is the "reads as applied while measuring nothing" shape this whole
+      lane is about. The daemon wires that sink from `DaemonHost` through
+      `AgentEnvironmentFactory`/`AgentEnvironmentComposition`) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
       the `mainguard-egress-proxy` container (image `DefaultImageRef` — the ref the v1 spawn preflight
       probes); renders + pushes the allowlist config; a `gatewayUpstream` ctor arg pushes the P2-08
       model-host fronting, and an `installedAdapterHosts` provider unions each installed CLI's declared
@@ -1007,7 +1205,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       load-bearing. It adds the gateway's own host to the rendered filter as a direct-route entry
       (`CombineGatewayHost`/`GatewayHostOf`, port stripped — tinyproxy filters on hostname) and emits no
       `upstream` directive, so a confined jail can reach the daemon while every existing host keeps the
-      route it had. `gatewayUpstream` would instead front the model hosts for EVERY agent, dragging OAuth
+      route it had. **F25/F26: `gatewayReachableAt` is now also passed to
+      `EgressProxyConfig.RenderIptablesScript`**, so the backstop bounds that host to the gateway port
+      alone, and `ProxyHostConfig` sets `ExtraHosts = ["host.docker.internal:host-gateway"]`
+      (`GatewayHostAlias`) — the one name that reaches the daemon from inside this container, and the
+      reason a loopback-bound gateway is usable at all. A proxy created before that mapping existed is
+      REPLACED (`HasGatewayHostAliasAsync`, same policy as an image upgrade): an `/etc/hosts` entry can
+      only be set at create time, and without it every BYOK spawn would silently skip confinement — i.e.
+      hand the jail the raw provider key — for the life of that container. Only the proxy gets the
+      mapping; the jails sit on Internal segments with no route anywhere. `gatewayUpstream` would instead front the model hosts for EVERY agent, dragging OAuth
       traffic through the gateway to be 401'd, which is why production passes only the former.
       `CanProxyReachAsync` performs the real connect from inside the proxy (bash `/dev/tcp`; the proxy
       image has no HTTP client), cached on success only.
@@ -1027,7 +1233,34 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       on (MG-7's resolver pin, MG-18's posture check) — a gate that compared against the literal
       `mainguard-agents` would have silently switched itself off the moment a second network appeared.
       `ProxyAddressesOf` collects the proxy's address on EVERY segment so the MG-18 backstop admits each
-      (a single-address render would DROP agents 2..N). **MG-27:** the proxy's image ref is resolved to
+      (a single-address render would DROP agents 2..N).
+    - `SandboxSegmentReaper.cs` (**audit F27 — the segments teardown never got to.** The segment is
+      created BEFORE `SpawnAsync`, and a failed spawn's rollback removes the container and the worktree
+      but not the segment; only a clean teardown calls `RemoveAgentSegmentAsync`. A few dozen failed
+      spawns exhaust Docker's default address pool, after which EVERY spawn fails at network creation on
+      a machine with no running agents. `SandboxSegmentReapPolicy` is the pure decision — `JailNameFor`
+      inverts `AgentSegmentName` back to the container name, which is what lets the sweep ask Docker
+      directly whether the jail this segment exists for is still present — and five independent
+      conditions each save a network on their own: not a segment name (`mainguard-agents` itself is one
+      character off the prefix and can never match), missing Mainguard's own `mainguard.role=agent-net`
+      stamp, anything attached other than the egress proxy (which is on every segment by construction),
+      a container with the segment's jail name existing **running or stopped**, and an age inside the
+      ten-minute grace, since a spawn creates the segment before the jail. `SandboxSegmentReaper.SweepAsync`
+      gathers the facts — networks, then ALL containers, then a per-candidate inspect because the network
+      LIST does not populate `Containers` — fails closed if either list is unavailable, and swallows
+      per-network failures so one bad network never stops the sweep. **Not wired from this file's own
+      branch — `fix/audit-w3a-restart-survival` (PR #369) owns the wiring and the launcher's rollback
+      release**, and carries its own copy of this file: the daemon-side caller is one `SweepAsync` per
+      sweep in `Mainguard.Server/Runtime/JailReaperHostedService`, and the grant at
+      `SandboxAgentLauncher.cs:347` gets its matching `RemoveAgentSegmentAsync` on the rollback path
+      there. Splitting it that way keeps both branches off a three-way conflict in the launcher.
+      **Merge note:** the two copies were byte-identical until the `Created`-`Kind` fix landed here
+      (`JudgeAsync` now uses `.ToUniversalTime()`, never `SpecifyKind(..., Utc)` — Docker.DotNet parses
+      RFC3339 with `RoundtripKind`, so an offset-suffixed `Created` from a non-UTC dockerd comes back
+      `Kind=Local` and stamping it Utc shifts the age by the host offset, defeating the grace), so an
+      add/add merge takes **this** file's contents and **#369's** wiring.
+      Refusals are pinned in `Mainguard.Tests/SandboxResidueReapingTests.cs`.
+      **MG-27:** the proxy's image ref is resolved to
       its content digest and both compared and created against that).
     - `EgressBlockDetector.cs` (pure: a CLI's failure output → the egress host the default-deny proxy
       refused, skipping already-allowlisted + git hosts — the "what was blocked" core behind the Fix-2
@@ -1188,6 +1421,23 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       builds), which is also why the layer is chosen at spawn — a live jail's image cannot be swapped
       underneath it. **Failure:** typed `ToolchainProvisioningException`/`UnknownToolchainException`
       (`Mainguard.Git/Exceptions/`), never a degrade;
+    - `ToolchainImageGc.cs` (**audit F32 — the layers nothing removed.** Every base-image refresh and
+      every recipe edit changes the content-addressed tag, so each one strands a 1–3 GB image forever.
+      `ToolchainImageCandidate` is one layer as the engine reports it (id, `RepoTags`, created, and the
+      count of containers referencing it, counted from the container list because the image list leaves
+      its own `Containers` field at `-1`); `ToolchainImageGcPolicy.Judge` is the pure decision, and its
+      whole value is the five independent conditions that each save a layer ON THEIR OWN, evaluated
+      most-certain-first so the reported reason is the strongest one: a tag outside
+      `mainguard-agent-toolchain` (`KeptForeign`), any referencing container **running or stopped** —
+      a stopped jail is a reusable jail (`KeptInUse`), a ref the caller still wants (`KeptWanted`),
+      younger than the six-hour grace, because a layer is built BEFORE the jail that uses it
+      (`KeptTooYoung`), and the newest N of whatever is left (`KeptRetained`, default 3, so a revert
+      does not rebuild). `DockerToolchainImageBuilder.CollectGarbageAsync` gathers the facts, lists ONLY
+      the toolchain repository, and deletes **non-forced** — the engine's own refusal to remove a
+      referenced image is a second safety net independent of the policy. Collection runs from
+      `ToolchainProvisioner` right after a successful BUILD (the one thing that creates the sprawl,
+      already minutes long) and never throws; refusals are pinned in
+      `Mainguard.Tests/SandboxResidueReapingTests.cs`);
     - `MergeQueueProvisioner` additionally runs each recipe's catalogued probe **inside the worker's own
       jail** before every verification, so "our records say provisioned, the container says otherwise"
       surfaces as a provisioning failure instead of an exit-127 that reads like the agent's code being
@@ -1334,7 +1584,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `TokenBucket.cs` (pure, injected-clock: two coupled requests/min + tokens/min buckets seeded from
       P2-01 `KeyHealth`; continuous fractional refill; FIFO waiter queue granted in order via `Pump`;
       `Release(lease, actual)` reconciles estimate→actual conserving tokens — the burst/refill/fairness
-      property target).
+      property target). **F52: the 60 RPM / 60k TPM fallbacks are configurable.**
+      `DefaultRequestsPerMinute`/`DefaultTokensPerMinute` read `MAINGUARD_GATEWAY_RPM` /
+      `MAINGUARD_GATEWAY_TPM` once per process (absent, unparseable or non-positive keeps the
+      conservative `Fallback*` constant — the failure direction for a rate limit is "too slow", never
+      "unbounded"), and `FromKeyHealth` takes optional explicit ceilings for a caller with its own
+      configuration source. One bucket is shared by the whole daemon, so those two numbers were a
+      fleet-wide ceiling with no way to change them: a Tier-4 key was throttled to a free-tier shape and
+      the only symptom was agents queueing.
     - `AiGateway.cs` (`IAiGateway` = `AcquireAsync`/`Report429`/`GetSnapshot` + records
       `GatewayLease`/`GatewaySnapshot`/`AgentSpendSnapshot`, the `IAgentSupervisor`
       pause/resume/mark-state seam + `NullAgentSupervisor`, and the pure `GatewayBackoff` —
@@ -1342,7 +1599,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       typed reason + `budget_exceeded` audit, never kills).
     - `BudgetLedger.cs` (per-agent + per-day token + cost caps `BudgetCaps`, the static `ModelPriceTable`,
       `ISpendStore`/`InMemorySpendStore`, `Record`/`IsExhausted`/`GetSpendSince` cost-per-merged-change
-      hook + `SpendRecorded` stream event).
+      hook + `SpendRecorded` stream event). **F23: `SettleReservation` REFUSES A ZERO SETTLE against a
+      live reservation** and charges the reserved amount instead. A reservation exists because a request
+      was admitted, so usage was expected; the gateway settled with whatever the response parser
+      returned, and for every SSE stream that was nothing — which, combined with a jail-supplied
+      estimate of zero, made both the per-agent caps and the shared bucket free to bypass. A settle with
+      no reservation behind it (id 0, the direct `Record` path) keeps its old meaning.
     - `AdmissionController.cs` (`CanSpawn(out reason)` — injectable `/proc/meminfo` sampler
       `MemorySample`, ≤5 s cache, 85%-used default, honest "N GB supports X–Y" message).
     - `SwarmReconciler.cs` (Docker-as-truth reconcile: expected-but-dead → `RemoveAgentWorktree(force)` +
@@ -1382,7 +1644,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       dedicated `IAgentControlChannel` — a named pipe / second channel, **not** the interactive PTY —
       awaits `[IPC_UPDATE_READY]` ≤ 10 s, else `ISandboxEngine.PauseAsync`; always returns an
       `IYieldToken` (the sole mutation gateway) whose `Resume`/`Dispose` unpauses the jail / signals
-      resume; `YieldOutcome` ByReady/ByPause). **The token OWNS the `IPauseArbiter` machine hold** and
+      resume; `YieldOutcome` ByReady/ByPause). The pause arm writes **and clears the pause axis**
+      (`IAgentSupervisor.MarkFrozen`, one `YieldPausedReason` constant shared by the word and the axis) —
+      audit F16: it used to write only the state WORD, which the merge queue's reflection rewrites on
+      every transition, so a yield-paused jail read `Working` again and every frozen-jail guard keyed on
+      the word waved a delivery into a SIGSTOPped process. **The token OWNS the `IPauseArbiter` machine hold** and
       settles it on either exit: `Resume` (in a `finally`, so a failed unpause still hands the critical
       section back) or **`ReleaseWithoutResuming`** — the conflict path's terminus, which hands the claim
       back and leaves the jail frozen. Holding it in the resume closure alone meant a token that is never
@@ -1404,12 +1670,38 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       repo-relative unmerged paths from `diff --diff-filter=U`, when — **an empty path list means NOT
       MEASURED, never "nothing conflicts"**), the `(repo, agent)`-keyed in-memory
       `RebaseConflictParkingStore` the provisioner owns and the gRPC projection reads, and
-      `ConflictActionResult` — refusal-as-result, like `AgentResumeResult`. Not persisted, deliberately: it
-      is a measurement of one worktree at one instant, and the durable record of the handoff is the audit
-      event. Since 2026-09-04 it also holds the **hand-back mark** (`MarkHandedBack`/`IsHandedBack`/
+      **W1-A**: the cycle resolves a `TrustedWorktreeLayout` from daemon-computed roots BEFORE it yields,
+      and every git below runs with `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE` pinned to it — so the
+      `add -A`/`commit`/`rebase` this runs as the daemon user, on the host, in an agent-writable
+      repository, no longer learns where that repository IS from the agent-writable `.git` pointer or
+      `commondir`. A worktree aimed at the shared mirror (or, when `AgentWorktreeLocation.AgentRepoPath`
+      is supplied, at any repository other than the provisioned one) ends the cycle as `Skipped` with the
+      measured reason, before any yield/pause/mutation. `AgentWorktreeLocation` gained the optional
+      `AgentRepoPath` for that, and `MergeQueueProvisioner`/`GatewayServiceRegistration` populate it in
+      production, so the cycle runs the strict pin. **Rework**: the layout is RE-resolved after the yield
+      and that second answer is the one the mutations run under — the pre-yield resolution is a snapshot
+      taken while the agent was still running, and what it validates (`.git`, `commondir`) is exactly what
+      the agent would rewrite. Same re-read-at-the-moment-of-action rule K6 applied to the mutation guard.
+      `ConflictActionResult` — refusal-as-result, like `AgentResumeResult`. **Persisted since the W3A
+      restart pass** (audit F3), through `AgentRestartLedger.Process`: the original "deliberately not
+      persisted, a restart re-measures" note was half wrong — nothing re-measures, because the parking is
+      written by the cascade's conflict arm and a restart is not a rebase, so a restart left Resolve and
+      Abort answering "this entry is not parked mid-rebase" about a worktree that really was, and a Stop
+      force-removing it mid-rebase. Since 2026-09-04 it also holds the **hand-back mark**
+      (`MarkHandedBack`/`IsHandedBack`/
       `ClearHandedBack`): "let the agent resolve" sets it, the composition root installs it on the ref
       mediator as `RewritePermitted`, and the worker's finished rebase — a rewrite of published history —
-      is published exactly once before rule 2 is absolute again).
+      is published exactly once before rule 2 is absolute again. The permit is **both stamped and
+      durable**, which are independent properties from two different audit findings: F44 gave it a
+      `HandBackLifetime` (24h) measured against the injected `_clock`, so Monday's decision stops
+      authorising Friday's rewrite; F3 write-through made it survive a restart, because the rewrite it
+      authorises arrives whenever the agent finishes. The single constructor takes both seams
+      (`IAgentRestartLedger? persist`, `Func<DateTimeOffset>? clock`, in that order — pass the clock by
+      NAME). `IsHandedBack`'s expiry path clears the LEDGER as well as memory, or the next restart would
+      resurrect what just expired. **Known gap:** `AgentRestartRecord.HandedBackRepos` carries the repo
+      list only, not the grant stamp, so a restored permit is stamped with restore time — it stays usable
+      and still expires, at the cost that a restart refreshes its 24h lifetime. Carrying the stamp
+      through the ledger record is the real fix and wants a schema change).
     - `AgentLifecycle.cs` (`AgentContext : IDisposable`/`IAsyncDisposable` — ordered, idempotent,
       failure-tolerant teardown from an injected `TeardownPlan`: kill PTY (leader) → stop container (per
       policy) → `RemoveAgentWorktree(force:true)` (also deletes `agent/<id>`) → emit the terminal event →
@@ -1417,7 +1709,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       into a `TeardownReport` that fails tests on residue); the P2-09 `AgentRunState` enum incl.
       `Conflict`; `AgentLifecycleEvent`).
     - `SessionLeader.cs` + `LeaderRegistry.cs` (the persistent PTY-fd owner intended to outlive the
-      daemon: `Register`/`Kill`/`PauseInput`/`ResumeInput`/`IsPaused` per agent, and boot
+      daemon: `Register`/`Kill`/`PauseInput`/`ResumeInput`/`IsPaused` per agent — **the input gate is
+      enforced since the W3A pass** (audit F7): `BoundTerminalSession.WriteInputAsync` consults
+      `IsPaused` and DROPS human keystrokes while it is closed, where before the only non-test reader was
+      the kill switch computing whether it had been the party to close the gate, so the gateway's 429 /
+      budget pause and the yield window forwarded a flag nothing checked; the coordinator's sanctioned
+      `send_worker_prompt` bypasses it for the same reason it bypasses the terminal lock — and boot
       `Reattach(liveContainers)` reconciling registry sessions toward Docker truth — a session whose
       container is dead is reaped; `LeaderRegistry` is the durable **leader-owned** JSON state (atomic
       temp-then-rename), the daemon reads it on boot — **no daemon-side pidfiles**).
@@ -1858,7 +2155,29 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the daemon provisioning-plane fetch, not HTTP. An optional `hostUrl` resolver overrides only WHERE
       the fetch points, so the end-to-end suite drives the real fetcher against a local fixture host; the
       host KIND — and hence the `refs/pull/<n>/head` shape — is always classified from the canonical host
-      name). **`PrWorkerHost.cs` (the intake's spawn seam —
+      name). **F40 — compare BEFORE destroying.** The fetch + `reset --hard` used to run on every poll of
+      every tracked PR, before anything compared the head: an in-flight verification's uncommitted work
+      was deleted once per interval and the reset raced the worker's own git on `.git/index.lock`. The new
+      `IPrHeadPeek` capability interface (in `PrHeadFetcher.cs`) answers "what is the head?" with
+      `git ls-remote` — no fetch, no worktree, no index, no lock — and the poll loop asks it first; an
+      unchanged head now returns having touched nothing. Null means UNKNOWN (the host did not advertise
+      the ref) and falls through to the authoritative fetch, and a fetcher that does not implement the
+      capability keeps the exact previous behaviour, so no existing implementor had to change. The
+      destructive leg additionally waits the worker's `index.lock` out on `GitMutationGuard`'s shared
+      backoff and refuses (typed) rather than colliding — deliberately not `RunGuarded`, which requires a
+      yield token the intake has no standing to claim. **W1-A**: the fetch/reset run under a pinned
+      `TrustedWorktreeLayout`, with a `resolveAgentRepoPath` ctor arg — supplied by
+      `GatewayServiceRegistration` — that turns the derive-and-validate path into a strict pin.
+      **W1-A rework**: `resolveMirrorPath` moves the PEEK's working directory off the worker's worktree.
+      `ls-remote` needs no repository, and asking it from inside the worker's made the answer
+      agent-controlled — `url.<x>.insteadOf` in a third party's PR worktree redirects the query and can
+      pin the intake at "unchanged" forever. It now runs in the daemon-owned mirror (fallback: the
+      worktree's parent, which is not a repository). **Still NOT closed on this path**: the config
+      snapshot/spawn race. The intake holds no yield token, so the worker's jail is live while
+      `reset --hard` runs smudge filters, and the external PR author controls the trigger (every push
+      causes a fetch) — see the type docs. Closing it means giving the intake a yield relationship with
+      the worker, which is a change of arbitration and is deliberately not made here.
+      **`PrWorkerHost.cs` (the intake's spawn seam —
       `IPrWorkerHost`/`PrWorkerOutcome`/`PrWorkerResult` + `ExternalPrIntake.WorkerAgentKind` =
       `external-pr`).** The intake used to create a worktree and an entry and **spawn nothing**, so an
       intake'd PR had no jail to be verified in and could never leave `Working` — the one criterion-4 leg
@@ -1897,8 +2216,22 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `JailReapPolicy.cs` (2026-09-04, owner decision — the pure rule behind the daemon's jail reaper:
       a jail is stopped when its merge-queue entry is terminal (Merged/Rejected/Discarded — the work has
       left it) or when no CLI has been bound to it for `CoordinatorLimits.IdleJailReapMinutes`; a jail
-      with a live CLI is never touched, whatever it is doing. `JailReapVerdict` carries the cause the
-      audit event records. Before this only a human pressing Stop ever removed a jail — the 26 GB of
+      with a live CLI is never touched, whatever it is doing.
+      **F59 narrowed the second rule, and the narrowing is SCOPED** (`terminalLostToRestart`): a jail
+      whose entry is still IN FLIGHT (Working/Verifying/Verified/StaleVerified/AwaitingReview/
+      VerificationFailed) is exempt from idle reaping **only when the reconciler adopted it** — i.e. it
+      outlived the daemon that started it, so its missing CLI is a fact about the daemon (the PTY died
+      with that process and Docker cannot re-attach a running exec) rather than about the jail. The
+      reaper reads that fact from `AgentSessionStore.WasAdoptedWithoutTerminal`, which adoption sets and
+      the first sighting of a bound CLI clears. Unscoped — the first cut — the exemption also covered the
+      ordinary worker that finished and sits in AwaitingReview until a human looks at it, i.e. every
+      worker's end state, which turned a fix for a mid-task kill into "no finished jail is ever
+      reclaimed": exactly the 26 GB population the reaper was written against. A jail left running costs
+      memory the operator reclaims with Stop; a jail reaped mid-task costs work nobody can get back.
+      RESIDUAL, deliberate: an ADOPTED jail whose CLI exited unobserved keeps an in-flight entry and is
+      never reaped here — that is the population the CLI re-bind-on-adoption work fixes, since re-binding
+      both restores the daemon's ability to see the exit and clears the adoption mark. `JailReapVerdict`
+      carries the cause the audit event records. Before this only a human pressing Stop ever removed a jail — the 26 GB of
       idle 2 GiB jails an owner measured.)
     - `CoordinatorLimits.cs` (**phase 2** — the daemon-side caps record, lifted out of `CoordinatorTools.cs`
       now that four call sites consume it: `MaxActiveWorkers` (6; **counts workers blocked on plan
@@ -2071,13 +2404,59 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `CoordinatorAgentReplyEngine` is a thin bridge onto `CoordinatorAgent.SendAsync`, no new
       orchestration — and appends the coordinator's reply; with no engine wired it records an honest
       system turn rather than fabricating a reply. `ConversationRole`/`ConversationTurn`).
+    - `SandboxSegmentReaper.cs` (**audit F27 — the segments teardown never got to.** The segment is
+      created BEFORE `SpawnAsync`, and a failed spawn's rollback removes the container and the worktree
+      but not the segment; only a clean teardown calls `RemoveAgentSegmentAsync`. A few dozen failed
+      spawns exhaust Docker's default address pool, after which EVERY spawn fails at network creation on
+      a machine with no running agents. `SandboxSegmentReapPolicy` is the pure decision — `JailNameFor`
+      inverts `AgentSegmentName` back to the container name, which is what lets the sweep ask Docker
+      directly whether the jail this segment exists for is still present — and five independent
+      conditions each save a network on their own: not a segment name, missing Mainguard's own
+      `mainguard.role=agent-net` stamp, anything attached other than the egress proxy (which is on every
+      segment by construction), a container with the segment's jail name existing **running or stopped**,
+      and an age inside the ten-minute grace, since a spawn creates the segment before the jail.
+      `SweepAsync` gathers the facts — networks, then ALL containers, then a per-candidate inspect because
+      the network LIST does not populate `Containers` — fails closed if either list is unavailable, and
+      swallows per-network failures so one bad network never stops the sweep. Authored on PR #368 and
+      imported here verbatim so the W3A branch could supply the caller it lacked: it is driven by
+      `Mainguard.Server/Runtime/JailReaperHostedService.SweepSegmentsOnceAsync` on its own 5-minute
+      cadence, and the ROLLBACK half — the release beside the grant, which a sweep is a backstop for
+      rather than a substitute for — is in `SandboxAgentLauncher`. Refusals are pinned in
+      `Mainguard.Tests/SandboxResidueReapingTests.cs` (PR #368) and the wiring in
+      `Mainguard.Server.Tests/JailReaperTests`.)
+    - `AgentRestartLedger.cs` (**the one durable store behind the five ledgers a daemon restart used to
+      erase** — audit F3, the W3A pass. `AgentRestartRecord` is one row per AGENT ID carrying: the human
+      pause flag (`HumanPauseLedger`), the kill switch's causation line (contained? which containers did
+      IT freeze? did IT take the terminal lock / close the input gate? — `SandboxKillTarget`), the pause
+      axis per repo (`AgentSessionStore._frozen`), the parked mid-rebase conflicts per repo and the
+      hand-back permits per repo (`RebaseConflictParkingStore`); the document also carries the outstanding
+      `KillEpochId`. **One store, not five**, because they are five facts about one question — "what did
+      the daemon do to this agent that a human now has to be able to undo?" — and every exit the audit
+      found closed needed several at once; five files would be five chances to rehydrate half a state, and
+      a jail remembered as frozen with no record of WHO froze it refuses every release while looking
+      recoverable. `IAgentRestartLedger` with three implementations: `JsonAgentRestartLedger` (the daemon's
+      — one JSON file, write-to-temp-then-rename, reads failing to *nothing remembered*, exactly the
+      `JsonHeldTaskStore` pattern it copies), `InMemoryAgentRestartLedger`, and `NullAgentRestartLedger`
+      (remembers nothing; what both test suites install process-wide from their module initializer, since
+      the five owners rehydrate in their constructors and one *remembering* shared instance made every rig
+      inherit the previous rig's state). Reached through the process-wide `AgentRestartLedger.Process`
+      rather than DI because the five owners are constructed in five places and one of them —
+      `MergeQueueProvisioner.ParkedConflicts` — is a field initializer with no argument to thread;
+      `UseForTests` is the replacement seam. Path: `<data root>/mainguard-restart-ledger.json`. Pinned by
+      `Mainguard.Server.Tests/RestartSurvivalTests` and, against real containers,
+      `RestartSurvivalDockerTests`.)
     - `KillSwitch.cs` (the emergency stop: **freeze the queue FIRST** synchronously via the shared
       `KillSwitchGate` (SA-1/F4 — before any await, so no `BeginMerge`/spawn slips the fan-out window;
       `QueueFrozenException`), then yield-all fan-out over an `IKillTarget` (timeout →
       `PauseAsync`/`docker pause`), then a journal snapshot via `IKillJournal` before returning;
       **`ResumeAsync` is the real mirror** (ISSUES-LOG #17 — it used to be `_gate.Resume()` and nothing
       else, leaving every paused jail frozen for the life of the daemon): the epoch's fan-out set is
-      remembered, `IKillTarget.UnpauseAsync` releases exactly those agents under the same RT-D4 deadline,
+      remembered — **durably, since the W3A restart pass** (audit F3): the set is rehydrated from
+      `AgentRestartLedger`'s per-agent containment flag (the target's own record of what it froze, which is
+      stricter than "every id the fan-out touched"), and the epoch id from the ledger or, failing that,
+      from `IKillJournal.ReadAll()` — which is that method's **first production caller**, closing its own
+      doc comment's complaint that a write-only journal is the defect —
+      `IKillTarget.UnpauseAsync` releases exactly those agents under the same RT-D4 deadline,
       the freeze flag then clears in a `finally` so a wedged engine can never also trap the queue, and an
       agent whose release could not be confirmed comes back `ResumeFailed` and STAYS in the ledger so a
       second press retries exactly it (`KillResumeOutcome`/`KillAgentResume`/`KillResumeReport`, audited
@@ -2134,7 +2513,59 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       neutralises an already-poisoned store with no migration, and on harvest
       (`HarvestCliSettingsAsync`), which stops the store re-acquiring one and makes it self-heal at the
       next attended stop. Covered by `Mainguard.Tests/CliSettingsGrantScrubTests.cs` +
-      `CliSettingsBoundaryTests` gate 3).
+      `CliSettingsBoundaryTests` gate 3.
+      **F45 — `CarryOnly(content)` is now the entry point for a declared `settingsPaths` file**: an
+      ALLOWLIST of carried keys (`permissions` — itself reduced to `allow`/`ask`/`deny`/
+      `additionalDirectories` — plus `model`, `outputStyle`, `includeCoAuthoredBy`) rather than a
+      denylist, so `hooks`, `apiKeyHelper`, `statusLine`, `mcpServers`, `env` and
+      `permissions.defaultMode` stop crossing between jails, and an unbounded grant (`Bash(*)`,
+      `Bash(:*)`, a bare tool name) is dropped from `allow`/`ask` while `deny` travels as written.
+      Non-JSON fails closed. `Scrub` (mount-only) stays for the settings files parked under
+      `credentialPaths` — gemini-cli's and qwen-code's — whose schema is a different vendor's, and it is
+      COMPOSED with the strip below rather than used alone (`SandboxAgentLauncher.CarryCredentialContent`):
+      `~/.gemini/settings.json` is where gemini-cli defines `mcpServers`, so the scrub on its own left the
+      original finding live for two of the three named files, while `CarryOnly` would have dropped
+      `selectedAuthType` and cost the sign-in.
+      **F2's last clause — `StripExecutableConfig(content, out unreviewedTopLevelKeys)`** is the third
+      entry point, for EVERY declared credential file, and it is `CarryOnly` INVERTED: it removes the keys
+      that name a program — `ExecutableConfigKeys` (`mcpServers`, `enableAllProjectMcpServers`,
+      `enabledMcpjsonServers`, `hooks`, `apiKeyHelper`, `statusLine`, `env`), at ANY depth, because
+      claude-code keeps a project's servers under `projects.<dir>.mcpServers` — and carries every other
+      key untouched, byte-identical when nothing matched. `enabledMcpjsonServers` names programs it does
+      not spell: it switches on the servers a repository's own committed `.mcp.json` defines, and that
+      repository is the jail's writable workspace. `BoundedRuleListKeys` (`allowedTools`) is the one value
+      this filter edits rather than keeps or drops: the list survives — those are the owner's "yes, don't
+      ask again" answers — with the whole-tool grants taken out by the same `IsUnbounded` rule the settings
+      leg applies to `permissions.allow`, so a jail cannot persist `Bash(*)` through `.claude.json` after
+      being refused it through `.claude/settings.json`. `hasTrustDialogAccepted` is a KNOWN residual,
+      carried deliberately: it names no program, and dropping it would hang every Managed worker on a
+      trust dialog its read-only terminal cannot answer. An allowlist over this file
+      was rejected: it is the file that says the user is logged in, and no unit test can prove a guessed
+      auth field right without a live account, whereas "a program name is not a credential" is provable
+      as written. `ExecutableConfigKeys` is the ONE list — `CarriedTopLevelKeys` is its complement and the
+      two are asserted disjoint, so the legs cannot drift (MG-12). Unparseable content follows `Scrub`
+      rather than `CarryOnly` (it travels unless it spells one of those keys as a JSON key), because
+      `.gemini/installation_id` is a bare UUID by design and a blanket refusal would cost a real login.
+      Every top-level key outside `ReviewedCredentialKeys` is reported to the caller to LOG BY NAME —
+      already reduced to a plain identifier or `<non-identifier>`, never a value — so a vendor that ships
+      a new executable key surfaces instead of passing silently. The daemon-owned mount is deliberately
+      NOT scrubbed from the files that are not settings-shaped; that is the settings leg's boundary, and
+      the settings-shaped credential paths DO get it, from the composition above).
+    - `AdapterCredentialPolicy.cs` (**F2** — the limits and shape rules of the CREDENTIAL round trip,
+      the twin of `AdapterSettingsPolicy`. `MaxFileBytes` (1 MiB, refused not truncated: half a
+      credential file is a corrupt one and it would REPLACE the good copy in the vault),
+      `IsSettingsShaped(path)` (a declared credential path whose file name is `settings.json` — the
+      gemini-cli / qwen-code files parked in that field for the migration reason the manifest explains;
+      matched on the name so a sixth adapter is covered the day it is added), and `MaxBytesFor(path)`
+      (the settings ceiling for those, this one for everything else — one place, so the harvest's
+      in-shell `wc -c` and the restore-side filter cannot drift), plus `ReportsUnreviewedKeys(path)`
+      (whether the daemon should LOG this file's unreviewed top-level key names — true by default,
+      including for any path a future adapter declares; false for the settings-shaped files and for
+      opencode's provider-keyed `auth.json` via the private `IsProviderKeyed`, whose keys are provider
+      ids chosen at runtime, so every one of them was "unreviewed" and the line fired on every harvest
+      AND every restore of a perfectly ordinary login. Only the report is dropped — both kinds of file
+      still go through the full strip). Consumed by
+      `SandboxAgentLauncher.HarvestCliCredentialsAsync` and `FilterCliCredentials`).
     - `AdapterSettingsPath.cs` (the `settingsPaths` declaration — the NON-credential twin of
       `credentialPaths`, so a CLI's permission allowlist survives a spawn instead of the user
       re-approving every command. `AdapterSettingsRoot` (`home` = the tmpfs `$HOME`, `workspace` = the
@@ -2146,14 +2577,21 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       see [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md)).
     - `AdapterChannel.cs` (`AdapterChannel.EnsureAsync(id)` — idempotent: green probe at the pinned
       version → no-op; else fetch payload → verify SHA-256 against the pin (typed `HashMismatch` refusal)
-      → run `installCmd` INSIDE the VM at the pinned version → write config shims → **place the platform
+      → **run the npm provenance gate whenever an OVERRIDE governs the install (audit F47)** → run
+      `installCmd` INSIDE the VM at the pinned version → write config shims → **place the platform
       executable** when the spec declares one → probe (exit 0 AND the
       pinned version substring); pin survival is structural — the install cmd + probe both carry the pin,
       so a breaking upstream never changes what's installed (the simulation test). Seams:
       `IAdapterChannelSource` (+ real `HttpsAdapterChannelSource`, HTTPS-only), `IAdapterInstallHost` (+
       real `WslAdapterInstallHost` over `IWslRunner` `wsl -d MainguardEnv --`, and
       `ContainerAdapterInstallHost.cs` — the macos-host implementation: every command runs in a
-      DISPOSABLE agent-base container with the daemon-owned adapters + toolchains roots mounted
+      DISPOSABLE **hardened** agent-base container (audit F49 — `HardeningArgs` mirrors
+      `ContainerSpecBuilder`'s jail posture: `--cap-drop ALL` + the minimal add-backs,
+      `no-new-privileges`, the shared default-deny `SeccompProfile` written out as a file for the docker
+      CLI, `--read-only` rootfs with two named tmpfs for npm's cache/temp, `SandboxLimits.Default`
+      memory/pids/CPU + nofile/nproc rlimits, and an explicit `--user 1000` pin; the default bridge is
+      kept and stated, because reaching the registry IS the job) with the daemon-owned adapters +
+      toolchains roots mounted
       read-write AT THEIR VM PATHS, so the channels' command shapes, markers and the spawn path's
       VmRoot→SandboxMount rewrite work verbatim while the bytes land in the host trees the jails
       later mount read-only; `AdapterPaths.DaemonSideRoot()`/`ToolchainPaths.DaemonSideRoot()` are
@@ -2197,8 +2635,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the argv the daemon execs in the jail. This is the `agentKind`→CLI wiring `SandboxAgentLauncher`
       used to ignore. The marker also carries `credentialPaths` and `settingsPaths` across the host/VM
       boundary — the ONLY declarations of what the daemon may restore into / harvest from a jail — plus
-      `instructionsFile`/`systemPromptArg` and (defect C2) `preApprovedCommandArg`/
-      `preApprovedCommandFormat`. **Defect D5a — the marker is no longer a second source of truth.**
+      `instructionsFile`/`systemPromptArg`, (defect C2) `preApprovedCommandArg`/
+      `preApprovedCommandFormat`, and the adoption re-bind's `resumeArg`. **Defect D5a — the marker is no
+      longer a second source of truth.**
       Those fields being null on an older marker was documented as "re-install to backfill", and on a real
       install nobody does: `~/mainguard/adapters/registry/claude-code.json` carried none of
       `preApprovedCommandArg`, `preApprovedCommandFormat` or `initialPromptStyle`, so two shipped fixes
@@ -2224,14 +2663,27 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the effective pin — version/payloadUrl/sha256/probe-substring together via
       `AdapterPinOverride.Apply` — with the replaced pin kept as one-step revert history;
       `AdapterChannel.EffectiveSpec` applies it inside `EnsureAsync`, `Set` validates like the manifest
-      parser so a hand-edited entry can never weaken an install).
+      parser so a hand-edited entry can never weaken an install). **Audit F47** adds `AdapterPinHosts` —
+      an override's `payloadUrl` must name a host the shipped channel itself uses
+      (`registry.npmjs.org`), enforced on BOTH sides of the file (write throws, read drops the entry),
+      because the same file supplies the URL *and* the sha256 that "verifies" it, so any-HTTPS-host was
+      a redirect primitive whose hash check passed by construction. The host rule alone is not the whole
+      fix — see the provenance gate in `AdapterChannel.EnsureAsync`. Covered by
+      `Mainguard.Tests/AdapterPinOverrideHostTests.cs`.
     - `AgentCliUpdateService.cs` (the Mainguard-managed CLI updater — the in-CLI self-updaters are
       disabled in every jail via `DISABLE_AUTOUPDATER=1`: `CheckForUpdatesAsync` sweeps npm for newer
       releases of npm-sourced CLIs (per-CLI failures silent — harmless at launch), `ApplyUpdateAsync`
-      downloads the exact new tarball, sha256-pins it as an override and installs through the channel's
-      verify path (a failure rolls the override back), `RevertAsync` restores the previous pin, and
-      `EnsureLatestAsync` is the INSTALL policy: resolve the registry's current release and pin THAT —
-      there is no fixed default install version; the bundled pins are the offline fallback.
+      downloads the exact new tarball, runs the provenance gate, INSTALLS it, and only then writes the
+      sha256 pin as an override (**audit F54** — writing the pin first left a crash window in which a
+      new pin was active over the old binary and the next `Ensure` installed it unprompted;
+      `AdapterChannel.VerifiedPin` carries the already-gated pin down so the user-writable file is
+      untouched until the install succeeds), `RevertAsync` restores the previous pin, and
+      `EnsureLatestAsync` is the INSTALL policy. **Audit F48 flipped that policy's default**: it now
+      installs the SHIPPED PIN and merely records a newer registry release as an offer, because every
+      check in this file is a check on the BYTES and none is a check on the CHOICE OF VERSION — a
+      legitimately signed release from a taken-over publisher account clears the whole ladder. The old
+      behaviour is the opt-in `autoAdoptRegistryLatest: true` ctor flag. The bundled pins remain the
+      offline fallback and are now also the default floor.
       `AgentCliInstaller` composes it in `CreateDefault`; the Pro launch sequence
       (`ProDesktopHost.KickAgentCliUpdateCheck`) toasts when an installed CLI has a newer release, and the
       Agent CLIs settings rows carry Update/Revert).
@@ -2284,9 +2736,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the self-derived hash), and the `INpmProvenanceGate`/`NpmProvenanceGate` +
       `INpmProvenanceSource`/`HttpNpmProvenanceSource` seams (the gate is the whole fetch+decide unit so
       the pinned key stays unreachable from outside it; an unreachable registry is a REFUSAL, not a pass).
-      Wired at the one point that MOVES a pin (`ApplyUpdateAsync` → typed
-      `AdapterChannelError.ProvenanceRejected`); `EnsureLatestAsync` refuses the registry's bytes and
-      falls back to the REVIEWED bundled pin, loudly. **Measured 2026-07-26:** only `@openai/codex`
+      **Audit F48 downgraded the top rung's LABEL rather than pretending to verify it**: the outcome is
+      now `BuildProvenanceAttestationPresent`, not `BuildProvenanceVerified`, and every passing verdict
+      carries `NpmProvenancePolicy.BuildProvenanceLimitation` — the attestation's own DSSE signature,
+      its Fulcio certificate chain and its Rekor inclusion proof are NOT checked, so the attestation
+      document is unauthenticated and its presence+digest binding is a change-detector, not an origin
+      proof. Real verification needs a pinned Sigstore trust root, which this build does not carry; the
+      caveat string is pinned by `NpmProvenanceTests` so it cannot be tidied back out.
+      Wired at the point that MOVES a pin (`ApplyUpdateAsync` → typed
+      `AdapterChannelError.ProvenanceRejected`) **and, since audit F47, at every install an override
+      governs (`AdapterChannel.EnsureAsync`)** — the rung always comes from the MANIFEST spec, never from
+      the user-writable override, so the file cannot lower its own requirement; a composition that passes
+      no gate gets the real registry-backed one lazily rather than silently skipping the check.
+      `EnsureLatestAsync` refuses the registry's bytes and falls back to the REVIEWED bundled pin, loudly. **Measured 2026-07-26:** only `@openai/codex`
       publishes npm build provenance; claude-code / gemini-cli / qwen-code / opencode-ai 404 on the
       attestations endpoint, so they sit at `npm-registry-signature` — a statement about upstream, not a
       Mainguard gap. **Residual, stated in the manifest too:** the pin-override file is user-writable

@@ -1,7 +1,7 @@
 <!-- Extracted verbatim from the AGENTS.md Repository Map. Keep current: when you add, move, or delete a file, update its entry here. -->
 ### `Mainguard.Server/` (P2-02 daemon — ASP.NET Core gRPC host)
 
-- **`Program.cs`** — thin entry point: parses `DaemonOptions`, runs the `--local-dev --smoke` self-probe or the daemon (`app.Run()`), maps a bind failure to a typed `DaemonStartupException`. `public partial class Program {}` so `WebApplicationFactory<Program>` can host it in-proc.
+- **`Program.cs`** — thin entry point: parses `DaemonOptions`, runs the `--local-dev --smoke` self-probe or the daemon (`app.Run()`), maps a bind failure to a typed `DaemonStartupException`. **Two distinct boot refusals come out of `Build`, and each keeps its own exit code.** **B1:** an `AuditPersistenceUnavailableException` prints + exits 78 (`EX_CONFIG`) — the audit chain's key ring cannot hold the master key safely, so the daemon refuses to start rather than run with an in-memory journal that looks healthy. **F55:** a `DaemonAlreadyRunningException` (from the single-instance lock, which fires during `Build` from the Kestrel options callback) exits via `DaemonExitCodes.RefusedStart()` with one line on stderr rather than a stack trace — the guard working is not a crash. The two cannot be confused: a daemon that loses the data-root race never opens a key ring at all (`ClearStaleMigrationLock` fails to take the same lock → `TryPrepareDatabase` false → `RegisterAuditLog`'s no-db branch), so it always exits through `RefusedStart()`. **N6:** that code is `AlreadyRunning` (3) when a human ran the daemon, and `AlreadyRunningUnderSupervisor` (0) when `MAINGUARD_SUPERVISOR` is set — the LaunchAgent sets it, and launchd's `{ SuccessfulExit: false }` KeepAlive restarts a job for as long as it exits non-zero, so a developer's own daemon on the data root used to make the login job exec-and-refuse every 30 seconds indefinitely. A script still gets the named non-zero code. `public partial class Program {}` so `WebApplicationFactory<Program>` can host it in-proc.
 - **`DaemonHost.cs`** — the shared host configuration (services, interceptors, gRPC service map,
   loopback-only Kestrel bind, silent logging) used by both the entry point and the in-proc tests;
   registers the durable `IKillJournal` (`JsonKillJournal` at `ResolveKillJournalPath`, beside the
@@ -10,7 +10,34 @@
   control-channel RTT source in this daemon and the record must say so rather than imply a healthy
   channel) and the `onRttSpike` sink — because it previously passed only `gate`/`target`/`audit` and
   nothing asserted that composition at all;
-  - `StartAsync` (typed port-bound failure) and `RunSmokeAsync` (authenticated loopback self-probe,
+  - **F55 — the port is won before any credential is written.** `ConfigureServices` now only MINTS the
+    session token and mTLS material (in memory); `RegisterCredentialPersistence` writes both from
+    `ApplicationStarted`, which fires inside `IHost.StartAsync` before it returns, so clients still find
+    the files exactly where and when they always did while a daemon that never binds writes nothing. The
+    Kestrel options callback takes the `DaemonInstanceLockHolder`'s lock on the data root before
+    configuring a listener — that callback is the seam separating a real daemon from the in-proc
+    `TestServer` tier, which never materializes Kestrel options and so never contends on its
+    deliberately-shared data root. A write that fails stops the host: a listening control plane whose
+    clients cannot read its credentials is worse than one that is plainly down.
+  - **F59 — `RegisterTerminalDetachOnShutdown`**: `ApplicationStopping` calls
+    `TerminalSessionManager.DetachAllForShutdown`, so a restart leaves mid-task agents running instead
+    of killing every bound CLI through container disposal.
+  - **F60 — HTTP/2 keepalive**: `Limits.Http2.KeepAlivePingDelay`/`KeepAlivePingTimeout` (20 s each) so
+    a half-open connection under a long-lived `Attach`/`StreamQueue`/`StreamAgentEvents` surfaces as a
+    fault the client reconnects from instead of hanging to the OS TCP timeout, plus
+    `Limits.MinRequestBodyDataRate = null` so a quiet read-only stream is not killed by a slow-loris
+    floor written for request bodies that end.
+  - The `AddGrpc` block sets `MaxReceiveMessageSize`/`MaxSendMessageSize` to 16 MiB (handoff from
+    `fix/audit-w1d-logging-and-secrets`): the 4 MiB receive default is below what a merge diff or a
+    scrollback page legitimately carries, and the send side is unbounded by default.
+  - **`BindFailureMessage`** — the operator-facing text for a failed control-plane bind, named rather
+    than inlined because it is now the only notice the *accidental victim* of a port collision gets. It
+    says what did NOT happen (the daemon holding the port keeps running, its credentials are untouched,
+    this instance wrote nothing), names the likely cause (a second build/worktree/LaunchAgent) and gives
+    the two ways out (`lsof` the port, or run the second daemon with its own `--port` AND its own
+    `MAINGUARD_DATA_ROOT`).
+  - `StartAsync` (typed port-bound failure; every failure path now disposes the host) and
+    `RunSmokeAsync` (authenticated loopback self-probe,
     which now goes over the real pinned mTLS transport); **MG-19: `ConfigureServices` runs BEFORE
     `ConfigureKestrel` and returns the `SessionTransportCertificates`, because the listener must present
     material that already exists — the control-plane listener is `UseHttps` +
@@ -20,7 +47,17 @@
     gateway stack via `Gateway/GatewayServiceRegistration` (the spend-ledger SQLite path resolved next
     to the isolated session token, `ResolveDataPath`); also registers the P2-09 `SessionLeader` + its
     durable `LeaderRegistry` (path next to the token, `ResolveLeaderRegistryPath`).
-- **`Gateway/GatewayServiceRegistration.cs`** — DI wiring for the P2-08 gateway (`AiGateway`,
+- **`Gateway/GatewayServiceRegistration.cs`** — **F55, second leg:** `TryPrepareDatabase` /
+  `ClearStaleMigrationLock` now take a `lockDirectory` (the DATA ROOT, threaded from `DaemonHost` because
+  `--data-path` can separate it from the DB's own directory) and clear EF's `__EFMigrationsLock` row ONLY
+  while holding `Runtime.DaemonInstanceLock`, taken transiently via `TryAcquire`. The method's premise —
+  "the daemon is this DB's only writer, so a row at boot was orphaned" — was an assumption, and it ran
+  during `ConfigureServices`, so a second daemon deleted the LIVE daemon's row before it ever discovered
+  the port was taken. Holding the lock at the moment of the delete is exactly the property required: if
+  nobody else holds the data root, no live daemon owns that row. A refused lock now short-circuits the
+  whole DB preparation to the in-memory fallback rather than spending the 60 s watchdog discovering that
+  EF cannot take a lock the live daemon holds — this instance is about to be refused anyway, and it must
+  not migrate a database that is not its own. DI wiring for the P2-08 gateway (`AiGateway`,
   `BudgetLedger`, `AdmissionController`, `SwarmReconciler`, `DaemonBootSequence` — both boot reconcile
   steps get the daemon's `IAuditLog` + log sink so a pass that prunes agents or reaps PTY sessions
   leaves an artifact); best-effort
@@ -31,7 +68,29 @@
   `SecureKeyring` rooted beside it, constructed EAGERLY so a store problem lands in migration.log;
   `InMemoryAuditLog` fallback otherwise, with the will-not-survive-restart loss logged out loud
   (note: the in-proc test tier's hosts share one run-scoped daemon DB, so Server.Tests audit
-  assertions are repo/agent-scoped, and the chain itself re-reads its head per append); **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
+  assertions are repo/agent-scoped, and the chain itself re-reads its head per append).
+  **B1 — a key-ring posture failure is FATAL, not a fallback.** The catch-all used to swallow
+  `SecureKeyring`'s refusal to store the audit master key, so a fresh Linux/WSL box bound its port,
+  served every RPC, answered `VerifyAudit` with `persistent=false` and lost every audit event at
+  shutdown — the exact "carries on looking healthy" failure the fail-closed keyring was written to
+  remove, one layer up, and the reason the MainguardOS startup smoke passed. `IsKeyringPosture`
+  (`UnprotectedKeyringException` / `KeyringUnreadableException` /
+  `KeyringProtectorUnavailableException`) now rethrows as `AuditPersistenceUnavailableException` and
+  the daemon refuses to boot; `Program.cs` prints it and exits **78** (`EX_CONFIG`) rather than
+  crashing with a stack trace. The DB-unavailable fallback stays — there the alternative is no daemon
+  at all — but it is logged through a new `logError` delegate at ERROR, alongside the key-ring posture
+  line (`SecureKeyring.DescribeProtection()`) which is now logged at every boot. `RegisterAuditLog` and
+  `IsKeyringPosture` are `internal` so `AuditPersistenceBootTests` drives the whole decision without a
+  host. **The two boot refusals cannot be confused with each other.** `Register` runs from
+  `ConfigureServices`, i.e. before the Kestrel options callback takes the instance lock, so the
+  key-ring check gets first refusal on paper — but in the case that matters, a second daemon on a data
+  root another daemon owns, it never runs: `ClearStaleMigrationLock` fails to take that same
+  `DaemonInstanceLock`, `TryPrepareDatabase` returns false, `dbFactory` is null, and `RegisterAuditLog`
+  takes its no-db branch, which opens no key ring. The loser therefore always exits through
+  `DaemonExitCodes.RefusedStart()` with the winner's token, mTLS material, key ring and migration lock
+  untouched; 78 stays reserved for "this machine's key ring cannot hold the audit master key".
+  `Register` takes BOTH the `logError` delegate (B1) and the `lockDirectory` (F55);
+  **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
   (`IPullRequestService`→`PullRequestService`, `IPrIntakeStore`→`DbPrIntakeStore`/in-memory fallback,
   `IPrHeadFetcher`→`PrHeadFetcher` over the substrate worktree path,
   **`IPrWorkerHost`→`Runtime/ExternalPrWorkerHost` (the spawn seam, sharing the merge queue's
@@ -47,6 +106,35 @@
     forward → on 429 `Report429` + PTY pause + backoff + retry + resume → settle actuals; the CLI only
     ever sees a delayed 200) + `ModelUsageParser` (provider usage → actual tokens) + the ASP.NET
     `ModelProxyMiddleware` fronting model hosts with per-agent-port attribution (`IAgentPortMap`).
+    **F23/F29 — streaming and honest metering.** The response is now RELAYED, not buffered: the
+    forwarder's `relay` overload hands the middleware the terminal response's headers, then copies the
+    body straight to the client while `ModelUsageSniffer` reads usage out of the bytes in flight
+    (constant memory; an SSE stream is parsed `data:` line by `data:` line, a JSON body accumulated to a
+    1 MiB cap). `UsageAccumulator` merges the pieces — Anthropic reports input in `message_start` and a
+    running output count per `message_delta`, OpenAI one `usage` chunk at the end — by taking each
+    field's MAXIMUM, which is correct for both dialects. The jail's `x-mainguard-token-estimate` is now
+    a FLOOR only (`Math.Max(defaultEstimate, …)`), so a `0` cannot buy a free request, and
+    `GatewayRequestTooLargeException` caps the retry-replay buffer at 8 MiB (→ 413).
+    **Audit B2 — an abort mid-stream is not a free completion.** The `finally` used to `Abandon` the
+    lease on ANY exception, so a jail running `curl -N … | head -c 200` (or an ordinary claude-code Esc)
+    let the provider generate and bill a whole completion while the ledger recorded no `SpendRecord` at
+    all. Once the upstream has committed — a terminal, non-4xx/5xx response in hand — an exception now
+    SETTLES `max(usage sniffed so far, the reservation)` instead (`SettleOrAbandonAfterFailure`); only
+    pre-commit failures (the send throwing, a cancelled retry loop, an aborted error response) still
+    refund. **The estimate raise is capped** at `MaxEstimateMultiple` (4) × the default: the reservation
+    is taken from the SHARED per-minute bucket, which `TokenBucket.Clamp` clamps to capacity, so an
+    unbounded `x-mainguard-token-estimate: 60000` was a one-header denial of service against every other
+    agent. `UsageAccumulator` also reads **Gemini's** `usageMetadata.{promptTokenCount,
+    candidatesTokenCount,totalTokenCount}` and its `modelVersion`, without which every confined
+    gemini-cli agent settles at the flat default estimate.
+    **F46 — Google's header shape.** Identification (`ExtractPresentedToken`) read only `x-api-key` and
+    `authorization`, and injection was Anthropic-or-Bearer; gemini-cli sends `x-goog-api-key`, so a
+    confined Gemini agent resolved to no agent, found no upstream binding, and fell through unfronted —
+    404 per model call, for an adapter the table calls confinable and verified. `x-goog-api-key` is now
+    read on the way in, dropped from what is relayed, and written on the way out for a `googleapis.com`
+    upstream (`IsGoogleHost`). Pinned by `GatewayUpstreamBindingTests` (unit) and
+    `GatewayConfinementDockerTests.ConfinedGeminiJail_…` (a real jail, since the existing Docker
+    coverage used the Anthropic shape only).
   - **`Runtime/GatewayHostedService.cs`** — runs the RT-D1 boot sequence + the token-bucket pump loop on
     host start.
   - **`Runtime/WorkerReadinessHostedService.cs`** — the boot slot whose ENTIRE job is to **resolve**
@@ -58,21 +146,65 @@
     still boots and still serves the human Verify button. Stop disposes the trigger (unsubscribe + wait
     for the sweep in flight). Asserted from the real composition root by
     `WorkerReadinessTriggerWiringTests`.
-  - **`Runtime/AuditRetentionService.cs`** (P2-15) — hosted retention sweep: once at boot and every
-    24 h, records older than 90 d are expired as chained REDACTIONS (tombstoned payloads, count
+  - **`Runtime/AuditRetentionService.cs`** (P2-15, F64b) — hosted retention sweep: once at boot and
+    every 24 h, records older than 90 d are expired as chained REDACTIONS (tombstoned payloads, count
     unchanged, chain verifiable — the schema's triggers would refuse a delete anyway); a no-op on
     the in-memory fallback journal, and a failed sweep logs + retries next round, never taking the
-    daemon down.
-  - **`Runtime/AuditAnchorService.cs`** (P2-15) — hourly best-effort RFC 3161 sweep: heads queue by
-    the `AuditAnchorQueue` policy (1000 records / 24 h) regardless, but nothing is SENT unless
+    daemon down. **Open merge leases hold their evidence back (F64b):** the sweep reads
+    `IMergeLeaseStore.AllOutstanding()` first and, when anything is in flight, walks the chain itself
+    instead of calling `ApplyRetention`, skipping every expired record whose canonical envelope names
+    an open lease's `LeaseId` or `AgentId` (never its `RepoHash` — that would stop retention for a
+    whole repository the moment one merge began). Held records are deferred, not exempt: the sweep
+    after the lease confirms expires them, and the held count is logged so a lease stuck open is
+    visible. **The hold predicate matches PARSED identity fields, not envelope text:** it used to be
+    `payloadJson.Contains(reference)` over the whole envelope, which is a substring search rather than
+    a statement about leases — agent ids as short as `a1` or `pr-42` are valid and `a1` occurs in
+    roughly every other hex sha, so while one such lease was open nearly every expired record read as
+    "held" and retention quietly stopped. `IsHeldByOpenLease` now parses the payload and compares the
+    `agent`/`agent_id`/`worker`/`worker_id` fields against agent ids and `lease`/`lease_id` against
+    lease ids (both spellings because both are in the store), with the two id kinds kept apart in a
+    `LeaseReferences` record. `Sweep`, `References` and `IsHeldByOpenLease` are `internal` so
+    `AuditRetentionLeaseTests` pins the behaviour without a 24 h wait.
+  - **`Runtime/AuditAnchorService.cs`** (P2-15, F64c) — hourly best-effort RFC 3161 sweep: heads queue
+    by the `AuditAnchorQueue` policy (1000 records / 24 h) regardless, but nothing is SENT unless
     `MAINGUARD_TSA_URL` names an endpoint — no default install silently talks to a third party, and
-    an operator who configures a TSA later gets the queued backlog anchored on the next sweep. A
-    TSA failure leaves rows pending (anchoring is best-effort, chaining is not).
+    an operator who configures a TSA later gets the queued backlog anchored on the next sweep.
+    **Off by default is a decision, and the daemon now says so at boot** (an INFO line naming the
+    variable and what turning it on would do) rather than leaving a null client to be inferred:
+    anchoring is the one part of the chain that leaves the machine, and defaulting it on would have
+    every install POST chain-head hashes to a TSA nobody chose, leaking the fact and cadence of a
+    user's activity. An install without a TSA still has the hash chain and the file-mirror witness;
+    what it lacks is third-party proof of WHEN a head existed. A TSA failure leaves rows pending
+    (anchoring is best-effort, chaining is not).
+  - **`Runtime/DaemonInstanceLock.cs`** (**F55**) — the cross-process single-instance guard: an
+    exclusive `FileShare.None` hold on `<data root>/daemon.lock` (`flock` on Unix, share-mode-zero on
+    Windows), taken from the Kestrel options callback BEFORE a listener is configured and released by
+    the kernel however the holder dies. Also `DaemonInstanceLockHolder` (the DI singleton that owns it
+    for the host's lifetime — acquired late so the in-proc `TestServer` tier, where every fixture shares
+    one data root, never contends) and `DaemonAlreadyRunningException`. **B3:** `Acquire` RETRIES for
+    `AcquireRetryWindow` (1.5 s; `Acquire(dir, TimeSpan.Zero)` is the old single-shot form, for a test
+    that wants an immediate refusal). Single-shot, the guard could be tripped by the app itself:
+    `MacDaemonController.IsInstanceLockHeld` probes this file `FileShare.None` from the UI process and
+    the Pro head's connect diagnosis calls it while the daemon starts, so a daemon reaching the Kestrel
+    callback inside that probe's `using` exited "already running" — under launchd, a 30-second throttled
+    outage caused by the app merely checking. A probe holds the lock for microseconds and a daemon holds
+    it for its whole life, so retrying separates them without anyone coordinating. The lock is on the DATA ROOT,
+    not the port: a second daemon on a *different* port damaged the same shared state and no bind error
+    could ever have caught it. `daemon.lock.holder` beside it records the holder's pid for the refusal
+    message only — nothing reads it to decide anything.
+  - **`Runtime/UnixPeerCredentials.cs`** (**F62**) — the uid/gid (and, on Linux, pid) of a Unix-socket
+    peer read from the kernel (`SO_PEERCRED` on Linux, `getpeereid(2)` on macOS) rather than claimed by
+    the peer. Used by `AgentIpcServer` to pin each endpoint to the first local identity that connects;
+    a uid *allowlist* is impossible here (the jail's uid is a userns-remapped subuid on Linux and comes
+    from another kernel on macOS), and null (Windows) degrades to "do not pin", never to "deny".
   - **`Runtime/MacSleepAssertion.cs`** — macos-host only (registered on macOS alone): while any
     `mainguard.agent`-labeled container is running, hold a sleep assertion via a child
-    `caffeinate -im -w <daemon pid>` so idle sleep / App Nap cannot stall a verification; the
+    `caffeinate -ims -w <daemon pid>` so idle **and system** sleep / App Nap cannot stall a
+    verification (**F60** added `-s`; `-d` is deliberately absent — the display is the operator's); the
     `-w` ties the assertion to the daemon's own lifetime (a killed daemon never leaks a machine
-    that refuses to sleep) and the child is killed the moment the last agent stops.
+    that refuses to sleep) and the child is killed the moment the last agent stops. Logs, once per
+    acquisition, that no power assertion can prevent lid-close (clamshell) sleep and that `-s` is
+    ignored on battery — a limit worth stating rather than letting an operator infer a guarantee.
   - **`Runtime/PrIntakeHostedService.cs`** (P2-13 carried-in from P2-12) — the daemon scheduler slot
     that drives `IExternalPrIntake.RunAsync` (the external-PR poll loop); **P2-47 registered the intake
     dependency chain (`RegisterPrIntake` in `GatewayServiceRegistration`) so this now RUNS the poll loop
@@ -80,23 +212,62 @@
     mapping is now real (`Runtime/PrIntakeTargetResolver.cs`); a source no active repo owns still
     resolves to null and makes a poll list-and-skip (no upstream writes), the same "empty until a repo
     is active" posture the merge-reconcile takes.
+- **`Gateway/GatewayBindPolicy.cs`** (**MG-13/MG-4**) — the pure bind-address rule for the model-gateway listener: loopback and private ranges are permitted; a wildcard bind and any public address are refused. `TryResolvePrivateHostAddress()` is the **default** bind since MG-4 turned the gateway on. **F25 narrowed it**: it used to pick the lexicographically lowest private IPv4 on *any* up NIC, which on a Mac without a 10.x/172.x interface is the Wi-Fi address — a plaintext, token-authenticated gateway on the operator's LAN. It is now a platform split: **macOS/Windows → loopback** (Docker Desktop routes `host.docker.internal`, mapped to `host-gateway`, to the host's loopback stack) and **Linux → `docker0`'s address only**, never a `br-*` segment bridge, because a container on an internal segment CAN reach its own bridge's address (measured: 0.05 ms) while everything off that subnet is "Network is unreachable" — binding a segment's own bridge would let a jail dial the gateway past tinyproxy. No bridge and not Docker Desktop → null, i.e. the gateway is simply disabled; there is deliberately no any-NIC fallback. `ProxyReachableHostFor(bind)` is the companion translation — identical to the bind except for loopback, which becomes `host.docker.internal`, because a jail's `NO_PROXY` covers `127.0.0.1` and a jail pointed there dials itself. Memoized once per process (the address is written into every confined jail's base-URL variable). It picks an address; whether a jail can REACH it is measured per spawn by `IEgressPolicy.CanProxyReachAsync`. Pure, so every case runs without a host.
+  **Audit B1 — an IDLE `docker0` is still the answer.** The Linux lookup filtered interfaces to
+  `OperationalStatus == Up` before matching the name, and a Linux bridge reports CARRIER rather than
+  admin state: with no port attached it is `<NO-CARRIER,…,UP> state DOWN`, `operstate` reads `down`, and
+  .NET maps that to `Down` (measured: a carrier-down `docker0` holding `172.17.0.1` is reported `Down`
+  by .NET on Linux, and that address still binds). Mainguard puts every container on a user-defined
+  network and never on the default bridge, so docker0 is idle on exactly the hosts this resolver exists
+  for — the filter returned null there, the gateway was disabled, and every BYOK spawn fell through to
+  "raw provider key in the jail". The selection is now the pure `SelectDockerBridgeAddress(IEnumerable<
+  HostInterface>)` over `(Name, Addresses)` only, a shape that cannot express the status filter.
+- **`Services/EgressGrpcService.cs`** (**P2-07/ESC-I2, SA-1/F2, F31**) — the App's only path to the daemon-owned default-deny egress allowlist: `ListAllowlist` reads the live entries, `Add`/`RemoveAllowlistHost` mutate them (change-logged by `EgressAllowlist`) and re-render the running proxy so the edit takes effect immediately. The audit actor comes from the authenticated connection (`IApproverIdentityResolver`), never from the message. **F31: `AddAllowlistHost` validates the pattern with `EgressHostPattern.IsValid` and refuses an invalid one with `InvalidArgument` before it can reach the persisted store** — this RPC is the one path a host pattern takes from outside the daemon into a tinyproxy regex, a dnsmasq config line and an iptables rule, none of which quote it.
+- **`Gateway/AgentGatewayCredentials.cs`** (**MG-4/MG-20/F25**) — the daemon-side custody boundary for model credentials: mints the opaque per-agent `mg_sess_` token the jail receives *instead of* the provider key, holds the real key and the per-agent upstream binding daemon-side, and resolves a presented token → agent id (the ONLY trustworthy identity at the gateway; the `x-mainguard-agent` header is never trusted). **F25 added scheduled rotation.** `RotateStale()` replaces any token older than `DefaultRotationInterval` (1 h) and keeps the superseded one resolvable for `DefaultOverlap` (5 min) so a request already in flight finishes; it is driven opportunistically from `ResolveAgent` (a timestamp compare on the one path every model request takes — no timer, no daemon lifecycle). Rotation is **gated on `TokenDelivery` returning true**: the token lives in the jail's `/run/secrets/agent/agent.env`, and retiring one that could not be redelivered would break the agent rather than protect it, so with no delivery hook wired the behaviour is exactly the pre-F25 one (issue at spawn, revoke on stop). `Revoke` gives no grace — nothing a stopped agent held may be replayed.
+- **`Gateway/GatewayConfinementOptions.cs`** — `GatewayConfinementOptions` (the spawn path's answer to "is there a gateway to point this jail at, and where"; `Disabled` is the default and means the provider key goes into the jail exactly as before; **`DisabledUnintentionally`** marks the audit-B1 case where the bind AUTO-RESOLVED to nothing rather than being switched off, which the launcher logs at ERROR because nobody asked for the key to go into the jail), `ModelHosts` (the model-API hosts, derived from `EgressAllowlist.DefaultEntries` so the allowlist and the gateway cannot drift), and `NullAgentPortMap` (Mainguard runs one gateway listener, so attribution comes from the agent token; this returns null rather than guessing an agent).
+- **`DaemonOptions.cs`** / **`DaemonStartupException.cs`** — parsed launch options (`--local-dev`/`--smoke`/`--port`, loopback-only by construction; `DataPath` overrides the P2-08 daemon SQLite path for test isolation; **`--gateway-bind`/`--gateway-port` control the model gateway, which is now ON BY DEFAULT (MG-4 item 3). It was previously settable only through `MAINGUARD_GATEWAY_BIND`, which nothing in the repo ever set, so in every supported deployment a BYOK jail received the raw provider key. `ResolveBindAddress` maps unset/`auto` → a private host address, `off` → disabled (the old posture), and an explicit address straight through to `GatewayBindPolicy`. **`GatewayBindConfigured`** keeps the raw configured value so `GatewayDisabledUnintentionally` can tell a deliberate `off` from a bind that resolved to nothing — the latter is reported as an error at boot (`DaemonHost` lifecycle) and per spawn, because it silently downgrades every BYOK agent to the raw key**) and the typed startup failure naming the port.
 - **`Gateway/GatewayBindPolicy.cs`** (**MG-13/MG-4**) — the pure bind-address rule for the model-gateway listener: loopback and private ranges are permitted; a wildcard bind and any public address are refused. `TryResolvePrivateHostAddress()` is the **default** bind since MG-4 turned the gateway on: a private, non-loopback IPv4 on an interface that is up, chosen deterministically so the address written into every confined jail is stable across restarts. Loopback is excluded as a default precisely because it binds cleanly and confines nothing — inside a container `127.0.0.1` is the container. It picks an address; whether a jail can REACH it is measured per spawn by `IEgressPolicy.CanProxyReachAsync`. The gateway fronts the user's provider key, so a listener that answers off-box is a credential-exposure surface rather than a convenience. Pure, so every case runs without a host.
 - **`Gateway/GatewayConfinementOptions.cs`** — `GatewayConfinementOptions` (the spawn path's answer to "is there a gateway to point this jail at, and where"; `Disabled` is the default and means the provider key goes into the jail exactly as before), `ModelHosts` (the model-API hosts, derived from `EgressAllowlist.DefaultEntries` so the allowlist and the gateway cannot drift), and `NullAgentPortMap` (Mainguard runs one gateway listener, so attribution comes from the agent token; this returns null rather than guessing an agent).
+- **`AuditPersistenceUnavailableException.cs`** (B1) — the typed boot refusal: the audit chain cannot
+  be opened without losing its tamper-evidence guarantees (no at-rest key-ring protector and no
+  explicit opt-in, a tampered/foreign ring, or a ring wrapped under a protector this process cannot
+  use). Its message carries the inner exception's named remedies, because the operator reading it is
+  looking at a daemon that did not start. Deliberately NOT survivable by the in-memory journal — see
+  the `RegisterAuditLog` note above for why that fallback is legitimate for a DB failure and not for
+  this one.
 - **`DaemonOptions.cs`** / **`DaemonStartupException.cs`** — parsed launch options (`--local-dev`/`--smoke`/`--port`, loopback-only by construction; `DataPath` overrides the P2-08 daemon SQLite path for test isolation; **`--gateway-bind`/`--gateway-port` control the model gateway, which is now ON BY DEFAULT (MG-4 item 3). It was previously settable only through `MAINGUARD_GATEWAY_BIND`, which nothing in the repo ever set, so in every supported deployment a BYOK jail received the raw provider key. `ResolveBindAddress` maps unset/`auto` → a private host address, `off` → disabled (the old posture), and an explicit address straight through to `GatewayBindPolicy`**) and the typed startup failure naming the port.
 - **`Auth/SessionTokenFile.cs`** — generates a 256-bit session token (`RandomNumberGenerator.GetBytes(32)`) written user-only-readable (Linux `~/.mainguard/daemon.token` mode 0600; Windows `%LocalAppData%\Mainguard\daemon.token` current-user ACL); prints nothing (G-13). Path via `Core.Daemon.DaemonPaths`.
+  **F55** split minting from writing: `Mint` produces the token in memory and `Persist` writes it, and
+  `DaemonHost` calls `Persist` from `ApplicationStarted` — i.e. only once the port is won. `Create`
+  (= `Mint` + `Persist`) remains for callers that are not behind a port race. **F64:** on Windows the
+  DACL is now tightened BEFORE the token is written, not after, so the secret never exists on disk under
+  the inherited ACL.
 - **`Auth/SessionTransportCertificates.cs`** (MG-19) — the control plane's **peer-authentication**
   layer, so the bearer token is no longer the sole gate. Mints two fresh self-signed P-256
   certificates per daemon start (server: `serverAuth` + loopback SANs; client: `clientAuth`) and
   writes the client PKCS#12 + the server DER beside `daemon.token` with the same 0600 /
-  single-ACE-DACL protection (`WriteRestricted`).
+  single-ACE-DACL protection (`WriteRestricted`, which — **F64** — sets the Windows DACL before writing
+  the key, not after). **F55:** `MintSession` mints in memory only and `Persist` writes, called from
+  `ApplicationStarted`; a daemon that loses the port race no longer rotates the live daemon's material
+  on its way to failing (`Create` = both, for callers not behind a race). The client PFX still carries
+  **no password**, deliberately: it sits 0600 beside the token, so a password stored in the same
+  directory protects nothing the file mode does not — see the PR notes for the change that would.
   - `IsPinnedClientCertificate` is the SHA-256 exact-fingerprint predicate Kestrel consults for every
     presented client certificate — chain/issuer/validity are deliberately not consulted (self-signed +
     session-scoped, and Windows-host↔WSL2-VM clock skew must never fail a correct connection).
     Rationale, the measured `localhostForwarding` exposure, and why a UDS + `SO_PEERCRED` was rejected
     for this topology: `docs/security-architecture.md`.
 - **`Auth/BearerTokenInterceptor.cs`** — authenticates **every** RPC (unary/all-streaming) via a constant-time compare (`CryptographicOperations.FixedTimeEquals`); no public-method allowlist (invariant 1); mismatch → `PermissionDenied`.
-- **`Auth/RoleInterceptor.cs`** (P2-14; 2026-09-04 adds `AgentService/SetJailLimits` to the coordinator's
-  deny list — the ceiling is the operator's lever over the machine's memory) — daemon-side role + terminal-lock enforcement at the gRPC
+- **`Auth/RoleInterceptor.cs`** (P2-14; **F11/F43** replaced the coordinator DENY list with an
+  **ALLOWLIST** — `CoordinatorAllowedMethods`, ~15 fleet/policy READS plus the coordinator's own
+  `CoordinatorService` conversation; every other RPC, including one added tomorrow, is refused by
+  default. The deny list was correct about each entry it had and wrong about its shape: it named ~30 of
+  ~50 methods and left the rest reachable, including `SpawnAgent` (the role lock undone in one RPC),
+  `StopAgent`, `TerminalService/Attach`, `HarvestAgentCredentials`, `KillSwitchService`,
+  `RunVerification`/`GetVerificationLog`/`GetMergeDiff`/`StreamQueue`, `EgressService` writes,
+  `SetBudgets` and the `RepoSyncService` mutations. `CoordinatorDeniedMethods` survives as the
+  *annotated record* of why each of those is refused — no longer the control, and pinned against the
+  allowlist by `CoordinatorAllowlistTests`) — daemon-side role + terminal-lock enforcement at the gRPC
   layer (runs after auth, before the mask). **Role:** a `ConnectionRole.Coordinator` credential
   (looked up in `ConnectionRoleRegistry` by bearer token — role bound to the token, not
   client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`/`AbandonMerge`/
@@ -149,12 +320,23 @@
     `User=mainguard`) render a bare `uid:1000`; `Environment.UserName` goes through `getpwuid`, not
     `$USER`, so it is not env-spoofable. `uid:<euid>` remains only as the last resort for a euid with no
     passwd entry, where `Environment.UserName` returns `""`.
-- **`Logging/SecretFieldMask.cs`** + **`SecretMaskingInterceptor.cs`** — the G-13 registry of
-  `(message, field number)` secrets (every `// SECRET` proto field) and the access-log formatter that
-  redacts them (value/length/prefix never logged). **`SecretMaskingInterceptor` now also records
-  handler faults** — a non-`RpcException` out of a handler is logged Error under the `Rpc` category
-  (method/peer/type/message/stack) then rethrown, so a bare `Unknown` to the client is no longer
-  invisible daemon-side.
+- **`Logging/SecretFieldMask.cs`** + **`SecretMaskingInterceptor.cs`** — the access-log renderer.
+  **Since F56 this is an ALLOWLIST, not a denylist: RPC bodies are never logged.**
+  `SecretFieldMask.Summarize(IMessage)` emits the op, the wire size, the allowlisted ids and bounded
+  scalars, and a count of what it withheld — e.g.
+  `SpawnAgentRequest{size=412B, repo_handle=…, agent_kind=claude-code, task_prompt=<str:57>, omitted=3}`.
+  Three rules: a bool/enum/number renders its value; a string renders its value only if its NAME is in
+  the `LoggableNames` handle allowlist AND the value is ≤64 identifier-shaped chars (else `<str:LEN>`);
+  bytes, repeated fields, maps and nested messages never render content (`<bytes:LEN>`, `[N]`, `{N}`,
+  shallow recursion). The old renderer wrote every field of every message and masked six names, so
+  `ReadAudit`'s decrypted payloads, scrollback rows, merge diffs, verification logs, task prompts, chat
+  text and plan text all went to `rpc.log` verbatim. The G-13 `(message, field number)` `// SECRET`
+  registry survives as a **second belt** (a registered field is refused even if the allowlist rules
+  would pass it) and the `// SECRET`-coverage test still holds it to the proto comments — but
+  forgetting an entry is no longer a leak. There is deliberately **no verbose-bodies switch**.
+  **`SecretMaskingInterceptor` also records handler faults** — a non-`RpcException` out of a handler is
+  logged Error under the `Rpc` category (method/peer/type/message/stack) then rethrown, so a bare
+  `Unknown` to the client is no longer invisible daemon-side.
 - **`Logging/DaemonLogCategories.cs`** + **`SubsystemFileLoggerProvider.cs`** +
   **`LoggingTransparencyLog.cs`** — the in-depth per-subsystem daemon logging.
   - `DaemonLogCategories` maps each `DaemonLogSubsystems` name to an `ILogger` category
@@ -163,7 +345,12 @@
     rolling (5 MB × 3), per-line flush, format `{ts:O} [LVL] [subsystem] (scope) message` + exception on
     the following lines; its **file writers are process-static + lock-guarded** so the pre-DI bootstrap
     factory and the runtime DI factory share one writer per file, and every file op is swallowed
-    (diagnostics never break the daemon).
+    (diagnostics never break the daemon). **Owner-only on disk (F56):** the nested
+    `RestrictedFiles` helper creates the logs directory `0700` and pre-creates every log file `0600`
+    before the first byte lands (the process umask made `rpc.log` world-readable); on Windows the
+    directory and each file get an inheritance-free single-ACE DACL, mirroring
+    `Auth/SessionTransportCertificates.WriteRestricted` rather than inventing a second pattern.
+    Rolled files keep the mode through `File.Move`.
   - `LoggingTransparencyLog` decorates `INetworkTransparencyLog` to tee each egress verdict summary into
     the `Egress` category (schema kept stable for P2-17/P2-44). Wired in `DaemonHost` (journald console
     + files when `!Smoke`; a bootstrap `LoggerFactory` logs the Lifecycle/Migration startup milestones
@@ -182,14 +369,25 @@
   recomputing those four conditions is the point: two derivations would eventually disagree invisibly.
   Results are cached for `DefaultCacheWindow` so N subscribers cannot multiply engine calls.
 - **`Runtime/AgentSessionStore.cs`** — the in-memory daemon agent registry + snapshot-then-deltas
-  event fan-out (host state, not transport); the gRPC classes dispatch here. Appends `spawn`/`stop`
+  event fan-out (host state, not transport); the gRPC classes dispatch here. Two W3A additions: the
+  **pause axis is durable** — `MarkFrozen` writes through `AgentRestartLedger` and a mark for a jail that
+  survived a restart is re-applied by `Spawn` (i.e. at the reconciler's adoption, since the axis is scoped
+  to live sessions and there are none until then), because the axis records WHO froze a jail and every
+  release path keys on it (audit F3); and `BeginTeardown`/`IsTearingDown`, the scope
+  `AgentSpawnService.StopAsync` holds from before the record is removed until the container is gone, which
+  the reconciler consults so it cannot adopt a jail mid-stop (audit F14). Appends `spawn`/`stop`
   audit events via `IAuditLog`; `MarkState(agentId, state, reason)` (P2-09) updates a session's state
   + broadcasts a state delta (the sink the real supervisor drives so a pause/rate-limit streams to
   clients) — and broadcasts when the **reason** changed as well as the state word, holding the last one
   on `AgentSession.Detail` so a new reason is told from a repeat. Comparing only the state word silently
   swallowed every update reporting progress WITHIN a state, which is the only shape a long step has: a
   coordinator sits in `Starting` for the minutes its toolchain image builds, so each progress line died
-  here and the client, hearing nothing, could only conclude the daemon had stopped responding. **P2-47 #8:** the `AgentSession` record carries a daemon-side-only
+  here and the client, hearing nothing, could only conclude the daemon had stopped responding. **B1:** an
+  ADOPTION axis alongside the pause axis — `MarkAdopted`/`ClearAdopted`/`WasAdoptedWithoutTerminal`,
+  written by `AgentSessionReconciler`'s adoption pass and cleared by `Stop` or the first sighting of a
+  bound CLI. Kept off the state word because adoption writes `Working` and so does an ordinary running
+  agent, while the jail reaper's question is not "is it working" but "is the missing terminal a fact
+  about the jail or about the daemon". **P2-47 #8:** the `AgentSession` record carries a daemon-side-only
   `ContainerId`/`RepoHash` (never serialized), and `AttachSandbox` binds a real jail to a spawned
   session (state → `Working`, `sandbox_attach` audit). **`Spawn` takes an optional explicit
   `agentId`** — it could previously only MINT GUIDs, so a session (and therefore a jail) named
@@ -221,13 +419,52 @@
     hardened jail (`Sandboxes.SpawnAsync`), returning the real container id;
   - `TryLaunchAsync` returns null (session-only, no jail) when the repo handle is not provisioned (the
     headless Alpha-loop-smoke path), cleans up a half-made worktree on failure, and `TeardownAsync`
-    removes the jail + worktree on stop. It also owns the daemon half of the **CLI login round-trip**:
+    removes the jail + worktree on stop. **Rollback also releases the MG-36 network segment** (audit F27,
+    W3A): the segment is created BEFORE `SpawnAsync`, so every failure from the image pull onwards leaked
+    one and only a clean teardown ever reclaimed it — a few dozen failed spawns exhaust Docker's ~32-network
+    local address pool, after which every spawn fails at network creation on a machine with no running
+    agents. Ordered after the container removal (Docker refuses to delete a network with a live endpoint)
+    and unconditional on the handle, because the failures that leak a segment are precisely the ones where
+    no container exists. **Teardown no longer honours the caller's cancellation** for the container removal
+    or the segment release (audit F19): past that point the session record is already gone, so a cancelled
+    removal leaves an unowned jail on a deleted worktree — the caller side is fixed too
+    (`AgentSpawnService.StopAsync` passes `CancellationToken.None`), this is the half the next caller
+    cannot get wrong. On the reuse question (audit F28) the launcher's `Limits:` argument IS the current
+    ceiling — `JailLimitsSettings.Current`, read live at every spawn — so an operator's lowered ceiling
+    reaches every jail created after the change; what it does not reach is a REUSED jail, because
+    `DockerSandboxEngine.SpawnAsync` decides reuse on mounts/DNS/network/secrets/image and never on the
+    limits. That check belongs beside the other eight in the engine's reuse decision rather than being
+    re-decided here (MG-12), and PR #368 puts it there, re-applying memory/CPU/pids in place on the live
+    cgroup rather than recreating the jail and losing the agent's session. It also owns the daemon half of the **CLI login round-trip**:
     `FilterCliCredentials` admits ONLY client-supplied files whose path exactly matches the installed
     adapter's declared `credentialPaths` (the marker is the allowlist — a compromised client can never
     seed arbitrary agent-home files), and `HarvestCliCredentialsAsync` reads those files back out of the
     jail's tmpfs `$HOME` (base64 over the exec pipe, best-effort — a failed harvest never blocks a stop)
     so `AgentSpawnService.StopAsync` can hand them to the client for the host OS keychain
-    (`AgentStopResult`). Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
+    (`AgentStopResult`). **F2 — the credential leg now has the two protections the settings leg had:**
+    a size ceiling checked IN THE SHELL (`AdapterCredentialPolicy.MaxBytesFor`, the same `wc -c` script
+    the settings harvest uses, so an oversized file is never read into the daemon's memory) and REFUSED
+    rather than truncated; and a declared credential path that is really a settings file (gemini-cli's /
+    qwen-code's `settings.json`) is put through `CliSettingsGrantScrub.Scrub` and held to the settings
+    ceiling WHERE IT SITS, in both directions (`FilterCliCredentials` applies the same pair on restore,
+    so an already-poisoned store is neutralised with no migration). **F2's last clause: EVERY credential
+    file carries `mcpServers` command definitions** — `.claude.json` does, and so does
+    `~/.gemini/settings.json`, which is where gemini-cli defines them. One private
+    `CarryCredentialContent(path, content, leg, kind, log, reportWhatWasFiltered)` is now the single
+    filter BOTH legs call: the mount scrub where the path is settings-shaped, then
+    `CliSettingsGrantScrub.StripExecutableConfig` on everything, which removes only the keys that name a
+    program and leaves every other key alone (a targeted strip rather than an allowlist: these are the
+    files that say the user is logged in, and an allowlist over them cannot be proved safe without a live
+    account — a claude-shaped one would drop gemini's `selectedAuthType`). The settings-shaped files got
+    the scrub ALONE until the composition landed, so the `mcpServers` an attended gemini jail wrote
+    travelled into every later Managed worker of that repo. The unreviewed top-level key NAMES are logged
+    by `LogUnreviewedCredentialKeys` on both legs — names only, already reduced to plain identifiers,
+    never a value — for the paths `AdapterCredentialPolicy.ReportsUnreviewedKeys` admits; the two "this
+    file changed" Information lines fire on the HARVEST only, because on the restore leg the same stored
+    blob is re-filtered on every spawn and the line would repeat forever saying what the harvest already
+    said. `BuildSecrets`/`FilterCliCredentials` take an optional `ILogger`
+    for that; the spawn chain passes the daemon's. WHETHER either harvest may run is
+    the caller's decision — see `CliHarvestPolicy`. Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
     refused outright (`Conflict`), so a conflicted keep-alive rebase used to put one raw
     `Docker.DotNet.DockerApiException` stack trace per declared path into the operator log — a warning
     meaning "as expected", which is how the warnings that mean something stop being read. A frozen jail is
@@ -256,7 +493,12 @@
     `Bind`/`TryGetBound`/`Release` register the long-lived **bound** CLI sessions the spawn chain
     creates (the real agent path — attaches subscribe, a detach never kills the CLI), while the legacy
     injectable per-attach `PtySession` factory remains the TI-P2-03 wiring-test shape; with neither,
-    attaches echo.
+    attaches echo. **F59:** `DetachAllForShutdown` (which `Dispose` now delegates to, and which
+    `DaemonHost` also hooks on `ApplicationStopping`) releases the daemon-side half of every bound
+    session **without killing the CLI**, and logs the agents it left running — container disposal used
+    to `Release` every key, i.e. `Kill` every live CLI, so any daemon restart terminated every agent
+    mid-task with no operator prompt. `Release` (StopAgent / teardown) still kills: there the kill is
+    the request.
   - **`Runtime/BoundTerminalSession.cs`** (PR3) — one agent's long-lived CLI terminal: a continuous
     `TerminalStreamer` pump drains the PTY into VT-safe frames kept in a bounded 512 KB replay ring and
     fanned out to subscribers (re-attach renders the missed output composed; a stalled attach is
@@ -269,11 +511,20 @@
     factory spawns `docker exec -i -t` under a daemon-side forkpty PTY from the pure `BuildPtyLaunch`
     plan (`CliPtyLaunch`: `SandboxCliLaunch` argv, interactive tty + attached stdin, explicit `TERM` on
     both sides of the exec, positive size — the TTY contract `AgentCliWiringTests` pins so an
-    unauthenticated CLI opens interactive login instead of dying non-interactive), registers the bound
+    unauthenticated CLI opens interactive login instead of dying non-interactive; **audit F54** also
+    pins that the command is `TrustedDockerBinary.Resolve()` (an absolute allow-listed path) and that the
+    child's `PATH` is `TrustedDockerBinary.TrustedChildPath` rather than the daemon's inherited one —
+    forwarding our own `PATH` while invoking a bare `"docker"` let whoever controlled the daemon's
+    environment choose the program that owns every jail), registers the bound
     session with `TerminalSessionManager` + the P2-09 `SessionLeader` (PTY-fd ownership + kill), audits
     `cli_bound`/`cli_bind_failed` (bind failure degrades to session-only + echo, never fails the spawn),
     and marks the session `Dead` when the CLI exits — auditing `cli_exited` with the exit code + the
-    VT-stripped output tail (`BoundTerminalSession.TailText`), the bound session staying registered so
+    output tail, which since the W3A pass goes through `SanitizeExitTail` first: the tail is raw PTY bytes
+    the untrusted jail occupant chooses, and it reached an audit event and a terminal-rendered state
+    reason verbatim, so ANSI CSI/OSC sequences (an OSC 52 clipboard write included), C0 controls, Unicode
+    format/bidi characters and newlines are folded out and the cap applied to the TEXT rather than to the
+    control bytes. `IsBound(key)` is the adoption path's guard against a second `docker exec` into a jail
+    that already has one. The bound session staying registered so
     attaching to the dead agent's terminal still replays its final output (the why).
     Also owns `TrySendPromptAsync` — the ONLY write path into a worker's CLI (coordinator contract §3
     `send_worker_prompt`), returning `PromptDelivery(Submitted, Echoed, Reacted, Refusal)`. It encodes
@@ -297,9 +548,32 @@
     authoritative by definition; unforced, git refuses the rewind and the human reads it as the error.
   - **`Runtime/JailReaperHostedService.cs`** (2026-09-04, owner decision) — the jail reaper: every
     `CoordinatorLimits.JailReapSweepSeconds` it walks `AgentSessionStore.List()`, asks `JailReapPolicy`
-    with the entry state, whether `TerminalSessionManager.TryGetBound` holds a live CLI, and how long it
-    has not, and stops what the policy names through the ordinary `AgentSpawnService.StopAsync` (harvest,
-    publish, teardown — nothing committed is lost). Audits `jail_reaped`. `SweepOnceAsync(now)` is public
+    with the entry state, whether `TerminalSessionManager.TryGetBound` holds a live CLI, how long it
+    has not, and — **B1** — whether the session is an ADOPTED jail no CLI has bound to since
+    (`AgentSessionStore.WasAdoptedWithoutTerminal`, cleared here the first time a live CLI is seen). That
+    last flag is the entire scope of the in-flight exemption: a jail this daemon started itself, whose
+    worker finished and sits in AwaitingReview, still reaps at the allowance. It stops what the policy
+    names through the ordinary `AgentSpawnService.StopAsync` (harvest,
+    publish, teardown — nothing committed is lost). Audits `jail_reaped`. A session the reconciler has
+    marked `Unresponsive` is **skipped** (audit F20, W3A): its jail is already gone, so there is no memory
+    or container to reclaim — which is this sweep's whole remit — and all a reap would still do is delete
+    the agent's worktree, i.e. put the decision to discard a dead agent's uncommitted work in the hands of
+    a 30-minute clock. The record stays, visible and Stoppable, until a human decides. It also runs the
+    **MG-36 network-segment sweep** every `SegmentSweepInterval` (5 min — its own, much slower cadence,
+    because a leaked segment is inert until a few dozen exhaust Docker's address pool while the sweep's own
+    grace is already ten minutes): `SandboxSegmentReaper.SweepAsync` reclaims per-agent networks whose jail
+    no longer exists, audited as `jail_segment_reaped` by segment name, and a sweep that throws is
+    swallowed so the load-bearing jail half is never lost with it (audit F27 — the reaper was complete and
+    tested and reached nothing). **"Throws" includes an `OperationCanceledException` on a token nobody
+    cancelled** (W3A rework): a Docker.DotNet call past its 100-second default surfaces as
+    `TaskCanceledException`, which the type-only filter let through — out of the sweep, out of the loop
+    lambda that had no catch around it, into a faulted `Task.Run` whose `while` never ran again, leaving
+    the jail sweep dead until the next daemon restart with nothing reporting it. A cancellation is only an
+    instruction when the caller's token is actually cancelled, and that one still propagates. **A different axis from the jail sweep, deliberately not sharing its
+    rules:** the jail sweep asks "idle too long", and PR #366 exempted a jail with an in-flight merge entry
+    from that; a segment is reaped on whether ANY container (running or stopped) exists for it, so a
+    live-but-idle jail's network is saved by the jail's existence whatever the queue thinks, and borrowing
+    the in-flight exemption could only let an exempt jail's network be swept while it ran on it. `SweepOnceAsync(now)` is public
     and caller-clocked so the daemon-tier test drives the idle allowance without waiting it out.
   - **`Runtime/FrozenJailPolicy.cs`** — the frozen-jail predicate behind `send_worker_prompt`,
     `request_verification` and the human's Verify: the session state word (`Paused`/`Conflict`) OR the
@@ -379,11 +653,29 @@
     harvested CLI login, **nor any CLI SETTINGS**, and seeds none of them). The settings gate is the
     stronger of the three: an inherited permission allowlist is inherited *execution*, so a jail holding
     a pull request's code must start asking about every command. `cliSettings` carries the repo's saved
-    approvals in; `CliSettingsHarvestPolicy` (in this file) gates them flowing back OUT — only a
-    HUMAN-ATTENDED session is harvested, because a `Managed` worker's terminal is daemon-locked
-    read-only, so anything in its settings file was written by the agent, not approved by a person.
-    Restore is deliberately wider than harvest (a Managed worker still receives the repo's approvals or
-    it stalls on prompts nobody can answer). `AgentStopResult` carries `CliSettings` + `RepoHandle` so
+    approvals in; **`CliHarvestPolicy`** (in this file; was `CliSettingsHarvestPolicy` until it stopped
+    being only about settings) gates them flowing back OUT — only a HUMAN-ATTENDED session is harvested,
+    because a `Managed` worker's terminal is daemon-locked read-only, so anything in its settings file
+    was written by the agent, not approved by a person. Restore is deliberately wider than harvest (a
+    Managed worker still receives the repo's approvals or it stalls on prompts nobody can answer).
+    **Audit F19, at the `StopAsync` call site: the two harvests sit inside a
+    `try`/`catch (OperationCanceledException)`, the TEARDOWN below them does not.** The harvests may
+    honour the RPC's token — they are best-effort reads and a client that hung up has stopped waiting for
+    its credentials — but past that point the session record is already gone, so a cancellation that
+    skipped the teardown would leave a running container nothing in the app can see, on a worktree the
+    same stop is about to want removed. The disconnect that reaches it is the ordinary case: a user
+    closing the window on a stop taking a few seconds. **The guard wraps the gate; it never replaces
+    it** — the call inside the `try` is `HarvestCredentialsIfAttendedAsync`, and swapping it back to the
+    ungated `_launcher.HarvestCliCredentialsAsync` reopens F2 with a green build, which is why the
+    reason is restated at the line and pinned by
+    `CliSettingsBoundaryTests.StoppingAnUnattendedWorker_HarvestsNoLogin_EvenThoughTheFileIsRightThere`.
+    **F2 — the same gate now covers CREDENTIALS** (`HarvestCredentialsIfAttendedAsync`, at both the live
+    `HarvestCredentialsAsync` and the `StopAsync` call sites). It did not before, and the asymmetry made
+    no sense in either direction it was argued: a coordinator's workers are spawned `Managed` running
+    real adapter kinds, so every one of them WAS harvested — the daemon read CLI login files out of an
+    unattended jail, on the word of the only party in it, and filed them in the host's durable
+    credential store. An OAuth refresh token is strictly more dangerous than a command allowlist, and it
+    was the one with no gate. `AgentStopResult` carries `CliSettings` + `RepoHandle` so
     the client files them under the right repository rather than whichever one is open. See
     [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md).
     **Phase 2** adds `heldTaskTitle`/`heldTaskPrompt`/
@@ -428,6 +720,20 @@
     the listeners, because the jail bind-mounts that directory by inode and deleting it orphaned every
     surviving jail's channel; only `CloseEndpoint` (the stop path) removes it, and `CreateEndpoint` re-binds
     at the same path when the reconciler adopts the jail back (`AgentSpawnService.TryReattachEndpoint`) —
+    **and, since F62, guarded by the PARENT rather than the leaf**: `EnsureRootPrivate` holds the
+    `agent-ipc/` root at `0700` on every `CreateEndpoint`, which is the traversal barrier that actually
+    stops another local account reaching a coordinator's socket and driving spawn/plan requests under the
+    operator's keys. The leaf modes stay permissive because they have to — the jail's uid is a
+    userns-remapped subuid on Linux and comes from a different kernel on macOS, so there is no uid or gid
+    to grant to — but the per-agent dir dropped to traverse-only (`0711`, no listing), the socket to
+    `0622` (connect(2) needs write and nothing else) and the daemon-only `inflight/` claim dir to `0700`;
+    only `outbox/` keeps `0777`, because the agent genuinely creates, reads and renames its own files
+    there. On top of that each endpoint PINS the first local peer identity that connects
+    (`Runtime/UnixPeerCredentials`) and refuses any later connection from a different uid, which is the
+    enforceable form of the check when no uid can be known in advance. The listen backlog is
+    `MaxInFlightConnections + 8` rather than a flat 8, so the kernel's pending-accept queue can hold the
+    burst the daemon's own cap is designed to answer — with the old value a jail could get an
+    unexplained `ECONNREFUSED` where the contract promises an honest refusal with a reason —
     **and beside it the role's `MAINGUARD.md` operating instructions**, written in the same call so the
     shim and the text that makes it discoverable cannot be staged independently: a shim is useless to a
     CLI that was never told it exists, which is what every jail was until now. Since **defect G2**
@@ -492,14 +798,54 @@
     differ per version). The arbitration rules: a human pause is sticky — the cascade's yield runs
     through a frozen jail and never wakes it (checked at RESUME time in `YieldProtocol`) — and a
     human unpause is refused while a machine hold is outstanding (self-clearing, seconds). Refusals
-    are answers, not exceptions. Pinned by `Mainguard.Server.Tests/AgentPauseTests` (incl. a real
-    docker pause→inspect→unpause leg) and the arbiter legs of `Mainguard.Tests/YieldProtocolTests`.
+    are answers, not exceptions. **The human half of the ledger is durable** (audit F3, W3A): it writes
+    through `AgentRestartLedger` and rehydrates in its constructor, because a `docker pause`d jail
+    outlives the daemon and the record of WHO paused it has to as well — without it the reconciler adopted
+    the jail as Paused and Unpause answered "this agent isn't human-paused", leaving a raw `docker unpause`
+    as the only exit. Machine holds stay in memory on purpose (a hold rehydrated from a dead process is a
+    refusal that never self-clears). Unpause also now (a) restores the human-pause flag when the engine
+    call FAILS, so a retry is a retry rather than needing the undocumented "pause again, then unpause"
+    (F17), and (b) accepts a jail whose pause axis carries only the engine's own reading — a freeze nobody
+    inside the app claims — which is F3's last exit; a freeze an in-app owner DOES claim is still refused,
+    because its owner's release does more than call unpause. **The two writes are ordered around the engine
+    call, and that order is the fix for the crash window the durable ledger opened** (W3A rework): Pause
+    persists the CLAIM before the freeze it explains, and Unpause drops the flag from MEMORY before the
+    engine call (`ForgetHumanPause`, for the machine-hold race) and from the FILE only after it
+    (`PersistHumanPauseCleared`). The other order left `{HumanPaused:false, Frozen:["a human paused it"]}`
+    for a daemon that died mid-loop — the audit's own wedge, made durable. `IsReleasableFreeze` closes the
+    same window from the reading side: this service's own axis reason (`HumanPausedFrozenReason`) with no
+    surviving flag is still a human's freeze, and a session that is not frozen at all does not veto the
+    others. Pinned by
+    `Mainguard.Server.Tests/AgentPauseTests` (incl. a real docker pause→inspect→unpause leg),
+    `RestartSurvivalTests`, `RestartSurvivalDockerTests`, and the arbiter legs of
+    `Mainguard.Tests/YieldProtocolTests`.
   - **`Runtime/AgentSessionReconciler.cs`** — **the live session store's reconcile against Docker**
     (ISSUES-LOG #18/#20), plus the `AgentSessionReconcilerService` `BackgroundService` that drives it at
     startup and every 30 s. Adoption reads the parent off `mainguard.agent.parent` and hands each adopted
     session to an `onAdopted` hook, which the composition root binds to
-    `AgentSpawnService.TryReattachEndpoint` so an adopted coordinator's tools and an adopted worker's plan
-    channel come back with it (before 2026-09-03 adoption rebuilt the record and nothing else). The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
+    `AgentSpawnService.TryReattachAdoptedAgent` (the W3A wrapper around the endpoint rebuild that used to
+    be called directly as `TryReattachEndpoint`, which is now its private half) so an adopted coordinator's tools and an adopted worker's
+    plan channel come back with it (before 2026-09-03 adoption rebuilt the record and nothing else) —
+    **and, since the W3A pass, its CLI** (audit F6): the exec'd CLI was a `docker exec` child of the dead
+    daemon's PTY, so an adopted agent had four re-bound tools and no process to call them. The hook also
+    fires on the paused → running correction, because `docker exec` into a SIGSTOPped container blocks and
+    a jail adopted frozen has to be re-attached by the pass that thaws it. Two further W3A rules: an
+    adoption is SKIPPED while `AgentSessionStore.IsTearingDown` says a stop is mid-teardown (audit F14 —
+    the stop removes the record seconds before the container goes, and a pass landing in that window
+    resurrected a ghost session that then refused the entry's Resume for half an hour), and the engine's
+    own freeze reason never overwrites a more specific one already on the pause axis. The rework adds the
+    converse of that last rule — `ClearFreezeOnAnAdoptedRunningJail`: a jail Docker lists as RUNNING does
+    not inherit a rehydrated freeze, because every release is two writes (wake the container, clear the
+    axis) and a daemon that died between them left a running jail whose axis said frozen, which the drift
+    pass never cleared (it only clears when the state WORD is Paused, and adoption had just written
+    `Working`). Safe only at adoption, where the key had no record a line earlier so no live owner can be
+    mid-pause on it; `SandboxKillTarget.DeadlineLapsedReason` is exempt, because it says containment could
+    not be READ and a listing is not the confirmation it is waiting for. Adoption
+    also calls `AgentSessionStore.MarkAdopted`, which is the jail reaper's ONE excuse for a jail with no
+    bound CLI — recorded here because this is the only pass that knows the CLI's PTY died with a previous
+    daemon rather than because the agent left. (The F6 re-bind above usually makes that excuse moot: a
+    successfully re-bound CLI clears the mark on the reaper's next sweep — the mark covers the window
+    between adoption and a CLI actually coming back, and the jails where none can.) The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
     table, `LeaderReattachTask` → the PTY leader registry) never wrote to `AgentSessionStore`, which is
     what `ListAgents`/`StreamAgentEvents`/the resource monitor/the kill switch actually render — so a
     restarted daemon reported zero agents while their jails kept running, and a `docker pause`/`unpause`
@@ -532,6 +878,18 @@
     kind) **CLI settings** (`RememberCliSettings`/`TryGetCliSettings`), so an IPC-spawned worker inherits
     the repo's approved-command list instead of stalling on prompts. A blank repo handle forms no scope
     and is dropped rather than collapsed into a shared bucket (MG-6). Never persisted, never logged.
+    **F50 — it now evicts**: `ForgetRepo(repo)` when the repo has no sessions left at all, and
+    `Forget(repo, kind)` when no session of that kind survives AND **no coordinator survives in the
+    repo** (both driven from `AgentSpawnService.StopAsync`, after the harvest that legitimately refreshes
+    it), plus `HasAnythingFor(repo, kind)` as the observable a test asserts on. Nothing evicted anything
+    before, so a provider key and a set of harvested OAuth files stayed resident for the daemon's whole
+    lifetime and stopping every agent left them there. The **coordinator** half of the per-kind condition
+    is load-bearing and was missing in the first cut: `SpawnWorkerAsync` takes the kind from the shim, so
+    a live coordinator spawns workers of ANY installed kind — a user who ran one codex session and
+    stopped it would otherwise leave the claude-code coordinator's every later codex worker booting with
+    no provider key and no login. Pinned end to end by
+    `CoordinatorSpawnKindTests.AWorkerOfAnotherKind_StillGetsThatKindsKey_…` (the key really reaches the
+    worker's jail) and at the cache by `CliSettingsBoundaryTests`' two cross-kind tests.
 - **`Runtime/CoordinatorSpawnGate.cs`** (**MG-2**) — the pure admission decision in front of the
   coordinator's in-jail spawn shim:
   `Evaluate(activeManagedWorkers, maxActiveWorkers, admission, planGate?)` returns a refusal reason or
@@ -656,7 +1014,13 @@
   written-space vs positioned-gap distinction), first-class scroll/pop ops, cursor, modes, and the
   colour wire encoding (high byte 0=default/1=indexed/2=rgb) the client mirrors.
 - **`Runtime/BoundTerminalSession.cs`** (P2-03, extended by P2-18) — the long-lived agent-bound
-  session: raw replay ring + fan-out + `TailText` (unchanged), and with the libvterm engine also one
+  session. **F59:** `Detach()` (daemon shutdown) and `Dispose()` (StopAgent/teardown) share one
+  `TearDownDaemonSide(reapChild)`, and the flag is the whole difference — detach calls
+  `ITerminalSession.Release`, dispose calls `Kill`+`Dispose`. Both used to end in `Dispose`, which for
+  the production `PtySession` is a `Kill`, so "detach" killed exactly what "dispose" killed;
+  `ShutdownDetachTests` now asserts the two apart against a double with `PtySession`'s contract. The
+  write gate is deliberately not disposed (a keystroke racing teardown should fail on the torn-down
+  stream, not on `ObjectDisposedException`). Otherwise: raw replay ring + fan-out + `TailText`, and with the libvterm engine also one
   `VtermSession` fed the same 16 ms VT-safe frames under the session gate — `SubscribeGrid` (atomic
   full snapshot + live `GridUpdate`/`ClipboardCopy` frames), `Resize` (PTY + vterm in the same breath,
   then a fresh snapshot — preceded by a ring-only update carrying the reflow's scrollback pushes/pops
@@ -681,7 +1045,14 @@
   "unknown" is carried explicitly rather than defaulting to a 0 that reads as "idle"),
   **`TerminalGrpcService.cs`** (P2-03/PR3: a
   **bound** CLI session streams replay-then-live frames — a detach only unsubscribes, a locked
-  (managed) attach gets the banner + output but `PERMISSION_DENIED` on input; otherwise the per-attach
+  (managed) attach gets the banner + output but `PERMISSION_DENIED` on input. **F64** fixes three things
+  about that lock: it is evaluated LIVE per frame (a `Func<bool>` over `TerminalLockRegistry`) rather
+  than snapshotted once at attach, so a worker becoming managed mid-attach is honoured on the next
+  frame; a locked attach no longer forwards **Resize** (a resize is a write — SIGWINCH into the managed
+  CLI and a reflow of the daemon's authoritative grid that every other viewer sees); and input is
+  **exclusive** via `BoundTerminalSession.TryClaimInput`, claimed lazily on the first keystroke and
+  released on detach, so two concurrent attaches can no longer interleave keystrokes into one PTY.
+  Otherwise the per-attach
   `PtySession` factory path through `TerminalStreamer`, else — for an agent the session store KNOWS
   but that has no bound CLI — the `DetachedNotice` attach (ISSUES-LOG #23: says so in one unprompted
   frame and discards input, instead of a silent echo that emitted nothing until the user typed and so
@@ -848,23 +1219,41 @@
     `ReadAudit`): the audit store's first production readers. Verification/decryption live in
     `IChainedAuditLog`; on the in-memory fallback journal both RPCs still answer with
     `persistent=false` (a heap verify must never read as tamper-evidence). Coordinator-denied at
-    the `RoleInterceptor`; `ReadAudit` pages are capped at 500 records (payloads carry full
-    prompts/outputs).
+    the `RoleInterceptor`; `ReadAudit` pages are **doubly capped (F64a)** — 500 records AND a 3 MB
+    response budget (`MaxResponseBytes`), because a record carries a decrypted prompt, verification
+    log or merge diff and 500 of them can exceed gRPC's 4 MB default receive limit, which turns the
+    whole page into a ResourceExhausted instead of a short one. The page is always a contiguous
+    prefix and a single oversized record is still returned, so the caller resumes from the last seq
+    it got exactly as it does at the end of the chain; no proto field signals truncation.
   - **`Cli/AuditCommands.cs`** (P2-15) — the offline `mainguardd audit verify [--data <db>]` verb
     (dispatched in `Program.cs` before daemon options, so it can never bind a port): walks the
     chain + mirror via `ChainedAuditLog` and validates stored RFC 3161 anchor tokens structurally
     (an anchor that no longer matches its recorded head hash exits 2 like chain tamper), prints
     head seq/hash; exit contract 0 intact (missing store / pre-chain DB = intact by definition) /
-    2 tampered with first-bad-seq printed / 64 usage / 1 cannot-verify.
+    2 tampered with first-bad-seq printed / 64 usage / 1 cannot-verify. **B3 — it is a READER again:**
+    it built an `AuditCrypto`, whose constructor mints and STORES a master key when there is none, so
+    on a box with no key-ring protector `audit verify` exited 1 with "Refusing to store
+    'audit-payload-key'…" where it previously reported an intact empty chain, and everywhere else it
+    left a key nobody asked for. It now uses `AuditCrypto.TryOpenExisting`, does not even create the
+    key-ring directory, and distinguishes "no key and no records" (0, intact by definition) from "no
+    key but records exist" (1, cannot verify — never reported as OK).
   - **`Runtime/SandboxKillTarget.cs`** (MG-8) — the `IKillTarget` that actually **stops work**, in
     three ordered steps: sever terminal input (`TerminalLockRegistry` + `SessionLeader.PauseInput` —
     in-proc and I/O-free, so they run BEFORE any Docker round-trip and an unreachable engine can never
     leave keystrokes reaching a killed agent), then `docker pause` the jail via
     `ISandboxEngine.PauseAsync` (freezer cgroup — no cooperation needed from the untrusted agent),
-    then mark session state, with an unpausable jail marked `Unresponsive` rather than `Paused`. It
+    then mark session state **and the pause axis** (F16 — it wrote the WORD only, which the merge
+    queue's reflection rewrites, and cleared on release a mark it had never set), with an unpausable jail
+    marked `Unresponsive` rather than `Paused` and a jail whose state could not be READ because the RT-D4
+    deadline lapsed marked `Unresponsive` with a distinct "containment UNCONFIRMED" reason rather than
+    with the measured-failure wording (F22 — the confirmation probe ran on the already-cancelled fan-out
+    token and its catch-all `false` is spelled the same as "Docker says it is running"). It
     REPLACED `SessionStoreKillTarget`, which only wrote `MarkState(…, "Paused")` while every process
     kept executing and every terminal stayed typeable — containment that was really just relabelling.
     Also the **release** half (`UnpauseAsync`, ISSUES-LOG #17): it keeps a per-agent **causation ledger**
+    — durable since W3A, written through `AgentRestartLedger` and rehydrated in the constructor, because
+    "engage the emergency stop, then restart" is the ordinary sequence and the restart used to leave every
+    frozen jail with nothing in the app entitled to wake it (audit F3) —
     of what it actually transitioned — which containers *it* paused, and whether *it* took the terminal
     lock / closed the leader's input gate — and `KillSwitch.ResumeAsync` reverses exactly those entries.
     A jail already frozen when the stop fired (a human pause, or the keep-alive rebase's yield hold —
@@ -874,7 +1263,14 @@
     (a role property) survives the cycle — that was the concern behind the original "Resume deliberately
     does NOT un-contain", honoured precisely instead of by refusing to recover at all. A container that
     no longer exists is released by definition (logged, skipped); an unpause the engine refuses marks the
-    session `Unresponsive` with "the jail is STILL paused" and keeps it in the retry ledger.
+    session `Unresponsive` with "the jail is STILL paused" and keeps it in the retry ledger. **The durable
+    entry is narrowed as the release proceeds and dropped once, at the very end** (W3A rework): dropping it
+    up front — before a single container had been woken — meant a daemon dying inside the fan-out left
+    `KillContained=false` with every jail still paused and the axis still reading "Kill switch engaged", so
+    the next daemon's Resume released nothing, Unpause refused (a claimed reason) and the CLI re-bind
+    skipped (the jail is frozen): a raw `docker unpause` was the only exit, which is the audit's Critical 3
+    written into the code added to close it. Each container leaves the entry only once it has been
+    witnessed awake, so a lost daemon rehydrates exactly what nobody woke.
   - `DaemonHost.cs` registers one `IAgentEnvironment` (`Wsl2AgentEnvironment`) as a singleton, the P2-14
     governance singletons (`ConnectionRoleRegistry`, `TerminalLockRegistry`,
     `IApproverIdentityResolver`, `CoordinatorLimits`, `PlanApprovalService` over a restart-safe
@@ -939,9 +1335,12 @@ and per-subsystem **rolling files** under `~/.mainguard/logs/<subsystem>.log` (5
 survive tier-1/tier-2 upgrades). The 12 categories are `DaemonLogSubsystems.All`
 (`lifecycle · migration · rpc · spawn · egress · gateway · terminal · merge · approval · killswitch · coordinator · intake`);
 a new daemon subsystem adds one name there + one `DaemonLogCategories` constant (the P2-46/P2-49
-extension point). **Mask discipline:** RPC bodies always go through `SecretFieldMask.Redact`; keep
-`LoggingMaskTests` + the `// SECRET`-coverage test green — this is G-13 (secret *transport*, not
-silence: masked logs are compliant). **Core stays log-free** — instrument Server-side
+extension point). **Mask discipline (F56):** RPC bodies are NOT logged — they go through
+`SecretFieldMask.Summarize`, which renders the op, the size and the allowlisted ids and withholds
+everything else by default; keep `LoggingMaskTests`, `SecretFieldMaskAllowlistTests` and the
+`// SECRET`-coverage test green. Adding a proto field never requires a mask entry to stay safe, and
+adding a name to `LoggableNames` is a deliberate decision to publish that field to disk. Log files
+are owner-only (`0700` dir, `0600` files; single-ACE DACL on Windows). **Core stays log-free** — instrument Server-side
 (`Mainguard.Server`) or tee from existing seams (`IAuditLog`, `INetworkTransparencyLog`); the
 operational log is the *diagnostic complement* to the governance audit log, never a replacement.
 `MAINGUARD_LOG_LEVEL` (default Information) sets the floor; per-frame paths (terminal streaming)

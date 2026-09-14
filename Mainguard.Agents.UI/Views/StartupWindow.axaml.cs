@@ -68,6 +68,13 @@ public partial class StartupWindow : Window
             desktop.MainWindow = main;
         }
 
+        // Re-point the control center's on-focus mirror refresh at the window that now IS the main window.
+        // The VM was constructed a few lines above — inside CreateShellWindow — at which moment
+        // desktop.MainWindow was still THIS loader, so anything it bound then was bound to a window about
+        // to be closed. That is why "refresh the mirror when you come back to the window" never fired in
+        // the shipped app; only the 60-second timer did.
+        (ProComposition.LiveAgentSurface as ControlCenterViewModel)?.BindMainWindowActivation(main);
+
         main.Show();
         Close();
     }
