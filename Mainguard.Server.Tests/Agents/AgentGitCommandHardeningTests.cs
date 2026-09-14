@@ -348,6 +348,79 @@ public sealed class AgentGitCommandHardeningTests : IDisposable
         Assert.Contains("cannot be overridden", ex.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// <c>url.&lt;base&gt;.insteadOf</c> — the key that redirects git's REMOTE rather than running a
+    /// command, and the half of this vector #363 left open.
+    ///
+    /// <para>#363 moved the head PEEK off the agent's worktree because one such key made
+    /// <c>ls-remote</c> answer from a remote of the agent's choosing (<c>PrHeadPeekOriginTests</c>). The
+    /// authoritative leg — <c>PrHeadFetcher.FetchHeadAsync</c>'s <c>fetch &lt;url&gt; +&lt;ref&gt;</c>,
+    /// followed by <c>reset --hard FETCH_HEAD</c> — still ran in the agent's own repository, and git
+    /// applies the rewrite to an explicit URL ARGUMENT. This test measures that first (unhardened git
+    /// really does fetch the decoy) and then requires the daemon's path to refuse.</para>
+    ///
+    /// <para>A refusal rather than a <c>-c</c> override, because for this family the key holds the
+    /// replacement and the value holds the prefix: <c>-c url.X.insteadOf=</c> is an EMPTY prefix, which
+    /// matches every URL. The neutralization would be the attack.</para>
+    /// </summary>
+    [Fact]
+    public void UrlInsteadOf_IsRefused_RatherThanLettingTheRepoChooseTheRemote()
+    {
+        var real = NewRepo("insteadof-real");
+        File.WriteAllText(Path.Combine(real, "f.txt"), "the real head\n");
+        AgentTestGit.RunChecked(real, "add", "-A");
+        AgentTestGit.RunChecked(real, "commit", "-q", "-m", "real");
+        var realHead = AgentTestGit.RunChecked(real, "rev-parse", "HEAD").Trim();
+
+        var decoy = NewRepo("insteadof-decoy");
+        File.WriteAllText(Path.Combine(decoy, "f.txt"), "attacker bytes\n");
+        AgentTestGit.RunChecked(decoy, "add", "-A");
+        AgentTestGit.RunChecked(decoy, "commit", "-q", "-m", "decoy");
+        var decoyHead = AgentTestGit.RunChecked(decoy, "rev-parse", "HEAD").Trim();
+        Assert.NotEqual(realHead, decoyHead);
+
+        var agent = NewRepo("insteadof-agent");
+        AgentTestGit.RunChecked(agent, "commit", "-q", "--allow-empty", "-m", "seed");
+        var head = AgentTestGit.RunChecked(real, "symbolic-ref", "--short", "HEAD").Trim();
+
+        // Non-vacuous, and the whole finding in one line: the rewrite redirects an explicit fetch URL.
+        AgentTestGit.RunChecked(agent, "config", "url." + decoy + ".insteadOf", real);
+        AgentTestGit.RunChecked(agent, "fetch", real, "+refs/heads/" + head);
+        Assert.Equal(decoyHead, AgentTestGit.RunChecked(agent, "rev-parse", "FETCH_HEAD").Trim());
+
+        // The daemon's path refuses instead — on the fetch, and on every other subcommand too, because a
+        // repository that declares one is a repository the daemon will not drive.
+        var ex = Assert.Throws<RepoProvisioningException>(
+            () => AgentGitCommand.Run(agent, "fetch", real, "+refs/heads/" + head));
+        Assert.Contains("URL-rewriting key", ex.Message, StringComparison.Ordinal);
+        Assert.Throws<RepoProvisioningException>(() => AgentGitCommand.Run(agent, "status", "--porcelain"));
+
+        // …and removing it restores an ordinary daemon fetch, which brings the REAL head.
+        AgentTestGit.RunChecked(agent, "config", "--unset", "url." + decoy + ".insteadOf");
+        AgentGitCommand.Run(agent, "fetch", real, "+refs/heads/" + head);
+        Assert.Equal(realHead, AgentGitCommand.Run(agent, "rev-parse", "FETCH_HEAD").Trim());
+    }
+
+    [Theory]
+    [InlineData("url.https://mirror.test/.insteadOf")]
+    [InlineData("url./tmp/decoy.git.insteadof")]
+    [InlineData("url.git@host:.pushInsteadOf")]
+    public void UrlRewritingKeys_AreClassifiedAsTransportRedirecting(string key)
+    {
+        Assert.True(GitConfigExecutionSurface.IsTransportRedirecting(key), key);
+        // They execute nothing, so the other classifier must keep saying no about them — the two
+        // questions are different, and conflating them is what would put an empty value on the wire.
+        Assert.False(GitConfigExecutionSurface.IsCommandExecuting(key), key);
+    }
+
+    [Theory]
+    [InlineData("remote.origin.url")]
+    [InlineData("url.https://mirror.test/.someOtherKey")]
+    [InlineData("core.hooksPath")]
+    [InlineData("")]
+    public void NonRewritingKeys_AreNotClassifiedAsTransportRedirecting(string key)
+        => Assert.False(GitConfigExecutionSurface.IsTransportRedirecting(key), key);
+
     /// <summary>The belt must not have made ordinary daemon git any less usable: a clean repository
     /// still stages, commits and reports through the same path.</summary>
     [Fact]
