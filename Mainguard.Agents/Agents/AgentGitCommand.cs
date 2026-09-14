@@ -143,11 +143,32 @@ internal static class AgentGitCommand
     /// <c>require_clean_work_tree()</c>, and <c>commit</c> only reaches a working-tree status on the
     /// "nothing to commit" arm — which both daemon callers gate behind a <c>status</c>/<c>diff</c> that
     /// already carries this flag.</para>
+    ///
+    /// <para><b><c>fetch</c> — the same shape, for the same reason, on the one subcommand that reaches a
+    /// nested repository over the network path.</b> <c>submodule.&lt;name&gt;.fetchRecurseSubmodules</c>
+    /// is a per-submodule key an agent can write into the repository config the daemon fetches in, and
+    /// <c>get_fetch_recurse_config()</c> documents it as overruling "everything except commandline".
+    /// Measured on git 2.55 against the audit's fixture (a populated gitlink, a <c>.gitmodules</c> entry,
+    /// <c>submodule.sub.fetchRecurseSubmodules=true</c> and a <c>remote.origin.uploadpack</c> payload in
+    /// the nested repository, which the enumeration never reads): with the key planted and NO pins the
+    /// payload runs, and it does NOT run when either <c>fetch.recurseSubmodules=false</c> or
+    /// <c>submodule.recurse=false</c> is pinned — <c>builtin/fetch.c</c> gates the whole of
+    /// <c>fetch_submodules()</c> on the merged value, so it never reaches the per-submodule lookup. The
+    /// pins therefore already held, and this flag is not a fix for a measured hole.</para>
+    ///
+    /// <para>It is here because the pins holding is a fact about one git's precedence order, and the
+    /// <c>--[no-]recurse-submodules</c> option is the form git's own documentation names as overriding
+    /// the per-submodule key. Carrying it makes the invariant independent of that precedence fact and
+    /// of the two config pins staying put: <c>AgentGitCommandHardeningTests</c> pins exactly that —
+    /// with both config pins removed, the flag alone keeps the nested payload from running. It costs an
+    /// argument and changes no behaviour (measured across the four fetch shapes the daemon issues,
+    /// including bare-mirror fetches).</para>
     /// </summary>
     private static readonly Dictionary<string, string> SubcommandHardeningFlag = new(StringComparer.Ordinal)
     {
         ["status"] = "--ignore-submodules=all",
         ["diff"] = "--ignore-submodules=all",
+        ["fetch"] = "--recurse-submodules=no",
     };
 
     /// <summary>
