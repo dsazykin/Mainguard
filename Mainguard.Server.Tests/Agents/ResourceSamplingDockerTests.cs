@@ -32,14 +32,16 @@ public class ResourceSamplingDockerTests
 {
     private const string TrivialImage = "busybox:latest";
 
-    [RequiresDockerDaemonFact]
+    // The busybox availability check used to be an inline `if (!await EnsureTrivialImageAsync(...))
+    // return;` — an early return, which xunit reports as Passed. On a registry-less runner this test
+    // therefore reported green having asserted nothing. Same condition (daemon up + busybox present
+    // or pullable), now carried by the attribute so the outcome reads as Skipped with a reason.
+    [RequiresDockerBusyboxFact]
     public async Task Sampler_BusyContainer_ShouldReportRealNonZeroCpuAndMemory()
     {
         using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
         var ct = cts.Token;
-
-        if (!await EnsureTrivialImageAsync(docker, ct)) return;
 
         var suffix = Guid.NewGuid().ToString("N")[..8];
         var agentId = "agent-" + suffix;
@@ -150,23 +152,5 @@ public class ResourceSamplingDockerTests
             await docker.Containers.RemoveContainerAsync(id, new ContainerRemoveParameters { Force = true });
         }
         catch (DockerApiException) { /* best-effort cleanup */ }
-    }
-
-    private static async Task<bool> EnsureTrivialImageAsync(IDockerClient docker, CancellationToken ct)
-    {
-        try
-        {
-            var images = await docker.Images.ListImagesAsync(new ImagesListParameters { All = false }, ct);
-            if (images.Any(i => i.RepoTags is not null && i.RepoTags.Contains(TrivialImage))) return true;
-
-            await docker.Images.CreateImageAsync(
-                new ImagesCreateParameters { FromImage = "busybox", Tag = "latest" },
-                null, new Progress<JSONMessage>(), ct);
-            return true;
-        }
-        catch (DockerApiException)
-        {
-            return false; // no registry access — nothing to prove, skip rather than fail
-        }
     }
 }
