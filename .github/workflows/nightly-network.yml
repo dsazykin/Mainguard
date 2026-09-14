@@ -1,0 +1,139 @@
+name: Nightly network tests (RequiresNetwork)
+
+# =================================================================================================
+# The nightly leg the [RequiresNetworkFact] attribute has always claimed to have, and did not.
+# =================================================================================================
+# `RequiresNetworkFactAttribute` (Mainguard.Tests/TestTools/PlatformFacts.cs) skips unless
+# `MAINGUARD_NETWORK_TESTS=1`, and its own docstring says "the nightly network leg sets it". No
+# workflow set it — anywhere. The one test behind that gate,
+# `Rfc3161AnchorTests.AnchorRoundTrip_ShouldValidateAgainstRealTsa`, is the ONLY thing in the suite
+# that proves a real RFC 3161 timestamp token from a live TSA round-trips and validates against the
+# audit log's head hash. Every other anchoring test drives a scripted client that returns
+# deliberately-invalid bytes, so the "an anchor actually anchors" claim was measured by nothing.
+#
+# This file is that leg. It is deliberately the ONLY place `MAINGUARD_NETWORK_TESTS=1` is set.
+#
+# WHY IT IS NON-BLOCKING FOR PULL REQUESTS
+# -----------------------------------------
+# The test reaches a third-party public TSA (freetsa.org by default; `MAINGUARD_TSA_URL` overrides
+# it for an internal one). A public endpoint's availability is not a property of this repository, so
+# a TSA outage must never turn a PR red — the P2-15 spec calls the suite deterministic, and a
+# network dependency in the merge gate would make that false. Two things keep it out of the way:
+#
+#   1. `paths:` — on a pull request this runs only when the change could plausibly affect it: the
+#      anchoring code, its test, the network-gate attribute, or this file. Every other PR does not
+#      trigger it at all.
+#   2. `continue-on-error: true` on the job — even when it DOES run on a PR, a red result is an
+#      annotation to read, never a merge blocker.
+#
+# The `paths:` filter is the exception to this repo's usual "no path filter on a gate" rule, and the
+# reason it is sound here is the reason it was unsound in e2e-verification.yml: THAT job runs
+# `.mainguard/verify` = the whole suite inside a jail, so its blast radius is the repository. This
+# job runs one test whose blast radius is enumerable — and the filter names this workflow file
+# itself, so the PR that changes the wiring is always the PR that proves the wiring runs.
+#
+# The nightly `schedule` leg carries no `continue-on-error`: there, a failure is the entire point.
+#
+# ON `schedule` AND `workflow_dispatch` NOT BEING LIVE YET — READ THIS BEFORE BELIEVING THE GATE
+# ----------------------------------------------------------------------------------------------
+# GitHub only honours `schedule` and `workflow_dispatch` for workflow files that exist on the
+# DEFAULT branch. This file arrives on `phase2`, so those two legs are INERT until phase2 reaches
+# main — the same caveat e2e-verification.yml records for itself. The `pull_request` leg works
+# immediately, which is what makes the introducing PR able to demonstrate the test actually running.
+# =================================================================================================
+
+on:
+  schedule:
+    # 05:30 UTC — half an hour after e2e-verification.yml, so the two nightlies do not compete for
+    # runner capacity, and a break is waiting in the morning rather than never being found.
+    - cron: '30 5 * * *'
+
+  workflow_dispatch:
+
+  pull_request:
+    branches: [main, phase2, 'feat/**', 'fix/**']
+    paths:
+      - '.github/workflows/nightly-network.yml'
+      - 'Mainguard.Git/Audit/**'
+      - 'Mainguard.Server/Runtime/AuditAnchorService.cs'
+      - 'Mainguard.Tests/Rfc3161AnchorTests.cs'
+      - 'Mainguard.Tests/TestTools/PlatformFacts.cs'
+
+concurrency:
+  group: nightly-network-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  network-tests:
+    name: RequiresNetwork suite (live TSA)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Non-blocking on a pull request; hard on the nightly schedule, where a failure is the signal.
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # MG-35: same locked restore as every other job — a nightly that resolved a different closure
+      # than the merge gate would be measuring a different product.
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
+
+      - name: Build Mainguard.Tests
+        run: dotnet build Mainguard.Tests/Mainguard.Tests.csproj --no-restore --configuration Release
+
+      # ---------------------------------------------------------------------------------------------
+      # The point of the whole file. MAINGUARD_NETWORK_TESTS=1 is set HERE and nowhere else in CI.
+      #
+      # The filter names the test explicitly rather than a category, because there is exactly one
+      # [RequiresNetworkFact] in the tree and running the rest of Mainguard.Tests here would only
+      # re-run what ci.yml already gates. The trx assertion below is what stops "explicit" from
+      # decaying into "stale": a renamed method leaves the filter matching nothing, and `dotnet test`
+      # runs zero tests and exits 0 perfectly happily.
+      # ---------------------------------------------------------------------------------------------
+      - name: The RFC 3161 anchoring round trip, against a live TSA
+        env:
+          MAINGUARD_NETWORK_TESTS: "1"
+          # F53 — CI-only throwaway; see the long note on ci.yml's `build-and-test` Test step. This
+          # is a Linux `dotnet test` and the test under it writes to the audit log, so without a
+          # protector SecureKeyring refuses the fail-closed `audit-payload-key`. Deliberately NOT
+          # MAINGUARD_ALLOW_UNPROTECTED_KEYRING, which would bypass the protector rather than run it.
+          MAINGUARD_KEYRING_PASSPHRASE: "ci-throwaway-not-a-secret"
+          # Set the repository variable MAINGUARD_TSA_URL to point at an internal TSA. The `||`
+          # fallback is load-bearing: an UNSET repo variable expands to the empty string, and the
+          # test reads `GetEnvironmentVariable(...) ?? default` — an empty string is not null, so
+          # without the fallback an unset variable would hand `new Uri("")` a value it cannot parse
+          # and the leg would fail for a configuration reason dressed up as a TSA failure.
+          MAINGUARD_TSA_URL: ${{ vars.MAINGUARD_TSA_URL || 'https://freetsa.org/tsr' }}
+        run: >
+          dotnet test Mainguard.Tests/Mainguard.Tests.csproj
+          --no-build --configuration Release --verbosity normal
+          --logger "trx;LogFileName=network.trx" --results-directory ${{ runner.temp }}/trx
+          --filter "FullyQualifiedName~Rfc3161AnchorTests.AnchorRoundTrip_ShouldValidateAgainstRealTsa"
+
+      # A run in which the test SKIPPED exits 0 — which is precisely how this gate could have been
+      # "added" without ever measuring anything, the same defect ticket #65 found in the opt-in E2E
+      # legs. Assert from the trx that it actually executed, so a future skip (the env var stops
+      # being read, the method is renamed, the attribute changes its variable name) fails the job
+      # instead of passing it quietly.
+      - name: Assert the leg actually ran (a skipped network gate is a failed network gate)
+        if: always()
+        run: |
+          set -euo pipefail
+          TRX="${{ runner.temp }}/trx/network.trx"
+          if [ ! -f "$TRX" ]; then
+            echo "::error::no .trx produced — cannot prove the network leg executed, so this job must not report success"
+            exit 1
+          fi
+          EXECUTED="$(grep -oP '<Counters[^>]*executed="\K[0-9]+' "$TRX" | head -1)"
+          echo "trx=$TRX executed=$EXECUTED"
+          if [ -z "$EXECUTED" ] || [ "$EXECUTED" -lt 1 ]; then
+            echo "::error::expected 1 executed test, got '${EXECUTED:-none}' — the network leg SKIPPED. MAINGUARD_NETWORK_TESTS, or the --filter method name, is wrong."
+            exit 1
+          fi
+          echo "The RequiresNetwork leg executed."
