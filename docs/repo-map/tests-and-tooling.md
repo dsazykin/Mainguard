@@ -1479,7 +1479,13 @@
   root for paths that CROSS the container boundary: macOS serves the temp dir behind `/var →
   /private/var`, host git canonicalizes its gitdir/alternates, and a jail has no `/var` symlink —
   so a fixture root in the raw spelling hands in-jail git a dangling pointer. Used by
-  `SandboxFixture` and the MG-3 mirror test; production roots (`~/mainguard`) are symlink-free.
+  `SandboxFixture`, the MG-3 mirror test, and — since verification gained a pre-run probe that asks
+  the JAIL's git whether the worktree is clean — `MergeQueueEndToEndDockerTests` and
+  `QueueEntryResumeDockerTests`, whose VM roots hold the agent repositories and worktrees those
+  pointers name. Those two were the last raw-`Path.GetTempPath()` holdouts, which made their whole
+  merge leg unrunnable on a Mac (every verification refused with "not a git repository") while CI
+  stayed green, since Linux's temp path is `/tmp` and no symlink serves it. Production roots
+  (`~/mainguard`) are symlink-free.
 - **`Mainguard.Server.Tests/Agents/AgentEnvironmentFactoryTests.cs`** — pins the composition-root
   substrate choice (macOS → `MacHostAgentEnvironment`, elsewhere → `Wsl2AgentEnvironment`), the
   macos-host sync-remote shape (`mainguard-local` + local bare path, SC-2), and the deliberate
