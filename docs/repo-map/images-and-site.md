@@ -18,7 +18,18 @@
   by name in the jail with no image rebuild; the daemon itself launches by the marker's ABSOLUTE argv,
   so this is for the agent's own shell, and an absent mount is just an empty PATH entry. **Caveat:** a
   LOGIN shell (`bash -l`) re-derives PATH from `/etc/profile` and drops both this and `/opt/toolchain`
-  — pre-existing, affects the Nix toolchain equally), `seccomp.json` (the default-deny profile itself
+  — pre-existing, affects the Nix toolchain equally; **`git config --system --add safe.directory
+  /workspace`** — the bind-mounted worktree is owned by the DAEMON's uid while every in-jail git runs
+  as `agent` (uid 1000), which userns-remap guarantees are different uids, so without this entry git's
+  ownership check refused every in-jail git with `fatal: detected dubious ownership in repository at
+  '/workspace'`. In-jail *scripts* used to add the exception themselves (`CliSettingsRoundTripDocker
+  Tests` still does); the daemon's verification cleanliness/HEAD probe spawns `git status` with no
+  shell and no environment of its own and could not, which is what made nine merge-queue E2E tests
+  refuse. **SYSTEM scope specifically**: `safe.directory` is honoured only in protected configuration,
+  and git documents `-c`/`GIT_CONFIG_*` as excluded — measured ignored in this repo at git 2.45
+  (`UncRemoteTrust`) even though this image's git 2.39.5 happens to honour it. Confined to the
+  container: host-side git sets `GIT_CONFIG_NOSYSTEM=1`/`GIT_CONFIG_SYSTEM=/dev/null`
+  (`AgentGitCommand.HardeningEnv`) and never reads it), `seccomp.json` (the default-deny profile itself
   — the canonical moby default with the three memory-inspection syscalls denied; **embedded into
   `Mainguard.Agents` and returned verbatim by `SeccompProfile.Json`** — one source of truth, what the
   tests assert equals what the container runs), `README.md`. **v1 provisioning:** this source tree
