@@ -470,7 +470,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `AgentRefWatcher` raises `Advanced` only on `Published`, so an eager publish here would disarm
       `WorkerReadinessTrigger` for the very commit it exists to react to. **W1-A rework**: those git calls
       — and `RemoveAgentWorktree`'s dirty check — run under a `TrustedWorktreeLayout` from the private
-      `PinFor(repoHash, agentId, worktreePath)`; the CREATION-time `remote remove`/`remote add` in
+      `PinFor(repoHash, agentId, worktreePath)`, whose trusted root comes from `TrustedRepoRootFor` —
+      the per-agent repository since MG-3, the shared MIRROR for a worktree made before it. That
+      distinction is load-bearing and the first cut had it backwards: `PinFor` and `CheckAgentBranch` both
+      named the per-agent repository unconditionally, which for a legacy worktree is a path that does not
+      exist and whose common dir legitimately IS the mirror — so the resolution refused as "shared
+      mirror", the alignment probe answered `Unknown`, and `CommitAgentWork` / `RemoveAgentWorktree(force:
+      false)` could not operate on the shape `RemoveAgentWorktree`'s own mirror-as-owner branch exists to
+      support. The branch is chosen by a daemon-owned fact (does the per-agent repo exist on disk), never
+      by anything an agent writes, and the mirror is read-only in every jail, so the legacy arm cannot be
+      manufactured. The CREATION-time `remote remove`/`remote add` in
       `FinishWorktreeLocked` deliberately do not, because they run between `worktree add` and the jail's
       first existence, when there is no agent yet to have written the pointers they would validate);
       `RemoveAgentWorktree(force)` (dirty non-force → typed refusal; force → `remove --force`, then
@@ -551,7 +560,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       primitive and maps a non-zero exit to a typed exception; NOT a second runner, spawns nothing.
       Carries the **MG-1** hardening on every daemon-side git — `core.hooksPath=/dev/null`,
       `core.fsmonitor=`, `protocol.ext.allow=never` via command-line `-c` plus
-      `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL=/dev/null` — which **MG-3 narrowed rather than retired**:
+      `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL=/dev/null`, plus a per-subcommand flag table for the pins a
+      repository can talk git out of (`--ignore-submodules=all` on `status`/`diff`;
+      `--recurse-submodules=no` on `fetch`, so the fetch-recursion invariant no longer rests on git's
+      config precedence order — measured, `fetch.recurseSubmodules=false` and `submodule.recurse=false`
+      each already held it, and the flag holds it with BOTH removed) — which **MG-3 narrowed rather than
+      retired**:
       the shared mirror is now read-only to every jail, so its `config`/`hooks` are no longer an attack
       surface at all, and what remains to defend is the per-agent repo + worktree, which the daemon also
       runs git against). All git routes through `GitService.RunGit`; the only process spawn here is the
@@ -595,6 +609,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `GitConfigExecutionSurface` (same file) — the **pure** classifier for "config keys git will spawn a
       command from", unit-pinned family by family so the list is a tested artifact. Deliberately excludes
       `alias.*` (a git alias cannot shadow a built-in and the daemon invokes nothing else).
+      It answers a SECOND, separate question too: `IsTransportRedirecting` — `url.<base>.insteadOf` /
+      `pushInsteadOf`, which execute nothing (so `IsCommandExecuting` rightly says no) but silently rewrite
+      the remote git contacts, **including a fetch URL the daemon passes as an argument**. Measured: with
+      every pin applied, `fetch <realUrl> +<ref>` in a repository declaring one lands the DECOY's commit in
+      `FETCH_HEAD` — and `PrHeadFetcher.FetchHeadAsync`'s next line is `reset --hard FETCH_HEAD`, so the
+      external-PR worktree and the head SHA the intake records as "PR #n" become the PR author's choice.
+      (#363 closed only the PEEK half of this, by moving `ls-remote` to the mirror.) It is a typed REFUSAL
+      rather than a `-c key=` override, because for this family the KEY holds the replacement and the VALUE
+      holds the prefix: an empty value is an empty prefix, which matches every URL — the neutralization
+      would BE the attack. Not a regression for any legitimate repository: the daemon writes no `url.*` key
+      and system/global config are already dropped.
     - `TrustedWorktreeLayout` (same file) — W1-A layer 2. Resolves an agent worktree's git layout from
       DAEMON-computed roots and validates it, instead of letting git discover it from the agent-writable
       `.git` pointer file and `commondir`. When the caller knows `AgentRepoLayout.AgentRepoPath` the layout
@@ -935,7 +960,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       **W1-A rework**: `WorktreeRegistrationFiles(agentRepoPath, worktreePath)` re-mounts the two files the
       pointer LEADS to — `<agentRepo>/worktrees/<name>/{commondir,gitdir}` — read-only on top of the
       read-write per-agent repo, for the same reason and with the same "written once by `worktree add`"
-      justification. `commondir` is the one that matters most: git's files ref backend resolves it with
+      justification. `LayoutPinMountTargets(agentRepoPath, worktreePath)` names those three in-jail
+      targets in ONE place, because they have two readers that must not drift: `Build` mounts them, and
+      `DockerSandboxEngine`'s reuse path treats a jail missing any of them — or carrying one read-write —
+      as stale (mounts are fixed at create, so a jail made after MG-3 but before W1-A passes every other
+      reuse check with the whole redirect chain writable). `ContainerSpecBuilderTests` asserts the two
+      agree. `commondir` is the one that matters most: git's files ref backend resolves it with
       `get_common_dir_noenv()`, so it follows that FILE even when the daemon pinned `GIT_COMMON_DIR`
       elsewhere — rewriting one line there put daemon ref writes into the shared mirror with every pin
       correct. Everything else in the registration (HEAD, index, logs, refs) stays writable.
@@ -1154,7 +1184,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       creates its own file in the tmpfs directory Docker mounted owned by it. `HasOwnedSecretDirsAsync`
       adds `staleSecretLayout` to the reuse staleness list, because tmpfs entries are fixed at create and
       reusing a pre-upgrade jail would exec a non-root owner into a directory that does not exist —
-      resurrecting the same EPERM for every container that outlived the upgrade.
+      resurrecting the same EPERM for every container that outlived the upgrade. `missingLayoutPins` is
+      the same argument for **W1-A**, one layer below `writableMirror`: a jail created after MG-3 but
+      before W1-A carries the agent-repo mount and a read-only mirror, so it satisfies every other check
+      while leaving `/workspace/.git` and the `commondir`/`gitdir` it names writable from inside. The
+      targets come from `ContainerSpecBuilder.LayoutPinMountTargets`, and a missing pin and a read-write
+      pin are the same verdict: recreate.
       **F24 — the reuse path now writes the jail's SECRETS too** (`agent.env` + `oob.key`, before the
       restores below it). Both live on tmpfs, which Docker recreates EMPTY on `docker start`, and the
       launcher mints a fresh gateway token every launch while `Issue` retires the previous one — so a
@@ -1924,6 +1959,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `docker pause` a paused jail), runs `git rebase --abort` under `GitMutationGuard.RunGuarded`, and
       resumes. Both refuse and forget the parking once the rebase is no longer in progress. Neither is the
       T-04 resolver.
+      **W1-A on this path**: `rebase --abort` moves a branch and rewrites a worktree the agent can write,
+      and it was reaching git through a plain unpinned call — the layout layer did not cover it. The
+      private `PinnedLayoutFor(repoHandle, agentId, worktreePath)` resolves the pin from
+      `LocateAgentWorktree`'s daemon-computed roots (so nothing has to be carried on `ConflictHandoff` or
+      `ParkedRebaseConflict`, where it would be a stale snapshot by the time a human clicks), and it runs
+      FIRST — before the unpause, before the yield, and before `TryOpenParkedConflict`, because "is the
+      rebase still in progress" is itself answered by following the worktree's pointer chain, so on a
+      redirected worktree that check reads a different repository and silently CLEARS the parking. A
+      tampered layout is now a refusal that pauses nothing and keeps the record.
+      `MeasureConflictedPaths` is pinned the same way (a refused layout reads as "not measured", which is
+      already how an empty list is read).
       **The conflict arm re-asserts `AgentRunState.Conflict` AFTER `Block`**, because the queue transition
       `Block` performs reflects the MERGE word onto the same session field the run state uses
       (`MarkMergeState` and `MarkRunState` are one field, two vocabularies) — so a `docker pause`d worktree

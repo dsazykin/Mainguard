@@ -284,6 +284,42 @@ public class ContainerSpecBuilderTests
         Assert.True(Assert.Single(create.HostConfig.Mounts, m => m.Source == bare).ReadOnly);
     }
 
+    /// <summary>
+    /// W1-A — <see cref="ContainerSpecBuilder.LayoutPinMountTargets"/> must name EXACTLY the read-only
+    /// layout mounts <see cref="ContainerSpecBuilder.Build"/> actually produces.
+    ///
+    /// <para>The list has a second consumer that <c>Build</c> does not: <c>DockerSandboxEngine</c>'s
+    /// reuse check treats a jail missing any of these targets — or carrying one read-write — as stale and
+    /// recreates it, because mounts are fixed at container create and a jail created after MG-3 but
+    /// before W1-A passes every other reuse check while keeping the whole redirect chain writable. Two
+    /// readers of one truth is exactly the shape that drifts, so the agreement is asserted rather than
+    /// assumed: if a fourth layout file is ever pinned and only <c>Build</c> learns about it, the reuse
+    /// path would go on reusing jails that do not have it, silently.</para>
+    /// </summary>
+    [Fact]
+    public void LayoutPinMountTargets_NamesExactlyTheReadOnlyLayoutMounts_Build_Produces()
+    {
+        const string bare = "/home/mainguard/mainguard/repos/abc123def456abc123.git";
+        const string agentRepo = "/home/mainguard/mainguard/agents/abc123def456abc123/agent-1.git";
+        var create = ContainerSpecBuilder.Build(
+            ValidRequest() with { BareRepoPath = bare, AgentRepoPath = agentRepo });
+
+        var expected = ContainerSpecBuilder.LayoutPinMountTargets(agentRepo, Ext4Worktree);
+        Assert.Equal(3, expected.Count);
+
+        foreach (var target in expected)
+        {
+            var mount = Assert.Single(create.HostConfig.Mounts, m => m.Target == target);
+            Assert.True(mount.ReadOnly, target);
+        }
+
+        // …and the names themselves, so a silent change of shape (a different `.git` target, a rename of
+        // commondir/gitdir) fails here rather than in a Docker tier nobody runs locally.
+        Assert.Contains(ContainerSpecBuilder.WorkspaceGitPointerTarget, expected);
+        Assert.Contains(agentRepo + "/worktrees/" + Ext4Worktree[(Ext4Worktree.LastIndexOf('/') + 1)..] + "/commondir", expected);
+        Assert.Contains(agentRepo + "/worktrees/" + Ext4Worktree[(Ext4Worktree.LastIndexOf('/') + 1)..] + "/gitdir", expected);
+    }
+
     [Theory]
     [InlineData("/mnt/c/Users/dev/agents/abc/agent-1.git")]
     [InlineData(@"C:\mainguard\agents\abc\agent-1.git")]

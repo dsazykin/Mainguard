@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents;
+using Mainguard.Agents.Agents.Adapters;
 using Mainguard.Agents.UI.ViewModels;
 using Mainguard.App.Shell.ViewModels;
 using Mainguard.Git;
@@ -225,6 +226,41 @@ public class ApiKeySettingsViewModelTests
     {
         Assert.Equal(confinable, ApiKeySettingsViewModel.ProviderCanBeGatewayConfined(provider));
         Assert.Equal(confinable, ApiKeySettingsViewModel.ConfinementNoticeFor(provider) is null);
+    }
+
+    /// <summary>
+    /// The fallback that <see cref="ApiKeySettingsViewModel.ProviderCanBeGatewayConfined"/> documents —
+    /// "a manifest we cannot read answers null, it does not throw" — has to name the exception the parse
+    /// really raises.
+    ///
+    /// <para>It did not. The filter listed <c>InvalidOperationException</c>, <c>JsonException</c> and
+    /// <c>ArgumentException</c>; <c>AdapterManifest.Parse</c> raises <c>AdapterManifestException</c> and
+    /// nothing else — it derives straight from <see cref="Exception"/> and it WRAPS the
+    /// <c>JsonException</c> a malformed document throws, so not one of the three could ever have fired.
+    /// A malformed shipped manifest would have thrown out of a property getter while the provider
+    /// settings page refreshed, which is precisely what the nullable return exists to prevent.</para>
+    ///
+    /// <para>Asserted on the parse rather than through the view model because the manifest it reads is
+    /// the SHIPPED one and there is no seam to hand it a broken document — so the fact the filter
+    /// depends on is pinned where it lives, and a future exception type that stops matching is caught
+    /// here.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("not json at all")]
+    [InlineData("{}")]
+    [InlineData("{\"adapters\":[{\"displayName\":\"x\"}]}")]
+    public void AMalformedManifest_ThrowsOnlyAdapterManifestException_WhichIsNoneOfTheOtherFilteredTypes(
+        string json)
+    {
+        var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(json));
+
+        // The reason none of the three could ever have matched, stated as the fact it is: this type
+        // derives from Exception directly. (The `is` form of this assertion does not even compile —
+        // the compiler rejects the patterns as unsatisfiable, which is the finding in one diagnostic.)
+        Assert.Equal(typeof(Exception), typeof(AdapterManifestException).BaseType);
+        Assert.IsNotType<InvalidOperationException>(ex);
+        Assert.IsNotType<System.Text.Json.JsonException>(ex);
+        Assert.IsNotType<ArgumentException>(ex);
     }
 
     /// <summary>The notice reaches the surface a user actually reads: the stored-key row. Only for a

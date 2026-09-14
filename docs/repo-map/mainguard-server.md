@@ -135,6 +135,16 @@
     upstream (`IsGoogleHost`). Pinned by `GatewayUpstreamBindingTests` (unit) and
     `GatewayConfinementDockerTests.ConfinedGeminiJail_…` (a real jail, since the existing Docker
     coverage used the Anthropic shape only).
+    **Provider-host classification is a DOMAIN test, not a string suffix** (`IsWithinDomain`). Both
+    selectors were a bare `EndsWith`, which has no notion of a label boundary: `evilgoogleapis.com` ends
+    with `googleapis.com` and `notanthropic.com` ends with `anthropic.com`, so either was classified
+    first-party and handed the daemon-held provider key in that provider's own header shape. The bound
+    upstream is an adapter manifest's `modelHost`, so a lookalike is a supplied string, not a
+    hypothetical; the Google arm arrived with F46 and the Anthropic one predates the audit baseline. Exact
+    match or a dot-delimited suffix now, with the apex and the trailing-dot FQDN spelling both accepted.
+    It fixes the CLASSIFICATION, not an egress decision — an unrecognised upstream still receives the key
+    as `Authorization: Bearer`, which `GatewayUpstreamBindingTests` asserts rather than glosses; deciding
+    which hosts may be BOUND belongs to the spawn path that reads the manifest.
   - **`Runtime/GatewayHostedService.cs`** — runs the RT-D1 boot sequence + the token-bucket pump loop on
     host start.
   - **`Runtime/WorkerReadinessHostedService.cs`** — the boot slot whose ENTIRE job is to **resolve**
