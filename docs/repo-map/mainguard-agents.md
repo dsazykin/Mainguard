@@ -375,8 +375,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       shell with no exec bit to check. `AgentBranchGuard.Probe` + `AgentBranchAlignment` are the
       backstop — measured `symbolic-ref`/`rev-parse`/`merge-base --is-ancestor`, never a guess, with
       `Unknown` deliberately distinct from "aligned"; `Describe` is the operator report naming the actual
-      branch, the expected branch and a recovery that was actually computed. Auto-recovery is
-      **rejected** — see `docs/design/agent-branch-confinement.md` §4).
+      branch, the expected branch and a recovery that was actually computed. **W1-A rework**: `Probe` runs
+      those three commands under a `TrustedWorktreeLayout` pinned from `agentRepoPath`, because it decides
+      whether an agent's work is on the branch the merge queue reads and it runs in a live agent's
+      worktree; a refused layout is `Unknown`, which every caller already treats as "not evidence of
+      alignment". Auto-recovery is **rejected** — see `docs/design/agent-branch-confinement.md` §4).
     - `AgentRefMediator.cs` (**MG-3 stage 2** — the ONE path by which anything an agent produced reaches
       the shared mirror, and the reason the design chose daemon-FETCH over push-to-daemon: with a push
       model the agent proposes `old new refname` triples the daemon must validate forever and correctly,
@@ -453,7 +456,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       distinct from `Committed` so a clean tree is never reported as recorded work, and pointedly NOT
       publishing —
       `AgentRefWatcher` raises `Advanced` only on `Published`, so an eager publish here would disarm
-      `WorkerReadinessTrigger` for the very commit it exists to react to);
+      `WorkerReadinessTrigger` for the very commit it exists to react to. **W1-A rework**: those git calls
+      — and `RemoveAgentWorktree`'s dirty check — run under a `TrustedWorktreeLayout` from the private
+      `PinFor(repoHash, agentId, worktreePath)`; the CREATION-time `remote remove`/`remote add` in
+      `FinishWorktreeLocked` deliberately do not, because they run between `worktree add` and the jail's
+      first existence, when there is no agent yet to have written the pointers they would validate);
       `RemoveAgentWorktree(force)` (dirty non-force → typed refusal; force → `remove --force`, then
       `ReapBranch` — `branch -D` **only when `AgentRefMediator.MayReap` proves the delete destroys
       nothing**, i.e. the tip is already contained in the mirror's integration branch — then delete the
@@ -536,9 +543,60 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the shared mirror is now read-only to every jail, so its `config`/`hooks` are no longer an attack
       surface at all, and what remains to defend is the per-agent repo + worktree, which the daemon also
       runs git against). All git routes through `GitService.RunGit`; the only process spawn here is the
-      injectable pnpm runner. `RunWithEnv` is the one env-accepting overload — extra env merged UNDER
-      the hardening pins (re-applied last, so a caller cannot un-pin them) — added for the queue
-      seeder's scratch `GIT_INDEX_FILE` plumbing.
+      injectable pnpm runner. `RunWithEnv`/`TryRunWithEnv` are the env-accepting overloads — extra env
+      merged UNDER the hardening pins (re-applied last, so a caller cannot un-pin them) — added for the
+      queue seeder's scratch `GIT_INDEX_FILE` plumbing and reused by the W1-A pinned-layout callers.
+      **W1-A closed the `filter.*` concession**: MG-1's fixed `-c` list cannot express a wildcard family,
+      so `filter.<d>.clean|smudge|process`, `diff.<d>.command|textconv`, `merge.<d>.driver` and friends
+      used to be written off as "confined to the per-agent repo" — confined in location, not execution,
+      since the keep-alive rebaser and the PR head fetcher run git there as the daemon user on the host.
+      Every invocation now ENUMERATES the target repository's effective config
+      (`git config --list --name-only -z`, which executes nothing) and emits `-c <key>=` for every key in
+      a command-executing family (empty is git's own "no driver"); a key whose name cannot be expressed
+      on the command line — a subsection containing `=`/whitespace — is a typed refusal, never a silently
+      misapplied override. The always-on pin list gained exactly ONE key, `safe.directory=` (the
+      protected-scope reset that makes git's ownership check provably strict on agent-owned paths), plus
+      `GIT_EDITOR`/`GIT_SEQUENCE_EDITOR=:` in the env. It deliberately stops there: pinning the other
+      fixed-name knobs empty was tried and `-c diff.external=` broke every CLEAN repository — git reads an
+      empty `diff.external`/`diff.<d>.command`/`diff.<d>.textconv` as a command to RUN, not as "none", so
+      the daemon's `git diff` died with `error: cannot run :` and the merge queue's flagged-change gate
+      silently took `CanMerge` false (caught by `MergeQueueProvisionerTests`; pinned now by
+      `CleanRepository_StillProducesARealDiff_ThroughTheDaemonPath`). "Empty means disabled" is a per-key
+      fact, not a rule, so it is only relied on where the enumerator has seen the key actually declared —
+      there the worst case is a loud failure on a repository that planted an executable value.
+      **W1-A rework — the enumeration reads ONE repository and git does not stay in one.** `status`/`diff`
+      call `is_submodule_modified()` for every POPULATED gitlink (mode 160000 whose `<path>/.git` exists —
+      no `.gitmodules` needed), which spawns `git status --porcelain=2` inside a repository whose
+      `filter.<d>.clean` was never enumerated and whose `GIT_DIR` pin `prepare_submodule_repo_env()` drops;
+      `fetch` defaults to `fetch.recurseSubmodules=on-demand`. So recursion is now pinned off at the source
+      (`-c diff.ignoreSubmodules=all -c submodule.recurse=false -c fetch.recurseSubmodules=false
+      -c status.submoduleSummary=false`), with `--ignore-submodules=all` injected AFTER the subcommand for
+      `status`/`diff` — not redundant: the config pin is a default that
+      `set_diffopt_flags_from_submodule_config()` clears for a repo declaring `submodule.<n>.ignore`, and
+      only the CLI option also sets `override_submodule_config`. `git add` has no such option and
+      `builtin/add.c` never loads `git_diff_ui_config`, so `GitlinkExclusions` reads the index
+      (`ls-files --stage -z` — no child git, no filter) and appends `:(exclude,literal)<path>` for every
+      populated gitlink. Measured cost, tested: daemon-side git stops SEEING submodule pointer moves (the
+      agent's own in-jail git still records them). `gpg.ssh.defaultKeyCommand` joined the classifier —
+      `commit.gpgsign=true` + `gpg.format=ssh` + no `user.signingkey` runs it through a shell on every
+      commit the daemon makes and every one a rebase replays.
+    - `GitConfigExecutionSurface` (same file) — the **pure** classifier for "config keys git will spawn a
+      command from", unit-pinned family by family so the list is a tested artifact. Deliberately excludes
+      `alias.*` (a git alias cannot shadow a built-in and the daemon invokes nothing else).
+    - `TrustedWorktreeLayout` (same file) — W1-A layer 2. Resolves an agent worktree's git layout from
+      DAEMON-computed roots and validates it, instead of letting git discover it from the agent-writable
+      `.git` pointer file and `commondir`. When the caller knows `AgentRepoLayout.AgentRepoPath` the layout
+      is COMPUTED (`GIT_DIR = <agentRepo>/worktrees/<the daemon's own worktree directory name>`) and the
+      pointer is read back only as a tamper alarm; without it the pointer selects the repository and is
+      shape-checked, mirror-checked and round-trip-checked. **Rework: it fails CLOSED.** Null now means
+      only "there is no linked-worktree indirection here" (a real `.git` DIRECTORY, or none at all) — once
+      `.git` is a FILE every exit is a validated layout or a typed refusal. It used to return null on any
+      validation failure and both callers read null as "run unpinned", so blanking
+      `worktrees/<n>/gitdir` was the whole exploit. **And the pin alone is not sufficient**: git's files
+      ref backend builds its common dir with `get_common_dir_noenv()`, so `GIT_COMMON_DIR` does not reach
+      it and the `commondir` FILE does — measured, a commit with every pin correct still advanced the
+      MIRROR's `refs/heads/main`. `AssertCommondirFileAgrees` therefore reads that file, only ever to
+      refuse, and `ContainerSpecBuilder` re-mounts it (and `gitdir`) read-only in the jail.
   - **`Agents/Bootstrap/`** (P2-05 MainguardOS bootstrapper — client-side; gets a WSL2-enabled
     Windows machine to a health-checked `mainguardd`).
     - `WslConfigMerger.cs` (the **pure**, IO-free INI merge for `%UserProfile%\.wslconfig`: adds only
@@ -856,7 +914,20 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       is the persisted document clamped over `SandboxLimits.Default`, `Set` clamps to [512 MiB, 64 GiB] ×
       [0.5, 64] CPUs, persists, audits `jail_limits_changed` and answers AS PERSISTED. Read-side clamp too,
       so a hand-edited zero is never a ceiling of zero. Defaults kept at 2 GiB / 2 CPUs; no fleet cap.)
-    - `ContainerSpecBuilder.cs` (**macOS agent-IPC fix**: `IpcOutboxPath` adds a READ-WRITE mount at
+    - `ContainerSpecBuilder.cs` (**W1-A**: `WorktreeGitPointer(worktreePath)` + `WorkspaceGitPointerTarget`
+      re-mount the worktree's `.git` POINTER FILE **read-only at `/workspace/.git`**, nested inside the
+      still-read-write workspace. `git worktree add` writes that one line once and nothing ever writes it
+      again, but it lives in the agent's workspace and it is the first thing any git run there reads —
+      including the daemon's, outside the jail; aiming it at the read-only shared mirror was the audit's
+      "plausible second vector". Travels with `AgentRepoPath`, which is what makes `.git` a file at all.
+      **W1-A rework**: `WorktreeRegistrationFiles(agentRepoPath, worktreePath)` re-mounts the two files the
+      pointer LEADS to — `<agentRepo>/worktrees/<name>/{commondir,gitdir}` — read-only on top of the
+      read-write per-agent repo, for the same reason and with the same "written once by `worktree add`"
+      justification. `commondir` is the one that matters most: git's files ref backend resolves it with
+      `get_common_dir_noenv()`, so it follows that FILE even when the daemon pinned `GIT_COMMON_DIR`
+      elsewhere — rewriting one line there put daemon ref writes into the shared mirror with every pin
+      correct. Everything else in the registration (HEAD, index, logs, refs) stays writable.
+      **macOS agent-IPC fix**: `IpcOutboxPath` adds a READ-WRITE mount at
       `/opt/mainguard/ipc/outbox`, **nested inside** the read-only IPC mount so the shim and the operating
       instructions stay the daemon's files. It is the coordinator jail's only writable bind mount, so the
       guard is exact rather than shaped — the source must be the `outbox/` child of THIS request's IPC dir
@@ -903,6 +974,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `EgressAllowlist.cs` (model + JSON persistence + `allowlist_changed` audit events; `DefaultEntries`
       = model APIs + package registries with **no git host** (A6);
       `EgressAllowlistEntry.DefeatsA6`/`LooksLikeGitHost` flag a git-host entry).
+      **F31 — `EgressHostPattern` lives here and nothing stores an unvalidated pattern any more.** The
+      grammar is the one a resolvable hostname already satisfies (an optional `*.` prefix, then
+      dot-separated LDH labels, ≤253 chars; IPv4 literals pass, which matters because the gateway's own
+      address is allowlisted as one). Nothing validated these before, and they are rendered into a
+      tinyproxy extended regex that escapes only the dot, and into a line-and-slash-delimited dnsmasq
+      config: `a|.*` became `^a|.*$`, an alternation matching every hostname there is (default-deny
+      turned allow-all while the UI still listed one innocuous entry); `(` made the filter uncompilable,
+      i.e. a fleet-wide egress outage; a `/` or a newline injected dnsmasq directives that can restore
+      the default upstream `no-resolv` exists to remove, re-opening DNS exfiltration. `Add` now throws
+      on an invalid pattern (the LAST gate — `EgressGrpcService` refuses one first), while
+      `FromPersistedForm` and `CombinedWith` DROP one instead of throwing: a corrupt file, or one
+      malformed adapter-declared host, must not cost the user every valid entry or take the fleet's
+      egress down.
       **Edits are now DURABLE.** `ToPersistedForm`/`FromPersistedForm` had no production callers on
       either side: `Wsl2AgentEnvironment` built `WithDefaults(audit)` on every daemon start, so an
       `EgressGrpcService` add/remove mutated an in-memory list that was audited, re-rendered onto the
@@ -917,7 +1001,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       render-time union with installed CLIs' auto-permitted hosts, not a user edit. Pinned by
       `Mainguard.Tests/EgressAllowlistPersistenceTests.cs`.
     - `EgressProxyConfig.cs` (pure renderer: tinyproxy allow-filter + dnsmasq pinned-DNS + iptables
-      backstop from the allowlist. The backstop is rendered as a complete `*filter` table piped to
+      backstop from the allowlist. **F31: every render path filters through `EgressHostPattern.IsValid`**
+      — the last line of defence, since this is the function whose output becomes a regex and a config
+      directive. **F26: `RenderIptablesScript` now takes the gateway's `host:port` and emits `OUTPUT`
+      rules bounding the daemon host to the GATEWAY PORT alone** (plus DNS), dropping everything else to
+      that address. tinyproxy's `Filter` matches a hostname and has no notion of a port (`ConnectPort`
+      bounds only CONNECT), so the MG-4 allowlist entry that makes the gateway reachable also handed
+      every jail a plain-HTTP proxy to *any* TCP port on the daemon host — a local Ollama, a dev server,
+      Docker's TCP API. The address is resolved by `getent` inside the script at apply time (the gateway
+      is a name Docker put in `/etc/hosts`), and `RenderGatewayOutputPrelude` refuses to interpolate
+      anything that is not a validated host plus a 1-65535 port, because that line runs as root in the
+      proxy. Still ONE `iptables-restore`, so the atomicity argument below is intact.
+      The backstop is rendered as a complete `*filter` table piped to
       **`iptables-restore`**, i.e. applied in ONE netlink transaction: it used to be `iptables -F` plus
       ~13 `iptables -A` processes, and measured on a live proxy the chain immediately after the flush is
       `-P INPUT DROP` with **zero rules** — a total blackhole including ESTABLISHED traffic — for the 131
@@ -1098,7 +1193,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       load-bearing. It adds the gateway's own host to the rendered filter as a direct-route entry
       (`CombineGatewayHost`/`GatewayHostOf`, port stripped — tinyproxy filters on hostname) and emits no
       `upstream` directive, so a confined jail can reach the daemon while every existing host keeps the
-      route it had. `gatewayUpstream` would instead front the model hosts for EVERY agent, dragging OAuth
+      route it had. **F25/F26: `gatewayReachableAt` is now also passed to
+      `EgressProxyConfig.RenderIptablesScript`**, so the backstop bounds that host to the gateway port
+      alone, and `ProxyHostConfig` sets `ExtraHosts = ["host.docker.internal:host-gateway"]`
+      (`GatewayHostAlias`) — the one name that reaches the daemon from inside this container, and the
+      reason a loopback-bound gateway is usable at all. A proxy created before that mapping existed is
+      REPLACED (`HasGatewayHostAliasAsync`, same policy as an image upgrade): an `/etc/hosts` entry can
+      only be set at create time, and without it every BYOK spawn would silently skip confinement — i.e.
+      hand the jail the raw provider key — for the life of that container. Only the proxy gets the
+      mapping; the jails sit on Internal segments with no route anywhere. `gatewayUpstream` would instead front the model hosts for EVERY agent, dragging OAuth
       traffic through the gateway to be 401'd, which is why production passes only the former.
       `CanProxyReachAsync` performs the real connect from inside the proxy (bash `/dev/tcp`; the proxy
       image has no HTTP client), cached on success only.
@@ -1469,7 +1572,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `TokenBucket.cs` (pure, injected-clock: two coupled requests/min + tokens/min buckets seeded from
       P2-01 `KeyHealth`; continuous fractional refill; FIFO waiter queue granted in order via `Pump`;
       `Release(lease, actual)` reconciles estimate→actual conserving tokens — the burst/refill/fairness
-      property target).
+      property target). **F52: the 60 RPM / 60k TPM fallbacks are configurable.**
+      `DefaultRequestsPerMinute`/`DefaultTokensPerMinute` read `MAINGUARD_GATEWAY_RPM` /
+      `MAINGUARD_GATEWAY_TPM` once per process (absent, unparseable or non-positive keeps the
+      conservative `Fallback*` constant — the failure direction for a rate limit is "too slow", never
+      "unbounded"), and `FromKeyHealth` takes optional explicit ceilings for a caller with its own
+      configuration source. One bucket is shared by the whole daemon, so those two numbers were a
+      fleet-wide ceiling with no way to change them: a Tier-4 key was throttled to a free-tier shape and
+      the only symptom was agents queueing.
     - `AiGateway.cs` (`IAiGateway` = `AcquireAsync`/`Report429`/`GetSnapshot` + records
       `GatewayLease`/`GatewaySnapshot`/`AgentSpendSnapshot`, the `IAgentSupervisor`
       pause/resume/mark-state seam + `NullAgentSupervisor`, and the pure `GatewayBackoff` —
@@ -1477,7 +1587,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       typed reason + `budget_exceeded` audit, never kills).
     - `BudgetLedger.cs` (per-agent + per-day token + cost caps `BudgetCaps`, the static `ModelPriceTable`,
       `ISpendStore`/`InMemorySpendStore`, `Record`/`IsExhausted`/`GetSpendSince` cost-per-merged-change
-      hook + `SpendRecorded` stream event).
+      hook + `SpendRecorded` stream event). **F23: `SettleReservation` REFUSES A ZERO SETTLE against a
+      live reservation** and charges the reserved amount instead. A reservation exists because a request
+      was admitted, so usage was expected; the gateway settled with whatever the response parser
+      returned, and for every SSE stream that was nothing — which, combined with a jail-supplied
+      estimate of zero, made both the per-agent caps and the shared bucket free to bypass. A settle with
+      no reservation behind it (id 0, the direct `Record` path) keeps its old meaning.
     - `AdmissionController.cs` (`CanSpawn(out reason)` — injectable `/proc/meminfo` sampler
       `MemorySample`, ≤5 s cache, 85%-used default, honest "N GB supports X–Y" message).
     - `SwarmReconciler.cs` (Docker-as-truth reconcile: expected-but-dead → `RemoveAgentWorktree(force)` +
@@ -1539,6 +1654,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       repo-relative unmerged paths from `diff --diff-filter=U`, when — **an empty path list means NOT
       MEASURED, never "nothing conflicts"**), the `(repo, agent)`-keyed in-memory
       `RebaseConflictParkingStore` the provisioner owns and the gRPC projection reads, and
+      **W1-A**: the cycle resolves a `TrustedWorktreeLayout` from daemon-computed roots BEFORE it yields,
+      and every git below runs with `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE` pinned to it — so the
+      `add -A`/`commit`/`rebase` this runs as the daemon user, on the host, in an agent-writable
+      repository, no longer learns where that repository IS from the agent-writable `.git` pointer or
+      `commondir`. A worktree aimed at the shared mirror (or, when `AgentWorktreeLocation.AgentRepoPath`
+      is supplied, at any repository other than the provisioned one) ends the cycle as `Skipped` with the
+      measured reason, before any yield/pause/mutation. `AgentWorktreeLocation` gained the optional
+      `AgentRepoPath` for that, and `MergeQueueProvisioner`/`GatewayServiceRegistration` populate it in
+      production, so the cycle runs the strict pin. **Rework**: the layout is RE-resolved after the yield
+      and that second answer is the one the mutations run under — the pre-yield resolution is a snapshot
+      taken while the agent was still running, and what it validates (`.git`, `commondir`) is exactly what
+      the agent would rewrite. Same re-read-at-the-moment-of-action rule K6 applied to the mutation guard.
       `ConflictActionResult` — refusal-as-result, like `AgentResumeResult`. Not persisted, deliberately: it
       is a measurement of one worktree at one instant, and the durable record of the handoff is the audit
       event. Since 2026-09-04 it also holds the **hand-back mark** (`MarkHandedBack`/`IsHandedBack`/
@@ -1950,7 +2077,29 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the daemon provisioning-plane fetch, not HTTP. An optional `hostUrl` resolver overrides only WHERE
       the fetch points, so the end-to-end suite drives the real fetcher against a local fixture host; the
       host KIND — and hence the `refs/pull/<n>/head` shape — is always classified from the canonical host
-      name). **`PrWorkerHost.cs` (the intake's spawn seam —
+      name). **F40 — compare BEFORE destroying.** The fetch + `reset --hard` used to run on every poll of
+      every tracked PR, before anything compared the head: an in-flight verification's uncommitted work
+      was deleted once per interval and the reset raced the worker's own git on `.git/index.lock`. The new
+      `IPrHeadPeek` capability interface (in `PrHeadFetcher.cs`) answers "what is the head?" with
+      `git ls-remote` — no fetch, no worktree, no index, no lock — and the poll loop asks it first; an
+      unchanged head now returns having touched nothing. Null means UNKNOWN (the host did not advertise
+      the ref) and falls through to the authoritative fetch, and a fetcher that does not implement the
+      capability keeps the exact previous behaviour, so no existing implementor had to change. The
+      destructive leg additionally waits the worker's `index.lock` out on `GitMutationGuard`'s shared
+      backoff and refuses (typed) rather than colliding — deliberately not `RunGuarded`, which requires a
+      yield token the intake has no standing to claim. **W1-A**: the fetch/reset run under a pinned
+      `TrustedWorktreeLayout`, with a `resolveAgentRepoPath` ctor arg — supplied by
+      `GatewayServiceRegistration` — that turns the derive-and-validate path into a strict pin.
+      **W1-A rework**: `resolveMirrorPath` moves the PEEK's working directory off the worker's worktree.
+      `ls-remote` needs no repository, and asking it from inside the worker's made the answer
+      agent-controlled — `url.<x>.insteadOf` in a third party's PR worktree redirects the query and can
+      pin the intake at "unchanged" forever. It now runs in the daemon-owned mirror (fallback: the
+      worktree's parent, which is not a repository). **Still NOT closed on this path**: the config
+      snapshot/spawn race. The intake holds no yield token, so the worker's jail is live while
+      `reset --hard` runs smudge filters, and the external PR author controls the trigger (every push
+      causes a fetch) — see the type docs. Closing it means giving the intake a yield relationship with
+      the worker, which is a change of arbitration and is deliberately not made here.
+      **`PrWorkerHost.cs` (the intake's spawn seam —
       `IPrWorkerHost`/`PrWorkerOutcome`/`PrWorkerResult` + `ExternalPrIntake.WorkerAgentKind` =
       `external-pr`).** The intake used to create a worktree and an entry and **spawn nothing**, so an
       intake'd PR had no jail to be verified in and could never leave `Working` — the one criterion-4 leg
