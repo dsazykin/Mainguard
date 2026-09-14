@@ -131,6 +131,46 @@ public sealed class AgentIpcServer : IDisposable
         _firstContactGrace = firstContactGrace ?? DefaultFirstContactGrace;
     }
 
+    /// <summary>
+    /// F62: holds the IPC root at <c>0700</c>, owned by the daemon's user — the traversal barrier that
+    /// actually closes the multi-user hole.
+    ///
+    /// <para>The per-agent leaf directories and the sockets inside them must stay reachable by an
+    /// identity the daemon cannot name (the jail's remapped uid), so their own modes cannot be the
+    /// control. The parent can: another local account that cannot execute this directory cannot reach any
+    /// path beneath it, no matter what those paths' modes say. The jail is unaffected because Docker
+    /// bind-mounts the per-agent directory into the container — the container never walks the host path
+    /// to get there, so the barrier is invisible to it and total to everyone else.</para>
+    ///
+    /// <para>Re-asserted on every <see cref="CreateEndpoint"/> rather than once in the constructor: the
+    /// directory can be recreated between endpoints (teardown deletes per-agent dirs, and a data-root
+    /// restore or an installer can put the root back at the umask default), and a permission that is only
+    /// ever set once is a permission that is eventually wrong.</para>
+    /// </summary>
+    private void EnsureRootPrivate()
+    {
+        Directory.CreateDirectory(_root);
+        if (OperatingSystem.IsWindows())
+        {
+            return; // the data root is already under the user-scoped %LocalAppData%.
+        }
+
+        try
+        {
+            File.SetUnixFileMode(
+                _root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A root we do not own is a misconfiguration worth naming, not worth refusing a spawn over:
+            // the peer-credential pin below is the second layer for exactly this case.
+            _log?.LogWarning(
+                "agent-ipc: could not set the IPC root '{Root}' to 0700 ({Message}). Another local user "
+                + "may be able to traverse it; peer-credential pinning still guards each endpoint.",
+                _root, ex.Message);
+        }
+    }
+
     /// <summary>The per-agent IPC dir (the container mount source). The dir name is the agent id's
     /// 12-char prefix — Unix socket paths have a hard ~104-byte limit, and live-session prefix
     /// collisions are not a real risk.</summary>
@@ -165,6 +205,7 @@ public sealed class AgentIpcServer : IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(instructions);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
+        EnsureRootPrivate();
         var endpoint = _endpoints.GetOrAdd(agentId, id => Endpoint.Start(
             DirFor(id), id, handler, role, new ChannelObserver(_log, _audit, id, role), _firstContactGrace,
             instructions));
@@ -278,6 +319,17 @@ public sealed class AgentIpcServer : IDisposable
             _log?.LogInformation(
                 "agent-ipc: {Role} endpoint ready for agent={Agent} at {Dir} (socket + outbox framings)",
                 _role, _agentId, dir);
+
+        /// <summary>
+        /// F62: the endpoint has bound itself to a local peer identity. Recorded because it is the fact a
+        /// later refusal is measured against — without it, "refused a different identity" is a claim with
+        /// nothing behind it in the log.
+        /// </summary>
+        public void PeerPinned(UnixPeerCredentials peer) =>
+            _log?.LogInformation(
+                "agent-ipc: agent={Agent} role={Role} pinned its socket peer ({Peer}); connections from "
+                + "any other local identity are refused",
+                _agentId, _role, peer);
 
         /// <summary>A request the daemon actually served — Debug, because this is what health looks like
         /// and a per-request Information line would drown the log a real fault has to be found in.</summary>
@@ -430,6 +482,13 @@ public sealed class AgentIpcServer : IDisposable
         /// <summary>Reported on the transition past the cap, as the outbox breach is.</summary>
         private bool _inFlightReported;
 
+        /// <summary>F62: the local identity this endpoint's first connection came from. Every later
+        /// connection must match it; see <see cref="AcceptPeer"/> for why it is pinned rather than
+        /// configured.</summary>
+        private UnixPeerCredentials? _pinnedPeer;
+
+        private readonly object _peerGate = new();
+
         public string Dir { get; }
 
         public AgentIpcEndpointRole Role { get; }
@@ -490,28 +549,54 @@ public sealed class AgentIpcServer : IDisposable
 
             var listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
             listener.Bind(new UnixDomainSocketEndPoint(socketPath));
-            listener.Listen(backlog: 8);
+            // The kernel's pending-accept queue must be able to hold at least as many connections as the
+            // daemon deliberately serves at once, or the two bounds fight: a burst up to
+            // MaxInFlightConnections — which this endpoint is designed to accept — was being refused by
+            // the kernel at connect() with a backlog of 8, before the daemon's own cap could answer it
+            // with a reason. A jail then saw an unexplained ECONNREFUSED where the contract promises an
+            // honest refusal. The daemon's cap stays the real bound; this just stops the queue from
+            // pre-empting it.
+            listener.Listen(backlog: AgentIpcPaths.MaxInFlightConnections + 8);
 
             if (!OperatingSystem.IsWindows())
             {
-                // The jail's agent uid must traverse the dir, exec the shim, and connect to the
-                // socket (connect needs write on the socket inode). The mount itself is read-only.
+                // F62. The leaf modes below stay permissive and they have to: the jail's agent uid is
+                // not the daemon's, under userns-remap it is an arbitrary host subuid, and on the macOS
+                // substrate the two are not even in the same kernel — so there is no uid or gid to grant
+                // to, and every attempt to name one would break an agent on some supported substrate.
+                //
+                // The control is therefore the PARENT, not the leaf: AgentIpcServer.CreateEndpoint holds
+                // the IPC root at 0700, owned by the daemon's user. Another local account cannot traverse
+                // into any of this from the host regardless of what the leaf modes say, while the jail is
+                // unaffected because it receives THIS directory as a bind mount and never walks the host
+                // path to reach it. Peer credentials are pinned on top (see ServeConnectionAsync), so a
+                // second local identity that somehow does reach the socket is refused on arrival rather
+                // than served as the agent.
+                //
+                // Traverse, not list: o+x lets the agent open the shim and the socket by their known
+                // names, and o-r stops anything that gets a descriptor from enumerating the mailbox.
                 File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
-                    | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
-                    | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+                    | UnixFileMode.GroupExecute
+                    | UnixFileMode.OtherExecute);
                 File.SetUnixFileMode(shimPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
                     | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
                     | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+                // connect(2) requires WRITE on the socket inode and nothing else — read grants no
+                // capability on a socket, so it is not given.
                 File.SetUnixFileMode(socketPath, UnixFileMode.UserRead | UnixFileMode.UserWrite
-                    | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
-                    | UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
-                // World-writable, and it has to be: the jail's agent uid is not the daemon's, and on the
-                // macOS substrate the two are not even in the same kernel. Nothing is shared — one jail
-                // mounts this directory and no other — so the reach of the mode is one agent's own
-                // mailbox. Same reasoning as the socket's mode directly above.
+                    | UnixFileMode.GroupWrite
+                    | UnixFileMode.OtherWrite);
+                // The outbox is the file-framed channel: the agent creates, reads and renames its own
+                // request/response files here, so it genuinely needs rwx. Its reach is one agent's own
+                // mailbox — one jail mounts this directory and no other — and the 0700 root above is what
+                // keeps that reach off the rest of the machine.
                 File.SetUnixFileMode(outbox, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
                     | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
                     | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
+                // The claim directory is the daemon's alone — a request renamed in here is out of the
+                // jail's reach by design, so it gets no group/other bits at all.
+                File.SetUnixFileMode(inflight,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
             }
 
             var endpoint = new Endpoint(dir, listener, role, observer);
@@ -573,7 +658,27 @@ public sealed class AgentIpcServer : IDisposable
                             + "endpoint — further connections are refused until some complete");
                     }
 
-                    _ = RefuseConnectionAsync(connection, ct);
+                    _ = RefuseConnectionAsync(
+                        connection, ct,
+                        "too many requests in flight on this channel — retry after one completes");
+                    continue;
+                }
+
+                // F62: the peer must be the same local identity every time. The FIRST connection on this
+                // endpoint pins whoever it is — the daemon cannot know that uid in advance, because under
+                // userns-remap it is an arbitrary host subuid and on macOS it comes through a different
+                // kernel — and every connection after it must match. A second local account that reaches
+                // the socket is refused here, before a single byte of its request is parsed.
+                //
+                // Deliberately not fatal when the platform gives no credentials (Windows): "unknown" is
+                // not "wrong", and refusing on a platform that cannot answer would break the channel
+                // rather than protect it. The 0700 root is the control there.
+                if (!AcceptPeer(connection))
+                {
+                    Interlocked.Decrement(ref _inFlight);
+                    _ = RefuseConnectionAsync(
+                        connection, ct,
+                        "this endpoint belongs to another local identity — refused");
                     continue;
                 }
 
@@ -595,15 +700,53 @@ public sealed class AgentIpcServer : IDisposable
             }
         }
 
-        private static async Task RefuseConnectionAsync(Socket connection, CancellationToken ct)
+        /// <summary>
+        /// F62: pins the endpoint to the first peer identity that connects, and matches every later
+        /// connection against it.
+        ///
+        /// <para>Returns true when the peer is the pinned one, when this is the first connection (which
+        /// does the pinning), or when the platform cannot report peer credentials at all. Returns false
+        /// only for a peer the kernel says is a DIFFERENT local identity from the one this endpoint has
+        /// been serving — the multi-user case the finding describes.</para>
+        /// </summary>
+        private bool AcceptPeer(Socket connection)
+        {
+            var peer = UnixPeerCredentials.TryRead(connection);
+            if (peer is null)
+            {
+                return true; // platform cannot answer; the 0700 root is the control there.
+            }
+
+            lock (_peerGate)
+            {
+                if (_pinnedPeer is null)
+                {
+                    _pinnedPeer = peer;
+                    _observer.PeerPinned(peer.Value);
+                    return true;
+                }
+
+                if (_pinnedPeer.Value.Uid == peer.Value.Uid)
+                {
+                    return true;
+                }
+            }
+
+            _observer.Rejected(
+                SocketFraming,
+                $"connection from a different local identity ({peer.Value}) than this endpoint's agent "
+                + $"({_pinnedPeer!.Value}) — refused before the request was read");
+            return false;
+        }
+
+        private static async Task RefuseConnectionAsync(Socket connection, CancellationToken ct, string reason)
         {
             using (connection)
             {
                 try
                 {
                     await using var stream = new NetworkStream(connection, ownsSocket: false);
-                    var response = new AgentIpcResponse(
-                        Ok: false, Error: "too many requests in flight on this channel — retry after one completes");
+                    var response = new AgentIpcResponse(Ok: false, Error: reason);
                     var bytes = Encoding.UTF8.GetBytes(AgentIpcProtocol.SerializeResponse(response) + "\n");
                     await stream.WriteAsync(bytes, ct).ConfigureAwait(false);
                 }
