@@ -486,7 +486,9 @@ public class VerificationOutcomeRenderHarness
     /// </summary>
     private sealed class StubQueue : IMergeQueueService
     {
-        public event Action? Changed;
+        // Never raised: this stub is a fixed projection, so the seam's event exists only to
+        // satisfy the interface — an accessor pair rather than a field-like event says so.
+        public event Action? Changed { add { } remove { } }
 
         /// <summary>Every agent whose recorded output was READ. The pair with <see cref="VerificationsRun"/>
         /// is what proves reading a failure never costs a run.</summary>

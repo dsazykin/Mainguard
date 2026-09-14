@@ -85,7 +85,7 @@ public sealed class BringLocalService
         return BringLocalResult.Success(branch);
     }
 
-    private static string FirstLine(string text)
+    private static string FirstLine(string? text)
     {
         var trimmed = (text ?? string.Empty).Trim();
         var nl = trimmed.IndexOf('\n');

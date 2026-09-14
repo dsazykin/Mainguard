@@ -42,6 +42,15 @@ public static class ProComposition
     // ---- external-PR intake configuration (P2-12) ----
 
     /// <summary>
+    /// One process-lifetime loopback client for the intake page's unary calls. Deliberately shared and
+    /// never disposed: Settings pages are cached per Settings window and nothing disposes them, so a
+    /// client per page would leak an mTLS channel every time the window is opened. The channel is
+    /// created lazily, on the first activation of this page, so a run that never opens it pays nothing.
+    /// </summary>
+    private static readonly Lazy<DaemonClient> SharedIntakeClient =
+        new(() => DaemonClient.ForLoopback(), isThreadSafe: true);
+
+    /// <summary>
     /// The seam Settings → PR Intake reads its configuration through. Production resolves the LIVE,
     /// daemon-owned gateway; the headless render harnesses override it with
     /// <see cref="InMemoryPrIntakeGateway"/> before building the page.
@@ -64,15 +73,6 @@ public static class ProComposition
         () => new DaemonJailLimitsGateway(SharedIntakeClient.Value);
 
     public static IJailLimitsGateway CreateJailLimitsGateway() => JailLimitsGatewayFactory();
-
-    /// <summary>
-    /// One process-lifetime loopback client for the intake page's unary calls. Deliberately shared and
-    /// never disposed: Settings pages are cached per Settings window and nothing disposes them, so a
-    /// client per page would leak an mTLS channel every time the window is opened. The channel is
-    /// created lazily, on the first activation of this page, so a run that never opens it pays nothing.
-    /// </summary>
-    private static readonly Lazy<DaemonClient> SharedIntakeClient =
-        new(() => DaemonClient.ForLoopback(), isThreadSafe: true);
 
     // ---- shell capabilities the shell wires at startup (all inert until then) ----
 
