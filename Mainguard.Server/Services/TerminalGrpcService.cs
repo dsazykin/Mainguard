@@ -96,7 +96,18 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
             // stream stays open — a banner + the live output prove it — but input DATA frames are
             // refused server-side (the RoleInterceptor also severs them at the gRPC layer; this is
             // defense-in-depth so a direct service call is enforced too). Never UI-only.
-            var locked = agentId is not null && _locks is not null && _locks.IsLocked(agentId);
+            //
+            // F64: evaluated LIVE, per frame, not captured once at attach. An attach is long-lived —
+            // hours — and the lock is applied when a worker becomes managed, which routinely happens
+            // while an operator is already watching. A snapshot taken at attach time meant a terminal
+            // opened before the lock stayed writable for the whole session, and a terminal opened before
+            // an unlock stayed read-only until the operator noticed and re-attached. The delegate reads
+            // the registry at the moment each frame arrives.
+            var id = agentId;
+            var isLocked = id is null || _locks is null
+                ? static () => false
+                : new Func<bool>(() => _locks.IsLocked(id));
+            var locked = isLocked();
 
             // The real agent path: a long-lived CLI session bound at spawn (P2-47 #3 wiring). Attach
             // subscribes (replay + live frames); detach only unsubscribes — the CLI keeps running.
@@ -116,11 +127,11 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
             {
                 if (wantsGrid && bound.GridEnabled)
                 {
-                    await PumpBoundGridAsync(bound, requestStream, responseStream, locked, ct);
+                    await PumpBoundGridAsync(bound, requestStream, responseStream, isLocked, ct);
                 }
                 else
                 {
-                    await PumpBoundAsync(bound, requestStream, responseStream, locked, ct);
+                    await PumpBoundAsync(bound, requestStream, responseStream, isLocked, ct);
                 }
 
                 return;
@@ -168,13 +179,14 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
         Runtime.BoundTerminalSession bound,
         IAsyncStreamReader<TerminalInput> requestStream,
         IServerStreamWriter<TerminalOutput> responseStream,
-        bool locked,
+        Func<bool> isLocked,
         System.Threading.CancellationToken ct)
     {
         var (replay, live) = bound.Subscribe(out var unsubscribe);
+        IDisposable? inputClaim = null;
         try
         {
-            if (locked)
+            if (isLocked())
             {
                 await responseStream.WriteAsync(new TerminalOutput
                 {
@@ -203,15 +215,40 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
                     switch (input.InputCase)
                     {
                         case TerminalInput.InputOneofCase.Data:
-                            if (locked)
+                            if (isLocked())
                             {
                                 throw new RpcException(new Status(StatusCode.PermissionDenied,
                                     "This terminal is locked (managed worker) — input is denied. The read stream stays open."));
                             }
 
+                            // F64: exactly one attach may type. The claim is taken lazily, on the first
+                            // keystroke, so merely opening a terminal never steals the keyboard from
+                            // whoever is using it — and released in this method's finally.
+                            inputClaim ??= bound.TryClaimInput();
+                            if (inputClaim is null)
+                            {
+                                throw new RpcException(new Status(StatusCode.FailedPrecondition,
+                                    "Another attach is already typing into this terminal. Input is "
+                                    + "exclusive (interleaved keystrokes from two clients corrupt escape "
+                                    + "sequences); the read stream stays open. Close the other terminal "
+                                    + "to take over."));
+                            }
+
                             await bound.WriteInputAsync(input.Data.Memory, ct);
                             break;
                         case TerminalInput.InputOneofCase.Resize:
+                            // F64: a read-only attach does not resize. "Window geometry is harmless" was
+                            // wrong twice over — a resize is a write to the managed worker's PTY
+                            // (SIGWINCH into its CLI, and a reflow of the daemon's authoritative grid),
+                            // and it is a shared one: every OTHER viewer of this session, including the
+                            // coordinator driving it, sees the terminal reshape under them because a
+                            // spectator opened a narrow window. The lock means the session is not yours
+                            // to change, and geometry is part of the session.
+                            if (isLocked())
+                            {
+                                break;
+                            }
+
                             bound.Resize((int)input.Resize.Cols, (int)input.Resize.Rows);
                             break;
                     }
@@ -240,6 +277,7 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
         }
         finally
         {
+            inputClaim?.Dispose();
             unsubscribe();
         }
     }
@@ -254,10 +292,11 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
         Runtime.BoundTerminalSession bound,
         IAsyncStreamReader<TerminalInput> requestStream,
         IServerStreamWriter<TerminalOutput> responseStream,
-        bool locked,
+        Func<bool> isLocked,
         System.Threading.CancellationToken ct)
     {
         var (snapshot, live) = bound.SubscribeGrid(out var unsubscribe);
+        IDisposable? inputClaim = null;
         try
         {
             // Single writer to the response stream: this pump task emits snapshot-then-live frames.
@@ -278,15 +317,36 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
                     switch (input.InputCase)
                     {
                         case TerminalInput.InputOneofCase.Data:
-                            if (locked)
+                            if (isLocked())
                             {
                                 throw new RpcException(new Status(StatusCode.PermissionDenied,
                                     "This terminal is locked (managed worker) — input is denied. The read stream stays open."));
                             }
 
+                            // F64: exactly one attach may type. The claim is taken lazily, on the first
+                            // keystroke, so merely opening a terminal never steals the keyboard from
+                            // whoever is using it — and released in this method's finally.
+                            inputClaim ??= bound.TryClaimInput();
+                            if (inputClaim is null)
+                            {
+                                throw new RpcException(new Status(StatusCode.FailedPrecondition,
+                                    "Another attach is already typing into this terminal. Input is "
+                                    + "exclusive (interleaved keystrokes from two clients corrupt escape "
+                                    + "sequences); the read stream stays open. Close the other terminal "
+                                    + "to take over."));
+                            }
+
                             await bound.WriteInputAsync(input.Data.Memory, ct);
                             break;
                         case TerminalInput.InputOneofCase.Resize:
+                            // F64, and it bites harder on the grid path: a resize reflows the daemon's
+                            // authoritative vterm and pushes a fresh snapshot to EVERY subscriber. A
+                            // read-only spectator must not repaint the session it is watching.
+                            if (isLocked())
+                            {
+                                break;
+                            }
+
                             bound.Resize((int)input.Resize.Cols, (int)input.Resize.Rows);
                             break;
                     }
@@ -312,6 +372,7 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
         }
         finally
         {
+            inputClaim?.Dispose();
             unsubscribe();
         }
     }

@@ -203,6 +203,57 @@ public sealed class AgentSessionStore
         }
     }
 
+    /// <summary>
+    /// The ADOPTION axis: sessions whose jail outlived the daemon that started it, and to which no CLI
+    /// has bound since.
+    ///
+    /// <para>Kept apart from the state word for the same reason the pause axis is: adoption writes
+    /// <c>Working</c>, which is also what an ordinary running agent reads, and the distinction the jail
+    /// reaper needs is not "is it working" but "is the reason there is no terminal a fact about the JAIL
+    /// or about the DAEMON". An adopted jail has no bound CLI because Docker cannot re-attach a running
+    /// exec, not because its agent left; a finished worker awaiting review has no bound CLI because its
+    /// CLI exited. Reaping the second at the idle allowance is the whole point of the reaper; reaping the
+    /// first is destroying a mid-task agent's uncommitted work.</para>
+    ///
+    /// <para>The mark is cleared the moment a CLI is seen bound to the session again (re-binding on
+    /// adoption is the work that ends the blind spot) and when the session is stopped.</para>
+    /// </summary>
+    private readonly HashSet<AgentSessionKey> _adopted = new();
+
+    /// <summary>Records that this session was adopted from a previous daemon — see <c>_adopted</c>.</summary>
+    public void MarkAdopted(AgentSessionKey key)
+    {
+        lock (_gate)
+        {
+            if (_sessions.ContainsKey(key))
+            {
+                _adopted.Add(key);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Clears the adoption mark: a CLI has bound to this session, so the daemon can observe its terminal
+    /// again and "no CLI" means what it ordinarily means. Idempotent.
+    /// </summary>
+    public void ClearAdopted(AgentSessionKey key)
+    {
+        lock (_gate)
+        {
+            _adopted.Remove(key);
+        }
+    }
+
+    /// <summary>True while this session is an adopted jail no CLI has bound to since — the jail reaper's
+    /// question, and the ONLY case in which a missing terminal is excused.</summary>
+    public bool WasAdoptedWithoutTerminal(AgentSessionKey key)
+    {
+        lock (_gate)
+        {
+            return _adopted.Contains(key);
+        }
+    }
+
     /// <summary>Records — or with <c>null</c>, clears — that this session's jail is frozen. See <c>_frozen</c>.</summary>
     public void MarkFrozen(AgentSessionKey key, string? reason)
     {
@@ -342,6 +393,7 @@ public sealed class AgentSessionStore
         {
             removed = _sessions.Remove(key);
             _frozen.Remove(key);
+            _adopted.Remove(key);
         }
 
         if (removed)

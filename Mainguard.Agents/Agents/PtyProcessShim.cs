@@ -76,6 +76,39 @@ public sealed class PtySession : ITerminalSession
         }
     }
 
+    /// <summary>
+    /// F59: lets go of the child instead of reaping it — unhooks the exit event, completes any waiter,
+    /// and disposes the PTY streams. <b>No <c>Kill</c>, and no <c>IPtyConnection.Dispose</c></b>, whose
+    /// contract includes reaping the process this method exists not to touch.
+    ///
+    /// <para>This is what daemon shutdown calls. Before it existed, <see cref="BoundTerminalSession"/>'s
+    /// detach path ended here in <see cref="Dispose"/> — i.e. in <c>Kill</c> — so "a daemon restart no
+    /// longer kills every bound CLI" was true of the test doubles and false of the only session type
+    /// production uses.</para>
+    ///
+    /// <para><b>The residual, stated rather than hidden.</b> Closing the master fd hangs the child's
+    /// controlling terminal up, and a child that dies of SIGHUP is just as gone as one that dies of
+    /// SIGKILL. What makes the agent survive is not this method alone but where the agent actually runs:
+    /// the child here is the <c>docker exec -i -t</c> CLIENT, and the process it fronts belongs to the
+    /// container engine, which keeps it running when its client detaches. Releasing rather than killing
+    /// is what makes that detach an ordinary client disconnect instead of a dead client.</para>
+    /// </summary>
+    public void Release()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        _connection.ProcessExited -= OnProcessExited;
+
+        // A waiter on ExitCode must not hang, and this session is no longer watching the child, so its
+        // exit can never be observed here again. -1 is the same "unknown" the reap path reports.
+        _exit.TrySetResult(-1);
+
+        _io.Dispose();
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)

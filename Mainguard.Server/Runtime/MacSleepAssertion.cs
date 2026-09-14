@@ -70,12 +70,30 @@ internal sealed class MacSleepAssertion : BackgroundService
         if (_caffeinate is { HasExited: false }) return;
 
         var psi = new ProcessStartInfo("/usr/bin/caffeinate") { UseShellExecute = false };
-        psi.ArgumentList.Add("-im"); // idle sleep + disk idle; never the display
+        // F60: -i (idle sleep) + -m (disk idle) + -s (SYSTEM sleep). -s was missing, and it is the one
+        // that covers the case the other two do not: an explicit sleep request — Apple menu > Sleep, a
+        // power-button press, the "sleep after N minutes" system setting firing on AC. Never -d: the
+        // display is the operator's, and keeping a laptop screen lit for a background daemon is a
+        // battery bug, not a feature.
+        psi.ArgumentList.Add("-ims");
         psi.ArgumentList.Add("-w");
         psi.ArgumentList.Add(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         _caffeinate = Process.Start(psi);
         _log.LogInformation("agents running — holding the sleep assertion (caffeinate pid {Pid})",
             _caffeinate?.Id);
+
+        // Said once per acquisition, and deliberately: no power assertion available to an unprivileged
+        // process prevents CLAMSHELL sleep. Closing the lid on a Mac with no external display suspends
+        // the machine regardless of -s, and on battery -s is not honoured at all. So a jail CAN be frozen
+        // mid-verification by a closed lid, the daemon's own long-lived gRPC streams go half-open with it,
+        // and neither this assertion nor the HTTP/2 keepalive can prevent that — the keepalive only makes
+        // the resulting dead stream SURFACE as a fault the client reconnects from, instead of hanging
+        // until the OS TCP timeout. Stating the limit in the log beats letting an operator infer a
+        // guarantee that macOS does not offer.
+        _log.LogInformation(
+            "note: a power assertion cannot prevent lid-close (clamshell) sleep, and -s is ignored on "
+            + "battery. Keep the lid open (or an external display attached, on AC) for a long "
+            + "verification; a closed-lid suspend pauses every jail until the machine wakes.");
     }
 
     private void Release()
