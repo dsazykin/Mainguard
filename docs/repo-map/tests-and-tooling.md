@@ -122,6 +122,12 @@
     `mainwindow_banner_<Theme>.png`;
   - `StartupShutdownViewModelTests` covers the checklist/status mapping, the tier-2 host toggle, and the
     `MainWindowViewModel` banner.
+  - **`Mainguard.Server.Tests/StalePayloadShutdownTests.cs`** (2026-09-15) — the daemon-side half of the
+    orphaned-daemon fix: a present payload never asks for shutdown, a missing one stops the daemon only
+    after the FULL run of consecutive misses, a payload that reappears mid-run resets the count (the
+    `MacDaemonUpdater` payload-swap case, which must never trip the shutdown), an unknown assembly
+    location disables the watch entirely, and the live loop reaches `StopApplication` on its own with no
+    launcher involved — which is the point, since the launcher is usually long gone.
   - **`Mainguard.Server.Tests/SubsystemFileLoggerProviderTests.cs`** +
     **`DaemonStartupLoggingTests.cs`** (in-depth daemon logging) — category→file routing, rolling at the
     cap, the line format, mask fidelity, swallowed IO, and the
@@ -398,7 +404,13 @@
   and output-equivalence against an embedded verbatim copy of the pre-optimization router),
   `PureEnginePropertyTests` (ADR-005: seeded-random property laws — PatchParser Serialize∘Parse
   byte-identical round-trip, MergeChunker conservation/no-spurious-conflict/base-coverage laws,
-  ChangelogGenerator nothing-ever-dropped), `GitServiceIndexLockTests` (Part-5 reliability: a held
+  ChangelogGenerator nothing-ever-dropped),
+  `DaemonOrphanLifecycleTests` (2026-09-15 — the agent-side half of the orphaned-daemon fix:
+  `DaemonPortHolder` parsing pinned against the REAL orphan's `ps` line, a stranger's process never
+  recognised as ours, an unparseable path failing safe as not-stale rather than stale, and
+  `IsResolvableByStoppingHolder` true only for a holder that is identifiably a Mainguard daemon.
+  Companion: `Mainguard.Server.Tests/StalePayloadShutdownTests`),
+  `GitServiceIndexLockTests` (Part-5 reliability: a held
   `.git/index.lock` clears mid-backoff → silent retry success; wedged → typed actionable
   `GitOperationException`, repo stays usable; reads unaffected), `GraphHitTesterTests` (pure graph
   hit-testing, T-09), `GitServiceWorktreeStateTests` (`RequiresGitCli`: merge/rebase state against a
