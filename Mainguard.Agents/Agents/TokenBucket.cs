@@ -32,8 +32,36 @@ public sealed class TokenBucket
 {
     // Conservative fallbacks when a provider returned no rate-limit headers (KeyHealth ceilings null):
     // a light paid tier. Never zero — a zero-capacity bucket would deadlock every acquire.
-    internal const int DefaultRequestsPerMinute = 60;
-    internal const int DefaultTokensPerMinute = 60_000;
+    internal const int FallbackRequestsPerMinute = 60;
+    internal const int FallbackTokensPerMinute = 60_000;
+
+    /// <summary>The env var that overrides the requests/min floor.</summary>
+    public const string RequestsPerMinuteVariable = "MAINGUARD_GATEWAY_RPM";
+
+    /// <summary>The env var that overrides the tokens/min floor.</summary>
+    public const string TokensPerMinuteVariable = "MAINGUARD_GATEWAY_TPM";
+
+    /// <summary>
+    /// F52 — the requests/min the bucket falls back to, now an operator setting rather than a constant.
+    ///
+    /// <para>These two numbers are the ceiling for the ENTIRE daemon: one bucket is shared by every
+    /// agent on the key, so 60 RPM / 60k TPM is what a whole fleet gets, whatever tier the operator
+    /// actually pays for. They were literals with no way to change them, so a Tier-4 key was throttled
+    /// to a free-tier shape and the only symptom was agents queueing. Read once per process from the
+    /// environment — a value that is absent, unparseable or non-positive keeps the conservative
+    /// fallback, because the failure direction for a rate limit is "too slow", never "unbounded".</para>
+    /// </summary>
+    public static int DefaultRequestsPerMinute { get; } =
+        ReadPositive(RequestsPerMinuteVariable, FallbackRequestsPerMinute);
+
+    /// <summary>The tokens/min the bucket falls back to. See <see cref="DefaultRequestsPerMinute"/>.</summary>
+    public static int DefaultTokensPerMinute { get; } =
+        ReadPositive(TokensPerMinuteVariable, FallbackTokensPerMinute);
+
+    internal static int ReadPositive(string variable, int fallback) =>
+        int.TryParse(Environment.GetEnvironmentVariable(variable), out var value) && value > 0
+            ? value
+            : fallback;
 
     private readonly double _reqCapacity;
     private readonly double _tokCapacity;
@@ -63,11 +91,25 @@ public sealed class TokenBucket
         _lastRefill = _clock();
     }
 
-    /// <summary>Seeds a bucket from the P2-01 key-health ceilings; missing/zero ceilings use the floors.</summary>
-    public static TokenBucket FromKeyHealth(KeyHealth? health, Func<DateTimeOffset> clock)
+    /// <summary>
+    /// Seeds a bucket from the P2-01 key-health ceilings; missing/zero ceilings use the configured
+    /// defaults (F52 — <see cref="DefaultRequestsPerMinute"/> / <see cref="DefaultTokensPerMinute"/>,
+    /// overridable per deployment). <paramref name="requestsPerMinute"/> /
+    /// <paramref name="tokensPerMinute"/> override both, for a caller that has its own configuration
+    /// source rather than the environment.
+    /// </summary>
+    public static TokenBucket FromKeyHealth(
+        KeyHealth? health,
+        Func<DateTimeOffset> clock,
+        int? requestsPerMinute = null,
+        int? tokensPerMinute = null)
     {
-        var rpm = health?.RequestsPerMinute is > 0 ? health.RequestsPerMinute!.Value : DefaultRequestsPerMinute;
-        var tpm = health?.TokensPerMinute is > 0 ? health.TokensPerMinute!.Value : DefaultTokensPerMinute;
+        var rpm = requestsPerMinute is > 0 ? requestsPerMinute.Value
+            : health?.RequestsPerMinute is > 0 ? health.RequestsPerMinute!.Value
+            : DefaultRequestsPerMinute;
+        var tpm = tokensPerMinute is > 0 ? tokensPerMinute.Value
+            : health?.TokensPerMinute is > 0 ? health.TokensPerMinute!.Value
+            : DefaultTokensPerMinute;
         return new TokenBucket(rpm, tpm, clock);
     }
 
