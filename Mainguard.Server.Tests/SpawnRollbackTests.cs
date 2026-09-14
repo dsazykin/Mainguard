@@ -14,10 +14,14 @@ using Xunit;
 namespace Mainguard.Server.Tests;
 
 /// <summary>
-/// A spawn that fails AFTER its jail exists must remove that jail (2026-09-04). The launcher's rollback used
-/// to clean up the worktree and leave the container running, unowned, for good — nothing that could stop
-/// it later knew it existed. Driven through the real launcher with an engine that records removals and a
-/// worktree manager whose ref-watch (the last step after the container starts) throws.
+/// A spawn that fails AFTER its jail exists must remove that jail (2026-09-04) <b>and release its network
+/// segment</b> (audit F27). The launcher's rollback used to clean up the worktree and leave the container
+/// running, unowned, for good — nothing that could stop it later knew it existed; and even once the
+/// container was removed the MG-36 per-agent segment, created BEFORE the container, was still left behind.
+/// Docker's default local address pool is about 32 networks, so a few dozen failed spawns exhaust it and
+/// every subsequent spawn fails at network creation on a machine with no running agents. Driven through the
+/// real launcher with an engine that records removals and a worktree manager whose ref-watch (the last step
+/// after the container starts) throws.
 /// </summary>
 public sealed class SpawnRollbackTests
 {
@@ -30,8 +34,9 @@ public sealed class SpawnRollbackTests
         try
         {
             var engine = new AgentSessionRepoScopingTests.RecordingEngine();
+            var environment = new ThrowingWatchEnvironment(root, engine);
             var launcher = new SandboxAgentLauncher(
-                new ThrowingWatchEnvironment(root, engine),
+                environment,
                 new InstalledAdapterCatalog(Path.Combine(root, "registry")),
                 NullLoggerFactory.Instance);
 
@@ -42,6 +47,11 @@ public sealed class SpawnRollbackTests
             var spawned = Assert.Single(engine.Spawns);
             Assert.Equal(("repo-a", "agent-1"), spawned);
             Assert.NotEmpty(engine.Removed);
+
+            // ...and so was its segment. A grant made before the container must have a release on the
+            // path that gives up before the container exists, which is most of the ways a spawn fails.
+            var released = Assert.Single(((ThrowingWatchEnvironment.NoEgress)environment.Egress).RemovedSegments);
+            Assert.Equal(("repo-a", "agent-1"), released);
         }
         finally
         {
@@ -114,8 +124,18 @@ public sealed class SpawnRollbackTests
                 throw new InvalidOperationException("the ref watcher refused this agent");
         }
 
-        private sealed class NoEgress : IEgressPolicy
+        internal sealed class NoEgress : IEgressPolicy
         {
+            /// <summary>Every (repo, agent) whose per-agent segment was released.</summary>
+            public List<(string Repo, string Agent)> RemovedSegments { get; } = new();
+
+            public Task RemoveAgentSegmentAsync(
+                string repoHash, string agentId, CancellationToken ct = default)
+            {
+                RemovedSegments.Add((repoHash, agentId));
+                return Task.CompletedTask;
+            }
+
             public EgressAllowlist Allowlist { get; } = EgressAllowlist.WithDefaults(new InMemoryAuditLog());
 
             public string NetworkName => "fake-net";

@@ -369,7 +369,13 @@
   recomputing those four conditions is the point: two derivations would eventually disagree invisibly.
   Results are cached for `DefaultCacheWindow` so N subscribers cannot multiply engine calls.
 - **`Runtime/AgentSessionStore.cs`** — the in-memory daemon agent registry + snapshot-then-deltas
-  event fan-out (host state, not transport); the gRPC classes dispatch here. Appends `spawn`/`stop`
+  event fan-out (host state, not transport); the gRPC classes dispatch here. Two W3A additions: the
+  **pause axis is durable** — `MarkFrozen` writes through `AgentRestartLedger` and a mark for a jail that
+  survived a restart is re-applied by `Spawn` (i.e. at the reconciler's adoption, since the axis is scoped
+  to live sessions and there are none until then), because the axis records WHO froze a jail and every
+  release path keys on it (audit F3); and `BeginTeardown`/`IsTearingDown`, the scope
+  `AgentSpawnService.StopAsync` holds from before the record is removed until the container is gone, which
+  the reconciler consults so it cannot adopt a jail mid-stop (audit F14). Appends `spawn`/`stop`
   audit events via `IAuditLog`; `MarkState(agentId, state, reason)` (P2-09) updates a session's state
   + broadcasts a state delta (the sink the real supervisor drives so a pause/rate-limit streams to
   clients) — and broadcasts when the **reason** changed as well as the state word, holding the last one
@@ -413,7 +419,23 @@
     hardened jail (`Sandboxes.SpawnAsync`), returning the real container id;
   - `TryLaunchAsync` returns null (session-only, no jail) when the repo handle is not provisioned (the
     headless Alpha-loop-smoke path), cleans up a half-made worktree on failure, and `TeardownAsync`
-    removes the jail + worktree on stop. It also owns the daemon half of the **CLI login round-trip**:
+    removes the jail + worktree on stop. **Rollback also releases the MG-36 network segment** (audit F27,
+    W3A): the segment is created BEFORE `SpawnAsync`, so every failure from the image pull onwards leaked
+    one and only a clean teardown ever reclaimed it — a few dozen failed spawns exhaust Docker's ~32-network
+    local address pool, after which every spawn fails at network creation on a machine with no running
+    agents. Ordered after the container removal (Docker refuses to delete a network with a live endpoint)
+    and unconditional on the handle, because the failures that leak a segment are precisely the ones where
+    no container exists. **Teardown no longer honours the caller's cancellation** for the container removal
+    or the segment release (audit F19): past that point the session record is already gone, so a cancelled
+    removal leaves an unowned jail on a deleted worktree — the caller side is fixed too
+    (`AgentSpawnService.StopAsync` passes `CancellationToken.None`), this is the half the next caller
+    cannot get wrong. On the reuse question (audit F28) the launcher's `Limits:` argument IS the current
+    ceiling — `JailLimitsSettings.Current`, read live at every spawn — so an operator's lowered ceiling
+    reaches every jail created after the change; what it does not reach is a REUSED jail, because
+    `DockerSandboxEngine.SpawnAsync` decides reuse on mounts/DNS/network/secrets/image and never on the
+    limits. That check belongs beside the other eight in the engine's reuse decision rather than being
+    re-decided here (MG-12), and PR #368 puts it there, re-applying memory/CPU/pids in place on the live
+    cgroup rather than recreating the jail and losing the agent's session. It also owns the daemon half of the **CLI login round-trip**:
     `FilterCliCredentials` admits ONLY client-supplied files whose path exactly matches the installed
     adapter's declared `credentialPaths` (the marker is the allowlist — a compromised client can never
     seed arbitrary agent-home files), and `HarvestCliCredentialsAsync` reads those files back out of the
@@ -497,7 +519,12 @@
     session with `TerminalSessionManager` + the P2-09 `SessionLeader` (PTY-fd ownership + kill), audits
     `cli_bound`/`cli_bind_failed` (bind failure degrades to session-only + echo, never fails the spawn),
     and marks the session `Dead` when the CLI exits — auditing `cli_exited` with the exit code + the
-    VT-stripped output tail (`BoundTerminalSession.TailText`), the bound session staying registered so
+    output tail, which since the W3A pass goes through `SanitizeExitTail` first: the tail is raw PTY bytes
+    the untrusted jail occupant chooses, and it reached an audit event and a terminal-rendered state
+    reason verbatim, so ANSI CSI/OSC sequences (an OSC 52 clipboard write included), C0 controls, Unicode
+    format/bidi characters and newlines are folded out and the cap applied to the TEXT rather than to the
+    control bytes. `IsBound(key)` is the adoption path's guard against a second `docker exec` into a jail
+    that already has one. The bound session staying registered so
     attaching to the dead agent's terminal still replays its final output (the why).
     Also owns `TrySendPromptAsync` — the ONLY write path into a worker's CLI (coordinator contract §3
     `send_worker_prompt`), returning `PromptDelivery(Submitted, Echoed, Reacted, Refusal)`. It encodes
@@ -522,7 +549,26 @@
     last flag is the entire scope of the in-flight exemption: a jail this daemon started itself, whose
     worker finished and sits in AwaitingReview, still reaps at the allowance. It stops what the policy
     names through the ordinary `AgentSpawnService.StopAsync` (harvest,
-    publish, teardown — nothing committed is lost). Audits `jail_reaped`. `SweepOnceAsync(now)` is public
+    publish, teardown — nothing committed is lost). Audits `jail_reaped`. A session the reconciler has
+    marked `Unresponsive` is **skipped** (audit F20, W3A): its jail is already gone, so there is no memory
+    or container to reclaim — which is this sweep's whole remit — and all a reap would still do is delete
+    the agent's worktree, i.e. put the decision to discard a dead agent's uncommitted work in the hands of
+    a 30-minute clock. The record stays, visible and Stoppable, until a human decides. It also runs the
+    **MG-36 network-segment sweep** every `SegmentSweepInterval` (5 min — its own, much slower cadence,
+    because a leaked segment is inert until a few dozen exhaust Docker's address pool while the sweep's own
+    grace is already ten minutes): `SandboxSegmentReaper.SweepAsync` reclaims per-agent networks whose jail
+    no longer exists, audited as `jail_segment_reaped` by segment name, and a sweep that throws is
+    swallowed so the load-bearing jail half is never lost with it (audit F27 — the reaper was complete and
+    tested and reached nothing). **"Throws" includes an `OperationCanceledException` on a token nobody
+    cancelled** (W3A rework): a Docker.DotNet call past its 100-second default surfaces as
+    `TaskCanceledException`, which the type-only filter let through — out of the sweep, out of the loop
+    lambda that had no catch around it, into a faulted `Task.Run` whose `while` never ran again, leaving
+    the jail sweep dead until the next daemon restart with nothing reporting it. A cancellation is only an
+    instruction when the caller's token is actually cancelled, and that one still propagates. **A different axis from the jail sweep, deliberately not sharing its
+    rules:** the jail sweep asks "idle too long", and PR #366 exempted a jail with an in-flight merge entry
+    from that; a segment is reaped on whether ANY container (running or stopped) exists for it, so a
+    live-but-idle jail's network is saved by the jail's existence whatever the queue thinks, and borrowing
+    the in-flight exemption could only let an exempt jail's network be swept while it ran on it. `SweepOnceAsync(now)` is public
     and caller-clocked so the daemon-tier test drives the idle allowance without waiting it out.
   - **`Runtime/FrozenJailPolicy.cs`** — the frozen-jail predicate behind `send_worker_prompt`,
     `request_verification` and the human's Verify: the session state word (`Paused`/`Conflict`) OR the
@@ -607,6 +653,17 @@
     because a `Managed` worker's terminal is daemon-locked read-only, so anything in its settings file
     was written by the agent, not approved by a person. Restore is deliberately wider than harvest (a
     Managed worker still receives the repo's approvals or it stalls on prompts nobody can answer).
+    **Audit F19, at the `StopAsync` call site: the two harvests sit inside a
+    `try`/`catch (OperationCanceledException)`, the TEARDOWN below them does not.** The harvests may
+    honour the RPC's token — they are best-effort reads and a client that hung up has stopped waiting for
+    its credentials — but past that point the session record is already gone, so a cancellation that
+    skipped the teardown would leave a running container nothing in the app can see, on a worktree the
+    same stop is about to want removed. The disconnect that reaches it is the ordinary case: a user
+    closing the window on a stop taking a few seconds. **The guard wraps the gate; it never replaces
+    it** — the call inside the `try` is `HarvestCredentialsIfAttendedAsync`, and swapping it back to the
+    ungated `_launcher.HarvestCliCredentialsAsync` reopens F2 with a green build, which is why the
+    reason is restated at the line and pinned by
+    `CliSettingsBoundaryTests.StoppingAnUnattendedWorker_HarvestsNoLogin_EvenThoughTheFileIsRightThere`.
     **F2 — the same gate now covers CREDENTIALS** (`HarvestCredentialsIfAttendedAsync`, at both the live
     `HarvestCredentialsAsync` and the `StopAsync` call sites). It did not before, and the asymmetry made
     no sense in either direction it was argued: a coordinator's workers are spawned `Managed` running
@@ -736,17 +793,54 @@
     differ per version). The arbitration rules: a human pause is sticky — the cascade's yield runs
     through a frozen jail and never wakes it (checked at RESUME time in `YieldProtocol`) — and a
     human unpause is refused while a machine hold is outstanding (self-clearing, seconds). Refusals
-    are answers, not exceptions. Pinned by `Mainguard.Server.Tests/AgentPauseTests` (incl. a real
-    docker pause→inspect→unpause leg) and the arbiter legs of `Mainguard.Tests/YieldProtocolTests`.
+    are answers, not exceptions. **The human half of the ledger is durable** (audit F3, W3A): it writes
+    through `AgentRestartLedger` and rehydrates in its constructor, because a `docker pause`d jail
+    outlives the daemon and the record of WHO paused it has to as well — without it the reconciler adopted
+    the jail as Paused and Unpause answered "this agent isn't human-paused", leaving a raw `docker unpause`
+    as the only exit. Machine holds stay in memory on purpose (a hold rehydrated from a dead process is a
+    refusal that never self-clears). Unpause also now (a) restores the human-pause flag when the engine
+    call FAILS, so a retry is a retry rather than needing the undocumented "pause again, then unpause"
+    (F17), and (b) accepts a jail whose pause axis carries only the engine's own reading — a freeze nobody
+    inside the app claims — which is F3's last exit; a freeze an in-app owner DOES claim is still refused,
+    because its owner's release does more than call unpause. **The two writes are ordered around the engine
+    call, and that order is the fix for the crash window the durable ledger opened** (W3A rework): Pause
+    persists the CLAIM before the freeze it explains, and Unpause drops the flag from MEMORY before the
+    engine call (`ForgetHumanPause`, for the machine-hold race) and from the FILE only after it
+    (`PersistHumanPauseCleared`). The other order left `{HumanPaused:false, Frozen:["a human paused it"]}`
+    for a daemon that died mid-loop — the audit's own wedge, made durable. `IsReleasableFreeze` closes the
+    same window from the reading side: this service's own axis reason (`HumanPausedFrozenReason`) with no
+    surviving flag is still a human's freeze, and a session that is not frozen at all does not veto the
+    others. Pinned by
+    `Mainguard.Server.Tests/AgentPauseTests` (incl. a real docker pause→inspect→unpause leg),
+    `RestartSurvivalTests`, `RestartSurvivalDockerTests`, and the arbiter legs of
+    `Mainguard.Tests/YieldProtocolTests`.
   - **`Runtime/AgentSessionReconciler.cs`** — **the live session store's reconcile against Docker**
     (ISSUES-LOG #18/#20), plus the `AgentSessionReconcilerService` `BackgroundService` that drives it at
     startup and every 30 s. Adoption reads the parent off `mainguard.agent.parent` and hands each adopted
     session to an `onAdopted` hook, which the composition root binds to
-    `AgentSpawnService.TryReattachEndpoint` so an adopted coordinator's tools and an adopted worker's plan
-    channel come back with it (before 2026-09-03 adoption rebuilt the record and nothing else). Adoption
+    `AgentSpawnService.TryReattachAdoptedAgent` (the W3A wrapper around the endpoint rebuild that used to
+    be called directly as `TryReattachEndpoint`, which is now its private half) so an adopted coordinator's tools and an adopted worker's
+    plan channel come back with it (before 2026-09-03 adoption rebuilt the record and nothing else) —
+    **and, since the W3A pass, its CLI** (audit F6): the exec'd CLI was a `docker exec` child of the dead
+    daemon's PTY, so an adopted agent had four re-bound tools and no process to call them. The hook also
+    fires on the paused → running correction, because `docker exec` into a SIGSTOPped container blocks and
+    a jail adopted frozen has to be re-attached by the pass that thaws it. Two further W3A rules: an
+    adoption is SKIPPED while `AgentSessionStore.IsTearingDown` says a stop is mid-teardown (audit F14 —
+    the stop removes the record seconds before the container goes, and a pass landing in that window
+    resurrected a ghost session that then refused the entry's Resume for half an hour), and the engine's
+    own freeze reason never overwrites a more specific one already on the pause axis. The rework adds the
+    converse of that last rule — `ClearFreezeOnAnAdoptedRunningJail`: a jail Docker lists as RUNNING does
+    not inherit a rehydrated freeze, because every release is two writes (wake the container, clear the
+    axis) and a daemon that died between them left a running jail whose axis said frozen, which the drift
+    pass never cleared (it only clears when the state WORD is Paused, and adoption had just written
+    `Working`). Safe only at adoption, where the key had no record a line earlier so no live owner can be
+    mid-pause on it; `SandboxKillTarget.DeadlineLapsedReason` is exempt, because it says containment could
+    not be READ and a listing is not the confirmation it is waiting for. Adoption
     also calls `AgentSessionStore.MarkAdopted`, which is the jail reaper's ONE excuse for a jail with no
     bound CLI — recorded here because this is the only pass that knows the CLI's PTY died with a previous
-    daemon rather than because the agent left. The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
+    daemon rather than because the agent left. (The F6 re-bind above usually makes that excuse moot: a
+    successfully re-bound CLI clears the mark on the reaper's next sweep — the mark covers the window
+    between adoption and a CLI actually coming back, and the jails where none can.) The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
     table, `LeaderReattachTask` → the PTY leader registry) never wrote to `AgentSessionStore`, which is
     what `ListAgents`/`StreamAgentEvents`/the resource monitor/the kill switch actually render — so a
     restarted daemon reported zero agents while their jails kept running, and a `docker pause`/`unpause`
@@ -1108,10 +1202,18 @@
     in-proc and I/O-free, so they run BEFORE any Docker round-trip and an unreachable engine can never
     leave keystrokes reaching a killed agent), then `docker pause` the jail via
     `ISandboxEngine.PauseAsync` (freezer cgroup — no cooperation needed from the untrusted agent),
-    then mark session state, with an unpausable jail marked `Unresponsive` rather than `Paused`. It
+    then mark session state **and the pause axis** (F16 — it wrote the WORD only, which the merge
+    queue's reflection rewrites, and cleared on release a mark it had never set), with an unpausable jail
+    marked `Unresponsive` rather than `Paused` and a jail whose state could not be READ because the RT-D4
+    deadline lapsed marked `Unresponsive` with a distinct "containment UNCONFIRMED" reason rather than
+    with the measured-failure wording (F22 — the confirmation probe ran on the already-cancelled fan-out
+    token and its catch-all `false` is spelled the same as "Docker says it is running"). It
     REPLACED `SessionStoreKillTarget`, which only wrote `MarkState(…, "Paused")` while every process
     kept executing and every terminal stayed typeable — containment that was really just relabelling.
     Also the **release** half (`UnpauseAsync`, ISSUES-LOG #17): it keeps a per-agent **causation ledger**
+    — durable since W3A, written through `AgentRestartLedger` and rehydrated in the constructor, because
+    "engage the emergency stop, then restart" is the ordinary sequence and the restart used to leave every
+    frozen jail with nothing in the app entitled to wake it (audit F3) —
     of what it actually transitioned — which containers *it* paused, and whether *it* took the terminal
     lock / closed the leader's input gate — and `KillSwitch.ResumeAsync` reverses exactly those entries.
     A jail already frozen when the stop fired (a human pause, or the keep-alive rebase's yield hold —
@@ -1121,7 +1223,14 @@
     (a role property) survives the cycle — that was the concern behind the original "Resume deliberately
     does NOT un-contain", honoured precisely instead of by refusing to recover at all. A container that
     no longer exists is released by definition (logged, skipped); an unpause the engine refuses marks the
-    session `Unresponsive` with "the jail is STILL paused" and keeps it in the retry ledger.
+    session `Unresponsive` with "the jail is STILL paused" and keeps it in the retry ledger. **The durable
+    entry is narrowed as the release proceeds and dropped once, at the very end** (W3A rework): dropping it
+    up front — before a single container had been woken — meant a daemon dying inside the fan-out left
+    `KillContained=false` with every jail still paused and the axis still reading "Kill switch engaged", so
+    the next daemon's Resume released nothing, Unpause refused (a claimed reason) and the CLI re-bind
+    skipped (the jail is frozen): a raw `docker unpause` was the only exit, which is the audit's Critical 3
+    written into the code added to close it. Each container leaves the entry only once it has been
+    witnessed awake, so a lost daemon rehydrates exactly what nobody woke.
   - `DaemonHost.cs` registers one `IAgentEnvironment` (`Wsl2AgentEnvironment`) as a singleton, the P2-14
     governance singletons (`ConnectionRoleRegistry`, `TerminalLockRegistry`,
     `IApproverIdentityResolver`, `CoordinatorLimits`, `PlanApprovalService` over a restart-safe

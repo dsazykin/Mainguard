@@ -1531,6 +1531,51 @@
   `Unresponsive` rather than leaving it claiming to work. Trivial `busybox` jails carrying the P2-07
   label set, scoped to the test's own minted agent id so a developer box with live jails on it is
   neither read nor written.
+- **`Mainguard.Server.Tests/RestartSurvivalTests.cs`** — **the exit the audit said nothing tested.**
+  `AgentSessionReconcileTests.Reconcile_ShouldAdoptAPausedJail_AsPaused` pins the ENTRY to F3's trap (a
+  restart adopts a `docker pause`d jail as Paused and frozen, and then Unpause says "this agent isn't
+  human-paused", the kill switch's Resume releases nothing, Resolve/Abort say "no rebase parked"); these
+  pin the way out. Every "restart" here is what a restart is — a SECOND set of daemon objects over the
+  same `JsonAgentRestartLedger` file, with the first discarded, nothing handed across in memory. Covers:
+  the acceptance walk-through (human pause → restart → adopt → **Unpause succeeds**, no `docker unpause`
+  anywhere); a jail frozen OUTSIDE the app being resumable once adopted, while one an in-app owner claims
+  is still refused; F17's retry (a failed unpause leaves the agent human-paused, so pressing Resume again
+  is a retry rather than the undocumented "pause again, then unpause"); the kill switch's containment and
+  its epoch surviving, including recovery of the epoch from `IKillJournal.ReadAll`; the pause axis coming
+  back at adoption and being dropped by a stop (`pr-<n>` ids are reused); the parked conflict and its
+  hand-back permit surviving; and an unreadable ledger rehydrating as nothing remembered.
+  **The CRASH WINDOWS** (rework) are the harder half and have their own section: a restart BETWEEN
+  operations is easy, while each of these operations is two durable writes with an engine round-trip
+  between them, and the write order decides what a daemon that dies in the middle leaves behind. Modelled
+  the only honest way — a crash is the process ceasing to exist, so nothing runs afterwards: the fake
+  engine's `OnPause`/`OnUnpause` hook photographs the ledger FILE as the engine call begins, the next
+  daemon is built over that photograph, and the jail is left in the state a killed daemon leaves it (still
+  paused, because the call in flight never landed). Covers human Unpause killed mid-loop, the two orderings
+  asserted directly on the file, a human-claimed freeze with no surviving flag still being resumable, the
+  kill switch's Resume killed mid-fan-out, and a RUNNING jail not inheriting a rehydrated freeze at
+  adoption while `DeadlineLapsedReason` does survive.
+- **`Mainguard.Server.Tests/AdoptionReattachTests.cs`** — adoption's second half and the stop race, at the
+  unit tier: the re-attach hook fires for an adopted RUNNING jail and **again when a jail adopted paused
+  thaws** (a `docker exec` into a SIGSTOPped container blocks, so the frozen adoption cannot re-bind and
+  something has to retry); a throwing hook is one agent's problem; the engine's freeze reason never
+  overwrites a more specific one; a jail whose teardown is in flight is **not** adopted (F14) and that
+  guard is repo-scoped; the reconciler **hosted service**, with the assembly-wide disable switch lifted
+  for the length of one test, actually adopts (the service was never exercised in-proc at all, and a
+  service that returns early runs nothing); `AgentCliBinder.SanitizeExitTail` over the escape sequences,
+  controls, bidi overrides and newlines that used to reach the audit chain verbatim; and F7's now-real
+  input gate — a paused `BoundTerminalSession` DROPS human keystrokes and forwards them again on resume,
+  while the daemon's own sanctioned `SubmitLine` (the coordinator's steering channel) bypasses it, for the
+  same reason it bypasses the terminal input lock.
+- **`Mainguard.Server.Tests/RestartSurvivalDockerTests.cs`** (`RequiresDocker`) — the same two claims with
+  **a real container engine as the witness**, which is the only honest tier for either: a `docker pause`d
+  container really outlives the process that asked for it, and a `docker exec` under a daemon-side PTY
+  really is a child process that dies with its parent — a fake engine cannot model the second at all. A
+  paused jail is resumed from inside the app after a restart (`docker inspect`'s `State.Paused` on both
+  sides); a kill-switched jail is released by a restarted daemon's Resume; and a mid-task agent's CLI is
+  **re-bound and steerable** after its PTY is killed the way a daemon death kills it — steerable proved
+  from the new CLI's own output coming back, never from the write returning, since a PTY master accepts a
+  write whether or not the child reads it. Trivial `busybox` jails with `/workspace` present so the
+  production `docker exec -u 1000 -w /workspace` argv applies, scoped to the test's own minted agent id.
 - **`Mainguard.Tests/MergeQueueJailReconcileTests.cs`** — the unit tier of the merge queue's **jail-liveness
   reconcile** (ISSUES-LOG #24): a `Working` entry whose jail is gone is stranded and its `CanMerge` wording
   replaced (`StaleVerified`'s "re-verifying" promise too — the cascade needs a jail to keep it), a live
@@ -2392,7 +2437,13 @@
   its own jail socket); `AgentSession.ParentAgentId` records the spawning coordinator;** the
   Unix-socket legs — coordinator IPC endpoint + locked managed-worker spawn via the socket, and the
   REAL python3 `mainguard-agent` shim round-trip — are `LinuxOnly`, authoritative in the Linux CI
-  leg),**
+  leg; **the adoption re-bind driven through the SHIPPED hook** — `AgentSpawnService.TryReattachAdoptedAgent`
+  over an adoption-shaped record, asserting the adapter lookup, the marker argv, the declared `resumeArg`
+  ahead of the variadic `--allowedTools`, the role instructions and the one shim grant re-applied, the
+  kickoff turn deliberately absent, and the `cli_reattached` audit; plus the guards the hook owns — a
+  frozen jail is skipped (`docker exec` into a SIGSTOPped container blocks) and a session that already has
+  a live CLI is left alone. Driving `TryBind` with a hand-written argv instead passes with the entire hook
+  deleted, which is why the entry point is the one under test),**
   **`PlanModeToggleDaemonTests`** (the plan-mode toggle AT THE DAEMON, on its own `PlanGateRig` so the
   switch it flips is its own host's: with the toggle off the worker's `task` op answers at once and the
   coordinator is told "Working"; with it on the same op is refused and then answers after an approval,
@@ -2615,7 +2666,10 @@
   shape the role lock already shipped as once),**
   **`SpawnRollbackTests` (2026-09-04 — a spawn that fails AFTER its jail exists removes that jail: the real
   launcher over a recording engine and a worktree manager whose ref-watch throws; the leak was every such
-  failure leaving a container running, unowned, for good),**
+  failure leaving a container running, unowned, for good) — **and releases its MG-36 network segment**
+  (audit F27): the segment is granted before the container, so the rollback that gives up before the
+  container exists is exactly the path that leaked one, and a few dozen leaks exhaust Docker's address
+  pool,**
   **`JailLimitsRpcTests` (2026-09-04 — the ceiling over the real composition root: Set answers clamped, Get
   agrees, the NEXT spawn's `SandboxSpawnRequest.Limits` carries it — the line a setting the launcher never
   read would lack — the file sits beside the session token, and a non-positive value is InvalidArgument;
@@ -2626,8 +2680,17 @@
   with the cause — scoped to that agent id, since the audit log is db-backed under the suite's shared data
   root and every other reap in the assembly lands in the same table. **B1** adds the adoption plumbing at
   this tier: an adopted jail with no queue entry is STILL reaped at the allowance (the mark is not a
-  blanket reprieve), and the mark is cleared by the first sweep that sees a bound CLI. The policy's own
-  table lives in `Mainguard.Tests/JailReapPolicyTests`),**
+  blanket reprieve), and the mark is cleared by the first sweep that sees a bound CLI. Plus audit F20: a session the reconciler has marked `Unresponsive` is NOT reaped, at any
+  clock — its jail is already gone, so all a reap would still do is delete the agent's worktree, i.e. let a
+  30-minute timer decide that a dead agent's uncommitted work is finished; the record stays and the human's
+  Stop still clears it. Plus audit F27's wiring: the host's `SweepSegmentsOnceAsync` runs the segment
+  reaper and audits `jail_segment_reaped` by segment name — a network that no longer exists cannot be
+  inspected afterwards — and a segment sweep that throws is swallowed rather than taking the load-bearing
+  jail sweep with it — including the throw that actually happens and was NOT swallowed before the rework:
+  a Docker.DotNet timeout arrives as `TaskCanceledException`, an `OperationCanceledException` on a token
+  nobody cancelled, which the type-only filter let out into a faulted reaper loop that never ran again;
+  a genuinely cancelled token still propagates, because that one means the host is stopping.
+  The policy's own table lives in `Mainguard.Tests/JailReapPolicyTests`),**
   **`StopAllAgentsOnExitTests` (2026-09-04 — the exit leg: `ControlCenterViewModel.StopAllAgentsAsync`
   ends every live mock agent and leaves the records (branches stay until teardown), honours an exhausted
   budget between agents, and the manifest's surface is the one `ProductionShutdownEnvironment` reaches —

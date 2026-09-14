@@ -321,6 +321,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     so the obvious spelling of this fix ships the fix and keeps the bug. Gated on `ipcDirPath` like the
     pre-approval beside it, and an unreadable style is REFUSED at parse (`BadInitialPrompt`) rather than
     defaulted, because degrading to "no first turn" is the deadlock).
+    **The fourth per-adapter field, `resumeArg`** (claude-code: `--continue`, measured against the CLI's own
+    `--help`), is the mirror image and is used on exactly ONE path — `BuildReattachLaunchArgv`, the adoption
+    re-bind after a daemon restart. The daemon's PTY dies with the daemon so the adopted agent's CLI is a
+    new `docker exec`, but its jail is not new: `/workspace`, the `agent/<id>` branch and the in-jail `$HOME`
+    all survive, and a CLI that keeps a per-directory session store keeps it under that `$HOME` — so the
+    transcript is still on disk and the flag is what opens it. Without it the re-bind restored a *process*,
+    not a loop: a steerable CLI at an empty input box with no idea what it was doing. Never on the spawn
+    line (a fresh jail has no conversation to continue), placed before the variadic `--allowedTools` for the
+    same reason the first turn is, and subject to the same rule as `preApprovedCommandArg` — verify the flag
+    against the PINNED binary, because a flag a CLI does not know makes it exit on its own launch line, and
+    on the re-bind path that is an adopted agent that had a jail and now has nothing. An adapter that
+    declares none re-binds exactly as it did before the field existed.
   - **`Agents/` (P2-06 repo provisioner — daemon-side, no UI).**
     - `RepoPathHasher.cs` (pure: a normalized Windows repo path → a stable lowercase-hex SHA-256;
       case-folds + unifies slashes + strips the trailing separator so `C:\Repo\` and `c:/repo` map to one
@@ -1632,7 +1644,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       dedicated `IAgentControlChannel` — a named pipe / second channel, **not** the interactive PTY —
       awaits `[IPC_UPDATE_READY]` ≤ 10 s, else `ISandboxEngine.PauseAsync`; always returns an
       `IYieldToken` (the sole mutation gateway) whose `Resume`/`Dispose` unpauses the jail / signals
-      resume; `YieldOutcome` ByReady/ByPause). **The token OWNS the `IPauseArbiter` machine hold** and
+      resume; `YieldOutcome` ByReady/ByPause). The pause arm writes **and clears the pause axis**
+      (`IAgentSupervisor.MarkFrozen`, one `YieldPausedReason` constant shared by the word and the axis) —
+      audit F16: it used to write only the state WORD, which the merge queue's reflection rewrites on
+      every transition, so a yield-paused jail read `Working` again and every frozen-jail guard keyed on
+      the word waved a delivery into a SIGSTOPped process. **The token OWNS the `IPauseArbiter` machine hold** and
       settles it on either exit: `Resume` (in a `finally`, so a failed unpause still hands the critical
       section back) or **`ReleaseWithoutResuming`** — the conflict path's terminus, which hands the claim
       back and leaves the jail frozen. Holding it in the resume closure alone meant a token that is never
@@ -1666,12 +1682,26 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       and that second answer is the one the mutations run under — the pre-yield resolution is a snapshot
       taken while the agent was still running, and what it validates (`.git`, `commondir`) is exactly what
       the agent would rewrite. Same re-read-at-the-moment-of-action rule K6 applied to the mutation guard.
-      `ConflictActionResult` — refusal-as-result, like `AgentResumeResult`. Not persisted, deliberately: it
-      is a measurement of one worktree at one instant, and the durable record of the handoff is the audit
-      event. Since 2026-09-04 it also holds the **hand-back mark** (`MarkHandedBack`/`IsHandedBack`/
+      `ConflictActionResult` — refusal-as-result, like `AgentResumeResult`. **Persisted since the W3A
+      restart pass** (audit F3), through `AgentRestartLedger.Process`: the original "deliberately not
+      persisted, a restart re-measures" note was half wrong — nothing re-measures, because the parking is
+      written by the cascade's conflict arm and a restart is not a rebase, so a restart left Resolve and
+      Abort answering "this entry is not parked mid-rebase" about a worktree that really was, and a Stop
+      force-removing it mid-rebase. Since 2026-09-04 it also holds the **hand-back mark**
+      (`MarkHandedBack`/`IsHandedBack`/
       `ClearHandedBack`): "let the agent resolve" sets it, the composition root installs it on the ref
       mediator as `RewritePermitted`, and the worker's finished rebase — a rewrite of published history —
-      is published exactly once before rule 2 is absolute again).
+      is published exactly once before rule 2 is absolute again. The permit is **both stamped and
+      durable**, which are independent properties from two different audit findings: F44 gave it a
+      `HandBackLifetime` (24h) measured against the injected `_clock`, so Monday's decision stops
+      authorising Friday's rewrite; F3 write-through made it survive a restart, because the rewrite it
+      authorises arrives whenever the agent finishes. The single constructor takes both seams
+      (`IAgentRestartLedger? persist`, `Func<DateTimeOffset>? clock`, in that order — pass the clock by
+      NAME). `IsHandedBack`'s expiry path clears the LEDGER as well as memory, or the next restart would
+      resurrect what just expired. **Known gap:** `AgentRestartRecord.HandedBackRepos` carries the repo
+      list only, not the grant stamp, so a restored permit is stamped with restore time — it stays usable
+      and still expires, at the cost that a restart refreshes its 24h lifetime. Carrying the stamp
+      through the ledger record is the real fix and wants a schema change).
     - `AgentLifecycle.cs` (`AgentContext : IDisposable`/`IAsyncDisposable` — ordered, idempotent,
       failure-tolerant teardown from an injected `TeardownPlan`: kill PTY (leader) → stop container (per
       policy) → `RemoveAgentWorktree(force:true)` (also deletes `agent/<id>`) → emit the terminal event →
@@ -1679,7 +1709,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       into a `TeardownReport` that fails tests on residue); the P2-09 `AgentRunState` enum incl.
       `Conflict`; `AgentLifecycleEvent`).
     - `SessionLeader.cs` + `LeaderRegistry.cs` (the persistent PTY-fd owner intended to outlive the
-      daemon: `Register`/`Kill`/`PauseInput`/`ResumeInput`/`IsPaused` per agent, and boot
+      daemon: `Register`/`Kill`/`PauseInput`/`ResumeInput`/`IsPaused` per agent — **the input gate is
+      enforced since the W3A pass** (audit F7): `BoundTerminalSession.WriteInputAsync` consults
+      `IsPaused` and DROPS human keystrokes while it is closed, where before the only non-test reader was
+      the kill switch computing whether it had been the party to close the gate, so the gateway's 429 /
+      budget pause and the yield window forwarded a flag nothing checked; the coordinator's sanctioned
+      `send_worker_prompt` bypasses it for the same reason it bypasses the terminal lock — and boot
       `Reattach(liveContainers)` reconciling registry sessions toward Docker truth — a session whose
       container is dead is reaped; `LeaderRegistry` is the durable **leader-owned** JSON state (atomic
       temp-then-rename), the daemon reads it on boot — **no daemon-side pidfiles**).
@@ -2329,13 +2364,59 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `CoordinatorAgentReplyEngine` is a thin bridge onto `CoordinatorAgent.SendAsync`, no new
       orchestration — and appends the coordinator's reply; with no engine wired it records an honest
       system turn rather than fabricating a reply. `ConversationRole`/`ConversationTurn`).
+    - `SandboxSegmentReaper.cs` (**audit F27 — the segments teardown never got to.** The segment is
+      created BEFORE `SpawnAsync`, and a failed spawn's rollback removes the container and the worktree
+      but not the segment; only a clean teardown calls `RemoveAgentSegmentAsync`. A few dozen failed
+      spawns exhaust Docker's default address pool, after which EVERY spawn fails at network creation on
+      a machine with no running agents. `SandboxSegmentReapPolicy` is the pure decision — `JailNameFor`
+      inverts `AgentSegmentName` back to the container name, which is what lets the sweep ask Docker
+      directly whether the jail this segment exists for is still present — and five independent
+      conditions each save a network on their own: not a segment name, missing Mainguard's own
+      `mainguard.role=agent-net` stamp, anything attached other than the egress proxy (which is on every
+      segment by construction), a container with the segment's jail name existing **running or stopped**,
+      and an age inside the ten-minute grace, since a spawn creates the segment before the jail.
+      `SweepAsync` gathers the facts — networks, then ALL containers, then a per-candidate inspect because
+      the network LIST does not populate `Containers` — fails closed if either list is unavailable, and
+      swallows per-network failures so one bad network never stops the sweep. Authored on PR #368 and
+      imported here verbatim so the W3A branch could supply the caller it lacked: it is driven by
+      `Mainguard.Server/Runtime/JailReaperHostedService.SweepSegmentsOnceAsync` on its own 5-minute
+      cadence, and the ROLLBACK half — the release beside the grant, which a sweep is a backstop for
+      rather than a substitute for — is in `SandboxAgentLauncher`. Refusals are pinned in
+      `Mainguard.Tests/SandboxResidueReapingTests.cs` (PR #368) and the wiring in
+      `Mainguard.Server.Tests/JailReaperTests`.)
+    - `AgentRestartLedger.cs` (**the one durable store behind the five ledgers a daemon restart used to
+      erase** — audit F3, the W3A pass. `AgentRestartRecord` is one row per AGENT ID carrying: the human
+      pause flag (`HumanPauseLedger`), the kill switch's causation line (contained? which containers did
+      IT freeze? did IT take the terminal lock / close the input gate? — `SandboxKillTarget`), the pause
+      axis per repo (`AgentSessionStore._frozen`), the parked mid-rebase conflicts per repo and the
+      hand-back permits per repo (`RebaseConflictParkingStore`); the document also carries the outstanding
+      `KillEpochId`. **One store, not five**, because they are five facts about one question — "what did
+      the daemon do to this agent that a human now has to be able to undo?" — and every exit the audit
+      found closed needed several at once; five files would be five chances to rehydrate half a state, and
+      a jail remembered as frozen with no record of WHO froze it refuses every release while looking
+      recoverable. `IAgentRestartLedger` with three implementations: `JsonAgentRestartLedger` (the daemon's
+      — one JSON file, write-to-temp-then-rename, reads failing to *nothing remembered*, exactly the
+      `JsonHeldTaskStore` pattern it copies), `InMemoryAgentRestartLedger`, and `NullAgentRestartLedger`
+      (remembers nothing; what both test suites install process-wide from their module initializer, since
+      the five owners rehydrate in their constructors and one *remembering* shared instance made every rig
+      inherit the previous rig's state). Reached through the process-wide `AgentRestartLedger.Process`
+      rather than DI because the five owners are constructed in five places and one of them —
+      `MergeQueueProvisioner.ParkedConflicts` — is a field initializer with no argument to thread;
+      `UseForTests` is the replacement seam. Path: `<data root>/mainguard-restart-ledger.json`. Pinned by
+      `Mainguard.Server.Tests/RestartSurvivalTests` and, against real containers,
+      `RestartSurvivalDockerTests`.)
     - `KillSwitch.cs` (the emergency stop: **freeze the queue FIRST** synchronously via the shared
       `KillSwitchGate` (SA-1/F4 — before any await, so no `BeginMerge`/spawn slips the fan-out window;
       `QueueFrozenException`), then yield-all fan-out over an `IKillTarget` (timeout →
       `PauseAsync`/`docker pause`), then a journal snapshot via `IKillJournal` before returning;
       **`ResumeAsync` is the real mirror** (ISSUES-LOG #17 — it used to be `_gate.Resume()` and nothing
       else, leaving every paused jail frozen for the life of the daemon): the epoch's fan-out set is
-      remembered, `IKillTarget.UnpauseAsync` releases exactly those agents under the same RT-D4 deadline,
+      remembered — **durably, since the W3A restart pass** (audit F3): the set is rehydrated from
+      `AgentRestartLedger`'s per-agent containment flag (the target's own record of what it froze, which is
+      stricter than "every id the fan-out touched"), and the epoch id from the ledger or, failing that,
+      from `IKillJournal.ReadAll()` — which is that method's **first production caller**, closing its own
+      doc comment's complaint that a write-only journal is the defect —
+      `IKillTarget.UnpauseAsync` releases exactly those agents under the same RT-D4 deadline,
       the freeze flag then clears in a `finally` so a wedged engine can never also trap the queue, and an
       agent whose release could not be confirmed comes back `ResumeFailed` and STAYS in the ledger so a
       second press retries exactly it (`KillResumeOutcome`/`KillAgentResume`/`KillResumeReport`, audited
@@ -2514,8 +2595,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the argv the daemon execs in the jail. This is the `agentKind`→CLI wiring `SandboxAgentLauncher`
       used to ignore. The marker also carries `credentialPaths` and `settingsPaths` across the host/VM
       boundary — the ONLY declarations of what the daemon may restore into / harvest from a jail — plus
-      `instructionsFile`/`systemPromptArg` and (defect C2) `preApprovedCommandArg`/
-      `preApprovedCommandFormat`. **Defect D5a — the marker is no longer a second source of truth.**
+      `instructionsFile`/`systemPromptArg`, (defect C2) `preApprovedCommandArg`/
+      `preApprovedCommandFormat`, and the adoption re-bind's `resumeArg`. **Defect D5a — the marker is no
+      longer a second source of truth.**
       Those fields being null on an older marker was documented as "re-install to backfill", and on a real
       install nobody does: `~/mainguard/adapters/registry/claude-code.json` carried none of
       `preApprovedCommandArg`, `preApprovedCommandFormat` or `initialPromptStyle`, so two shipped fixes
