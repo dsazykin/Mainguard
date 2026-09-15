@@ -496,6 +496,21 @@
     filename) the jail's `info/exclude` is built from, so what the daemon writes and what git ignores are
     decided by one field. `Worktrees` exposes this daemon's own worktree manager for the in-daemon
     caller that acts on a live agent's worktree (the worker's `commit_work`).
+    It owns the **conversation store** too, and that one is deliberately NOT a round trip: it calls
+    `ConversationStoreManager.Prepare` before the container exists (mounts are fixed at create) and hands
+    the resulting bind mounts to `SandboxSpawnRequest`, so the CLI's transcripts land on daemon-owned
+    ext4 as they are written and survive a jail that dies without a clean stop — the case a harvest,
+    which runs in `StopAsync`, can never cover. `Prepare` re-asserts the no-credential-overlap invariant
+    against the MARKER and its failure is typed and un-caught. **Not for a repository-less jail**: that is
+    the role-locked coordinator, which `BuildCapabilityOnlyMounts` denies every writable bind mount on
+    purpose, and requesting a store there made `ContainerSpecBuilder`'s fail-closed assert refuse the
+    spawn. The same block decides the **resume verb**: the adapter's existing `resumeArg` is appended to
+    the launch argv on the ADOPT path only, and only when `HasTranscripts` finds a real file from a
+    previous jail — a resume flag with no prior session is a worse failure than no flag. One declaration,
+    two situations: `BuildReattachLaunchArgv` passes the same flag when a daemon restart re-binds a CLI
+    into a jail that is still running and the tmpfs `$HOME` never died. Both outcomes are logged by name,
+    because "the resume worked but the conversation is gone" is exactly the report this answers.
+    See [`docs/design/agent-conversation-persistence.md`](../design/agent-conversation-persistence.md).
   - **`Runtime/PtyAgentSupervisor.cs`** (P2-09) — the real `IAgentSupervisor`:
     `PauseInput`/`ResumeInput` via the `SessionLeader`, `MarkState` via the `AgentSessionStore` (the
     P2-08↔P2-09 integration).
