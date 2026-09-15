@@ -1164,7 +1164,16 @@
   **K3/§23.4 merge identity:** `BeginMerge` puts BOTH halves of the identity on the lease — the queue's
   `CurrentMainSha` and `LastVerification(agent)?.BranchSha`, the `agent/<id>` tip the verification was
   measured on — and returns both to the client (`expected_branch_sha`), for the same reason
-  `expected_main_sha` already travelled there: the client's projection is a stream snapshot. `ConfirmMerge`
+  `expected_main_sha` already travelled there: the client's projection is a stream snapshot.
+  **The integration branch travels the same way.** The lease is taken against
+  `MergeQueueProvisioner.IntegrationBranch(handle)` — the mirror's own HEAD — not the literal `"main"`
+  this used to write, and the branch comes back on `BeginMergeResponse.main_branch` so the client
+  fast-forwards the branch the lease authorized rather than choosing one itself. `QueueUpdate.main_branch`
+  carries the same name for the rail. `Get/SetIntegrationBranch` are the read and the write;
+  `SetIntegrationBranch` re-points the mirror's HEAD (so `RepoProvisioner`, `WorktreeManager`,
+  `AgentRefMediator`, `QueueSeeder` and `MergeBranchDiffService` all move with it), refuses a branch the
+  mirror has not got, fires the stale cascade because every verification was measured against the OLD
+  branch, and is denied to the coordinator role. `ConfirmMerge`
   then SCREENS the `new_main_sha` the caller reports, which nothing used to look at even though the daemon
   wrote it into the idempotency record, set the queue's authoritative main to it, and cascaded every
   co-tenant onto it. Three checks, all before the transition and all against the daemon's own records:

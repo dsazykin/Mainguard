@@ -1982,7 +1982,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       bridge behind `GetMergeDiff` that reuses the audited git path (`git diff main...agent/<id>` in the
       bare mirror via `AgentGitCommand`) + the pure T-06 `PatchParser`, returning the parsed `FilePatch`
       list the review cockpit's `ReviewCockpitContext.MergeDiff` needs; no new diff algorithm).
-      `MergeQueueProvisioner.cs` (**MG-10 — the missing constructor call.** `new MergeQueue(...)` +
+      `MergeQueueProvisioner.cs` (**the integration branch lives here:** `IntegrationBranch(handle)` is
+      `ResolveDefaultBranch` — the mirror's own `symbolic-ref HEAD` — made public so `BeginMerge` can lease
+      against the branch the merge will actually move; `MirrorBranches(handle)` is the candidate set, read
+      from the MIRROR (a branch the checkout has but the mirror has not is not one agents could integrate
+      on); `SetIntegrationBranch(handle, branch)` re-points that HEAD, refuses a branch the mirror has not
+      got (HEAD at an unresolvable ref is the "main unreadable" state `AlignLeaseMainBranch` repairs),
+      fetches the new branch forward, and fires `NotifyMainMoved` — the stale cascade is the POINT, since
+      every verification in the queue was measured against the old branch's tip. Returns
+      `IntegrationBranchChange`. **MG-10 — the missing constructor call.** `new MergeQueue(...)` +
       `registry.Register(...)` existed ONLY in the test projects, so the registry stayed empty for the
       daemon's whole lifetime and every merge-queue RPC answered NOT_FOUND — the P2-10 guarantees were
       neither enforced nor bypassable, they simply were not running. Builds a repo's queue on the events

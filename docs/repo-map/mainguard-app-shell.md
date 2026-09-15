@@ -656,7 +656,12 @@
     control center flips them; the shell hosts it as opaque `AgentRailContent` → `AgentRailView` via
     ViewLocator, so the shell names no Pro rail type), `QueueRailViewModel`/`QueueEntryViewModel` (the
     rail projection over `IMergeQueueService` — **the merge-queue surface the shipped Control Center
-    actually hosts**: state words, `CanMerge` gate line, the header `CountText` ("N in play · N in
+    actually hosts**: state words, `CanMerge` gate line, the header's **integration-branch picker**
+    (`MainBranch` + `IntegrationBranchOptions` + `LoadIntegrationBranchesCommand` /
+    `ChangeIntegrationBranchCommand` — "merges into &lt;branch&gt;", the ONE place a human can change where
+    agent work lands; the branch list is a daemon round trip so it loads when the picker opens, not on
+    every `Refresh`, and nothing is projected locally on the strength of the request — the new branch
+    arrives on the queue stream with the stale cascade the change fires), the header `CountText` ("N in play · N in
     history") that keeps a row scrolled below the fold from reading as a row that vanished (ISSUES-LOG
     #4 and #13 were both filed against rows that were rendering), the verified-against stamp (from the wire's
     `VerifiedMainSha`), the one Review accent on the front-most fresh Verified entry PLUS a
@@ -1360,7 +1365,11 @@
   `EditionReferenceGraphTests.Shell_IsReferenceClean_OfTheAgentPlatform`, keyed on assembly identity)
   — which is exactly what lets the Client head's published `.deps.json` exclude the whole agent
   platform. Holds: the composition-root `App.axaml.cs` (edition-agnostic only — DB migrate,
-  `ViewLocator` seed, theme, tray icon, the guarded full-exit
+  `ViewLocator` seed, theme, tray icon — `Assets/avalonia-logo.ico` on Windows,
+  `Assets/tray-icon.png` on Linux, and on macOS `Assets/tray-icon-template.png` (the brand mark
+  minus its opaque plate, black-on-transparent) with `MacOSProperties.SetIsTemplateIcon(…, true)`
+  so the status item is tinted like every other menu-bar glyph instead of rendering in colour —
+  the geometry is `site/public/favicon.svg`'s paths — the guarded full-exit
   `RequestFullExitGuardedAsync`/`RequestFullExit`; the Pro launch/shutdown are reached ONLY through
   the null-until-wired seams `App.ProDesktopStarter` / `App.VisualizedShutdownAsync` /
   `App.AfterInitialize` the Pro head fills — under Client they stay null and the launch is the

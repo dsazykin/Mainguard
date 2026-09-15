@@ -140,6 +140,11 @@ public sealed class RoleInterceptor : Interceptor
         // Refreshing the mirror's main can fire the stale cascade at every co-tenant; that is the merge
         // conversation's own lever, and an agent does not get to pull it (2026-09-04).
         "/mainguard.v1.MergeQueueService/RefreshMirrorMain",
+        // Strictly more than the line above: re-aiming the integration branch fires the stale cascade at
+        // every co-tenant AND changes which branch every subsequent lease authorizes a merge onto. An
+        // agent that could call it could point the repository's integration branch at one it controls.
+        // Choosing where work lands is the human's decision about their own repository.
+        "/mainguard.v1.MergeQueueService/SetIntegrationBranch",
         // The per-jail ceiling is the operator's lever over the machine's memory. A coordinator that could
         // raise it would size its own workers' jails (2026-09-04); reading it is harmless.
         "/mainguard.v1.AgentService/SetJailLimits",
