@@ -107,6 +107,18 @@
     `PropertyChanged` → `…Command.NotifyCanExecuteChanged()` (`[NotifyCanExecuteChangedFor]` on the
     parent's `IsBusy` covers only half of it). The ViewModel-level twins that pin the notification
     itself live in `AgentCliUiTests.Settings_Row*`.
+  - **`Mainguard.Tests/Headless/EmptyStateOpenRepoTests.cs`** — the no-repo empty state's folder glyph
+    must be a real way into the repo picker, not decoration. Renders `MainWindow` with nothing open
+    (Client edition), finds the glyph's activation path the way an automation client does — walk UP from
+    the `PathIcon` looking for an `IInvokeProvider`, the technique `RepoPickerAccessibilityTests`
+    introduced for the W2 rows — and asserts a NAMED ("Open a repository"), keyboard-focusable `Button`
+    carrying the Hand cursor whose `Command` is the SAME instance as
+    `MainWindowViewModel.OpenRepoPickerCommand` (reuse, not a duplicated handler). Then it invokes:
+    `MainWindowViewModel.ActiveRepoPicker` (an internal accessor that exists for this test) must hold a
+    shown `RepoPickerWindow` bound to the same shell VM, a second invoke must reuse that one window, and
+    a focused Enter must open it too. Finding the glyph by pattern rather than by control type is what
+    makes it fail — not fail to compile — against the inert `PathIcon` it replaced. Teardown closes the
+    picker by hand (`HarnessHygiene.Teardown` there would dispose the shell VM the picker only borrows).
   - **`Mainguard.Tests/Headless/MainWindowShellRenderHarness.cs`** — the real `MainWindow` shell:
     top-nav/toolbar + opening overlay (`mainwindow_shell.png`), the Settings window's pinned-menu
     picker (`settings_window.png`), and BOTH toast hosts pinned to the **bottom-right** corner with

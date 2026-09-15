@@ -530,7 +530,19 @@
             <StackPanel IsVisible="{Binding CurrentWorkspace, Converter={x:Static ObjectConverters.IsNull}}" 
                             HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="20">
                     <TextBlock Text="Select a repository to begin" Foreground="{DynamicResource TextMuted}" FontSize="18" FontWeight="SemiBold" HorizontalAlignment="Center"/>
-                    <PathIcon Data="{StaticResource FolderIcon}" Width="48" Height="48" Foreground="{DynamicResource BorderHairline}" HorizontalAlignment="Center"/>
+                    <!-- The folder glyph is the obvious click target in this empty state, so it IS one:
+                         a real Button on the same OpenRepoPickerCommand the title-bar "Select Repo"
+                         action and the Mac menu item use (no duplicated handler), styled with the
+                         design system's circular icon-button class. Being a Button is also what gives
+                         it keyboard focus, Enter/Space activation and an InvokePattern peer — the W2
+                         lesson from the repo-picker rows. The glyph moves off BorderHairline (the
+                         near-invisible divider token) onto TextMuted: an interactive control has to be
+                         visible at rest. -->
+                    <Button Classes="IconButton" Command="{Binding OpenRepoPickerCommand}"
+                            ToolTip.Tip="Open a repository" AutomationProperties.Name="Open a repository"
+                            Cursor="Hand" Padding="12" HorizontalAlignment="Center">
+                        <PathIcon Data="{StaticResource FolderIcon}" Width="48" Height="48" Foreground="{DynamicResource TextMuted}"/>
+                    </Button>
                     
                     <Border IsVisible="{Binding IsReopenRepoCardVisible}"
                             Background="{DynamicResource SurfaceCard}"
