@@ -26,6 +26,88 @@ public partial class QueueRailViewModel : ViewModelBase
 
     [ObservableProperty] private string _mainShaText = "";
 
+    /// <summary>The branch agent work merges into — what <see cref="MainShaText"/>'s sha names.</summary>
+    [ObservableProperty] private string _mainBranch = "main";
+
+    /// <summary>
+    /// The branches the integration branch could be re-aimed at, for the header's picker. Loaded on
+    /// demand (<see cref="LoadIntegrationBranchesCommand"/>) rather than on every <see cref="Refresh"/>:
+    /// it is an extra round trip to the daemon, and the answer is only needed when a human opens the
+    /// picker. Until then it holds just the current branch, so the control never renders empty.
+    /// </summary>
+    public ObservableCollection<string> IntegrationBranchOptions { get; } = new() { "main" };
+
+    /// <summary>Why the last attempt to change the integration branch did nothing, or empty. The common
+    /// one is naming a branch the daemon's mirror has not got yet, which is a sentence, not an error
+    /// dialog.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasIntegrationBranchError))]
+    private string _integrationBranchError = "";
+
+    public bool HasIntegrationBranchError => IntegrationBranchError.Length > 0;
+
+    /// <summary>True while a change is in flight — the picker is disabled so a second pick cannot race
+    /// the first, which would leave the header showing a branch neither call settled on.</summary>
+    [ObservableProperty] private bool _isChangingIntegrationBranch;
+
+    /// <summary>
+    /// Fills <see cref="IntegrationBranchOptions"/> from the daemon. Called when the picker opens.
+    /// </summary>
+    [RelayCommand]
+    private async Task LoadIntegrationBranchesAsync()
+    {
+        var options = await _queue.GetIntegrationBranchAsync().ConfigureAwait(true);
+
+        IntegrationBranchOptions.Clear();
+        foreach (var name in options.Available)
+        {
+            IntegrationBranchOptions.Add(name);
+        }
+
+        if (IntegrationBranchOptions.Count == 0)
+        {
+            IntegrationBranchOptions.Add(options.Branch);
+        }
+
+        MainBranch = options.Branch;
+    }
+
+    /// <summary>
+    /// Re-aims the integration branch. Every verification in the queue was measured against the OLD
+    /// branch's tip, so the daemon fires its stale cascade — the rail repopulates off the queue stream
+    /// as it always does, and nothing is written here on the strength of the request alone.
+    /// </summary>
+    [RelayCommand]
+    private async Task ChangeIntegrationBranchAsync(string? branch)
+    {
+        if (string.IsNullOrWhiteSpace(branch) || branch == MainBranch || IsChangingIntegrationBranch)
+        {
+            return;
+        }
+
+        IsChangingIntegrationBranch = true;
+        IntegrationBranchError = "";
+        try
+        {
+            var error = await _queue.SetIntegrationBranchAsync(branch).ConfigureAwait(true);
+            if (error is { Length: > 0 })
+            {
+                IntegrationBranchError = error;
+                // Put the control back on the branch that is actually in force: a picker left showing a
+                // branch the daemon refused is a lie about where the next merge lands.
+                OnPropertyChanged(nameof(MainBranch));
+                return;
+            }
+
+            _report?.Invoke($"Agent work now merges into '{branch}'.", false);
+        }
+        finally
+        {
+            IsChangingIntegrationBranch = false;
+            Refresh();
+        }
+    }
+
     /// <summary>The mirror's freshness (2026-09-04): "mirror refreshed N min ago", or the daemon's error
     /// when its last pull from the checkout failed. Empty until the daemon has tried once.</summary>
     [ObservableProperty]
@@ -95,7 +177,10 @@ public partial class QueueRailViewModel : ViewModelBase
     public void Refresh()
     {
         var snapshot = _queue.GetQueue();
-        MainShaText = "main " + _queue.MainSha;
+        // The BRANCH, not the word "main": this repository's integration branch is a choice now, and a
+        // rail that labels `develop`'s tip "main" is describing a branch the queue is not measuring.
+        MainBranch = _queue.MainBranch;
+        MainShaText = MainBranch + " " + _queue.MainSha;
         (MirrorText, MirrorRefreshFailed) = MirrorFreshness(
             _queue.MirrorMainRefreshedAt, _queue.MirrorMainRefreshError, DateTimeOffset.UtcNow);
 

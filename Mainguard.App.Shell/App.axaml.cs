@@ -276,15 +276,30 @@ public partial class App : Application
 
         // The brand PNG on macOS/Linux (a status item wants a small raster; the .ico stays for
         // the Windows notification area, where ICO is the native currency).
+        //
+        // macOS gets a DIFFERENT raster, and a flag to go with it. The colour mark sat in the menu bar
+        // as the one coloured item in a row of monochrome system glyphs, because Avalonia's
+        // IsTemplateIcon defaults to false and macOS then draws the bitmap literally — brand plate and
+        // all. A template image is tinted from its ALPHA alone (white on a dark bar, black on a light
+        // one, inverted while the item is highlighted), which is the whole reason every other icon up
+        // there matches: so the asset is the mark WITHOUT its opaque plate, which would otherwise
+        // template into a solid filled rectangle.
         var iconUri = OperatingSystem.IsWindows()
             ? new Uri("avares://Mainguard.App.Shell/Assets/avalonia-logo.ico")
-            : new Uri("avares://Mainguard.App.Shell/Assets/tray-icon.png");
+            : OperatingSystem.IsMacOS()
+                ? new Uri("avares://Mainguard.App.Shell/Assets/tray-icon-template.png")
+                : new Uri("avares://Mainguard.App.Shell/Assets/tray-icon.png");
         _trayIcon = new TrayIcon
         {
             Icon = new Avalonia.Controls.WindowIcon(Avalonia.Platform.AssetLoader.Open(iconUri)),
             ToolTipText = "Mainguard",
             Menu = menu,
         };
+        if (OperatingSystem.IsMacOS())
+        {
+            Avalonia.Controls.MacOSProperties.SetIsTemplateIcon(_trayIcon, true);
+        }
+
         _trayIcon.Clicked += (_, _) => ShowMainWindow(desktop);
         TrayIcon.SetIcons(this, new TrayIcons { _trayIcon });
     }

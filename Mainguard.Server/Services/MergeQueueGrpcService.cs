@@ -379,8 +379,13 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         // component that could re-derive it is a component that could re-derive it into agreement with
         // whatever the branch happens to be now (K4).
         var verifiedBranch = ctx.Queue.LastVerification(request.AgentId)?.BranchSha ?? string.Empty;
+        // The repo's INTEGRATION BRANCH, not the literal "main" this used to write. The client performs
+        // the merge, so the branch the lease authorizes has to be the branch the client will move — it is
+        // returned on the response for exactly that reason. Where the daemon has no provisioner to ask
+        // (the slimmest fixtures), "main" remains the answer, which is what such a daemon leased before.
+        var mainBranch = IntegrationBranchOf(request.RepoHandle);
         var lease = ctx.Leases.TryBegin(
-            request.RepoHandle, leaseId, request.AgentId, verified, "main", verifiedBranch);
+            request.RepoHandle, leaseId, request.AgentId, verified, mainBranch, verifiedBranch);
         if (lease is null && _queues is not null
             && _queues.TryReconcileLandedLease(request.RepoHandle, out _))
         {
@@ -388,7 +393,7 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             // before its ConfirmMerge). It is recorded now, so this repo is free again — retry once.
             verified = ctx.Queue.CurrentMainSha;
             lease = ctx.Leases.TryBegin(
-                request.RepoHandle, leaseId, request.AgentId, verified, "main", verifiedBranch);
+                request.RepoHandle, leaseId, request.AgentId, verified, mainBranch, verifiedBranch);
         }
 
         if (lease is null)
@@ -414,8 +419,8 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             return Task.FromResult(new BeginMergeResponse { Granted = false, Reason = gateReason });
         }
 
-        _log.LogInformation("BeginMerge repo={Repo} agent={Agent} granted=True main={Sha}",
-            request.RepoHandle, request.AgentId, verified);
+        _log.LogInformation("BeginMerge repo={Repo} agent={Agent} granted=True main={Branch}@{Sha}",
+            request.RepoHandle, request.AgentId, mainBranch, verified);
 
         // The CAS old-OID travels back with the grant. The Windows-side merge has to fast-forward FROM
         // exactly this sha and ConfirmMerge compares against exactly this sha, so both legs must read it
@@ -427,7 +432,79 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             LeaseId = lease.LeaseId,
             ExpectedMainSha = lease.ExpectedMainSha,
             ExpectedBranchSha = lease.ExpectedBranchSha,
+            // The branch half of the same reasoning: the lease was taken against THIS branch, so the
+            // client must fast-forward THIS branch. Reading it off the lease rather than re-deriving it
+            // keeps the two legs unable to name different branches.
+            MainBranch = lease.MainBranch,
         });
+    }
+
+    /// <summary>
+    /// The repository's integration branch, or <c>"main"</c> when this daemon has no provisioner to ask.
+    /// The fallback is not a guess dressed as an answer: a daemon without a provisioner has no mirror, so
+    /// there is no other branch it could be leasing against, and <c>"main"</c> is what it leased against
+    /// before the branch was configurable at all.
+    /// </summary>
+    private string IntegrationBranchOf(string repoHandle)
+    {
+        var branch = _queues?.IntegrationBranch(repoHandle);
+        return string.IsNullOrWhiteSpace(branch) ? "main" : branch;
+    }
+
+    public override Task<IntegrationBranchState> GetIntegrationBranch(
+        GetIntegrationBranchRequest request, ServerCallContext context)
+    {
+        var state = new IntegrationBranchState { Branch = IntegrationBranchOf(request.RepoHandle) };
+        state.Available.AddRange(AvailableBranches(request.RepoHandle, state.Branch));
+        return Task.FromResult(state);
+    }
+
+    public override Task<IntegrationBranchState> SetIntegrationBranch(
+        SetIntegrationBranchRequest request, ServerCallContext context)
+    {
+        // While the kill switch holds the queue frozen, no merge may begin — and re-aiming the branch
+        // every queued merge will land on fires the stale cascade at all of them, which is strictly more
+        // than BeginMerge does. Same refusal, for the same reason.
+        ThrowIfFrozen("SetIntegrationBranch");
+
+        if (_queues is null)
+        {
+            return Task.FromResult(new IntegrationBranchState
+            {
+                Branch = IntegrationBranchOf(request.RepoHandle),
+                Error = "this daemon has no provisioner, so it has no mirror whose branch could be changed",
+            });
+        }
+
+        var change = _queues.SetIntegrationBranch(request.RepoHandle, request.Branch);
+        if (change.Changed)
+        {
+            _log.LogInformation("SetIntegrationBranch repo={Repo} branch={Branch}",
+                request.RepoHandle, change.Branch);
+        }
+        else if (change.Error is { Length: > 0 })
+        {
+            _log.LogInformation("SetIntegrationBranch repo={Repo} refused: {Reason}",
+                request.RepoHandle, change.Error);
+        }
+
+        var state = new IntegrationBranchState
+        {
+            Branch = change.Branch,
+            Error = change.Error ?? string.Empty,
+        };
+        state.Available.AddRange(AvailableBranches(request.RepoHandle, change.Branch));
+        return Task.FromResult(state);
+    }
+
+    /// <summary>The mirror's branches, with <paramref name="current"/> guaranteed present — a picker that
+    /// omitted the branch it is currently showing would read as though the current choice were invalid.</summary>
+    private IReadOnlyList<string> AvailableBranches(string repoHandle, string current)
+    {
+        var branches = _queues?.MirrorBranches(repoHandle) ?? Array.Empty<string>();
+        return branches.Contains(current, StringComparer.Ordinal)
+            ? branches
+            : branches.Prepend(current).ToList();
     }
 
     /// <summary>
@@ -1211,7 +1288,13 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     private QueueUpdate Snapshot(string repoHandle, MergeQueueContext ctx)
     {
         var queue = ctx.Queue;
-        var update = new QueueUpdate { MainSha = queue.CurrentMainSha };
+        var update = new QueueUpdate
+        {
+            MainSha = queue.CurrentMainSha,
+            // Which branch that sha is. Carried so the rail can say "develop <sha>" rather than
+            // labelling every repository's integration branch "main".
+            MainBranch = IntegrationBranchOf(repoHandle),
+        };
         if (_queues?.LastMainRefresh(repoHandle) is { } refresh)
         {
             update.MirrorMainRefreshedAt = refresh.At.ToString("O", System.Globalization.CultureInfo.InvariantCulture);

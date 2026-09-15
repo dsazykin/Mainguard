@@ -225,6 +225,35 @@ public partial class BranchBrowserViewModel : ViewModelBase
     }
 
     /// <summary>
+    /// The repository's branches as a FLAT list — locals first, then remote-tracking, each
+    /// alphabetical — for a menu that cannot render <see cref="BranchCategories"/>.
+    ///
+    /// <para>The macOS native menu bar's "Switch To" list is the caller. A <c>NativeMenu</c> has no
+    /// way to bind the grouped tree: its leaves are folder-nested <see cref="MenuItemViewModel"/>s
+    /// whose <c>DisplayHeader</c> is only the last path segment, and whose checkout action is one
+    /// entry inside a per-branch action flyout — reaching it would mean matching sub-item headers
+    /// by string. Handing out the <see cref="GitBranchItem"/>s instead lets that menu invoke
+    /// <see cref="CheckoutBranchCommand"/> with the same argument the sidebar passes it.</para>
+    ///
+    /// <para>Empty rather than throwing when the repository can't be read: the caller is populating
+    /// a menu that is already opening, and a menu is not a place to surface a git error.</para>
+    /// </summary>
+    public IReadOnlyList<GitBranchItem> ListBranchesForSwitchMenu()
+    {
+        try
+        {
+            return _gitService.GetBranches(_repoPath)
+                .OrderBy(b => b.IsRemote)
+                .ThenBy(b => b.FriendlyName, StringComparer.Ordinal)
+                .ToList();
+        }
+        catch (Exception)
+        {
+            return Array.Empty<GitBranchItem>();
+        }
+    }
+
+    /// <summary>
     /// Builds the context menu for a ref label hit in the commit graph (T-09). Reuses the exact
     /// branch/tag menus the sidebar shows so the actions stay in one place. Returns <c>null</c>
     /// when the ref no longer resolves (deleted between render and click).

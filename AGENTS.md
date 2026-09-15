@@ -127,6 +127,17 @@ knowledge:
   a `.dylib` via the same pinned `build/libvterm/build.sh`.
 - Platform traits: `UnixOnlyFact` (Linux + macOS) vs `LinuxOnlyFact` (genuinely Linux-bound) vs
   `MacOnlyFact` — a "not Windows" assumption no longer implies Linux.
+- **MainWindow's `MenuBarGroup` is hidden outright on macOS** (`WindowChromePolicy.InWindowMenuVisible`),
+  so `Services/MacMenuBar.cs` is the ONLY route to everything in it — the Branch pill, the Sync and
+  Repository flyouts, the push options. An item added to that panel needs an entry in `MacMenuBar` too,
+  or it simply does not exist in the Mac build. Only menus belong there: a status readout nested inside
+  it (the auto-fetch freshness label was) disappears from macOS along with the flyouts.
+- **A dynamic `NativeMenu` must not do real work on `NeedsUpdate` unguarded.** AppKit raises it while
+  matching key equivalents, not only when a menu is about to open, so the handler can run per keystroke —
+  `MacMenuBar`'s branch list is rate-limited for that reason.
+- **The macOS status item is a template image** (`MacOSProperties.SetIsTemplateIcon`): macOS tints it
+  from the ALPHA channel alone, so its asset is the mark without its opaque plate. A colour raster there
+  renders literally and is the one coloured thing in the menu bar.
 
 ### EF Core migrations
 
@@ -143,6 +154,7 @@ Commit the generated migration + snapshot together. Never hand-edit an applied m
 
 - **LibGit2Sharp handles:** always go through `IGitService.ExecuteWithRepo(...)`. It opens/disposes the native `Repository` handle deterministically. Do not hold long-lived `Repository` instances or new one up ad hoc — leaked native handles cause `.git/index.lock` collisions, which is exactly the class of bug this app exists to prevent.
 - **Git-directory paths:** never build one as `Path.Combine(repoPath, ".git", …)`. In a linked worktree (`git worktree add` — which the Worktrees window *and* the agent platform's `WorktreeManager` create constantly) `.git` is a **file**, per-worktree state (`HEAD`, `index`, `MERGE_HEAD`, `rebase-merge/`, `rebase-apply/`) lives under `<main>/.git/worktrees/<name>/`, and shared `refs/`/`objects/` live in the common dir. Use `GitService.GitDirPath(repoPath, …)` / `ResolveGitDir` / `ResolveCommonGitDir`, which resolve exactly as git does. Combining against the `.git` *file* yields a path that can never exist, so every state check silently answers "no" — forever. (`Mainguard.Agents`' `GitMutationGuard.ResolveGitDir` is the daemon-side equivalent and is already correct.)
+- **The integration branch is the mirror's HEAD — never the literal `"main"`.** Which branch agent work lands on is a per-repo choice (`MergeQueueProvisioner.IntegrationBranch` / `SetIntegrationBranch`, `Get/SetIntegrationBranch` on the wire). `RepoProvisioner`, `WorktreeManager`, `AgentRefMediator`, `QueueSeeder`, `MergeBranchDiffService` and the provisioner all resolve it with `symbolic-ref --short HEAD` on the bare mirror, which is why setting it re-points one ref and moves all of them together. Do not reintroduce a hard-coded `"main"`, and do not add a second store for the name: a lease taken against one branch while the merge fast-forwards another records a merge the gate never authorized, which is why `BeginMergeResponse.main_branch` exists and why the client never chooses the branch itself.
 - **MVVM:** ViewModels derive from `ViewModelBase`; expose state with `[ObservableProperty]`, actions with `[RelayCommand]` (async commands as `...Async`). Keep git/IO work in Core services, off the UI thread; marshal back with `Dispatcher.UIThread` when updating bound state.
 - **Views:** one `.axaml` + `.axaml.cs` per ViewModel, resolved via `ViewLocator`. Prefer compiled bindings (`x:DataType`).
 - **DI:** there is currently **no DI container** — `App` exposes a static `Settings`, and `MainWindowViewModel` is instantiated directly. Follow the existing pattern; if you introduce a container, do it deliberately and update this file.

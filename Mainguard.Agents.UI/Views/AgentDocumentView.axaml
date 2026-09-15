@@ -86,7 +86,7 @@
           </ItemsControl.ItemTemplate>
         </ItemsControl>
         <StackPanel Orientation="Horizontal" Spacing="10">
-          <Button Classes="Accent" Content="Merge to main" FontSize="12"
+          <Button Classes="Accent" Content="{Binding MergeButtonText}" FontSize="12"
                   Command="{Binding MergeCommand}" IsEnabled="{Binding CanMerge}"
                   ToolTip.Tip="{Binding MergeGateReason}"/>
           <TextBlock Text="{Binding MergeGateReason}" FontSize="11" VerticalAlignment="Center"
