@@ -17,7 +17,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
 - **`Terminal/`** — the engine-agnostic terminal seam (P2-03).
   - `ITerminalView.cs` (the interface the ViewModel talks to —
     `FeedOutput`/`InputAvailable`/`Resize`/opaque `GetStateSnapshot`/`RestoreState`; never leaks a
-    renderer type so P2-18's libvterm engine swaps in with no ViewModel change).
+    renderer type so P2-18's libvterm engine swaps in with no ViewModel change). **MG-24: `Resize` is
+    the session's AUTHORITATIVE size — the geometry the PTY is actually running at, as reported by the
+    daemon's `geometry` frame — not the size of the pane.** The two coincide for an ordinary terminal
+    and diverge for a managed worker, whose terminal is input-locked (P2-14) so F64 refuses to reshape
+    it for a spectator. An engine that sizes itself from its pane instead parses the CLI's
+    cursor-addressed redraws against the wrong width; fit the pane by scaling what you draw, never by
+    changing the size you parse at.
   - `VtBoundaryDetector.cs` (pure `SafeFlushLength`: Ground/Esc/Csi/Osc/Dcs/Ss3 + UTF-8 continuation
     counting; returns the largest prefix that never splits a VT sequence or UTF-8 codepoint — the
     correctness heart, split-at-every-offset tested).

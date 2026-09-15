@@ -195,4 +195,100 @@ public sealed class TerminalReplayGeometryTests
             HarnessHygiene.Teardown(win);
         }
     }
+
+    /// <summary>
+    /// MG-24 — the managed-worker case, which is #22's sibling and the one that actually shipped
+    /// broken. Here the pane is NARROWER than the session: the daemon reports 120x32 (the size the
+    /// worker's PTY was spawned at, which F64 refuses to change on a spectator's behalf) while the
+    /// docked pane is only ~68 columns wide.
+    ///
+    /// <para>The engine must keep parsing at 120 and scale what it draws. Reshaping the grid to the
+    /// pane — which is what layout used to do — re-wraps 120-column output at 68 with no reflow, so
+    /// the CLI's absolutely-positioned redraws land on the wrong rows and overwrite what is already
+    /// there. That is what made a worker terminal unreadable.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public void ASessionWiderThanItsPane_KeepsTheDaemonsWidth_AndIsNotReWrapped()
+    {
+        var terminal = new TerminalControl();
+
+        // The daemon's `geometry` frame leads the replay, exactly as it does on the wire.
+        terminal.Resize(120, 32);
+        terminal.FeedOutput(Recording());
+
+        var win = new Window { Content = terminal, Width = 620, Height = 520 };
+        win.Show();
+        for (var i = 0; i < 5; i++)
+        {
+            Dispatcher.UIThread.RunJobs();
+        }
+
+        var grid = terminal.ReadGrid();
+        try
+        {
+            // The pane could never hold 120 columns at the base cell size — that is the point.
+            Assert.True(
+                terminal.Bounds.Width < 120 * 8.0,
+                $"the harness window must be narrower than the session ({terminal.Bounds.Width}px)");
+
+            // The grid is still the daemon's, not the pane's.
+            Assert.Equal(120, grid.Cols);
+            Assert.Equal(32, grid.Rows);
+
+            // And the content is laid out as the 120-column session wrote it: the long line is
+            // intact on one row, row 1 is still blank (a 68-column re-wrap would have spilled onto
+            // it), and the absolutely-positioned fragment is at the column it was recorded at.
+            Assert.EndsWith("select a smaller model.", grid.RowText(0));
+            Assert.Equal(string.Empty, grid.RowText(1));
+            Assert.Equal(95, grid.RowText(2).IndexOf("right-edge marker", StringComparison.Ordinal));
+            Assert.Equal("tail line", grid.RowText(4));
+
+            // Byte-for-byte what a native 120-column parse produces.
+            Assert.Equal(
+                Enumerable.Range(0, 32).Select(ParsedNatively(120, 32).ReadGrid().RowText).ToArray(),
+                Enumerable.Range(0, grid.Rows).Select(grid.RowText).ToArray());
+        }
+        finally
+        {
+            HarnessHygiene.Teardown(win);
+        }
+    }
+
+    /// <summary>
+    /// The ordinary terminal must be untouched by MG-24: when the daemon honours the resize, the
+    /// session size and the pane agree and the engine is exactly pane-sized as before. A fix for the
+    /// locked case that shrank every normal terminal would be a worse bug than the one it fixed.
+    /// </summary>
+    [AvaloniaFact]
+    public void AnOrdinaryTerminal_IsStillSizedToItsPane()
+    {
+        var terminal = new TerminalControl();
+
+        var win = new Window { Content = terminal, Width = 900, Height = 500 };
+        win.Show();
+        for (var i = 0; i < 5; i++)
+        {
+            Dispatcher.UIThread.RunJobs();
+        }
+
+        try
+        {
+            // No geometry frame has arrived, so layout still sizes the engine — the fallback that
+            // keeps the echo / detached-notice / pre-daemon paths rendering.
+            var fromLayout = terminal.ReadGrid();
+            Assert.True(fromLayout.Cols > 1 && fromLayout.Rows > 1);
+
+            // Now the daemon grants exactly what the pane asked for, which is the normal case.
+            terminal.Resize(fromLayout.Cols, fromLayout.Rows);
+            Dispatcher.UIThread.RunJobs();
+
+            var granted = terminal.ReadGrid();
+            Assert.Equal(fromLayout.Cols, granted.Cols);
+            Assert.Equal(fromLayout.Rows, granted.Rows);
+        }
+        finally
+        {
+            HarnessHygiene.Teardown(win);
+        }
+    }
 }
