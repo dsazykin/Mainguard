@@ -5,7 +5,7 @@
  * Endpoints:
  *   POST /api/waitlist            { email, interests?, turnstileToken, website? }
  *   POST /api/contact             { name, email, topic?, message, turnstileToken, website? }
- *   POST /api/event               { type, path, referrer?, campaign?, theme?, label? }
+ *   POST /api/event               { type: 'pageview'|'cta', path, referrer?, campaign?, theme?, label? }
  *   GET  /api/admin/submissions   Authorization: Bearer <ADMIN_TOKEN>; ?kind=waitlist|contact&limit=N
  *   GET  /api/admin/stats         Authorization: Bearer <ADMIN_TOKEN>; ?days=N
  *
@@ -206,7 +206,7 @@ async function handleContact(request: Request, env: Env, origin: string | null):
   return json({ ok: true }, 200, origin);
 }
 
-const EVENT_TYPES = new Set(['pageview', 'cta', 'depth']);
+const EVENT_TYPES = new Set(['pageview', 'cta']);
 /** Paths the SPA can legitimately report. Anything else is recorded as 'other'. */
 const KNOWN_PATHS = new Set([
   '/',
@@ -334,12 +334,19 @@ async function handleStats(request: Request, env: Env, origin: string | null): P
     return results;
   };
 
-  const [pages, referrers, countries, devices, themes, ctas, daily, totals] = await Promise.all([
+  const [pages, referrers, campaigns, countries, devices, themes, ctas, daily, totals] =
+    await Promise.all([
     group(
       "SELECT path, COUNT(*) AS views, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY path ORDER BY views DESC",
     ),
     group(
       "SELECT COALESCE(referrer_host,'(direct)') AS source, COUNT(*) AS views FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY source ORDER BY views DESC LIMIT 25",
+    ),
+    // Campaign tags were being recorded and never reported, which made a
+    // tagged link pointless. Visitors, not raw hits — the question a campaign
+    // answers is how many people it brought.
+    group(
+      "SELECT campaign, COUNT(*) AS views, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND campaign IS NOT NULL AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY campaign ORDER BY visitors DESC LIMIT 25",
     ),
     group(
       "SELECT COALESCE(country,'??') AS country, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY country ORDER BY visitors DESC LIMIT 40",
@@ -362,7 +369,19 @@ async function handleStats(request: Request, env: Env, origin: string | null): P
   ]);
 
   return json(
-    { ok: true, days, totals: totals[0] ?? {}, pages, referrers, countries, devices, themes, ctas, daily },
+    {
+      ok: true,
+      days,
+      totals: totals[0] ?? {},
+      pages,
+      referrers,
+      campaigns,
+      countries,
+      devices,
+      themes,
+      ctas,
+      daily,
+    },
     200,
     origin,
   );

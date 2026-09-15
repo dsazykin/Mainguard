@@ -104,10 +104,27 @@ What makes it defensible, and what must not be quietly eroded:
   collects nothing rather than everything.
 - **Can never break the page.** Beacons are fire-and-forget and the worker always answers 204.
 
-Read the numbers with `GET /api/admin/stats?days=30` and an `ADMIN_TOKEN` bearer token — top
-pages, referrers, countries, devices, themes, CTA clicks, daily uniques, and waitlist signups over
-the same window. It returns aggregates only; there is no endpoint that reconstructs one visitor's
-trail, because the data cannot support one.
+Only two event types exist, `pageview` and `cta`, and the D1 `CHECK` enforces it. Scroll-depth
+tracking was considered and dropped: the privacy policy promises no scroll tracking, and that
+promise is worth more than knowing how far down the Pro page people scroll. Adding it back means
+changing the policy in the same commit.
+
+**Reading the numbers:**
+
+```bash
+cd site/worker
+ADMIN_TOKEN=… npm run stats        # last 30 days, as tables
+ADMIN_TOKEN=… npm run stats -- 7   # last 7
+```
+
+That wraps `GET /api/admin/stats?days=N` (bearer `ADMIN_TOKEN`), which returns top pages,
+referrers, campaigns, countries, devices, themes, CTA clicks, daily uniques, and waitlist signups
+over the same window. Aggregates only; there is no endpoint that reconstructs one visitor's trail,
+because the data cannot support one.
+
+Two things to keep in mind when reading them: unique visitors are counted **per day** and cannot be
+summed across days, and because analytics is opt-in every figure undercounts. They are trend lines,
+not totals.
 
 CTA tracking is by delegation: put `data-cta="some-label"` on any element and the click is counted.
 

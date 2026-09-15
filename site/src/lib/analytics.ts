@@ -20,7 +20,7 @@ import { API_BASE } from '../config';
  * clicked. What it cannot learn: who you are, or what you did yesterday.
  */
 
-type EventType = 'pageview' | 'cta' | 'depth';
+type EventType = 'pageview' | 'cta';
 
 interface EventPayload {
   type: EventType;
