@@ -199,7 +199,7 @@ export function Cloud() {
             <p className="muted" style={{ marginInline: 'auto' }}>
               Paid, cloud-based, pricing announced at launch. The waitlist gets first invites.
             </p>
-            <Link to="/waitlist?p=cloud" className="btn btn-accent btn-lg">
+            <Link to="/waitlist?p=cloud" className="btn btn-accent btn-lg" data-cta="waitlist-cloud">
               Join the Cloud waitlist
             </Link>
           </Reveal>

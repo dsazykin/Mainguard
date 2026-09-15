@@ -2,8 +2,11 @@ import { Link } from 'react-router';
 import { Wordmark } from './Wordmark';
 import { IconGitHub } from './Icons';
 import { GITHUB_REPO_LABEL, GITHUB_URL } from '../config';
+import { useConsent } from '../lib/consent';
 
 export function Footer() {
+  const { consentApplies, openPreferences } = useConsent();
+
   return (
     <footer className="footer">
       <div className="container footer-inner">
@@ -24,8 +27,19 @@ export function Footer() {
         </nav>
         <nav className="footer-col" aria-label="Company">
           <h4>Get in touch</h4>
-          <Link to="/waitlist">Join the waitlist</Link>
+          <Link to="/waitlist" data-cta="waitlist-footer">Join the waitlist</Link>
           <Link to="/contact">Contact</Link>
+        </nav>
+        <nav className="footer-col" aria-label="Legal">
+          <h4>Legal</h4>
+          <Link to="/privacy">Privacy policy</Link>
+          <Link to="/terms">Terms of service</Link>
+          {/* Only shown once something actually needs consent — see lib/consent.tsx. */}
+          {consentApplies && (
+            <button type="button" className="footer-linkish" onClick={openPreferences}>
+              Cookie settings
+            </button>
+          )}
         </nav>
       </div>
       <div className="container footer-legal">

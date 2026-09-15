@@ -8,13 +8,16 @@ import './styles/base.css';
 import './styles/site.css';
 import './styles/vignettes.css';
 import { ThemeProvider } from './theme/ThemeProvider';
+import { ConsentProvider } from './lib/consent';
 import App from './App';
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <BrowserRouter basename={import.meta.env.BASE_URL}>
       <ThemeProvider>
-        <App />
+        <ConsentProvider>
+          <App />
+        </ConsentProvider>
       </ThemeProvider>
     </BrowserRouter>
   </StrictMode>,

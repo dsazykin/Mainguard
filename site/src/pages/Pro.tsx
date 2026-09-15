@@ -332,7 +332,7 @@ export function Pro() {
               Pricing is announced at launch, and waitlist members get early access and founding
               terms.
             </p>
-            <Link to="/waitlist?p=pro" className="btn btn-accent btn-lg">
+            <Link to="/waitlist?p=pro" className="btn btn-accent btn-lg" data-cta="waitlist-pro">
               Join the Pro waitlist
             </Link>
           </Reveal>

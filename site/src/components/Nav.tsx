@@ -51,7 +51,7 @@ export function Nav() {
 
         <div className="nav-actions">
           <ThemeSwitcher />
-          <Link to="/waitlist" className="btn btn-accent nav-cta">
+          <Link to="/waitlist" className="btn btn-accent nav-cta" data-cta="waitlist-nav">
             Join waitlist
           </Link>
           <button
@@ -78,7 +78,12 @@ export function Nav() {
                 {l.tag && <span className="nav-tag">{l.tag}</span>}
               </NavLink>
             ))}
-            <Link to="/waitlist" className="btn btn-accent btn-lg" style={{ justifyContent: 'center' }}>
+            <Link
+              to="/waitlist"
+              className="btn btn-accent btn-lg"
+              style={{ justifyContent: 'center' }}
+              data-cta="waitlist-nav-mobile"
+            >
               Join waitlist
             </Link>
             <div style={{ paddingTop: 'var(--space-4)' }}>

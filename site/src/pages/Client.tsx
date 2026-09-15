@@ -250,7 +250,7 @@ export function Client() {
             <p className="muted" style={{ marginInline: 'auto' }}>
               Windows and macOS. Join the waitlist and get the download link the moment it's live.
             </p>
-            <Link to="/waitlist?p=client" className="btn btn-accent btn-lg">
+            <Link to="/waitlist?p=client" className="btn btn-accent btn-lg" data-cta="waitlist-client">
               Get the client first
             </Link>
           </Reveal>
