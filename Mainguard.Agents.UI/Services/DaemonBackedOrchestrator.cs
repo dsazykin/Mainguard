@@ -1294,6 +1294,11 @@ public sealed class DaemonBackedOrchestrator :
         {
             RaiseIsolated(() => Changed?.Invoke());
         }
+
+        // The one place with an AUTHORITATIVE listing in hand, which is exactly what a prune needs: the
+        // stream's deltas can lag, and pruning against a projection that has merely not heard about an
+        // agent yet would delete a name whose agent is alive.
+        PruneAgentNames();
     }
 
     /// <summary>
