@@ -2,7 +2,7 @@
 
 **Lane G Part 2 · Register: brand · Status: calendar + publish-ready drafts.**
 
-The editorial layer of [`LaunchCampaignPlan.md`](LaunchCampaignPlan.md): what publishes when, and the full drafts. Every piece conforms to the [Voice & Delight Bible](../../creative/Mainguard_Voice_And_Delight_Bible.md) (brand register — one degree warmer, personality unchanged), honors the honesty contract ([Narrative §0](../../creative/Narrative.md)), and uses the competitor sentences of Narrative §2 as its public comparison register. Comparison pages exist for a strategic reason on record: contest the category vocabulary before MergeLoom's 161-post SEO wall owns it (Master Doc §14.5 #8; the Nimbalyst playbook — copy their content machine, not their features).
+The editorial layer of [`LaunchCampaignPlan.md`](LaunchCampaignPlan.md): what publishes when, and the full drafts. Every piece conforms to the [Voice & Delight Bible](../../../creative/Mainguard_Voice_And_Delight_Bible.md) (brand register — one degree warmer, personality unchanged), honors the honesty contract ([Narrative §0](../../../creative/Narrative.md)), and uses the competitor sentences of Narrative §2 as its public comparison register. Comparison pages exist for a strategic reason on record: contest the category vocabulary before MergeLoom's 161-post SEO wall owns it (Master Doc §14.5 #8; the Nimbalyst playbook — copy their content machine, not their features).
 
 Dates key off **L1** (act-one Show HN) and **L2** (act-two Show HN, L1+4–8 weeks).
 
@@ -35,7 +35,7 @@ Cadence commitment: one substantial piece every two weeks minimum, indefinitely.
 
 ### 2.1 Comparison — *Mainguard vs GitKraken: native instrument vs Electron incumbent*
 
-*(Web page. Sources: Competitor Research §2, Feature Inventory §11, GTM Plan §5.3, Narrative §2.1. Comparison tables of record: LaunchReserve §3 Table A (archived at `docs/obsolete docs/LaunchReserve.md`; narrative teardown of record is Narrative §2). Update the GitKraken column against their changelog before every publish — they move fast.)*
+*(Web page. Sources: Competitor Research §2, Feature Inventory §11, GTM Plan §5.3, Narrative §2.1. Comparison tables of record: LaunchReserve §3 Table A (archived at `docs/archive/LaunchReserve.md`; narrative teardown of record is Narrative §2). Update the GitKraken column against their changelog before every publish — they move fast.)*
 
 ---
 

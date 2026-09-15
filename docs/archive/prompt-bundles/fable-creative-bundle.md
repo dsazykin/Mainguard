@@ -87,7 +87,7 @@ LANE C — Voice, Copy & Narrative  (independent; run in parallel)
 Output: an elevated Voice Bible + docs/creative/Microcopy.md (final strings) + docs/creative/Narrative.md
 ═══════════════════════════════════════════════════════════════════════════════════════════
 The writing/persuasion lane — pure voice work. Read the Voice & Delight Bible, docs/creative/EmptyStates.md
-+ Microcopy.md, docs/market-analysis/*, and docs/go-to-market/*.
++ Microcopy.md, docs/business/market-analysis/*, and docs/business/go-to-market/*.
 Part 1 — Product voice & copy. Elevate the Voice Bible from good to exceptional (sharper principles,
 better do/don't examples). Then APPLY it: re-derive and tighten every empty-state headline, microcopy
 string, hostile-git-error rewrite (index.lock, detached HEAD, non-fast-forward, mid-rebase conflict),

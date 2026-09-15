@@ -2,8 +2,8 @@
 
 **Date:** 2026-07-06
 **Status:** Working plan — revisit after the August advisor meeting and again before launch.
-**Reads alongside:** `docs/market-analysis/Mainguard_Market_Research_v2.md` (market/moat/licensing) and
-`docs/market-analysis/Mainguard_Viability_And_Differentiation_2026-07.md` (positioning pivot). This doc
+**Reads alongside:** `docs/business/market-analysis/Mainguard_Market_Research_v2.md` (market/moat/licensing) and
+`docs/business/market-analysis/Mainguard_Viability_And_Differentiation_2026-07.md` (positioning pivot). This doc
 is the *execution* layer: who we sell to, how we launch, how we pitch, and how we win against the
 July 2026 field. Competitive facts below were re-verified 2026-07-06.
 **Companion:** `Advisor_Pitch_August_2026.md` — the playbook for the August advisor meeting.

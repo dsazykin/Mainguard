@@ -2,7 +2,7 @@
 
 **The first launch of the shipped Mainguard client, storyboarded as a precision instrument — not a wizard.**
 
-This is a Wave-2 creative doc. It conforms to the source-of-truth hierarchy: [`DESIGN.md`](../../DESIGN.md) and [`PRODUCT.md`](../../PRODUCT.md) govern the design system, register, and success definition; [`AGENTS.md`](../../AGENTS.md) pins every surface below to a real view, control, or ViewModel; the [Voice & Delight Bible](../Mainguard_Voice_And_Delight_Bible.md) supplies the numbered, citable rules (`V-#`/`ES-#`/`T-#`/`TT-#`/`M-#`/`N-#`). Where any of them disagree, they win and the drift is fixed here. Nothing here invents a color, radius, spacing value, or motion outside the system.
+This is a Wave-2 creative doc. It conforms to the source-of-truth hierarchy: [`DESIGN.md`](../../DESIGN.md) and [`PRODUCT.md`](../../PRODUCT.md) govern the design system, register, and success definition; [`AGENTS.md`](../../AGENTS.md) pins every surface below to a real view, control, or ViewModel; the [Voice & Delight Bible](Mainguard_Voice_And_Delight_Bible.md) supplies the numbered, citable rules (`V-#`/`ES-#`/`T-#`/`TT-#`/`M-#`/`N-#`). Where any of them disagree, they win and the drift is fixed here. Nothing here invents a color, radius, spacing value, or motion outside the system.
 
 **Scope of tense.** Everything in §1–§4 governs the shipped single-user Git client (the code today). §5 is marked **[Horizon]** and is deliberately non-actionable — it records the *stance* future agent onboarding inherits, per Design Principle 5 and DESIGN.md §6 ("Don't design speculative UI").
 

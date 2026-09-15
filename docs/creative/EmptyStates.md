@@ -2,7 +2,7 @@
 
 > **Strings:** the final headline/body copy for every state below now lives in [`Microcopy.md`](Microcopy.md) §6 — where a string here differs, Microcopy.md wins. This doc remains the source of truth for the layout, icon, kind, and motion of each state (and the shared ES card, §9).
 
-**Wave-2 creative doc.** The empty / zero / first-run state for every surface in the app. This conforms to [`DESIGN.md`](../DESIGN.md) (tokens, shape, type, motion), [`PRODUCT.md`](../PRODUCT.md) (register, principles), and cites the numbered rules in [`Mainguard_Voice_And_Delight_Bible.md`](../Mainguard_Voice_And_Delight_Bible.md). Every surface below is a real view/window in the [`AGENTS.md`](../AGENTS.md) Repository Map.
+**Wave-2 creative doc.** The empty / zero / first-run state for every surface in the app. This conforms to [`DESIGN.md`](../../DESIGN.md) (tokens, shape, type, motion), [`PRODUCT.md`](../../PRODUCT.md) (register, principles), and cites the numbered rules in [`Mainguard_Voice_And_Delight_Bible.md`](Mainguard_Voice_And_Delight_Bible.md). Every surface below is a real view/window in the [`AGENTS.md`](../../AGENTS.md) Repository Map.
 
 ## How to read this
 

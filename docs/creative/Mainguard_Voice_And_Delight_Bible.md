@@ -4,7 +4,7 @@
 
 Creative North Star: **The Precision Loom** — a native instrument for high-stakes Git work, growing into a control center for supervising a swarm of coding agents. This document is the *contract* that every Wave-2 creative doc (empty states, microcopy library, motion spec, onboarding, launch copy) conforms to. Its rules are numbered and stable so downstream docs can cite them (e.g. "per **V-4**", "shape from **C-2**").
 
-**Source-of-truth hierarchy.** [`DESIGN.md`](../DESIGN.md) and [`PRODUCT.md`](../PRODUCT.md) govern the design system, register, and brand personality; [`AGENTS.md`](../AGENTS.md) is the Repository Map that pins every example below to a real view, control, token, or exception. Where this Bible and those files ever disagree, they win — and the drift gets fixed here. Nothing in this document invents a color, radius, spacing value, or motion outside the system.
+**Source-of-truth hierarchy.** [`DESIGN.md`](../../DESIGN.md) and [`PRODUCT.md`](../../PRODUCT.md) govern the design system, register, and brand personality; [`AGENTS.md`](../../AGENTS.md) is the Repository Map that pins every example below to a real view, control, token, or exception. Where this Bible and those files ever disagree, they win — and the drift gets fixed here. Nothing in this document invents a color, radius, spacing value, or motion outside the system.
 
 **Scope of tense.** Rules stated in the present tense govern the shipped single-user Git client (the code today). Rules marked **[Horizon]** govern the multi-agent control center on the `phase2` roadmap; they specify *voice and naming that future work will inherit*, not UI to build now (per Design Principle 5 and DESIGN.md §6 "Don't design speculative UI"). A Wave-2 doc for a shipped surface should not cite a **[Horizon]** rule as license to build.
 
@@ -265,7 +265,7 @@ IDs are stable. When a rule is retired, it is struck through in place and its ID
 
 ## Appendix C — Agent naming: the sanctioned options
 
-*Folded verbatim from `LaunchReserve.md` §4 (2026-07-12 consolidation; LaunchReserve is archived at `docs/obsolete docs/LaunchReserve.md`). This appendix is the authoritative home of the agent-naming option table that extends N-4.*
+*Folded verbatim from `LaunchReserve.md` §4 (2026-07-12 consolidation; LaunchReserve is archived at `docs/archive/LaunchReserve.md`). This appendix is the authoritative home of the agent-naming option table that extends N-4.*
 
 
 Per **N-4** (agents are precise, not pets — a stable neutral working name tied to a thread of work,

@@ -22,7 +22,7 @@ ones we want. The ask is never "buy," never "try our product," and — in the fi
 
 **Three rules that outrank the templates:**
 
-1. **Never claim the agent platform is shipped.** The honesty contract ([`../../creative/Narrative.md`](../../creative/Narrative.md) §0)
+1. **Never claim the agent platform is shipped.** The honesty contract ([`../../creative/Narrative.md`](../../../creative/Narrative.md) §0)
    binds outreach exactly as it binds marketing. Shipped: the Git client. Everything else is marked, in the
    email, as not-yet.
 2. **Never send a template unedited.** Every target on the list has a specific public artefact — a repo, a
