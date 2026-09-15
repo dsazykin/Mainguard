@@ -84,31 +84,63 @@ internal static class TestPorts
     }
 
     /// <summary>
-    /// Whether something is accepting TCP connections on this loopback port right now.
+    /// What a single connect attempt actually established about a loopback port.
     ///
-    /// <para>Only <see cref="SocketError.ConnectionRefused"/> — the kernel saying "nothing is bound
-    /// here" — counts as dead. Every other outcome, including a connect that never answers, is treated
-    /// as occupied: the cost of discarding a usable port is one more probe, while the cost of handing
-    /// out a live one is the flake this exists to prevent.</para>
+    /// <para>The distinction that matters is between the two DEFINITIVE answers and the absence of
+    /// one. A connect that never answers proves nothing: the port may be dead and the runner merely
+    /// busy. Callers decide what an unproven port is worth, and the two callers here want opposite
+    /// things — see <see cref="IsListening"/> and <see cref="OnDeadPortAsync"/>.</para>
     /// </summary>
-    public static bool IsListening(int port)
+    internal enum PortProbe
+    {
+        /// <summary>The kernel refused the connection — nothing is bound here.</summary>
+        Refused,
+
+        /// <summary>The connection was accepted — something is listening here.</summary>
+        Listening,
+
+        /// <summary>No answer within <see cref="ProbeTimeout"/>, or some other socket error. Unknown.</summary>
+        Indeterminate,
+    }
+
+    /// <summary>
+    /// One connect attempt against a loopback port, reported without flattening "no answer" into
+    /// either definitive verdict.
+    /// </summary>
+    internal static PortProbe Probe(int port)
     {
         using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         using var timeout = new CancellationTokenSource(ProbeTimeout);
         try
         {
             socket.ConnectAsync(IPAddress.Loopback, port, timeout.Token).AsTask().GetAwaiter().GetResult();
-            return true;
+            return PortProbe.Listening;
         }
         catch (SocketException error)
         {
-            return error.SocketErrorCode != SocketError.ConnectionRefused;
+            return error.SocketErrorCode == SocketError.ConnectionRefused
+                ? PortProbe.Refused
+                : PortProbe.Indeterminate;
         }
         catch (OperationCanceledException)
         {
-            return true;
+            return PortProbe.Indeterminate;
         }
     }
+
+    /// <summary>
+    /// Whether something is accepting TCP connections on this loopback port right now.
+    ///
+    /// <para>Only <see cref="SocketError.ConnectionRefused"/> — the kernel saying "nothing is bound
+    /// here" — counts as dead. Every other outcome, including a connect that never answers, is treated
+    /// as occupied: the cost of discarding a usable port is one more probe, while the cost of handing
+    /// out a live one is the flake this exists to prevent.</para>
+    ///
+    /// <para>That conservative reading is right for LEASING, which is what this answers. It is wrong
+    /// for deciding a port was stolen, which is why <see cref="OnDeadPortAsync"/> reads
+    /// <see cref="Probe"/> directly instead of calling this.</para>
+    /// </summary>
+    public static bool IsListening(int port) => Probe(port) != PortProbe.Refused;
 
     /// <summary>
     /// Runs <paramref name="body"/> against a port nothing is listening on, and — bounded by
@@ -118,6 +150,12 @@ internal static class TestPorts
     /// <para>The retry is narrow on purpose. A body that fails while its port is still refusing
     /// connections has found a real defect and is rethrown on the first attempt, so this cannot turn a
     /// genuine regression into a slow, confusing pass.</para>
+    ///
+    /// <para>Narrow means only a PROVEN theft earns a retry — <see cref="PortProbe.Listening"/>, the
+    /// kernel accepting a connection. A probe that times out is not evidence of theft: under load the
+    /// runner can leave a genuinely dead port unanswered, and reading that as "taken" re-ran, and
+    /// eventually masked, real failures. That is the blind spot this helper exists to refuse, so an
+    /// unproven port is treated as still dead and the body's exception surfaces.</para>
     /// </summary>
     public static async Task OnDeadPortAsync(Func<int, Task> body, int maxAttempts = MaxAttempts)
     {
@@ -129,7 +167,7 @@ internal static class TestPorts
                 await body(port).ConfigureAwait(false);
                 return;
             }
-            catch (Exception) when (attempt < maxAttempts && IsListening(port))
+            catch (Exception) when (attempt < maxAttempts && Probe(port) == PortProbe.Listening)
             {
                 // A foreign process took the port between the lease and the assertion, so the premise
                 // the body was handed stopped being true. Try again on a fresh dead port.

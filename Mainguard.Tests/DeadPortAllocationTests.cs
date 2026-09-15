@@ -66,6 +66,32 @@ public sealed class DeadPortAllocationTests
         Assert.False(TestPorts.IsListening(port), "a released loopback port must read as dead");
     }
 
+    /// <summary>
+    /// The probe's THIRD answer is the point. <see cref="TestPorts.IsListening"/> folds "no answer"
+    /// into "occupied", which is the right conservative read when leasing — but folding it in
+    /// everywhere is what let a timeout masquerade as a stolen port and re-run a real failure. So the
+    /// two definitive verdicts are pinned as distinct values here, not as a bool.
+    /// </summary>
+    [Fact]
+    public void Probe_SeparatesTheTwoDefinitiveVerdicts_FromEachOther()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        try
+        {
+            Assert.Equal(TestPorts.PortProbe.Listening, TestPorts.Probe(port));
+        }
+        finally
+        {
+            listener.Stop();
+        }
+
+        // Refused is its own verdict — NOT merely "not Listening", which Indeterminate also satisfies.
+        Assert.Equal(TestPorts.PortProbe.Refused, TestPorts.Probe(port));
+    }
+
     // -------------------------------------------------------------------------------------------
     // Mechanism 1 — deadness is CHECKED, not assumed.
     // -------------------------------------------------------------------------------------------
