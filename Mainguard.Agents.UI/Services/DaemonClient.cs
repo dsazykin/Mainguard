@@ -325,6 +325,18 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return new ProvisionedRepo(response.RepoHandle, response.SyncRemoteName, response.SyncRemoteUrl);
     }
 
+    /// <summary>Deletes an agent and its work — jail, worktree, queue entry and branch. A generous
+    /// default deadline: it stops a container before it touches git, and a stop is seconds of real
+    /// work.</summary>
+    public async Task<DeleteAgentResponse> DeleteAgentAsync(
+        string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        return await client.DeleteAgentAsync(
+            new DeleteAgentRequest { RepoHandle = repoHandle, AgentId = agentId },
+            CallOptions(ct, deadline ?? TimeSpan.FromMinutes(2)));
+    }
+
     /// <summary>Human per-agent pause (docker pause on the jail; refusal-as-response).</summary>
     public async Task<PauseAgentResponse> PauseAgentAsync(string agentId, CancellationToken ct, TimeSpan? deadline = null)
     {

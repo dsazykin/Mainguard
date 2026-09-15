@@ -120,6 +120,11 @@ public sealed class RoleInterceptor : Interceptor
         // never re-verifies), and one that could unpause could break the cascade's critical section.
         "/mainguard.v1.AgentService/PauseAgent",
         "/mainguard.v1.AgentService/UnpauseAgent",
+        // The strongest power in this service, and the reason it is a method rather than a flag on
+        // StopAgent: it DESTROYS a branch. An agent able to call it could erase the commits of work it
+        // competes with — the evidence a co-tenant's merge rests on — and do it under the ordinary stop
+        // vocabulary. Deleting work is a human decision about a human's repository.
+        "/mainguard.v1.AgentService/DeleteAgent",
         // The two parked-conflict actions, on exactly the boundary the line above draws. Handing a
         // conflict back UNPAUSES a co-tenant's jail and then types into its CLI — UnpauseAgent plus the
         // terminal input lock's whole purpose, in one call; aborting a parked rebase rewrites a co-tenant

@@ -426,7 +426,9 @@ public partial class ControlCenterViewModel
 
     // ---- projections ----
 
-    private void RefreshAgents()
+    /// <remarks>Internal rather than private so the rail's reconcile — the pass that rebuilds and
+    /// reorders rows — can be driven directly by a test asserting that the selection survives it.</remarks>
+    internal void RefreshAgents()
     {
         // The coordinator is NOT a row among the workers: it is its own entity, owned by the
         // coordinator surface (the card below). Only worker/manual agents populate the rail.

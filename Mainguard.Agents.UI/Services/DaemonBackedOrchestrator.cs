@@ -1485,6 +1485,62 @@ public sealed class DaemonBackedOrchestrator :
         return stored;
     }
 
+    /// <summary>
+    /// Deletes an agent and its work. The daemon performs all of it — see the RPC's comment for why the
+    /// three steps are not driven from here as three calls.
+    ///
+    /// <para>The agent's stored NAME is forgotten too, and only after the daemon confirms the delete: a
+    /// name dropped ahead of a refusal would leave the row on the rail wearing a label the human had
+    /// already been told was gone.</para>
+    /// </summary>
+    public async Task<AgentDeletion> DeleteAgentAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return AgentDeletion.Refused("no repository is active for agents yet");
+        }
+
+        Proto.DeleteAgentResponse response;
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            response = await _client.DeleteAgentAsync(repoHandle!, agentId, cts.Token).ConfigureAwait(false);
+        }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.Unimplemented)
+        {
+            return AgentDeletion.Refused("this daemon is too old to delete agents — update Mainguard OS");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return AgentDeletion.Refused(ex.Message);
+        }
+
+        if (response.Deleted)
+        {
+            _agentNameStore.Forget(repoHandle!, agentId);
+            lock (_gate)
+            {
+                _agentNames.Remove(agentId);
+                // Dropped from the projection immediately rather than waiting for the next listing: the
+                // row is what the human asked to be rid of, and leaving it until a stream tick arrives
+                // is how a confirmed delete looks like it did nothing.
+                _agents.Remove(agentId);
+            }
+
+            Changed?.Invoke();
+        }
+
+        return new AgentDeletion(
+            response.Deleted, response.Reason ?? string.Empty,
+            response.BranchDeleted, response.DeletedBranchSha ?? string.Empty);
+    }
+
     /// <summary>Drops every stored name whose agent the daemon no longer lists, so the file stays the
     /// size of the fleet rather than the size of its history. Best effort and never on the critical
     /// path of anything — a name left behind is residue, not a fault.</summary>
