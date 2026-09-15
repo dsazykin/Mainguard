@@ -193,12 +193,18 @@
                 PointerPressed="TitleBar_PointerPressed" DoubleTapped="TitleBar_DoubleTapped">
             <Grid ColumnDefinitions="Auto, *, Auto, Auto">
 
-                <!-- Left Side: hamburger toggle + compact (Branch/Sync/Repository) or expanded
+                <!-- Left side of the title bar. The auto-fetch freshness label is a sibling of the
+                     menu group, not a child of it, because the group is HIDDEN on macOS and the label
+                     is not a menu — nesting it there took the whole "last fetched" indicator off the
+                     Mac build along with the flyouts. -->
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+
+                <!-- hamburger toggle + compact (Branch/Sync/Repository) or expanded
                      (Select Repo/Close Repository/Settings/Exit) — JetBrains-style, never both at once.
                      Hidden entirely on macOS (code-behind, WindowChromePolicy.InWindowMenuVisible):
                      every item here is a menu/flyout, and on macOS those live in the native menu bar
                      (Services.MacMenuBar) instead — Windows/Linux keep this exactly as before. -->
-                <StackPanel x:Name="MenuBarGroup" Grid.Column="0" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                <StackPanel x:Name="MenuBarGroup" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
 
                     <!-- Hamburger: a pure compact/expand toggle now — Select Repo (below) is what opens
                          the repo picker; the old File/Theme/Layout/Keyboard-Shortcuts/Window&amp;Exit
@@ -316,24 +322,6 @@
                             </Button.Flyout>
                         </Button>
 
-                        <!-- Auto-fetch freshness (T-10): dims once the picture is >15 min stale, and turns
-                             warning-coloured while background fetch is FAILING — at which point this label
-                             and the ahead/behind badge next to it are both describing a stale picture. -->
-                        <TextBlock Text="{Binding LastFetchedText}" FontSize="11" VerticalAlignment="Center"
-                                   DataContext="{Binding CurrentWorkspace}" x:DataType="vm:RepoDashboardViewModel"
-                                   ToolTip.Tip="{Binding LastFetchedText}"
-                                   Opacity="{Binding IsLastFetchStale, Converter={x:Static BoolToOpacityConverter.Instance}}"
-                                   IsVisible="{Binding LastFetchedText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"
-                                   Classes.fetchFailing="{Binding IsAutoFetchFailing}">
-                            <TextBlock.Styles>
-                                <Style Selector="TextBlock">
-                                    <Setter Property="Foreground" Value="{DynamicResource TextMuted}"/>
-                                </Style>
-                                <Style Selector="TextBlock.fetchFailing">
-                                    <Setter Property="Foreground" Value="{DynamicResource WarningBrush}"/>
-                                </Style>
-                            </TextBlock.Styles>
-                        </TextBlock>
                     </StackPanel>
 
                     <!-- EXPANDED: replaces the row above entirely while toggled on (JetBrains-style —
@@ -348,6 +336,28 @@
                         <Button Classes="Toolbar" Content="Settings" Command="{Binding OpenSettingsCommand}" VerticalAlignment="Center"/>
                         <Button Classes="Toolbar" Content="Exit" Command="{Binding ExitApplicationCommand}" VerticalAlignment="Center"/>
                     </StackPanel>
+                </StackPanel>
+
+                <!-- Auto-fetch freshness (T-10): dims once the picture is >15 min stale, and turns
+                     warning-coloured while background fetch is FAILING — at which point this label
+                     and the ahead/behind badge next to it are both describing a stale picture.
+                     OUTSIDE MenuBarGroup: it is a status readout, not a menu, and belongs on macOS
+                     too (where the group above is hidden). -->
+                <TextBlock Text="{Binding LastFetchedText}" FontSize="11" VerticalAlignment="Center"
+                           DataContext="{Binding CurrentWorkspace}" x:DataType="vm:RepoDashboardViewModel"
+                           ToolTip.Tip="{Binding LastFetchedText}"
+                           Opacity="{Binding IsLastFetchStale, Converter={x:Static BoolToOpacityConverter.Instance}}"
+                           IsVisible="{Binding LastFetchedText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"
+                           Classes.fetchFailing="{Binding IsAutoFetchFailing}">
+                    <TextBlock.Styles>
+                        <Style Selector="TextBlock">
+                            <Setter Property="Foreground" Value="{DynamicResource TextMuted}"/>
+                        </Style>
+                        <Style Selector="TextBlock.fetchFailing">
+                            <Setter Property="Foreground" Value="{DynamicResource WarningBrush}"/>
+                        </Style>
+                    </TextBlock.Styles>
+                </TextBlock>
                 </StackPanel>
 
                 <!-- Right Side: Push/Pull Buttons. (main's #78 pinned-icon strip is not rendered

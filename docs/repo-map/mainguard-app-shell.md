@@ -1051,11 +1051,19 @@
   - `TerminalLauncher.cs` — the single open-a-folder-in-the-OS-terminal path (same hygiene as the
     reveal path): macOS `open -a Terminal`, Windows `wt.exe` falling back to `cmd`, Linux
     `x-terminal-emulator`. Surfaced from the macOS menu bar's Repository menu.
-  - `MacMenuBar.cs` — the macOS top-of-screen menu bar (no-op elsewhere): File / Repository /
-    View / Help built over EXISTING seams — repo actions dispatch through
+  - `MacMenuBar.cs` — the macOS top-of-screen menu bar (no-op elsewhere): File / Branch /
+    Repository / View / Help built over EXISTING seams — repo actions dispatch through
     `MainWindowViewModel.InvokeActionByIdCommand` (the same registry the shortcuts and palette
-    use, so availability rules hold), themes through `ThemeManager` keys ("System" included),
-    reveal/terminal through the launchers above. The menu bar follows the KEY window on macOS,
+    use, so availability rules hold), dashboard-only actions (push options, Update Project,
+    Manage Remotes, Submodules, Git LFS, Worktrees, Reflog, Operation History) through the
+    `RepoDashboardViewModel` commands the in-window flyouts bind, themes through `ThemeManager`
+    keys ("System" included), reveal/terminal through the launchers above. It is the ONLY route
+    to all of those on macOS, where MainWindow's `MenuBarGroup` is hidden outright
+    (`WindowChromePolicy.InWindowMenuVisible`) — an item added there needs one here too.
+    **Branch ▸ Switch To** is the Mac counterpart of the in-window Branch pill: filled in on
+    `NativeMenu.NeedsUpdate` from `BranchBrowserViewModel.ListBranchesForSwitchMenu()` and
+    invoking the same `CheckoutBranchCommand`, rate-limited because AppKit raises `NeedsUpdate`
+    during key-equivalent matching and not only when a menu opens. The menu bar follows the KEY window on macOS,
     so `Attach` is called from MainWindow's ctor and from every `ChromedWindow` via the
     `ChromedWindow.MenuInstaller` seam; `App.axaml` names the application ("Mainguard") because
     Avalonia titles the app menu from `Application.Name`, not the bundle.
