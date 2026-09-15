@@ -22,7 +22,7 @@ export function Client() {
         <h1 style={{ marginTop: 'var(--space-4)' }}>The Git client, taken seriously again.</h1>
         <p className="lede">
           Most Git GUIs are a web page in a window: slow to open, slow to scroll, and account-walled.
-          Mainguard is rendered natively — a precision instrument for the work you do a hundred times a
+          Mainguard is rendered natively, a precision instrument for work you do a hundred times a
           day. Every window on this page is a working miniature, not a screenshot. Click around.
         </p>
         <hr className="thread-rule" />
@@ -46,7 +46,7 @@ export function Client() {
               <br />
               <span className="ok">✓</span> native rendering, instant startup, 60fps everywhere
               <br />
-              <span className="ok">✓</span> the full client is free — no login, no telemetry, no held-hostage features
+              <span className="ok">✓</span> the full client is free, with no login, no telemetry and nothing held back
               <br />
               <span className="ok">✓</span> deterministic repository access: open, operate, release. No lock collisions.
               <br />
@@ -62,7 +62,7 @@ export function Client() {
             <div className="feature-row">
               <div>
                 <h3 data-thread-node>
-                  <IconGraph /> A commit graph that moves like the app is native — because it is
+                  <IconGraph /> A commit graph that moves like the app is native, because it is
                 </h3>
                 <p className="muted">
                   Branches, merges and tags drawn as colored lanes at a rock-solid 60fps, whether
@@ -81,8 +81,8 @@ export function Client() {
                   <IconStage /> Stage exactly what you mean
                 </h3>
                 <p className="muted">
-                  Files, hunks, or single lines — build precise commits from messy working
-                  directories. The diff view shows whitespace ghosts and word-level changes so
+                  Files, hunks or single lines. Build precise commits out of a messy working
+                  directory. The diff view shows whitespace ghosts and word-level changes so
                   nothing slips through. Try it: stage a few lines and commit them.
                 </p>
               </div>
@@ -97,9 +97,8 @@ export function Client() {
                   <IconMerge /> Conflicts, without the cold sweat
                 </h3>
                 <p className="muted">
-                  Ours, theirs, and the merged result side by side. Every choice is reversible until
-                  you commit, and the UI always makes the safer path the obvious one — that's the
-                  house rule.
+                  Ours, theirs and the merged result side by side. Every choice stays reversible until
+                  you commit, and the safer path is always the obvious one.
                 </p>
               </div>
               <ConflictVignette />
@@ -113,17 +112,17 @@ export function Client() {
                   <IconGitHub /> Your host, inside the client
                 </h3>
                 <p className="muted">
-                  Pull requests, issues, reviews, CI checks, notifications and releases — first-class
-                  panels, not browser tabs. Check out any PR into its own worktree with one click,
+                  Pull requests, issues, reviews, CI checks, notifications and releases live in panels
+                  rather than a browser tab. Check out any PR into its own worktree with one click,
                   and jump from a blame line straight to the PR that introduced it.
                 </p>
               </div>
-              <WindowFrame title="mainguard — pull requests">
+              <WindowFrame title="mainguard · pull requests">
                 <div className="vg-grid">
                   {[
                     ['#128 · feat: partial stash UI', 'checks ✓ · 2 approvals', 'var(--success)'],
                     ['#127 · fix: graph virtualization', 'checks running…', 'var(--warning)'],
-                    ['#125 · docs: release notes', 'review requested — you', 'var(--accent)'],
+                    ['#125 · docs: release notes', 'review requested: you', 'var(--accent)'],
                   ].map(([title, state, color]) => (
                     <div key={title} className="vg-row">
                       <span className="mono" style={{ fontSize: 12 }}>{title}</span>
@@ -144,9 +143,9 @@ export function Client() {
                 </h3>
                 <p className="muted">
                   Full management of everything your repository holds, in one window. Worktrees are
-                  first-class — the same foundation that hosts agent sandboxes in Pro. Interactive
-                  rebase, force-with-lease, LFS and stash apply/pop included, all behind safe
-                  defaults.
+                  first-class, and they are the same foundation that hosts agent sandboxes in Pro.
+                  Interactive rebase, force-with-lease, LFS and stash apply or pop are all here,
+                  behind safe defaults.
                 </p>
               </div>
               <RefsVignette />
@@ -161,19 +160,19 @@ export function Client() {
                 </h3>
                 <p className="muted">
                   A pre-commit safety scanner flags secrets and keys before they enter history. The
-                  commit composer nudges toward clean conventional commits. Destructive operations
-                  ask once, clearly — and force-push is always force-with-lease.
+                  commit composer nudges toward clean conventional commits. Destructive operations ask
+                  once, clearly, and force-push is always force-with-lease.
                 </p>
               </div>
-              <WindowFrame title="mainguard — pre-commit scan">
+              <WindowFrame title="mainguard · pre-commit scan">
                 <div className="ledger" style={{ padding: '14px 16px', fontSize: '0.8rem', lineHeight: 1.9 }}>
-                  <span className="dim">$ commit — scanning 3 staged files…</span>
+                  <span className="dim">$ commit · scanning 3 staged files…</span>
                   <br />
-                  <span className="err">⚠ appsettings.json:14 — looks like an API key (sk-…)</span>
+                  <span className="err">⚠ appsettings.json:14 looks like an API key (sk-…)</span>
                   <br />
                   <span className="dim">   [ unstage line ]  [ it's a fake, commit anyway ]</span>
                   <br />
-                  <span className="ok">✓ history stays clean — caught before it ever left your machine</span>
+                  <span className="ok">✓ history stays clean, caught before it ever left your machine</span>
                 </div>
               </WindowFrame>
             </div>
@@ -186,9 +185,9 @@ export function Client() {
                   <IconZap /> Four themes, one design system
                 </h3>
                 <p className="muted">
-                  Midnight Loom, Daylight Loom, Graphite, Atelier. Every color in the app is a
-                  named token — switch palettes live, and every surface follows. The settings
-                  panel on the right is wired to this website; use it.
+                  Midnight Loom, Daylight Loom, Graphite, Atelier. Every color in the app is a named
+                  token. Switch palettes live and every surface follows. The settings panel on the
+                  right is wired to this website, so try it.
                 </p>
               </div>
               <ThemePanelVignette />
@@ -201,19 +200,19 @@ export function Client() {
         <div className="container">
           <Reveal>
             <h2 data-thread-node>And the rest of the toolbox</h2>
-            <p className="lede">The unglamorous features you reach for daily — done properly, included free.</p>
+            <p className="lede">The unglamorous features you reach for daily, done properly and included free.</p>
             <dl className="spec-list">
               {(
                 [
                   ['Word-level diffs', 'whitespace ghosts, intra-line highlights, image diffs'],
-                  ['Interactive rebase', 'reorder, squash, reword — with a live preview of the result'],
+                  ['Interactive rebase', 'reorder, squash, reword, with a live preview of the result'],
                   ['Undo, everywhere', 'reflog-backed undo for the operations that usually mean panic'],
                   ['Blame → PR jump', 'from any line to the pull request that introduced it'],
                   ['Conventional commits', 'a composer that formats type(scope): summary for you'],
-                  ['Stash management', 'create, inspect, apply, pop — with diffs before you decide'],
+                  ['Stash management', 'create, inspect, apply, pop, with diffs before you decide'],
                   ['Tags & releases', 'annotated tags, release notes, host releases in one panel'],
-                  ['Submodules & LFS', 'status, init, update — no CLI round-trips'],
-                  ['History search', 'filter every commit by text, author, path or date — not just HEAD'],
+                  ['Submodules & LFS', 'status, init and update without a CLI round-trip'],
+                  ['History search', 'filter every commit by text, author, path or date, across every branch'],
                   ['File history', 'follow one file through renames, with the diff at each step'],
                   ['Command palette', 'every action a keystroke away, without leaving the keyboard'],
                   ['Identities & keys', 'per-repo commit identity, SSH keys and host accounts in one place'],
@@ -234,8 +233,8 @@ export function Client() {
           <Reveal>
             <h2 data-thread-node>Why free? Honestly:</h2>
             <p className="lede">
-              The client is the handshake. It's complete — nothing is held hostage behind an
-              upgrade prompt, and it never asks who you are. When you're ready to put coding
+              The client is the handshake. It is complete. Nothing is held back behind an upgrade
+              prompt, and it never asks who you are. When you're ready to put coding
               agents to work, <Link to="/pro">Pro</Link> is where Mainguard earns its keep. Until
               then, enjoy a Git client that respects you.
             </p>

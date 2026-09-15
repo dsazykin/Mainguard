@@ -98,7 +98,7 @@ export function Contact() {
     else
       setError(
         (res.error ?? 'Something went wrong.') +
-          ' Your message is still here — nothing was lost. Please try again.',
+          ' Your message is still here, nothing was lost. Try again.',
       );
   }
 
@@ -106,7 +106,7 @@ export function Contact() {
     return (
       <div className="container form-page">
         <SuccessGate title="Message sent.">
-          <p className="muted">Thanks for writing, {name.trim().split(/\s+/)[0]} — expect a reply within a couple of days.</p>
+          <p className="muted">Thanks for writing, {name.trim().split(/\s+/)[0]}. Expect a reply within a couple of days.</p>
         </SuccessGate>
       </div>
     );
@@ -116,7 +116,7 @@ export function Contact() {
     <div className="container form-page">
       <h1>Contact</h1>
       <p className="lede" style={{ marginBottom: 'var(--space-8)' }}>
-        Questions, beta access, partnerships, or just opinions about Git clients — all welcome. One
+        Questions, beta access, partnerships, or just opinions about Git clients are all welcome. One
         question at a time; nothing you type gets lost.
       </p>
 
@@ -197,7 +197,7 @@ export function Contact() {
               <label htmlFor="ct-message">What's on your mind?</label>
               <textarea
                 id="ct-message"
-                placeholder="Take your time — Back won't eat this."
+                placeholder="Take your time. Back won't eat this."
                 value={message}
                 maxLength={5000}
                 onChange={(e) => setMessage(e.target.value)}

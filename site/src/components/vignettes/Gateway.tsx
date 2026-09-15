@@ -32,7 +32,7 @@ export function GatewayVignette() {
 
   return (
     <div ref={ref}>
-      <WindowFrame title="mainguard pro — gateway">
+      <WindowFrame title="mainguard pro · gateway">
         <div className="vg-grid">
           {PROVIDERS.map((p, i) => (
             <div key={p.name} className="vg-row" style={{ display: 'block' }}>

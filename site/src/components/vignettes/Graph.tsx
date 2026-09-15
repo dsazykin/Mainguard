@@ -16,7 +16,7 @@ interface Commit {
 const COMMITS: Commit[] = [
   { id: 'c0', x: 30, y: 20, lane: 'var(--lane-1)', msg: 'refactor commit router', hash: 'a3f9c21', delta: '+64 −12' },
   { id: 'c1', x: 30, y: 60, lane: 'var(--lane-1)', msg: 'stage hunks by selection', hash: 'e8d0b47', delta: '+128 −9' },
-  { id: 'c2', x: 30, y: 100, lane: 'var(--lane-1)', msg: 'merge agent/parser — verified ✓', hash: '52c11fe', delta: '+412 −38', strong: true },
+  { id: 'c2', x: 30, y: 100, lane: 'var(--lane-1)', msg: 'merge agent/parser · verified ✓', hash: '52c11fe', delta: '+412 −38', strong: true },
   { id: 'c3', x: 70, y: 95, lane: 'var(--lane-2)', msg: 'agent: parser edge cases', hash: '9b30a6d', delta: '+96 −40' },
   { id: 'c4', x: 110, y: 90, lane: 'var(--lane-3)', msg: 'agent: tokenizer tests', hash: '7f4e2ba', delta: '+230 −0' },
   { id: 'c5', x: 30, y: 140, lane: 'var(--lane-1)', msg: 'initial worktree layout', hash: '1d92f03', delta: '+58 −3' },
@@ -31,7 +31,7 @@ export function GraphVignette() {
 
   return (
     <div ref={ref}>
-      <WindowFrame title="mainguard — commit graph">
+      <WindowFrame title="mainguard · commit graph">
         <svg
           viewBox="0 0 420 190"
           width="100%"
@@ -96,7 +96,7 @@ export function GraphVignette() {
           <span>{selected.msg}</span>
           <span>{selected.delta}</span>
         </div>
-        <p className="vg-hint">click any commit — it's real chrome, not a screenshot</p>
+        <p className="vg-hint">click any commit. this is real chrome, not a screenshot</p>
       </WindowFrame>
     </div>
   );

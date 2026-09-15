@@ -21,7 +21,7 @@ export function Footer() {
         </div>
         <nav className="footer-col" aria-label="Products">
           <h4>Products</h4>
-          <Link to="/client">Git Client — free</Link>
+          <Link to="/client">Git Client · free</Link>
           <Link to="/pro">Mainguard Pro</Link>
           <Link to="/cloud">Mainguard Cloud</Link>
         </nav>

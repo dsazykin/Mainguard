@@ -26,7 +26,7 @@ export function AuditVignette() {
 
   return (
     <div ref={ref}>
-      <WindowFrame title="mainguard pro — audit log">
+      <WindowFrame title="mainguard pro · audit log">
         <div className="ledger" style={{ padding: '14px 16px', fontSize: '0.78rem', lineHeight: 1.9 }}>
           {ENTRIES.slice(0, shown).map((e, i) => (
             <div key={e.n} className={reduced ? undefined : 'vg-audit-line'} style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
@@ -38,11 +38,11 @@ export function AuditVignette() {
           ))}
           {verified && (
             <div className={reduced ? undefined : 'vg-audit-line'}>
-              <span className="ok">$ mainguard audit verify — chain intact ✓</span>
+              <span className="ok">$ mainguard audit verify · chain intact ✓</span>
             </div>
           )}
         </div>
-        <p className="vg-note">who did what, when, on whose approval — provable after the fact, exportable to your SIEM</p>
+        <p className="vg-note">who did what, when, and on whose approval. provable after the fact, with one command</p>
       </WindowFrame>
     </div>
   );

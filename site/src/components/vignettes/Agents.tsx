@@ -17,8 +17,8 @@ const AGENTS: AgentDef[] = [
     log: [
       [5, '> reading TestScheduler.cs'],
       [30, '> pinning clock in 3 flaky tests'],
-      [62, '> dotnet test — 214/214 passed'],
-      [96, '> gates green — awaiting your review'],
+      [62, '> dotnet test · 214/214 passed'],
+      [96, '> gates green · awaiting your review'],
     ],
   },
   {
@@ -28,7 +28,7 @@ const AGENTS: AgentDef[] = [
     log: [
       [5, '> scaffolding ImportWizardViewModel'],
       [40, '> wiring CSV column mapping'],
-      [70, '> dotnet build — 0 warnings'],
+      [70, '> dotnet build · 0 warnings'],
       [96, '> running test suite…'],
     ],
   },
@@ -81,7 +81,7 @@ export function AgentsVignette() {
 
   return (
     <div ref={ref}>
-      <WindowFrame title="mainguard pro — agents">
+      <WindowFrame title="mainguard pro · agents">
         <div className="vg-grid">
           {AGENTS.map((a, i) => {
             const st = stateFor(shown[i]);

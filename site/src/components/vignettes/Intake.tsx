@@ -25,7 +25,7 @@ export function IntakeVignette() {
 
   return (
     <div ref={ref}>
-      <WindowFrame title="mainguard pro — external intake">
+      <WindowFrame title="mainguard pro · external intake">
         <div className="vg-grid">
           {PRS.map((pr) => {
             if (t < pr.appearAt) return null;
@@ -44,7 +44,7 @@ export function IntakeVignette() {
             );
           })}
           <p className="vg-note">
-            any agent's PRs, one pipeline — same gates, same review queue, same audit trail
+            any agent's PRs, one pipeline: same gates, same review queue, same audit trail
           </p>
         </div>
       </WindowFrame>

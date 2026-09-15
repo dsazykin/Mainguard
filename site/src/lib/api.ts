@@ -17,6 +17,6 @@ export async function postJson(path: string, body: unknown): Promise<ApiResult> 
     if (data) return data;
     return { ok: res.ok, error: res.ok ? undefined : 'Unexpected response. Please try again.' };
   } catch {
-    return { ok: false, error: 'Network error — please check your connection and try again.' };
+    return { ok: false, error: 'Network error. Check your connection and try again.' };
   }
 }

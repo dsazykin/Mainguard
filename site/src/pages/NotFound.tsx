@@ -16,7 +16,7 @@ export function NotFound() {
       </svg>
       <h1 style={{ fontSize: 'var(--text-2xl)' }}>This trail leads nowhere.</h1>
       <p className="muted" style={{ marginInline: 'auto' }}>
-        The page you're after was never committed — or it's been rebased away.
+        The page you're after was never committed, or it has been rebased away.
       </p>
       <Link to="/" className="btn btn-accent btn-lg" style={{ marginTop: 'var(--space-4)' }}>
         Back to the gatehouse

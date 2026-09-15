@@ -13,7 +13,7 @@ export function RefsVignette() {
   const [head, setHead] = useState('main');
 
   return (
-    <WindowFrame title="mainguard — refs">
+    <WindowFrame title="mainguard · refs">
       <div className="vg-grid">
         {REFS.map((r) =>
           r.branch ? (
@@ -45,7 +45,7 @@ export function RefsVignette() {
             </div>
           ),
         )}
-        <p className="vg-hint">click a branch — checkout, without touching your other worktrees</p>
+        <p className="vg-hint">click a branch to check it out, without touching your other worktrees</p>
       </div>
     </WindowFrame>
   );

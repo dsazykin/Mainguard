@@ -23,8 +23,8 @@ export function Pro() {
           Generating code is cheap now. The expensive part is what comes after: checking it,
           trusting it, merging it. Mainguard Pro runs several coding agents against one repository,
           each jailed on its own branch, and lets nothing reach main until it has been verified
-          against current main and approved by you. Every window below is live — click, approve,
-          replay.
+          against current main and approved by you. Every window below is live, so click, approve
+          and replay.
         </p>
         <hr className="thread-rule" />
       </div>
@@ -47,12 +47,12 @@ export function Pro() {
               <br />
               <span className="err">✗ agent-3 force-pushed and ate your local fixes</span>
               <br />
-              <span className="err">✗ 4,000 generated lines merged — tests never ran</span>
+              <span className="err">✗ 4,000 generated lines merged, tests never ran</span>
               <br />
               <br />
               <span className="dim">Three agents, one repo, Mainguard Pro:</span>
               <br />
-              <span className="ok">✓ each agent works a jailed worktree — collisions are impossible</span>
+              <span className="ok">✓ each agent works a jailed worktree, so collisions are impossible</span>
               <br />
               <span className="ok">✓ every change passes build + tests + lint before it can merge</span>
               <br />
@@ -71,12 +71,12 @@ export function Pro() {
                   <IconWorktree /> Jailed parallel agents
                 </h3>
                 <p className="muted">
-                  Five pinned CLI adapters — Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode —
-                  each running in its own hardened container: no-new-privileges, seccomp, dropped
+                  Five pinned CLI adapters (Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode), each
+                  running in its own hardened container: no-new-privileges, seccomp, dropped
                   capabilities, read-only rootfs, user namespaces and per-jail resource limits.
-                  They can't touch each other's work and they can never touch your working
-                  directory. Windows via a lightweight background WSL2 VM — no Docker Desktop
-                  dependency — and native on macOS.
+                  They cannot touch each other's work, and they can never touch your working
+                  directory. On Windows they run in a lightweight background WSL2 VM with no
+                  Docker Desktop dependency. On macOS they run natively.
                 </p>
               </div>
               <AgentsVignette />
@@ -91,7 +91,7 @@ export function Pro() {
                 </h3>
                 <p className="muted">
                   Nothing merges on vibes. The verdict is the container's real exit code, read by
-                  the trusted daemon from outside the container — never a value the agent supplies.
+                  the trusted daemon from outside the container, never a value the agent supplies.
                   The resolved test command and config hash are pinned immutably, so nothing slips
                   through by quietly weakening what "verify" means. If main moves, every other
                   verified branch is invalidated and re-verified before it is eligible again.
@@ -109,11 +109,11 @@ export function Pro() {
                 </h3>
                 <p className="muted">
                   All agent output flows into one queue of verified diffs, ranked by risk so you
-                  spend attention where it matters. Every hunk carries provenance — which agent,
+                  spend attention where it matters. Every hunk carries its provenance: which agent,
                   which run. Changes flagged as sensitive need an explicit acknowledgement before
                   you can approve them, and the merge itself is an atomic compare-and-swap, so two
                   racing agents cannot land a stale result. Verification earns a branch the right
-                  to be considered; it never merges anything on its own.
+                  to be considered. It never merges anything on its own.
                 </p>
               </div>
               <ReviewQueueVignette />
@@ -127,14 +127,14 @@ export function Pro() {
                   <IconMerge /> You approve the plan before anyone writes code
                 </h3>
                 <p className="muted">
-                  Point Pro at a piece of work and a coordinator decomposes it into a plan — then
-                  stops. No worker spawns until you have read that plan and let it through. The
+                  Point Pro at a piece of work and a coordinator breaks it into a plan, then stops.
+                  No worker spawns until you have read that plan and let it through. The
                   coordinator's own tool surface is locked to a small contract that has nothing in
                   common with a worker's, so the thing that plans the work cannot quietly start
                   doing it.
                 </p>
               </div>
-              <WindowFrame title="mainguard pro — plan gate">
+              <WindowFrame title="mainguard pro · plan gate">
                 <div className="vg-grid">
                   {[
                     ['1 · extract IImportSource from CsvImporter', 'Mainguard.Git/Import/'],
@@ -148,7 +148,7 @@ export function Pro() {
                   ))}
                   <div className="vg-row" style={{ borderColor: 'var(--accent)' }}>
                     <span className="mono" style={{ fontSize: 11.5, color: 'var(--accent)' }}>
-                      3 workers held — awaiting your approval
+                      3 workers held · awaiting your approval
                     </span>
                   </div>
                   <p className="vg-note">nothing spawns until the plan clears the gate</p>
@@ -164,7 +164,7 @@ export function Pro() {
                   <IconGraph /> Vendor-neutral by design
                 </h3>
                 <p className="muted">
-                  Agents that live elsewhere — Codex, Jules, Copilot — open PRs against your repo
+                  Agents that live elsewhere, like Codex, Jules and Copilot, open PRs against your repo
                   all day. Pro pulls them into the same verify → review → merge pipeline as your
                   local agents, so there's one standard for what lands, no matter who or what wrote
                   it. Swap agents as models leapfrog each other; keep the workflow.
@@ -181,8 +181,8 @@ export function Pro() {
                   <IconKey /> Your keys, your models, your terms
                 </h3>
                 <p className="muted">
-                  Bring your own API keys or existing agent subscriptions — they live in the OS
-                  keyring, and Pro orchestrates without metering your tokens. The built-in gateway
+                  Bring your own API keys or existing agent subscriptions. They live in the OS keyring,
+                  and Pro never meters your tokens. The built-in gateway
                   smooths rate limits across the fleet so a burst from one agent doesn't starve the
                   rest, enforces per-agent and per-day token and cost budgets, applies honest
                   admission control instead of overselling your hardware, and tells you what every
@@ -202,7 +202,7 @@ export function Pro() {
                 <p className="muted">
                   Every agent action, verification run, approval and merge lands in a hash-chained,
                   tamper-evident log with typed events, retention policy and RFC-3161 timestamp
-                  anchoring — plus a command-line integrity check. When compliance asks "who
+                  anchoring, plus a command-line integrity check. When compliance asks "who
                   approved this AI-written change?", you answer in seconds. Built for the EU AI Act
                   era, useful long before an auditor shows up.
                 </p>
@@ -219,7 +219,7 @@ export function Pro() {
             <h2 data-thread-node>One control stops everything.</h2>
             <p className="lede">
               An always-visible stop control freezes the merge queue first, then pauses every
-              agent — in that order, so nothing slips through the gate on the way down. It runs
+              agent, in that order, so nothing slips through the gate on the way down. It runs
               under a hard thirty-second ceiling that a misbehaving worker cannot stretch. Wherever
               you can lose work, the safer path is the default one.
             </p>
@@ -236,10 +236,10 @@ export function Pro() {
               {(
                 [
                   ['Default-deny egress', 'model APIs and registries reachable from a jail; your git host is not'],
-                  ['Read-only git proxy', 'only the daemon may reach a host — an agent cannot clone or exfiltrate'],
+                  ['Read-only git proxy', 'only the daemon may reach a host, so an agent cannot clone or exfiltrate'],
                   ['Pre-baked toolchains', 'declared and built ahead of time, so nothing fetches at runtime'],
                   ['Conflict parking', 'a branch that can no longer merge cleanly is parked, not silently dropped'],
-                  ['Real terminals', 'genuine OS pseudo-terminals (ConPTY, forkpty) — not a pipe pretending'],
+                  ['Real terminals', 'genuine OS pseudo-terminals (ConPTY, forkpty), not a pipe pretending'],
                   ['Persistent conversations', "an agent's CLI history survives its jail being rebuilt"],
                   ['Resource monitor', 'live CPU, memory and jail pressure across the fleet'],
                   ['External PR intake', 'bot-authored PRs enter the same gate as everything else'],
@@ -292,8 +292,9 @@ export function Pro() {
               <p>
                 <strong>…a vendor's own agent app?</strong>{' '}
                 <span className="muted">
-                  They orchestrate one vendor's agent. Pro is neutral ground — mix agents, swap
-                  them as models leapfrog each other, keep one workflow and one audit trail.
+                  They orchestrate one vendor's agent. Pro is neutral ground, so you can mix agents and
+                  swap them as models leapfrog each other while keeping one workflow and one audit
+                  trail.
                 </span>
               </p>
               <p>
@@ -314,8 +315,9 @@ export function Pro() {
               <p>
                 <strong>…the terminal, like today?</strong>{' '}
                 <span className="muted">
-                  You can babysit two agents in tmux. You can't babysit five. The ceiling on your
-                  leverage is the pipeline, and Pro is that pipeline.
+                  You can babysit two agents in tmux. Five is beyond anyone. Starting them was
+                  never the hard part. Checking what they produce is, and that is the part Pro
+                  builds.
                 </span>
               </p>
             </div>
