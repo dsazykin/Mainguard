@@ -498,7 +498,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       make the next intake of that number collide with `CreateAgentWorktree`'s duplicate refusal on every
       poll forever. Audited with the sha it removed (`agent_branch_discarded`); idempotent — an already
       absent branch is success; interface default returns false, since a manager with no mirror deleted
-      nothing and residue here is residue, never lost work);
+      nothing and residue here is residue, never lost work. The **`out string deletedSha`** overload is
+      the one `AgentSpawnService.DeleteAsync` calls: a human-driven delete has to be able to say WHAT it
+      destroyed, and that sha — still in the mirror's reflog until expiry — is the only handle left on
+      the commits. Reported only after `branch -D` succeeds, so a sha never names commits that survived;
+      empty when there was no branch, which is a success with nothing destroyed);
       **`AdoptAgentWorktree`** (the RESUME half — `worktree add <path> agent/<id>` with **no `-b`**, so a
       jail spawned for a stranded queue entry starts on that entry's existing branch with its commits
       intact: rescue-publish the dead jail's own repo into the mirror first (a crash can leave commits the

@@ -277,7 +277,12 @@
   `RunVerification`/`GetVerificationLog`/`GetMergeDiff`/`StreamQueue`, `EgressService` writes,
   `SetBudgets` and the `RepoSyncService` mutations. `CoordinatorDeniedMethods` survives as the
   *annotated record* of why each of those is refused — no longer the control, and pinned against the
-  allowlist by `CoordinatorAllowlistTests`) — daemon-side role + terminal-lock enforcement at the gRPC
+  allowlist by `CoordinatorAllowlistTests`. **`AgentService/DeleteAgent`** is on it, and is the
+  strongest entry there: it DESTROYS `refs/heads/agent/<id>`, so an agent able to call it could erase
+  the commits of work it competes with — the evidence a co-tenant's merge rests on — under the ordinary
+  stop vocabulary. That is also why it is a distinct method from `StopAgent` rather than a flag on it:
+  this interceptor dispatches by METHOD and cannot see a field inside a shared message) — daemon-side
+  role + terminal-lock enforcement at the gRPC
   layer (runs after auth, before the mask). **Role:** a `ConnectionRole.Coordinator` credential
   (looked up in `ConnectionRoleRegistry` by bearer token — role bound to the token, not
   client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`/`AbandonMerge`/
