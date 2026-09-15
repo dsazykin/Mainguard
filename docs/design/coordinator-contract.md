@@ -346,3 +346,45 @@ Once the loop runs against this surface, locking the coordinator is:
 Step 3 is the acceptance test for this entire contract. If the coordinator cannot do its job with
 only these four tools, the surface is wrong and the contract changes — deliberately, not by quietly
 handing it back a capability.
+
+## 9. Mainguard Coordinator standing rules
+
+Everything above says what the daemon will *let* a coordinator do. This section says how a coordinator
+should *use* it. These are operating rules, not enforcement — by §5 nothing here constrains anything but
+a cooperative coordinator, and none of it is checked daemon-side. They are written down in the repository
+because they were living in a private per-machine config file, where the rest of the team never saw them.
+
+### Rule 1 — watch spawned workers with a Monitor, never a shell poll loop
+
+Immediately after each successful `mainguard-agent spawn`, arm a **Monitor** for that agent id. Never
+hand-roll `mainguard-agent status` polling through Bash `sleep` / `for` / `until` loops.
+
+### Rule 2 — report only the transitions the operator cannot already see
+
+Plan creation and plan approval are **already visible in the operator UI**, so reporting them back is
+tokens spent telling the human something they are looking at. A worker Monitor must stay silent through
+routine progress — `Working`, `Verifying`, waiting on plan approval — and emit only:
+
+- **a message sent from the worker**;
+- **something going wrong** — a failure, a refusal, an error, or `VerificationFailed`;
+- **the worker finishing** — idle with work ready to propose, or `Verified`.
+
+### Mechanics
+
+One Monitor per agent id, `timeout_ms` at the `1800000` maximum, re-armed on expiry. The shape:
+
+```
+prev=""
+while true; do
+  cur=$(/opt/mainguard/ipc/mainguard-agent status <id> 2>&1 || true)
+  case "$cur" in
+    *Verified*|*VerificationFailed*|*Idle*|*idle*|*Failed*|*failed*|*rror*|*efused*|*essage*)
+      [ "$cur" != "$prev" ] && { echo "$cur"; prev="$cur"; } ;;
+  esac
+  case "$cur" in *Verified*|*VerificationFailed*) break;; esac
+  sleep 20
+done
+```
+
+Keep the attention filter broad in the failure direction, so that silence means progressing normally and
+never crashed unnoticed.
