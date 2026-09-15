@@ -94,6 +94,18 @@ When adding a future category: add it to `NON_ESSENTIAL`, gate the script on
 First-party, opt-in, and deliberately thin. `src/lib/analytics.ts` posts to `/api/event` on the
 site's own worker; rows land in the `events` table in D1.
 
+Two things keep the numbers honest rather than merely plentiful:
+
+- **Bots are dropped before they are recorded** (`looksAutomated`). A blunt user-agent filter plus
+  Cloudflare's verified-bot label. It will not catch a crawler that lies, and that is fine — the
+  point is not to build week-one conclusions out of crawler traffic. The UA is only ever used to
+  discard; it is never stored.
+- **Global Privacy Control is honoured as a standing refusal.** No banner, nothing sent, and it
+  overrides a stored opt-in from before the signal was switched on. The preferences dialog shows
+  the analytics switch as off and disabled, because a switch reading "on" while nothing is
+  collected would be lying. DNT is deliberately *not* honoured: browsers dropped it, and some sent
+  it without the user choosing, so it is too ambiguous to act on either way.
+
 What makes it defensible, and what must not be quietly eroded:
 
 - **No cookie and no device identifier.** Unique visitors come from `visitor_day`, a salted hash
@@ -117,10 +129,25 @@ ADMIN_TOKEN=… npm run stats        # last 30 days, as tables
 ADMIN_TOKEN=… npm run stats -- 7   # last 7
 ```
 
-That wraps `GET /api/admin/stats?days=N` (bearer `ADMIN_TOKEN`), which returns top pages,
-referrers, campaigns, countries, devices, themes, CTA clicks, daily uniques, and waitlist signups
-over the same window. Aggregates only; there is no endpoint that reconstructs one visitor's trail,
-because the data cannot support one.
+That wraps `GET /api/admin/stats?days=N` (bearer `ADMIN_TOKEN`), which returns top pages, entry
+pages, referrers, campaigns, countries, devices, themes, CTA clicks, daily uniques, engagement
+depth and waitlist signups over the same window. Aggregates only; there is no endpoint that
+reconstructs one visitor's trail, because the data cannot support one.
+
+Both the endpoint and the weekly digest read from one `collectStats()`, so the two can never drift
+into disagreeing about the same week.
+
+**Entry pages** (which page a visitor-day landed on first) and **engagement** (pages per visitor,
+single-page percentage) are derived from data already collected — they added no new tracking.
+
+A **weekly digest** goes to `NOTIFY_EMAIL` every Monday at 08:00 UTC via the cron trigger in
+`wrangler.jsonc`. It needs `RESEND_API_KEY` set, and does nothing silently without it. Test it
+without waiting a week:
+
+```bash
+npx wrangler dev --test-scheduled
+curl "http://localhost:8787/__scheduled?cron=0+8+*+*+1"
+```
 
 Two things to keep in mind when reading them: unique visitors are counted **per day** and cannot be
 summed across days, and because analytics is opt-in every figure undercounts. They are trend lines,

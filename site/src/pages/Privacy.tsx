@@ -226,6 +226,14 @@ export function Privacy() {
           change your analytics choice at any time through <strong>Cookie settings</strong> in the
           footer, and withdrawing is exactly as easy as agreeing was.
         </p>
+        <div className="legal-callout">
+          <p>
+            <strong>Global Privacy Control is respected.</strong> If your browser sends the GPC
+            signal, analytics is treated as declined before you are asked anything — you will not
+            see a consent banner, and nothing is sent. Turning the signal on is enough; you do not
+            have to tell this site twice.
+          </p>
+        </div>
       </section>
 
       <section id="processors">

@@ -41,9 +41,32 @@ interface ConsentContextValue {
   closePreferences: () => void;
   /** Whether to show any consent affordance at all (footer control included). */
   consentApplies: boolean;
+  /** The browser is sending Global Privacy Control; analytics is off regardless. */
+  privacyControlActive: boolean;
 }
 
 const ConsentContext = createContext<ConsentContextValue | null>(null);
+
+/**
+ * Global Privacy Control: a browser-level "do not sell or share my data"
+ * signal the visitor has deliberately switched on. Treated as a standing
+ * refusal — no banner is shown, nothing is sent, and the visitor is not
+ * nagged to override a preference they already expressed.
+ *
+ * Legally binding in some jurisdictions and, for a product that sells not
+ * doing the creepy thing, the only defensible reading of the signal.
+ *
+ * Deliberately NOT honouring the older DNT header: browsers have dropped it,
+ * some sent it without the user ever choosing, and an ambiguous signal is a
+ * bad basis for silently discarding consent either way. GPC is explicit.
+ */
+function privacyControlEnabled(): boolean {
+  try {
+    return (navigator as Navigator & { globalPrivacyControl?: boolean }).globalPrivacyControl === true;
+  } catch {
+    return false;
+  }
+}
 
 function read(): StoredConsent | null {
   try {
@@ -81,16 +104,25 @@ function write(decisions: Decisions): StoredConsent {
 export function ConsentProvider({ children }: { children: ReactNode }) {
   const [stored, setStored] = useState<StoredConsent | null>(read);
   const [preferencesOpen, setPreferencesOpen] = useState(false);
+  // Read once: the signal does not change mid-visit, and re-reading it on every
+  // render would invalidate the memo below for no reason.
+  const [gpc] = useState(privacyControlEnabled);
 
+  // The feature still exists under GPC — the footer control stays, so someone
+  // can open it and see WHY analytics is off. What GPC suppresses is the
+  // banner: nagging someone to override a preference they set is the whole
+  // behaviour the signal exists to stop.
   const consentApplies = NON_ESSENTIAL.length > 0;
-  const needsDecision = consentApplies && stored === null;
+  const needsDecision = consentApplies && !gpc && stored === null;
 
   const hasConsent = useCallback(
     (category: ConsentCategory) => {
       if (category === 'necessary') return true;
+      // A standing refusal outranks anything stored, including an older opt-in.
+      if (gpc) return false;
       return stored?.decisions[category] === true;
     },
-    [stored],
+    [stored, gpc],
   );
 
   const save = useCallback((decisions: Decisions) => {
@@ -128,8 +160,19 @@ export function ConsentProvider({ children }: { children: ReactNode }) {
       openPreferences: () => setPreferencesOpen(true),
       closePreferences: () => setPreferencesOpen(false),
       consentApplies,
+      privacyControlActive: gpc,
     }),
-    [stored, needsDecision, preferencesOpen, hasConsent, acceptAll, rejectAll, save, consentApplies],
+    [
+      stored,
+      needsDecision,
+      preferencesOpen,
+      hasConsent,
+      acceptAll,
+      rejectAll,
+      save,
+      consentApplies,
+      gpc,
+    ],
   );
 
   return <ConsentContext.Provider value={value}>{children}</ConsentContext.Provider>;

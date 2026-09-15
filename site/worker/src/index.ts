@@ -234,6 +234,30 @@ async function visitorDayHash(ip: string, ua: string): Promise<string> {
   return (await sha256(`mainguard:${day}:${ip}:${ua}`)).slice(0, 32);
 }
 
+/**
+ * Obvious non-humans, kept out of the analytics table.
+ *
+ * This is a deliberately blunt instrument and it will not catch a crawler that
+ * lies about its user agent. That is fine: the goal is not perfect exclusion,
+ * it is not building a week-one picture out of crawler traffic and then making
+ * decisions on it. A number that quietly includes bots is worse than no number.
+ *
+ * Only ever used to DISCARD an event — never stored, never counted.
+ */
+const BOT_UA =
+  /bot|crawl|spider|slurp|headless|phantom|puppeteer|playwright|selenium|curl|wget|python-requests|go-http-client|java\/|okhttp|axios|node-fetch|lighthouse|pagespeed|gtmetrix|pingdom|uptime|monitor|scrapy|feedfetcher|preview|fetcher/i;
+
+function looksAutomated(request: Request, ua: string): boolean {
+  // No user agent at all is a script, not a browser.
+  if (!ua) return true;
+  if (BOT_UA.test(ua)) return true;
+  // Cloudflare labels bots it has positively identified (search engines and
+  // the like). Present only on some plans, so it supplements the regex.
+  const cf = (request as Request & { cf?: { verifiedBotCategory?: string } }).cf;
+  if (cf?.verifiedBotCategory) return true;
+  return false;
+}
+
 /** Desktop / mobile / tablet, which is all the device detail worth keeping. */
 function deviceClass(ua: string): string {
   if (/iPad|Tablet/i.test(ua)) return 'tablet';
@@ -284,6 +308,11 @@ async function handleEvent(request: Request, env: Env, origin: string | null): P
 
   const ip = request.headers.get('CF-Connecting-IP') ?? '0.0.0.0';
   const ua = request.headers.get('User-Agent') ?? '';
+
+  // Drop automated traffic before it reaches the table, so the numbers describe
+  // people. Silent: a bot gets the same 204 as everyone else.
+  if (looksAutomated(request, ua)) return noContent();
+
   const visitor = await visitorDayHash(ip, ua);
 
   const { results } = await env.DB.prepare(
@@ -319,14 +348,29 @@ async function handleEvent(request: Request, env: Env, origin: string | null): P
   return noContent();
 }
 
-/** Aggregates only — this endpoint cannot return a single visitor's trail. */
-async function handleStats(request: Request, env: Env, origin: string | null): Promise<Response> {
-  const auth = request.headers.get('Authorization') ?? '';
-  if (auth !== `Bearer ${env.ADMIN_TOKEN}`) {
-    return json({ ok: false, error: 'Unauthorized.' }, 401, origin);
-  }
-  const url = new URL(request.url);
-  const days = Math.min(Math.max(Number(url.searchParams.get('days')) || 30, 1), 365);
+interface Stats {
+  days: number;
+  totals: Record<string, unknown>;
+  engagement: Record<string, unknown>;
+  pages: unknown[];
+  entryPages: unknown[];
+  referrers: unknown[];
+  campaigns: unknown[];
+  countries: unknown[];
+  devices: unknown[];
+  themes: unknown[];
+  ctas: unknown[];
+  daily: unknown[];
+}
+
+/**
+ * Every aggregate, in one place.
+ *
+ * Shared by the admin endpoint and the weekly digest so the two can never drift
+ * into disagreeing about the same week. Aggregates only — nothing here can
+ * reconstruct a single visitor's trail, because the data cannot support one.
+ */
+async function collectStats(env: Env, days: number): Promise<Stats> {
   const since = `-${days} days`;
 
   const group = async (sql: string) => {
@@ -334,10 +378,29 @@ async function handleStats(request: Request, env: Env, origin: string | null): P
     return results;
   };
 
-  const [pages, referrers, campaigns, countries, devices, themes, ctas, daily, totals] =
-    await Promise.all([
+  const [
+    pages,
+    entryPages,
+    referrers,
+    campaigns,
+    countries,
+    devices,
+    themes,
+    ctas,
+    daily,
+    totals,
+    engagement,
+  ] = await Promise.all([
     group(
       "SELECT path, COUNT(*) AS views, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY path ORDER BY views DESC",
+    ),
+    // Landing page: the FIRST page each visitor-day saw. Tells you whether
+    // people arrive at the front door or deep-link straight to /pro, which is a
+    // different question from which page is most read. Relies on SQLite's
+    // documented bare-column rule: with MIN(), the other selected columns come
+    // from the row that produced the minimum.
+    group(
+      "SELECT path, COUNT(*) AS visitors FROM (SELECT visitor_day, path, MIN(created_at) FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY visitor_day) GROUP BY path ORDER BY visitors DESC",
     ),
     group(
       "SELECT COALESCE(referrer_host,'(direct)') AS source, COUNT(*) AS views FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY source ORDER BY views DESC LIMIT 25",
@@ -364,27 +427,40 @@ async function handleStats(request: Request, env: Env, origin: string | null): P
       "SELECT substr(created_at,1,10) AS day, COUNT(*) AS views, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY day ORDER BY day DESC",
     ),
     group(
-      "SELECT (SELECT COUNT(*) FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)) AS pageviews, (SELECT COUNT(*) FROM submissions WHERE kind='waitlist' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)) AS waitlist_signups",
+      "SELECT (SELECT COUNT(*) FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)) AS pageviews, (SELECT COUNT(DISTINCT visitor_day) FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)) AS visitors, (SELECT COUNT(*) FROM submissions WHERE kind='waitlist' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)) AS waitlist_signups",
+    ),
+    // Depth of engagement. One page and gone is a very different signal from
+    // three pages read, and both come from data already collected.
+    group(
+      "SELECT ROUND(AVG(n), 2) AS pages_per_visitor, ROUND(100.0 * SUM(CASE WHEN n = 1 THEN 1 ELSE 0 END) / COUNT(*), 1) AS single_page_pct FROM (SELECT visitor_day, COUNT(*) AS n FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY visitor_day)",
     ),
   ]);
 
-  return json(
-    {
-      ok: true,
-      days,
-      totals: totals[0] ?? {},
-      pages,
-      referrers,
-      campaigns,
-      countries,
-      devices,
-      themes,
-      ctas,
-      daily,
-    },
-    200,
-    origin,
-  );
+  return {
+    days,
+    totals: (totals[0] as Record<string, unknown>) ?? {},
+    engagement: (engagement[0] as Record<string, unknown>) ?? {},
+    pages,
+    entryPages,
+    referrers,
+    campaigns,
+    countries,
+    devices,
+    themes,
+    ctas,
+    daily,
+  };
+}
+
+/** Aggregates only — this endpoint cannot return a single visitor's trail. */
+async function handleStats(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const auth = request.headers.get('Authorization') ?? '';
+  if (auth !== `Bearer ${env.ADMIN_TOKEN}`) {
+    return json({ ok: false, error: 'Unauthorized.' }, 401, origin);
+  }
+  const url = new URL(request.url);
+  const days = Math.min(Math.max(Number(url.searchParams.get('days')) || 30, 1), 365);
+  return json({ ok: true, ...(await collectStats(env, days)) }, 200, origin);
 }
 
 async function handleAdmin(request: Request, env: Env, origin: string | null): Promise<Response> {
@@ -407,7 +483,72 @@ async function handleAdmin(request: Request, env: Env, origin: string | null): P
   return json({ ok: true, count: results.length, submissions: results }, 200, origin);
 }
 
+/** `  label  value` rows, or a single "nothing" line for an empty group. */
+function digestRows(rows: unknown[], labelKey: string, valueKey: string, limit = 8): string {
+  if (!rows.length) return '  (nothing)';
+  return rows
+    .slice(0, limit)
+    .map((r) => {
+      const row = r as Record<string, unknown>;
+      return `  ${String(row[labelKey] ?? '—').padEnd(28)}${String(row[valueKey] ?? 0)}`;
+    })
+    .join('\n');
+}
+
+/**
+ * The weekly digest, sent by the cron trigger in wrangler.jsonc.
+ *
+ * Plain text on purpose: it is read on a phone on a Monday morning, and the
+ * numbers matter more than the formatting. Silently does nothing when
+ * RESEND_API_KEY is unset, which is also how `notify` behaves.
+ */
+async function sendWeeklyDigest(env: Env): Promise<void> {
+  const s = await collectStats(env, 7);
+  const t = s.totals as { pageviews?: number; visitors?: number; waitlist_signups?: number };
+  const e = s.engagement as { pages_per_visitor?: number; single_page_pct?: number };
+
+  const pv = Number(t.pageviews ?? 0);
+  const signups = Number(t.waitlist_signups ?? 0);
+  const rate = pv > 0 ? `${((signups / pv) * 100).toFixed(2)}%` : 'n/a';
+
+  const body = [
+    'Mainguard site — last 7 days',
+    '',
+    `  pageviews          ${pv}`,
+    `  visitors           ${t.visitors ?? 0}   (per-day uniques, not summable)`,
+    `  waitlist signups   ${signups}`,
+    `  signup rate        ${rate} of pageviews`,
+    `  pages per visitor  ${e.pages_per_visitor ?? 0}`,
+    `  single-page visits ${e.single_page_pct ?? 0}%`,
+    '',
+    'Where they landed',
+    digestRows(s.entryPages, 'path', 'visitors'),
+    '',
+    'Where they came from',
+    digestRows(s.referrers, 'source', 'views'),
+    '',
+    'Most read',
+    digestRows(s.pages, 'path', 'views'),
+    '',
+    'Countries',
+    digestRows(s.countries, 'country', 'visitors'),
+    '',
+    'CTA clicks',
+    digestRows(s.ctas, 'label', 'clicks'),
+    '',
+    'Analytics is opt-in, so every figure undercounts. Trends, not totals.',
+    'Full detail: cd site/worker && ADMIN_TOKEN=… npm run stats -- 7',
+  ].join('\n');
+
+  await notify(env, `Mainguard site — weekly numbers (${signups} signups)`, body);
+}
+
 export default {
+  /** Cron trigger; schedule lives in wrangler.jsonc. */
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(sendWeeklyDigest(env));
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     const origin = request.headers.get('Origin');
     const { pathname } = new URL(request.url);

@@ -54,15 +54,20 @@ function table(title, rows, labelKey, valueKeys) {
 }
 
 const t = s.totals ?? {};
+const e = s.engagement ?? {};
 console.log(bold(`\nMainguard site — last ${s.days} days`));
-console.log(`  pageviews        ${t.pageviews ?? 0}`);
-console.log(`  waitlist signups ${t.waitlist_signups ?? 0}`);
+console.log(`  pageviews          ${t.pageviews ?? 0}`);
+console.log(`  visitors           ${t.visitors ?? 0} ${dim('(per-day uniques)')}`);
+console.log(`  waitlist signups   ${t.waitlist_signups ?? 0}`);
 
 // The number that actually matters: how many readers turned into signups.
 const pv = Number(t.pageviews) || 0;
 const su = Number(t.waitlist_signups) || 0;
-if (pv > 0) console.log(`  signup rate      ${((su / pv) * 100).toFixed(2)}% of pageviews`);
+if (pv > 0) console.log(`  signup rate        ${((su / pv) * 100).toFixed(2)}% of pageviews`);
+console.log(`  pages per visitor  ${e.pages_per_visitor ?? 0}`);
+console.log(`  single-page visits ${e.single_page_pct ?? 0}%`);
 
+table('Landed on', s.entryPages, 'path', ['visitors']);
 table('Pages', s.pages, 'path', ['views', 'visitors']);
 table('Referrers', s.referrers, 'source', ['views']);
 table('Campaigns', s.campaigns, 'campaign', ['visitors', 'views']);
@@ -76,7 +81,9 @@ console.log(
   dim(
     '\n  Columns are views then unique visitors, except where only one applies.\n' +
       '  Uniques are per day and cannot be summed across days — the same person\n' +
-      '  visiting twice in a week counts twice. Analytics is opt-in, so every\n' +
-      '  number here undercounts; read them as trends, not totals.\n',
+      '  visiting twice in a week counts twice. Obvious bots are dropped before\n' +
+      '  they are recorded, and analytics is opt-in (and off entirely for anyone\n' +
+      '  sending Global Privacy Control), so every number here undercounts.\n' +
+      '  Read them as trends, not totals.\n',
   ),
 );

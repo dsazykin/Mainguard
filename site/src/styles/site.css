@@ -1071,3 +1071,9 @@
     columns: 1;
   }
 }
+
+/* A switch the visitor cannot change (Global Privacy Control decided it). */
+.consent-switch:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

@@ -87,6 +87,7 @@ function ConsentDialog({
   onRejectAll: () => void;
 }) {
   const [draft, setDraft] = useState<Partial<Record<ConsentCategory, boolean>>>(initial);
+  const { privacyControlActive } = useConsent();
 
   useEffect(() => {
     document.body.style.overflow = 'hidden';
@@ -112,10 +113,22 @@ function ConsentDialog({
           ever changes.
         </p>
 
+        {privacyControlActive && (
+          <div className="legal-callout" style={{ margin: 'var(--space-4) 0 0' }}>
+            <p style={{ margin: 0, fontSize: 'var(--text-sm)', lineHeight: 1.7 }}>
+              Your browser is sending <strong>Global Privacy Control</strong>, so analytics is
+              already off and nothing is being sent. There is nothing here you need to change.
+            </p>
+          </div>
+        )}
+
         <div className="consent-list">
           {CATEGORIES.map((c) => {
             const inUse = c.required || NON_ESSENTIAL.includes(c.id);
-            const on = c.required || draft[c.id] === true;
+            // Under GPC the effective answer is no, whatever is stored from
+            // before. The switch has to show the truth, or it is telling the
+            // visitor they are being counted when they are not.
+            const on = c.required || (!privacyControlActive && draft[c.id] === true);
             return (
               <div key={c.id} className="consent-item">
                 <div className="consent-item-head">
@@ -127,7 +140,14 @@ function ConsentDialog({
                       type="button"
                       role="switch"
                       aria-checked={on}
-                      aria-label={`${c.label} — ${on ? 'allowed' : 'blocked'}`}
+                      disabled={privacyControlActive}
+                      aria-label={`${c.label} — ${
+                        privacyControlActive
+                          ? 'blocked by Global Privacy Control'
+                          : on
+                            ? 'allowed'
+                            : 'blocked'
+                      }`}
                       className={`consent-switch ${on ? 'is-on' : ''}`}
                       onClick={() => setDraft((d) => ({ ...d, [c.id]: !on }))}
                     >
@@ -143,16 +163,26 @@ function ConsentDialog({
           })}
         </div>
 
+        {/* Offering "Allow all" under GPC would be offering a button that does
+            nothing, since the signal overrides whatever gets stored. */}
         <div className="consent-actions consent-actions-end">
-          <button type="button" className="btn btn-quiet" onClick={onRejectAll}>
-            Reject non-essential
-          </button>
-          <button type="button" className="btn btn-quiet" onClick={onAcceptAll}>
-            Allow all
-          </button>
-          <button type="button" className="btn btn-accent" onClick={() => onSave(draft)}>
-            Save choices
-          </button>
+          {privacyControlActive ? (
+            <button type="button" className="btn btn-accent" onClick={onClose}>
+              Close
+            </button>
+          ) : (
+            <>
+              <button type="button" className="btn btn-quiet" onClick={onRejectAll}>
+                Reject non-essential
+              </button>
+              <button type="button" className="btn btn-quiet" onClick={onAcceptAll}>
+                Allow all
+              </button>
+              <button type="button" className="btn btn-accent" onClick={() => onSave(draft)}>
+                Save choices
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>

@@ -9,6 +9,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-01",
   "observability": { "enabled": true },
+  // Weekly analytics digest to NOTIFY_EMAIL: Mondays at 08:00 UTC.
+  // Needs RESEND_API_KEY set, or the scheduled run does nothing.
+  "triggers": { "crons": ["0 8 * * 1"] },
   "vars": {
     "NOTIFY_EMAIL": "daniel.sazykin@gmail.com"
   },
