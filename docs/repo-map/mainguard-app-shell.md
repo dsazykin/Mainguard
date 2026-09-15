@@ -60,7 +60,13 @@
     auto-dismissing, mirrors RepoDashboard's #85 toast styles; its `Grid.Row="1"` is load-bearing —
     without it the host falls into the Auto-sized title-bar row and `VerticalAlignment="Bottom"`
     renders the stack in the TOP-right corner, the 2026-08 regression pinned by
-    `Headless/MainWindowShellRenderHarness.ShellToasts_*`). The command-palette overlay hosts
+    `Headless/MainWindowShellRenderHarness.ShellToasts_*`). Its no-repo empty state ("Select a
+    repository to begin") wraps the folder glyph in a `Button.IconButton` on
+    `MainWindowViewModel.OpenRepoPickerCommand` — the same command the title-bar "Select Repo" button and
+    `MacMenuBar` use — with a Hand cursor, tooltip and `AutomationProperties.Name`, so the icon everyone
+    tries to click actually opens the picker by mouse, keyboard or screen reader
+    (`Headless/EmptyStateOpenRepoTests`; `MainWindowViewModel.ActiveRepoPicker` is the internal accessor
+    that test asserts through). The command-palette overlay hosts
     `CommandPaletteView` (T-18: a reusable palette card — query box + ranked/highlighted result rows
     with category headers, category chips, and gesture chips) bound to
     `MainWindowViewModel.CommandPalette`;
