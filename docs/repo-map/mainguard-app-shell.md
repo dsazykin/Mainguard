@@ -663,7 +663,15 @@
     moved off the coordinator. The row also owns the **context menu** — open / rename / reset name /
     review / verify / verification log / copy id / copy branch / pause-resume / end / delete — as thin
     dispatches through `IAgentRowActions`, implemented by `ControlCenterViewModel` because every one of
-    them needs a confirmation, a daemon seam or a toast that a recyclable list item must not own), `AgentRailViewModel` (2d — the Pro agent rail as its own surface: a thin view over
+    them needs a confirmation, a daemon seam or a toast that a recyclable list item must not own),
+    `AgentActionPrompt.cs` (`AgentActionKind` + the one pending question the agent-action card asks —
+    rename / end / delete. **The consequence sentence is a field on the record, not something the view
+    composes**, because the three differ in exactly the way a human needs told and a dialog is worst at
+    conveying: ending keeps the work, deleting destroys it, renaming touches nothing. A shared "are you
+    sure?" over a variable verb would make the destructive one look like the recoverable one, so each
+    carries its own words written where the difference is known — including the branch NAME in the
+    delete copy, since "its branch" is abstract and `agent/70b21c13` is the thing about to stop
+    existing), `AgentRailViewModel` (2d — the Pro agent rail as its own surface: a thin view over
     `ControlCenterViewModel` exposing its `Agents` list + the kill-switch
     `IsFrozen`/`KillSwitchLabel`/`ToggleKillSwitchCommand`, re-raising the two derived readouts when the
     control center flips them; the shell hosts it as opaque `AgentRailContent` → `AgentRailView` via
