@@ -70,7 +70,7 @@ export function Waitlist() {
     <div className="container form-page">
       <h1>Join the waitlist</h1>
       <p className="lede" style={{ marginBottom: 'var(--space-8)' }}>
-        First access to the free client this fall, and founding-member terms for Pro and Cloud.
+        First access to the free client, and founding-member terms for Pro and Cloud.
       </p>
       <form onSubmit={submit} noValidate>
         <div className="field">

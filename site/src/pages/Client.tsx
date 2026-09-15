@@ -183,12 +183,12 @@ export function Client() {
             <div className="feature-row">
               <div>
                 <h3 data-thread-node>
-                  <IconZap /> Five themes, one design system
+                  <IconZap /> Four themes, one design system
                 </h3>
                 <p className="muted">
-                  Midnight Watch, Day Watch, Command Deck, Atelier, Aurora. Every color in
-                  the app is a named token — switch palettes live, and every surface follows. The
-                  settings panel on the right is wired to this website; use it.
+                  Midnight Loom, Daylight Loom, Graphite, Atelier. Every color in the app is a
+                  named token — switch palettes live, and every surface follows. The settings
+                  panel on the right is wired to this website; use it.
                 </p>
               </div>
               <ThemePanelVignette />
@@ -213,8 +213,10 @@ export function Client() {
                   ['Stash management', 'create, inspect, apply, pop — with diffs before you decide'],
                   ['Tags & releases', 'annotated tags, release notes, host releases in one panel'],
                   ['Submodules & LFS', 'status, init, update — no CLI round-trips'],
-                  ['Bisect', 'guided good/bad bisection with build shortcuts (rolling out)'],
-                  ['Global search', 'find code across all history, not just HEAD (rolling out)'],
+                  ['History search', 'filter every commit by text, author, path or date — not just HEAD'],
+                  ['File history', 'follow one file through renames, with the diff at each step'],
+                  ['Command palette', 'every action a keystroke away, without leaving the keyboard'],
+                  ['Identities & keys', 'per-repo commit identity, SSH keys and host accounts in one place'],
                 ] as Array<[string, string]>
               ).map(([t, d]) => (
                 <div key={t}>
@@ -232,7 +234,7 @@ export function Client() {
           <Reveal>
             <h2 data-thread-node>Why free? Honestly:</h2>
             <p className="lede">
-              The client is our handshake. It's complete — nothing is held hostage behind an
+              The client is the handshake. It's complete — nothing is held hostage behind an
               upgrade prompt, and it never asks who you are. When you're ready to put coding
               agents to work, <Link to="/pro">Pro</Link> is where Mainguard earns its keep. Until
               then, enjoy a Git client that respects you.
@@ -244,9 +246,9 @@ export function Client() {
       <section className="cta-band" aria-label="Call to action">
         <div className="container">
           <Reveal>
-            <h2>Shipping this fall.</h2>
+            <h2>In alpha now.</h2>
             <p className="muted" style={{ marginInline: 'auto' }}>
-              Join the waitlist and get the download link the moment it's live.
+              Windows and macOS. Join the waitlist and get the download link the moment it's live.
             </p>
             <Link to="/waitlist?p=client" className="btn btn-accent btn-lg">
               Get the client first

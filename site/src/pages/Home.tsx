@@ -15,9 +15,9 @@ export function Home() {
           <div className="hero-content">
             <h1>Agents do the work. The guard holds main.</h1>
             <p className="lede">
-              Mainguard is a premium, natively-rendered Git client — free, no login — growing into
-              a control center for running many coding agents against one repo, where nothing lands
-              on main until it's verified and you wave it through.
+              Agent CLIs made it trivial to produce ten branches an hour. Nothing on the market
+              makes it safe to merge them. Mainguard is a native Git client — free, no login — and
+              a control center where agent work becomes trustworthy commits on main.
             </p>
             <div className="hero-ctas">
               <Link to="/waitlist" className="btn btn-accent btn-lg">
@@ -27,7 +27,7 @@ export function Home() {
                 Explore the client
               </Link>
             </div>
-            <p className="hero-note">native · 60fps · zero telemetry · Windows first</p>
+            <p className="hero-note">native · 60fps · zero telemetry · Windows and macOS</p>
           </div>
         </div>
       </section>
@@ -40,7 +40,7 @@ export function Home() {
             <h2 data-thread-node>Born from one error message.</h2>
             <p className="lede">
               Run two tools against the same repository and sooner or later you meet it. Now
-              multiply by a swarm of coding agents.
+              multiply by a room full of coding agents.
             </p>
           </Reveal>
           <Reveal delay={80}>
@@ -58,6 +58,48 @@ export function Home() {
               <br />
               <span className="ok">✓ committed 3 files · handle released in 41ms</span>
             </div>
+          </Reveal>
+        </div>
+      </section>
+
+      <section className="section" aria-label="How verification works">
+        <div className="container">
+          <Reveal>
+            <h2 data-thread-node>A pass an agent cannot fake.</h2>
+            <p className="lede">
+              Most tools ask the agent whether its work is good. Mainguard never does. The verdict
+              is the container's real exit code, read by a trusted daemon from outside the
+              container — so printing "all tests passed" buys an agent nothing.
+            </p>
+          </Reveal>
+          <Reveal delay={80}>
+            <dl className="spec-list">
+              {(
+                [
+                  [
+                    'Observed, not reported',
+                    'the daemon reads the exit code from the container runtime — a value the agent never gets to supply',
+                  ],
+                  [
+                    'Always against current main',
+                    'when anything merges, every other verified branch is invalidated and re-verified before it is eligible again',
+                  ],
+                  [
+                    'Provenance-pinned',
+                    'the resolved test command and config hash are recorded immutably, so nothing slips through by weakening what "verify" means',
+                  ],
+                  [
+                    'Never automatic',
+                    'passing only makes a branch eligible; you approve it, and the merge is an atomic compare-and-swap',
+                  ],
+                ] as Array<[string, string]>
+              ).map(([t, d]) => (
+                <div key={t}>
+                  <dt>{t}</dt>
+                  <dd>{d}</dd>
+                </div>
+              ))}
+            </dl>
           </Reveal>
         </div>
       </section>
@@ -94,8 +136,9 @@ export function Home() {
                   </div>
                   <h3>Mainguard Pro</h3>
                   <p>
-                    Run a swarm of coding agents in sandboxed worktrees, gate every change through a
-                    verification pipeline, and review it all from one cockpit.
+                    Several coding agents, each jailed in its own hardened container on its own
+                    branch. Nothing they write reaches main until your build and tests have passed
+                    and you have waved it through.
                   </p>
                 </div>
                 <IconArrowRight className="trio-arrow" />
@@ -105,7 +148,7 @@ export function Home() {
               <Link to="/cloud" className="trio-row">
                 <div>
                   <div className="trio-meta">
-                    <span className="pill pill-accent">Paid · cloud · waitlist open</span>
+                    <span className="pill pill-accent">Planned · cloud · waitlist open</span>
                   </div>
                   <h3>Mainguard Cloud</h3>
                   <p>
@@ -128,9 +171,9 @@ export function Home() {
               <div style={{ maxWidth: '38rem' }}>
                 <h2 data-thread-node style={{ marginBottom: 'var(--space-3)' }}>This page is wearing the app.</h2>
                 <p className="muted" style={{ margin: 0 }}>
-                  Mainguard ships one design system with five switchable palettes — Midnight Watch,
-                  Day Watch, Command Deck, Atelier and Aurora. Try them. Everything you're looking
-                  at changes the guard, exactly like the client does.
+                  Mainguard ships one design system with four switchable palettes — Midnight Loom,
+                  Daylight Loom, Graphite and Atelier. Try them. Everything you're looking at
+                  changes the guard, exactly like the client does.
                 </p>
               </div>
               <ThemeSwitcher large />
@@ -142,9 +185,9 @@ export function Home() {
       <section className="cta-band" aria-label="Call to action">
         <div className="container">
           <Reveal>
-            <h2>The free client ships this fall.</h2>
+            <h2>The free client is in alpha.</h2>
             <p className="muted" style={{ marginInline: 'auto' }}>
-              Be first in line for the download — and early access to Pro and Cloud.
+              Be first in line for the download — and early access to Pro.
             </p>
             <Link to="/waitlist" className="btn btn-accent btn-lg">
               Join the waitlist

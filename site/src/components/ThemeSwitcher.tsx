@@ -2,7 +2,7 @@ import { THEMES } from '../theme/themes';
 import { useTheme } from '../theme/ThemeProvider';
 
 /**
- * The five-theme switcher — the site's live demo of the app's design system.
+ * The four-theme switcher — the site's live demo of the app's design system.
  * Each swatch is that theme's window surface with its accent thread across it.
  */
 export function ThemeSwitcher({ large = false }: { large?: boolean }) {

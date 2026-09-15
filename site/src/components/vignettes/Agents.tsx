@@ -22,7 +22,7 @@ const AGENTS: AgentDef[] = [
     ],
   },
   {
-    name: 'agy · feat/import-wizard',
+    name: 'codex · feat/import-wizard',
     rate: 0.9,
     start: 28,
     log: [
@@ -116,7 +116,7 @@ export function AgentsVignette() {
               </button>
             );
           })}
-          <p className="vg-note">3 worktrees · 0 lock collisions · your working directory untouched</p>
+          <p className="vg-note">3 jails · 0 lock collisions · your working directory untouched</p>
           <p className="vg-hint">click an agent to tail its log</p>
         </div>
       </WindowFrame>
