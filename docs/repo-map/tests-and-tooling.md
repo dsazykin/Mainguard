@@ -887,7 +887,13 @@
     a full queue refusing loudly rather than growing unbounded, a transport-refused write faulting
     the caller, and pre-attach input reporting undelivered instead of silent success), and
     `Headless/TerminalRenderHarness` (a coloured TUI frame through the interim engine captured in
-    MidnightLoom + DaylightLoom, `terminal_frame_*.png`), and `Headless/BootstrapProgressRenderHarness`
+    MidnightLoom + DaylightLoom, `terminal_frame_*.png`), `Headless/TerminalWheelScrollHarness` (the
+    wheel through the REAL controls — the wiring `WheelScrollAccumulatorTests` cannot see: one line
+    per notch and ten micro-ticks worth one line on BOTH engines, keystroke still snaps to live, a
+    sub-line tick consumed rather than bubbled to an ancestor scroller, and the grid engine's other
+    two wheel destinations — one mouse report per notch to a tracking app, one
+    arrow per notch to an alt-screen app, both formerly three per event), and
+    `Headless/BootstrapProgressRenderHarness`
     (P2-05 staged checklist — a running mix + a failed run — in every theme,
     `bootstrap_progress_*.png`). P2-05 units: `WslConfigMergerTests` (the six `.wslconfig` fixtures
     under `Fixtures/WslConfig/` — empty / no-`[wsl2]` / existing-`[wsl2]` / user-keys-preserved /
@@ -1084,6 +1090,10 @@
     beside them: `GridModelTests.cs` (proto → cells, scroll/push/pop ops, packed runs, clipboard
     frames), `GridSelectionTests.cs` (the REQUIRED selection-copy contract: Ink run collapse,
     written-space preservation, wide-spacer skip, absolute-row survival), `GridInputEncoderTests.cs`,
+    `WheelScrollAccumulatorTests.cs` (the wheel→lines conversion both engines share: one line per
+    discrete notch, ten 0.1 trackpad ticks worth ONE line — the "terminal scrolls far too fast"
+    regression, where the interim engine moved 10 and the grid engine 30 — carry kept across events
+    and dropped on reversal/Reset, NaN/∞/0 deltas inert, per-event ceiling),
     `VtermSessionTests.cs` (+`TerminalModeTrackerTests` — OSC 52 query-never rule daemon-side).
 - **`Mainguard.Tests/BootStaleCascadeTests.cs`** (MG-29) — a merge replayed by the boot reconcile
   must fire the stale cascade on the queue that OWNS the agent. The daemon wired `onMerged` as
