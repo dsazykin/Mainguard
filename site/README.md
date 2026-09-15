@@ -27,12 +27,14 @@ npm run preview # serve the production build locally
 
 ```
 src/
-  pages/        one component per route (Home, Client, Pro, Cloud, Waitlist, Contact, NotFound)
-  components/   Nav, Footer, Wordmark, ThemeSwitcher, GateHero, PatrolSpine, Turnstile, SuccessGate
+  pages/        one component per route (Home, Client, Pro, Cloud, Waitlist, Contact,
+                Privacy, Terms, NotFound)
+  components/   Nav, Footer, Wordmark, ThemeSwitcher, GateHero, PatrolSpine, Turnstile,
+                SuccessGate, CookieConsent
     vignettes/  the interactive "working miniature" app windows embedded in the feature rows
   theme/        THEMES (the four palettes) + ThemeProvider
   styles/       tokens.css (design tokens), base.css, site.css, vignettes.css
-  lib/          api client, hooks, Reveal (scroll-reveal wrapper)
+  lib/          api client, hooks, Reveal (scroll-reveal wrapper), consent
 worker/         Cloudflare Worker + D1 backend for the waitlist and contact forms
 ```
 
@@ -61,6 +63,30 @@ rule never to imply users, customers, pilots or testimonials, because there are 
 keeps its roadmap items in a separate, clearly labelled "Honestly, not yet" section for this
 reason. The GTM plan also forbids leading with "swarm" or "orchestration"; the claim is
 safe-to-merge.
+
+## Legal pages and consent
+
+`/privacy` and `/terms` live in `src/pages/`, and both read the operator identity, governing law
+and "last updated" date from `src/config.ts` — change them there, once, not in the prose.
+
+**The privacy policy is a description of what the code does.** If you change what
+`worker/src/index.ts` collects, what `worker/schema.sql` stores, or which third-party script the
+site loads, update the policy in the *same commit*. Stale marketing copy is embarrassing; a stale
+privacy policy is a legal problem.
+
+Cookie consent (`src/lib/consent.tsx`, `src/lib/consentCategories.ts`, `CookieConsent.tsx`) is
+built, wired and **deliberately dormant**. The site's only browser storage is the theme preference
+the visitor sets and what Turnstile needs on the two form pages — both strictly necessary, both
+exempt from consent, so no banner is shown. Showing one anyway would be misleading.
+
+To turn it on when analytics or similar is added:
+
+1. Add the category to `NON_ESSENTIAL` in `src/lib/consentCategories.ts`. That single edit enables
+   the banner, the preferences dialog and the footer "Cookie settings" control.
+2. Gate the new script on `useConsent().hasConsent('analytics')`, which returns false until the
+   visitor opts in.
+3. Add the cookie to the table in `src/pages/Privacy.tsx` §4.
+4. Bump `CONSENT_VERSION` if the category set changed, so prior decisions are re-asked.
 
 ## Forms backend
 

@@ -8,3 +8,25 @@ export const API_BASE = 'https://mainguard-site-api.daniel-sazykin.workers.dev';
 export const TURNSTILE_SITEKEY = '0x4AAAAAADw_X6swd7JbWQRB';
 export const GITHUB_URL = 'https://github.com/dsazykin/Mainguard';
 export const GITHUB_REPO_LABEL = 'dsazykin/Mainguard';
+
+/**
+ * Legal identity shown on the privacy policy and terms.
+ *
+ * CONFIRM BEFORE RELYING ON THESE. They are deliberately conservative: a
+ * natural person operating under a product name, which is true today. If a
+ * company is ever incorporated, or if a registered address, KvK number or VAT
+ * number becomes legally required for this site, they belong here — the two
+ * legal pages read every one of these from this file, so one edit updates both.
+ *
+ * Dutch consumer-facing sites generally must publish the trader's identity and
+ * a registered address; a contact form alone may not be sufficient. That is a
+ * question for a lawyer, not for this comment.
+ */
+export const LEGAL_ENTITY = 'Daniel Sazykin, trading as Mainguard';
+export const LEGAL_JURISDICTION = 'the Netherlands';
+/** Governing law for the terms of service. */
+export const LEGAL_GOVERNING_LAW = 'Dutch law';
+/** Courts with jurisdiction over disputes under the terms. */
+export const LEGAL_VENUE = 'the competent court in the Netherlands';
+/** Bump whenever either legal page changes in substance. */
+export const LEGAL_LAST_UPDATED = '15 September 2026';
