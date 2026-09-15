@@ -1089,20 +1089,27 @@
   "unknown" is carried explicitly rather than defaulting to a 0 that reads as "idle"),
   **`TerminalGrpcService.cs`** (P2-03/PR3: a
   **bound** CLI session streams replay-then-live frames — a detach only unsubscribes, a locked
-  (managed) attach gets the banner + output but `PERMISSION_DENIED` on input. **F64** fixes three things
+  (managed) attach gets the banner + output but `PERMISSION_DENIED` on input. **F64** fixes two things
   about that lock: it is evaluated LIVE per frame (a `Func<bool>` over `TerminalLockRegistry`) rather
   than snapshotted once at attach, so a worker becoming managed mid-attach is honoured on the next
-  frame; a locked attach no longer forwards **Resize** (a resize is a write — SIGWINCH into the managed
-  CLI and a reflow of the daemon's authoritative grid that every other viewer sees); and input is
+  frame; and input is
   **exclusive** via `BoundTerminalSession.TryClaimInput`, claimed lazily on the first keystroke and
   released on detach, so two concurrent attaches can no longer interleave keystrokes into one PTY.
-  **MG-24 completes F64's other half:** refusing the spectator's resize was right, but it left the
-  client no way to KNOW it had been refused — it kept rendering at the size it asked for while the PTY
-  ran at the size it was spawned with, so 120-column output was parsed into a ~68-column grid with no
-  reflow and the CLI's cursor-addressed redraws landed on the wrong rows (the unreadable worker
-  terminal). A raw attach now leads with a **`geometry`** frame — ahead of the banner and the replay
-  tail, since the replay is raw bytes produced at that size — and streams every later change from
-  `SubscribeGeometry`. That makes two producers on one response stream, so every write goes through
+  **MG-24 narrows F64 (owner's decision): the lock is about INPUT, and a locked attach resizes.** F64
+  also refused `Resize`, on the reasoning that a resize is a write every other viewer of a shared
+  session sees. The mechanism does not bear that out — `Resize` is TIOCSWINSZ on the PTY master plus a
+  vterm reflow under the session gate, writing NO bytes to the PTY stream, so it cannot interleave
+  with an in-flight `WriteInputAsync` or split an escape sequence; it delivers SIGWINCH and the CLI
+  repaints, which is what a resize means. What the refusal produced was a pane the operator could drag
+  whose terminal would not follow, stuck at the 120×32 spawn default while the pane rendered ~68
+  columns with no reflow — the unreadable worker terminal. Two panes at different sizes are
+  last-writer-wins, as in any multiplexer. The residual is that `SubmitObservation`'s echo/reaction
+  heuristic can read repaint output as a reaction, which that type already documents as
+  report-never-assert. **The `geometry` frame is what keeps it honest** and matters more now, not
+  less: the daemon clamps dimensions, the replay tail is bytes produced at the OLD size, and a second
+  pane can win the last write — in all three the size asked for is not the size granted. A raw attach
+  therefore leads with **`geometry`** — ahead of the banner and the replay tail — and streams every
+  later change from `SubscribeGeometry`. That makes two producers on one response stream, so every write goes through
   `WriteGuardedAsync`'s semaphore (gRPC allows one in-flight `WriteAsync` per stream; the gate is
   deliberately NOT disposed, because an exception escaping the try can reach the `finally` while a
   pump is still inside it). The grid pump needs none of this — every `GridUpdate` already carries

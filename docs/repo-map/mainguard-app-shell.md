@@ -1025,11 +1025,13 @@
     daemon for a size; the answer comes back as the next `geometry` frame), and the layout-sizing path
     above survives as the fallback for attaches that never report a size — the echo, detached-notice
     and locked-without-session paths. This is the fix for the unreadable **managed-worker** terminal:
-    a managed worker's terminal is input-locked (P2-14) so F64 drops the viewer's resize and the PTY
-    stays at the 120×32 it was spawned at, and the pane used to reshape its engine to ~68 columns
-    anyway — re-wrapping 120-column output with no reflow, so the CLI's absolutely-positioned redraws
-    landed on the wrong rows and overwrote each other (the same sentence drawn twice, at two widths,
-    superimposed). `TerminalReplayGeometryTests` pins both directions: a session wider than its pane
+    its PTY was stuck at the 120×32 it was spawned at (P2-14 locks a managed worker's terminal and F64
+    then refused the viewer's resize — MG-24 narrows that, see the daemon map) while the pane reshaped
+    its engine to ~68 columns anyway, re-wrapping 120-column output with no reflow, so the CLI's
+    absolutely-positioned redraws landed on the wrong rows and overwrote each other (the same sentence
+    drawn twice, at two widths, superimposed). The scale survives the lock change because the ask and
+    the answer can still differ — the ~50 ms debounce window, a clamped size, a second pane winning
+    the last write, and the replay tail, which always predates the first resize. `TerminalReplayGeometryTests` pins both directions: a session wider than its pane
     keeps the daemon's width, and an ordinary terminal is still exactly pane-sized. The
     renderer is the fallback for the planned vendored `Iciclecreek.Avalonia.Terminal` (see note below).
     **Known field gaps (2026-07-22), deferred to P2-18 by decision — do NOT grow `VtScreen` toward

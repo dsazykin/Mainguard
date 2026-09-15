@@ -19,9 +19,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     `FeedOutput`/`InputAvailable`/`Resize`/opaque `GetStateSnapshot`/`RestoreState`; never leaks a
     renderer type so P2-18's libvterm engine swaps in with no ViewModel change). **MG-24: `Resize` is
     the session's AUTHORITATIVE size — the geometry the PTY is actually running at, as reported by the
-    daemon's `geometry` frame — not the size of the pane.** The two coincide for an ordinary terminal
-    and diverge for a managed worker, whose terminal is input-locked (P2-14) so F64 refuses to reshape
-    it for a spectator. An engine that sizes itself from its pane instead parses the CLI's
+    daemon's `geometry` frame — not the size of the pane.** Usually they agree, since the pane asks
+    and the daemon grants, but the ask is a request and not a fact: the daemon clamps dimensions, the
+    replay tail is bytes produced at the size before the resize, and a second pane on the same session
+    can win the last write. An engine that sizes itself from its pane instead parses the CLI's
     cursor-addressed redraws against the wrong width; fit the pane by scaling what you draw, never by
     changing the size you parse at.
   - `VtBoundaryDetector.cs` (pure `SafeFlushLength`: Ground/Esc/Csi/Osc/Dcs/Ss3 + UTF-8 continuation

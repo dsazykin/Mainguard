@@ -156,10 +156,10 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
         // TUI positions its redraws by absolute cursor address computed for its own width, and
         // parsing those against a different width lands them on the wrong rows.
         //
-        // It is NOT always the size this pane asked for. A managed worker's terminal is input-locked
-        // (P2-14) and F64 therefore drops a viewer's resize, so the session stays at the size it was
-        // spawned with however the operator sizes the pane. From here on layout only scales what is
-        // drawn (UpdateRenderScale); it no longer reshapes the grid.
+        // It is NOT always the size this pane asked for: the daemon clamps dimensions, the replay
+        // tail is bytes produced at the size BEFORE a resize, and a second pane on the same session
+        // can win the last write. From here on layout only scales what is drawn
+        // (UpdateRenderScale); it no longer reshapes the grid.
         _authoritativeCols = cols;
         _authoritativeRows = rows;
         _screen.Resize(cols, rows);
@@ -241,8 +241,8 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
         var cols = Math.Max(1, (int)(size.Width / _cellWidth));
         var rows = Math.Max(1, (int)(size.Height / _cellHeight));
 
-        // The pane is always what we ASK the daemon for — that is unchanged, and it is what keeps an
-        // ordinary (unlocked) terminal exactly pane-sized. Whether the ask is granted is the
+        // The pane is always what we ASK the daemon for — every terminal, managed worker included,
+        // and it is what keeps a pane-sized terminal pane-sized. What the ask BECOMES is the
         // daemon's call, and its answer arrives as a `geometry` frame through Resize.
         UserResized?.Invoke(this, new TerminalResizeEventArgs(cols, rows));
 
@@ -250,8 +250,8 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
         {
             // MG-24: the daemon has told us the real size. Layout no longer touches the grid — it
             // only decides how large to draw it. Reshaping the grid to the pane here is precisely
-            // what garbled a managed worker's terminal: the ask is refused, the PTY keeps emitting
-            // 120-column output, and the pane parsed it at its own narrower width with no reflow.
+            // what garbled a worker terminal: the engine assumed its ask had landed, and parsed
+            // 120-column output at its own narrower width with no reflow.
             UpdateRenderScale(size);
             InvalidateVisual();
             return;
@@ -272,11 +272,12 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
     }
 
     /// <summary>
-    /// The uniform factor that fits the authoritative grid into the pane — <c>1.0</c> whenever it
-    /// already fits, which is every terminal whose resize the daemon honours (the grid is derived
-    /// from the pane, so it cannot overflow it). Scaling only ever shrinks: a session the operator
-    /// cannot resize is shown whole and smaller rather than clipped or garbled, which is the honest
-    /// rendering of "this is 120x32 and it is not yours to reshape".
+    /// The uniform factor that fits the authoritative grid into the pane — <c>1.0</c> in the settled
+    /// case, where the grid was derived from this pane and so cannot overflow it. It earns its keep
+    /// in the gaps: the ~50 ms between a drag and the daemon's answer, a size the daemon clamped, the
+    /// replay tail rendered before the first resize lands, and a second pane that won the last write.
+    /// Scaling only ever shrinks — a grid larger than its pane is shown whole and smaller rather than
+    /// clipped or re-wrapped, because re-wrapping it is the bug this whole change exists to fix.
     /// </summary>
     private void UpdateRenderScale(Size size)
     {
