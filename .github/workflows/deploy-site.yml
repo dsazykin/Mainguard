@@ -1,5 +1,7 @@
-# Builds site/ and deploys it to GitHub Pages (https://dsazykin.github.io/GitLoom/).
+# Builds site/ and deploys it to GitHub Pages, served at https://mainguard.dev
+# (custom domain, site/public/CNAME).
 # Runs on pushes to main that touch the site, or manually via workflow_dispatch.
+# main is the deployment branch: site changes land here, never on phase2.
 name: Deploy site
 
 on:

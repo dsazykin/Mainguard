@@ -22,8 +22,7 @@
     <script>
       // Apply the persisted theme before first paint to avoid a flash.
       // Also reads the legacy gitloom-theme key so pre-rename visitors keep their choice.
-      // Validated against the live four: Command Deck and Aurora were retired, and a
-      // browser still holding one of those ids must fall through to the default.
+      // Validated against the live four so a retired id falls through to the default.
       try {
         var t = localStorage.getItem('mainguard-theme') || localStorage.getItem('gitloom-theme');
         if (t && ['midnight', 'daylight', 'graphite', 'atelier'].indexOf(t) !== -1) {
