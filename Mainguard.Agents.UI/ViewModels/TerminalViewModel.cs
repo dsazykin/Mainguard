@@ -96,8 +96,9 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
     /// MG-24: the daemon's authoritative (cols, rows) for this session. Forwarded straight to the
     /// engine — it is the ONLY caller of <see cref="ITerminalView.Resize"/>, because it is the only
     /// party that knows the real size. What this pane asked for is a request (see
-    /// <see cref="OnUserResize"/>); this is the answer, and the two differ whenever the terminal is
-    /// input-locked and the daemon declines to reshape a session the operator does not own.
+    /// <see cref="OnUserResize"/>); this is the answer, and the two differ whenever the daemon clamps
+    /// the size, the replay tail predates the resize, or another pane on the same session won the
+    /// last write.
     /// </summary>
     private void OnGeometryReceived(int cols, int rows)
     {
@@ -171,10 +172,11 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
         }
 
         // MG-24: the engine is NOT resized to the pane here any more. This size is a request; the
-        // daemon answers with a `geometry` frame and OnGeometryReceived applies it. Resizing the
-        // engine to the pane before the answer is what made a managed worker's terminal unreadable —
-        // the request is refused for an input-locked session, so the engine sat at a width the PTY
-        // had never heard of, parsing cursor-addressed redraws onto the wrong rows.
+        // daemon answers with a `geometry` frame and OnGeometryReceived applies it. Assuming the
+        // answer is what made a managed worker's terminal unreadable — the engine sat at a width the
+        // PTY had never heard of, parsing cursor-addressed redraws onto the wrong rows. Even now that
+        // every terminal's resize is honoured, the answer can still differ from the ask (the daemon
+        // clamps; another pane can win the last write), and the replay tail always predates it.
         try
         {
             await _gateway.SendResizeAsync(_pendingCols, _pendingRows);

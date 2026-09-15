@@ -45,8 +45,9 @@
     reattach/recovery/thin clients. **MG-24 adds `geometry` to the output oneof** — the session's
     AUTHORITATIVE (cols, rows), sent ahead of the replay tail and on every change. A `grid` client
     never needed it (every `GridUpdate` carries cols/rows) but a raw client had no way to learn the
-    size at all and assumed its own pane was authoritative — false for a managed worker, whose
-    terminal is input-locked so F64 refuses its resize and the PTY keeps the size it was spawned at).
+    size at all and assumed its own pane was authoritative. It is not: the daemon clamps dimensions,
+    the replay tail is bytes produced at the size BEFORE a resize, and a second pane on the same
+    session can win the last write — so the size asked for is not always the size granted).
   - `audit.proto` (P2-15: `AuditService` — `VerifyAudit` (chain + mirror walked daemon-side; head
     seq/hash; `persistent=false` flags the in-memory fallback journal so a heap verify can never
     pass as tamper-evidence) and `ReadAudit` (paged decrypted canonical envelopes) — the audit

@@ -81,10 +81,11 @@ public sealed class TerminalViewModelTests
     [Fact]
     public void Geometry_ShouldResizeEngine_EvenWhenItContradictsTheRequestedSize()
     {
-        // The managed-worker case, which is what MG-24 exists for: the pane asks for 68x45, the
-        // daemon refuses (F64 drops a locked session's resize) and keeps reporting the 120x32 the
-        // PTY was spawned at. The engine must follow the daemon, not the pane — parsing 120-column
-        // output at 68 columns is what made the worker terminal unreadable.
+        // The engine follows the DAEMON, not the pane. The pane asks for 68x45 while the daemon is
+        // reporting 120x32 — which happens in the window before a resize lands, when the daemon
+        // clamps the size, and when another pane on the same session won the last write. Assuming
+        // the ask took effect is what made the worker terminal unreadable: 120-column output parsed
+        // at 68 columns, with no reflow, puts every cursor-addressed redraw on the wrong row.
         var view = new FakeTerminalView();
         var gateway = new FakeTerminalGateway();
         using var vm = new TerminalViewModel(gateway, resizeDebounce: TimeSpan.FromMilliseconds(1));
