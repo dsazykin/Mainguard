@@ -7,7 +7,7 @@
     <title>Mainguard — the native Git client for the agent era</title>
     <meta
       name="description"
-      content="Mainguard is a premium, natively-rendered Git GUI — free, no login — growing into a control center for running many coding agents against one repository, where nothing lands on main unverified."
+      content="Mainguard is a premium, natively-rendered Git GUI — free, no login — and a control center for running coding agents against one repository, where nothing lands on main until it is verified against current main and you approve it."
     />
     <meta property="og:type" content="website" />
     <meta property="og:title" content="Mainguard — the native Git client for the agent era" />
@@ -22,9 +22,13 @@
     <script>
       // Apply the persisted theme before first paint to avoid a flash.
       // Also reads the legacy gitloom-theme key so pre-rename visitors keep their choice.
+      // Validated against the live four: Command Deck and Aurora were retired, and a
+      // browser still holding one of those ids must fall through to the default.
       try {
         var t = localStorage.getItem('mainguard-theme') || localStorage.getItem('gitloom-theme');
-        if (t) document.documentElement.dataset.theme = t;
+        if (t && ['midnight', 'daylight', 'graphite', 'atelier'].indexOf(t) !== -1) {
+          document.documentElement.dataset.theme = t;
+        }
       } catch (e) {}
     </script>
   </head>

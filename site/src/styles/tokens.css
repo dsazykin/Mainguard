@@ -1,6 +1,6 @@
 /*
  * Mainguard design tokens, ported 1:1 from the app's Themes/*.axaml.
- * One design system, five switchable palettes. Shape, spacing and typography
+ * One design system, four switchable palettes. Shape, spacing and typography
  * are fixed; only color tokens change per theme (data-theme on <html>).
  */
 
@@ -46,7 +46,7 @@
   --z-toast: 300;
 }
 
-/* ————— Midnight Watch (default) ————— */
+/* ————— Midnight Loom (default) ————— */
 :root,
 :root[data-theme='midnight'] {
   color-scheme: dark;
@@ -60,23 +60,23 @@
   --text-primary: #e6e9ef;
   --text-muted: #9aa3b5; /* app muted #8A93A6 lifted one step for 16px web body contrast */
   --on-accent: #0b0d10;
-  --accent: #8b8bf5;
-  --accent-hover: #a5a5f8;
-  --accent-selection: rgba(139, 139, 245, 0.15);
+  --accent: #8487f0;
+  --accent-hover: #9ea1f5;
+  --accent-selection: rgba(132, 135, 240, 0.15);
   --success: #42b968;
-  --danger: #f87171;
+  --danger: #e5484d;
   --warning: #e3b341;
   --info: #58a6ff;
-  --lane-1: #8b8bf5;
-  --lane-2: #f472b6;
-  --lane-3: #2dd4bf;
-  --lane-4: #e3b341;
-  --lane-5: #58a6ff;
+  --lane-1: #9f9ffc;
+  --lane-2: #d0709f;
+  --lane-3: #c0eae3;
+  --lane-4: #f2a918;
+  --lane-5: #0b87f5;
   --diff-added-bg: #11271b;
   --diff-removed-bg: #33191e;
 }
 
-/* ————— Day Watch ————— */
+/* ————— Daylight Loom (light) ————— */
 :root[data-theme='daylight'] {
   color-scheme: light;
   --surface-window: #edeff4;
@@ -92,46 +92,46 @@
   --accent: #6467e8;
   --accent-hover: #5457de;
   --accent-selection: rgba(100, 103, 232, 0.15);
-  --success: #1f9d55;
-  --danger: #d64545;
+  --success: #187c43;
+  --danger: #c13939;
   --warning: #a9770f;
   --info: #0b78ce;
-  --lane-1: #6467e8;
-  --lane-2: #c13584;
-  --lane-3: #0d9488;
-  --lane-4: #a9770f;
-  --lane-5: #0b78ce;
+  --lane-1: #2f2fd6;
+  --lane-2: #ab467b;
+  --lane-3: #054743;
+  --lane-4: #8a4a0b;
+  --lane-5: #138be6;
   --diff-added-bg: #ddf3e4;
   --diff-removed-bg: #fbe2e2;
 }
 
-/* ————— Command Deck ————— */
-:root[data-theme='commanddeck'] {
+/* ————— Graphite (the macOS-native neutral) ————— */
+:root[data-theme='graphite'] {
   color-scheme: dark;
-  --surface-window: #0a0c0e;
-  --surface-panel: #0e1114;
-  --surface-deep: #07090b;
-  --surface-card: #13171b;
-  --surface-hover: #1b2227;
-  --button-bg: #141a1e;
-  --border-hairline: #1f2529;
-  --text-primary: #dce3e8;
-  --text-muted: #8c9aa4; /* app muted #7C8A94 lifted for 16px web body contrast */
-  --on-accent: #07090b;
-  --accent: #2dd4bf;
-  --accent-hover: #5eead4;
-  --accent-selection: rgba(45, 212, 191, 0.14);
-  --success: #34d399;
-  --danger: #fb7185;
-  --warning: #fbbf24;
-  --info: #38bdf8;
-  --lane-1: #2dd4bf;
-  --lane-2: #c084fc;
-  --lane-3: #34d399;
-  --lane-4: #fbbf24;
-  --lane-5: #38bdf8;
-  --diff-added-bg: #0d251f;
-  --diff-removed-bg: #2a161b;
+  --surface-window: #1d1d1f;
+  --surface-panel: #232326;
+  --surface-deep: #161618;
+  --surface-card: #2a2a2e;
+  --surface-hover: #36363b;
+  --button-bg: #2e2e33;
+  --border-hairline: #3a3a3f;
+  --text-primary: #e8e8ea;
+  --text-muted: #aaaab3; /* app muted #9A9AA2 lifted one step for 16px web body contrast */
+  --on-accent: #131316;
+  --accent: #409cff;
+  --accent-hover: #66afff;
+  --accent-selection: rgba(64, 156, 255, 0.15);
+  --success: #30b158;
+  --danger: #ff453a;
+  --warning: #e5993b;
+  --info: #5ac8f5;
+  --lane-1: #9d9de8;
+  --lane-2: #a36784;
+  --lane-3: #abd9d0;
+  --lane-4: #e6ab21;
+  --lane-5: #3e96f2;
+  --diff-added-bg: #15281c;
+  --diff-removed-bg: #321b1d;
 }
 
 /* ————— Atelier ————— */
@@ -145,49 +145,20 @@
   --button-bg: #272219;
   --border-hairline: #322d25;
   --text-primary: #ede7db;
-  --text-muted: #aca294; /* app muted #9C9284 lifted for 16px web body contrast */
+  --text-muted: #aca294; /* app muted #9C9284 lifted one step for 16px web body contrast */
   --on-accent: #171512;
   --accent: #d8a25a;
   --accent-hover: #e4b677;
   --accent-selection: rgba(216, 162, 90, 0.15);
   --success: #8fbc7f;
-  --danger: #e5726a;
+  --danger: #d65a4a;
   --warning: #d9b04c;
   --info: #6e96be;
-  --lane-1: #d8a25a;
-  --lane-2: #c08bb8;
-  --lane-3: #8fbc7f;
-  --lane-4: #7fa6c4;
-  --lane-5: #c4766b;
+  --lane-1: #dbbc93;
+  --lane-2: #b06a9e;
+  --lane-3: #c7e0bf;
+  --lane-4: #40739c;
+  --lane-5: #da9a91;
   --diff-added-bg: #1e2a1a;
   --diff-removed-bg: #33201d;
-}
-
-/* ————— Aurora ————— */
-:root[data-theme='aurora'] {
-  color-scheme: dark;
-  --surface-window: #111322;
-  --surface-panel: #161930;
-  --surface-deep: #0c0e1a;
-  --surface-card: #1c2038;
-  --surface-hover: #262b4a;
-  --button-bg: #1f2440;
-  --border-hairline: #2a2f52;
-  --text-primary: #e4e7f7;
-  --text-muted: #9da3c6; /* app muted #8D93B8 lifted for 16px web body contrast */
-  --on-accent: #0c0e1a;
-  --accent: #4fd1c5;
-  --accent-hover: #76e0d6;
-  --accent-selection: rgba(79, 209, 197, 0.15);
-  --success: #4ade80;
-  --danger: #f8719d;
-  --warning: #facc6b;
-  --info: #60a5fa;
-  --lane-1: #4fd1c5;
-  --lane-2: #a78bfa;
-  --lane-3: #f472b6;
-  --lane-4: #facc6b;
-  --lane-5: #60a5fa;
-  --diff-added-bg: #10291f;
-  --diff-removed-bg: #351a26;
 }

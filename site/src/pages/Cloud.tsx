@@ -9,13 +9,17 @@ export function Cloud() {
     <div className="threaded">
       <PatrolSpine />
       <div className="container page-hero">
-        <span className="pill pill-accent">Paid · cloud · waitlist open</span>
+        <span className="pill pill-accent">Planned · cloud · waitlist open</span>
         <h1 style={{ marginTop: 'var(--space-4)' }}>Describe it. Ship it verified.</h1>
         <p className="lede">
           Mainguard Cloud is for builders who don't want to think about git at all. Tell it what
           you want; coding agents build it in the cloud, every change passes the gate before it
           counts, and you get a working product — plus a clean, professional history underneath,
           in case you ever need it.
+        </p>
+        <p className="muted" style={{ marginTop: 'var(--space-4)' }}>
+          Cloud is a plan, not a product — this page describes where it's headed, after Pro. The
+          waitlist is how you hear when it's real.
         </p>
         <hr className="thread-rule" />
       </div>
@@ -151,19 +155,19 @@ export function Cloud() {
       <section className="section" aria-label="What people build">
         <div className="container">
           <Reveal>
-            <h2 data-thread-node>What gets built</h2>
-            <div className="ledger" role="img" aria-label="Examples of things people build with Cloud">
-              <span className="dim">requests that recently cleared the gate:</span>
+            <h2 data-thread-node>What it's for</h2>
+            <div className="ledger" role="img" aria-label="The kinds of things Cloud is designed to build">
+              <span className="dim">the kind of thing Cloud is built for:</span>
               <br />
-              <span className="ok">✓</span> a booking page with deposits and reminder emails — a pottery studio
+              <span className="ok">·</span> a booking page with deposits and reminder emails — a pottery studio
               <br />
-              <span className="ok">✓</span> an inventory tracker with barcode scans — a bike shop
+              <span className="ok">·</span> an inventory tracker with barcode scans — a bike shop
               <br />
-              <span className="ok">✓</span> a members portal with paid tiers — a climbing gym
+              <span className="ok">·</span> a members portal with paid tiers — a climbing gym
               <br />
-              <span className="ok">✓</span> an internal quoting tool replacing four spreadsheets — a joinery
+              <span className="ok">·</span> an internal quoting tool replacing four spreadsheets — a joinery
               <br />
-              <span className="dim">no repositories were harmed — or seen — in the making of any of them</span>
+              <span className="dim">illustrations, not customers — Cloud has not been built yet</span>
             </div>
           </Reveal>
         </div>

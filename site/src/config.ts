@@ -1,11 +1,10 @@
 /**
  * Deployment-specific constants for the Mainguard marketing site.
  *
- * The GitHub URL still carries the legacy repo name until the GitHub rename
- * lands (rebrand plan Phase 2, docs/rebrand/) — update it here when it does.
- * The old gitloom-site-api worker stays deployed until traffic drains
- * (Phase 5), then gets deleted.
+ * The GitHub rename has landed: dsazykin/GitLoom now redirects to
+ * dsazykin/Mainguard, so the canonical URL is used directly here.
  */
 export const API_BASE = 'https://mainguard-site-api.daniel-sazykin.workers.dev';
 export const TURNSTILE_SITEKEY = '0x4AAAAAADw_X6swd7JbWQRB';
-export const GITHUB_URL = 'https://github.com/dsazykin/GitLoom';
+export const GITHUB_URL = 'https://github.com/dsazykin/Mainguard';
+export const GITHUB_REPO_LABEL = 'dsazykin/Mainguard';

@@ -9,6 +9,5 @@ export { PipelineVignette } from './Pipeline';
 export { ReviewQueueVignette } from './ReviewQueue';
 export { GatewayVignette } from './Gateway';
 export { CloudVignette } from './Cloud';
-export { RadarVignette } from './Radar';
 export { IntakeVignette } from './Intake';
 export { AuditVignette } from './Audit';
