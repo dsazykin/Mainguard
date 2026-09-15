@@ -75,9 +75,13 @@ TypeScript SPA re-implementing the app's five-theme token design system in CSS; 
 `deploy-site.yml`. Forms are backed by a Cloudflare Worker (deployed separately from `site/worker/`,
 **not** by CI). Commands (from `site/`): `npm run dev` / `npm run build` / `npm run lint`.
 Credentials for the Worker live in the repo-root `.cloudflare.env` (git-excluded — never commit it).
-The product rename is phased — `docs/rebrand/Mainguard_Rebrand_Plan.md` is the plan of record; the
-repo is now `dsazykin/Mainguard` and tracked refs point at it, while some deployed identifiers (e.g.
-the Cloudflare Worker name/URL) still carry the old name until their phase.
+The product rename has landed — the repo is `dsazykin/Mainguard`, tracked refs point at it, and
+every identifier in the solution is `Mainguard.*`. The phased plan is archived at
+`docs/archive/Mainguard_Rebrand_Plan.md`. Some **deployed** identifiers still carry the old name
+(e.g. the Cloudflare Worker name/URL in `site/src/config.ts`), and the site's theme names
+(Midnight Watch, Command Deck, Aurora) are the ones the rebrand plan proposed but the app never
+adopted — the shipped themes are Midnight Loom, Daylight Loom, Graphite and Atelier. Both are known
+drift between the marketing site and the product, not a doc error.
 
 - **`index.html`** — meta/OG tags + pre-paint theme restore (reads `mainguard-theme`, falls back to the legacy `mainguard-theme`); **`vite.config.ts`** — `base: '/'` (custom domain serves at the root); **`public/`** — `favicon.svg`, `og.png`, `CNAME` (the Pages custom domain).
 - **`src/config.ts`** — deployed Worker URL, Turnstile sitekey, GitHub URL. **`src/main.tsx`** / **`src/App.tsx`** — entry, router, per-route titles.

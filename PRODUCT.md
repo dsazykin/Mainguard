@@ -227,7 +227,7 @@ reproduces WSL2 Docker. The Windows test leg is advisory with a known-failure ba
   real-Docker sandbox security tests and an in-jail end-to-end verification job. **The "1,042 tests"
   figure in the creative and marketing docs is stale**: it counts the v1 Git client on `main` only.
   Re-count before quoting a number publicly.
-- Audit-log evidence written up in `docs/reports/P2-15_Audit_Log_Evidence_2026-08-19.md`.
+- Audit-log evidence written up in `docs/archive/reports/P2-15_Audit_Log_Evidence_2026-08-19.md`.
 - A deployed marketing site with working waitlist and contact infrastructure
   (`site/`, `site/worker/`, Cloudflare D1 + Turnstile + Resend).
 - Site imagery: `site/src/assets/hero.png`, `site/public/og.png`.

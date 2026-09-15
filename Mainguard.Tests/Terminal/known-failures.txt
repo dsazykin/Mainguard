@@ -8,7 +8,7 @@
 # One case-id per line, followed by a comment explaining the gap. As P2-18's libvterm engine (or a
 # hardened interim engine) closes a gap, delete the corresponding line here.
 #
-# --- coverage matrix (docs/feature-plans/P2-04 §3.4) ---
+# --- coverage matrix (docs/archive/feature-plans/phase-2/P2-04 §3.4) ---
 coverage/alternate-screen     # VtScreen has no alt-screen buffer; DECSET ?1049 is a no-op, primary content is overwritten not restored
 coverage/truecolor            # VtScreen folds 38;2;r;g;b to the 216-colour cube (Indexed), never exact Rgb
 coverage/cjk-emoji-width      # VtScreen has no East-Asian-width table; wide glyphs occupy 1 cell and ZWJ emoji split per-char
@@ -16,6 +16,6 @@ coverage/osc8-hyperlink       # VtScreen consumes and discards OSC 8; cells carr
 coverage/bracketed-paste      # interim input path has no bracketed-paste encoder (no 200~/201~ wrapping)
 coverage/mouse-reporting      # interim input path has no mouse encoder (no SGR 1006 click sequences)
 #
-# --- vttest-style conformance (docs/feature-plans/P2-04 §3.2) ---
+# --- vttest-style conformance (docs/archive/feature-plans/phase-2/P2-04 §3.2) ---
 vttest/scroll-region-decstbm  # VtScreen ignores DECSTBM (CSI r); a scroll region does not constrain scrolling
 vttest/save-restore-cursor    # VtScreen ignores DECSC/DECRC (ESC 7 / ESC 8); cursor save+restore is a no-op
