@@ -67,7 +67,52 @@ public sealed class TerminalViewModelTests
 
         Assert.Single(gateway.Resizes);
         Assert.Equal((100, 40), gateway.Resizes[0]);
+
+        // MG-24: a layout resize is a REQUEST to the daemon and nothing more. The engine is not
+        // resized off the back of it — only the daemon's `geometry` answer does that — because for
+        // an input-locked worker the request is refused and the pane size is then a width the PTY
+        // has never run at.
+        Assert.Equal((0, 0), view.LastResize); // never resized — Resize was not called at all
+
+        gateway.PushGeometry(100, 40);
         Assert.Equal((100, 40), view.LastResize);
+    }
+
+    [Fact]
+    public void Geometry_ShouldResizeEngine_EvenWhenItContradictsTheRequestedSize()
+    {
+        // The managed-worker case, which is what MG-24 exists for: the pane asks for 68x45, the
+        // daemon refuses (F64 drops a locked session's resize) and keeps reporting the 120x32 the
+        // PTY was spawned at. The engine must follow the daemon, not the pane — parsing 120-column
+        // output at 68 columns is what made the worker terminal unreadable.
+        var view = new FakeTerminalView();
+        var gateway = new FakeTerminalGateway();
+        using var vm = new TerminalViewModel(gateway, resizeDebounce: TimeSpan.FromMilliseconds(1));
+        vm.AttachView(view);
+
+        gateway.PushGeometry(120, 32);
+        vm.OnUserResize(68, 45);
+
+        Assert.Equal((120, 32), view.LastResize);
+    }
+
+    [Fact]
+    public void Geometry_ArrivingBeforeAttachView_ShouldBeAppliedAheadOfBufferedOutput()
+    {
+        // The geometry frame leads the replay tail, so on a pane that binds late it has already been
+        // and gone. It must be re-applied to the arriving view BEFORE the buffered bytes are fed, or
+        // those bytes are parsed at the engine's default width — the exact garbling MG-24 fixes.
+        var gateway = new FakeTerminalGateway();
+        using var vm = new TerminalViewModel(gateway);
+
+        gateway.PushGeometry(120, 32);
+        gateway.PushOutput(new byte[] { (byte)'h', (byte)'i' });
+
+        var view = new FakeTerminalView();
+        vm.AttachView(view);
+
+        Assert.Equal((120, 32), view.LastResize);
+        Assert.Equal(new byte[] { (byte)'h', (byte)'i' }, Assert.Single(view.Fed));
     }
 
     [Fact]
@@ -312,7 +357,12 @@ public sealed class TerminalViewModelTests
 
         public event Action<ReadOnlyMemory<byte>>? OutputReceived;
 
+        public event Action<int, int>? GeometryReceived;
+
         public void PushOutput(byte[] data) => OutputReceived?.Invoke(data);
+
+        /// <summary>MG-24: the daemon reporting the session's authoritative size.</summary>
+        public void PushGeometry(int cols, int rows) => GeometryReceived?.Invoke(cols, rows);
 
         public Task AttachAsync(string agentId, CancellationToken ct)
         {

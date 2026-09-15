@@ -37,6 +37,11 @@ public sealed class ReadOnlyAttachTests
     private const string RepoHash = "repo-f64";
     private const string AgentId = "worker-f64";
 
+    /// <summary>The size the session under test is bound at — the daemon's own spawn default, which
+    /// is the size a managed worker is stuck with because F64 refuses to let a viewer change it.</summary>
+    private const int BoundCols = 120;
+    private const int BoundRows = 32;
+
     [Fact]
     public async Task LockedAttach_CannotResizeTheManagedWorkersTerminal()
     {
@@ -49,6 +54,12 @@ public sealed class ReadOnlyAttachTests
         using var call = client.Attach(fixture.AuthHeaders());
 
         await call.RequestStream.WriteAsync(new TerminalInput { AgentId = AgentId });
+
+        // MG-24: geometry leads every raw attach, ahead of the banner and the replay tail — the
+        // client has to know the size before it parses a single byte at it.
+        Assert.True(await call.ResponseStream.MoveNext(CancellationToken.None));
+        Assert.Equal(TerminalOutput.FrameOneofCase.Geometry, call.ResponseStream.Current.FrameCase);
+
         // The read-only banner proves the output stream is open before we test the input direction.
         Assert.True(await call.ResponseStream.MoveNext(CancellationToken.None));
         Assert.Contains("read-only", call.ResponseStream.Current.Raw.ToStringUtf8());
@@ -68,6 +79,85 @@ public sealed class ReadOnlyAttachTests
         Assert.Equal(StatusCode.PermissionDenied, refusal.StatusCode);
 
         Assert.Null(cli.LastResize);
+    }
+
+    /// <summary>
+    /// MG-24, the other half of F64. Refusing a spectator's resize is right, but it left the client
+    /// with no way to know the refusal happened: it kept rendering at the size it asked for while
+    /// the PTY ran at the size it was spawned with, so 120-column output was parsed into a ~68-column
+    /// grid with no reflow and the CLI's cursor-addressed redraws landed on the wrong rows. A locked
+    /// attach is therefore TOLD the authoritative size, and told it again when it does not change in
+    /// response to the resize it just asked for.
+    /// </summary>
+    [Fact]
+    public async Task LockedAttach_IsToldTheAuthoritativeSizeItMayNotChange()
+    {
+        using var fixture = new DaemonFixture();
+        using var cli = new RecordingSession();
+        BindBoundSession(fixture, cli);
+        fixture.Services.GetRequiredService<TerminalLockRegistry>().Lock(AgentId);
+
+        var client = new TerminalService.TerminalServiceClient(fixture.CreateChannel());
+        using var call = client.Attach(fixture.AuthHeaders());
+
+        await call.RequestStream.WriteAsync(new TerminalInput { AgentId = AgentId });
+
+        Assert.True(await call.ResponseStream.MoveNext(CancellationToken.None));
+        var geometry = call.ResponseStream.Current;
+        Assert.Equal(TerminalOutput.FrameOneofCase.Geometry, geometry.FrameCase);
+
+        // The size the session was actually bound at — not a size this attach chose.
+        Assert.Equal(BoundCols, (int)geometry.Geometry.Cols);
+        Assert.Equal(BoundRows, (int)geometry.Geometry.Rows);
+
+        // And asking for something else changes nothing: no resize reaches the CLI, so there is no
+        // second geometry frame to contradict the first.
+        await call.RequestStream.WriteAsync(new TerminalInput
+        {
+            Resize = new Resize { Cols = 68, Rows = 45 },
+        });
+        await call.RequestStream.WriteAsync(new TerminalInput { Data = ByteString.CopyFromUtf8("x") });
+        await call.RequestStream.CompleteAsync();
+
+        await Assert.ThrowsAsync<RpcException>(() => DrainAsync(call));
+        Assert.Null(cli.LastResize);
+    }
+
+    /// <summary>
+    /// The unlocked counterpart: the resize IS honoured, and the client is told the new authoritative
+    /// size, so an ordinary terminal ends up rendering at exactly the size it asked for.
+    /// </summary>
+    [Fact]
+    public async Task UnlockedAttach_IsToldTheNewSizeAfterItsResizeIsHonoured()
+    {
+        using var fixture = new DaemonFixture();
+        using var cli = new RecordingSession();
+        BindBoundSession(fixture, cli);
+
+        var client = new TerminalService.TerminalServiceClient(fixture.CreateChannel());
+        using var call = client.Attach(fixture.AuthHeaders());
+
+        await call.RequestStream.WriteAsync(new TerminalInput { AgentId = AgentId });
+        await call.RequestStream.WriteAsync(new TerminalInput
+        {
+            Resize = new Resize { Cols = 100, Rows = 30 },
+        });
+
+        // Read until the geometry frame reports the size we asked for. Raw frames from the CLI can
+        // be interleaved with it, which is exactly why geometry is its own frame and not bytes.
+        var reported = (Cols: 0, Rows: 0);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (reported != (100, 30) && await call.ResponseStream.MoveNext(timeout.Token))
+        {
+            if (call.ResponseStream.Current.FrameCase == TerminalOutput.FrameOneofCase.Geometry)
+            {
+                var g = call.ResponseStream.Current.Geometry;
+                reported = ((int)g.Cols, (int)g.Rows);
+            }
+        }
+
+        Assert.Equal((100, 30), reported);
+        Assert.Equal((100, 30), cli.LastResize);
     }
 
     [Fact]
@@ -192,7 +282,8 @@ public sealed class ReadOnlyAttachTests
 
     private static void BindBoundSession(DaemonFixture fixture, ITerminalSession cli)
         => fixture.Services.GetRequiredService<TerminalSessionManager>()
-            .Bind(new AgentSessionKey(RepoHash, AgentId), new BoundTerminalSession(AgentId, cli));
+            .Bind(new AgentSessionKey(RepoHash, AgentId),
+                new BoundTerminalSession(AgentId, cli, cols: BoundCols, rows: BoundRows));
 
     /// <summary>Polls a condition the server satisfies asynchronously, with a bounded wait.</summary>
     private static async Task WaitForAsync(Func<bool> condition)

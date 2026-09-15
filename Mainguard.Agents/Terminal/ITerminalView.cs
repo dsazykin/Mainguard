@@ -18,7 +18,18 @@ public interface ITerminalView
     /// <summary>Raised when the engine has keystrokes/paste to send toward the PTY.</summary>
     event Action<byte[]>? InputAvailable;
 
-    /// <summary>Notifies the engine of a new terminal size (columns × rows).</summary>
+    /// <summary>
+    /// Notifies the engine of the session's AUTHORITATIVE size (columns × rows) — the geometry the
+    /// PTY is actually running at, as reported by the daemon.
+    ///
+    /// <para>MG-24: this is deliberately not "the size of the pane". The two coincide for an
+    /// ordinary terminal, whose resize the daemon honours, and they do not for a managed worker,
+    /// whose terminal is input-locked (P2-14) so that F64 refuses to reshape it on a spectator's
+    /// behalf. An engine that sizes itself from its pane instead parses the CLI's cursor-addressed
+    /// redraws — computed for the real width — against the wrong one, and they land on the wrong
+    /// rows and overwrite each other. Fit the pane by scaling what you draw, never by changing the
+    /// size you parse at.</para>
+    /// </summary>
     void Resize(int cols, int rows);
 
     /// <summary>Captures the current screen + scrollback as an opaque snapshot (engine detail).</summary>

@@ -1002,7 +1002,20 @@
     instead of waiting for the ViewModel's ~50 ms debounced round trip. Without it a rehydrated
     agent's replayed scrollback (which the daemon sends within milliseconds of attach, long before
     arrange) is parsed at the 80×24 placeholder and, since this engine has no reflow, stays wrapped
-    at 80 columns forever — the garbled restart-resume terminal. The
+    at 80 columns forever — the garbled restart-resume terminal. **Authoritative geometry (MG-24):**
+    once the daemon's `geometry` frame has reported the session's real (cols, rows), layout STOPS
+    reshaping the grid and only sets `_renderScale` — a uniform fit-to-pane factor, capped at 1.0 so
+    an ordinary terminal is never magnified, applied as one `PushTransform` in `Render` so every cell
+    offset stays in unscaled units. `ArrangeOverride` still raises `UserResized` (the pane asking the
+    daemon for a size; the answer comes back as the next `geometry` frame), and the layout-sizing path
+    above survives as the fallback for attaches that never report a size — the echo, detached-notice
+    and locked-without-session paths. This is the fix for the unreadable **managed-worker** terminal:
+    a managed worker's terminal is input-locked (P2-14) so F64 drops the viewer's resize and the PTY
+    stays at the 120×32 it was spawned at, and the pane used to reshape its engine to ~68 columns
+    anyway — re-wrapping 120-column output with no reflow, so the CLI's absolutely-positioned redraws
+    landed on the wrong rows and overwrote each other (the same sentence drawn twice, at two widths,
+    superimposed). `TerminalReplayGeometryTests` pins both directions: a session wider than its pane
+    keeps the daemon's width, and an ordinary terminal is still exactly pane-sized. The
     renderer is the fallback for the planned vendored `Iciclecreek.Avalonia.Terminal` (see note below).
     **Known field gaps (2026-07-22), deferred to P2-18 by decision — do NOT grow `VtScreen` toward
     conformance:** Ink/Yoga TUIs (claude-code) mis-render — no scroll regions (DECSTBM), insert/delete
@@ -1098,7 +1111,12 @@
     entry's last verification artifact — never its daemon path, G-14).
   - `ITerminalGateway.cs` (P2-03) — the ViewModel-facing seam onto that stream: `DaemonTerminalGateway`
     writes the first `agent_id` frame then forwards input/resize and raises `OutputReceived` for each
-    `raw` frame; a fake backs the ViewModel tests. **Every frame it sends — selector, input, resize —
+    `raw` frame; a fake backs the ViewModel tests. **MG-24 adds `GeometryReceived`** — the session's
+    authoritative (cols, rows) from the daemon's `geometry` frame, on its OWN event rather than the
+    byte channel, because on the raw path those bytes *are* the PTY stream and anything mixed into
+    them would be parsed as terminal output. `TerminalViewModel` forwards it to the engine and is the
+    only caller of `ITerminalView.Resize`; a layout resize is now purely a request to the daemon
+    (`SendResizeAsync`) and no longer resizes the engine behind the daemon's back. **Every frame it sends — selector, input, resize —
     goes through the one `TerminalWriteQueue` below** (stress S1 / G5: gRPC permits a single in-flight
     `WriteAsync` per request stream, and this class has three concurrent writers, so a keystroke
     landing inside another frame's round-trip threw `Can't write the message because the previous
@@ -1424,7 +1442,13 @@
   mouse; Ctrl+C stays SIGINT), OSC 52 → host clipboard from daemon-decoded frames, the three paste
   chords via `Controls/GridInputEncoder` (paste reuses the pinned `BuildPasteBytes`; DECCKM-aware
   keys; SGR/X10 mouse encoders), wheel scrollback over the local ring, and a minimal IME preedit
-  overlay at the cursor), `Controls/WheelScrollAccumulator` (the wheel→lines conversion BOTH
+  overlay at the cursor; **MG-24:** the daemon already owns this engine's grid size, so the defect
+  here was clipping rather than garbling — a 120-column worker in a narrow pane had its right-hand
+  side drawn past the edge and lost. Same fix as the interim engine: `UpdateRenderScale` (uniform,
+  capped at 1.0, recomputed on arrange AND on a geometry-changing model update, since the daemon can
+  resize the grid without the pane moving) applied as one `PushTransform`, with `CellAt` dividing the
+  pointer back out of it and `CursorCellRect` multiplying into it so selection and the IME anchor
+  stay on the cell the operator sees), `Controls/WheelScrollAccumulator` (the wheel→lines conversion BOTH
   engines spend — one line per discrete notch, fractional trackpad/precision deltas accumulated with
   the remainder carried instead of each micro-event being worth a line (interim) or three (grid),
   which is why the panes used to fly; carry dropped on reversal and snap-to-live, per-event cap. The

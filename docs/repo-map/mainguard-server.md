@@ -1059,7 +1059,11 @@
   `VtermSession` fed the same 16 ms VT-safe frames under the session gate — `SubscribeGrid` (atomic
   full snapshot + live `GridUpdate`/`ClipboardCopy` frames), `Resize` (PTY + vterm in the same breath,
   then a fresh snapshot — preceded by a ring-only update carrying the reflow's scrollback pushes/pops
-  so the client ring never desyncs), `GetScrollback` (the lazy-fetch RPC's data source).
+  so the client ring never desyncs), `GetScrollback` (the lazy-fetch RPC's data source). **MG-24:**
+  `Cols`/`Rows` track the authoritative size for EVERY engine (not just libvterm — the interim engine
+  has no daemon-side grid to read it off), clamped through the same gate `Resize` uses, and
+  `SubscribeGeometry` hands an attach that size atomically with enrolment plus a latest-value channel
+  (capacity 1, `DropOldest`) of every later change, so a slow reader can never stall the resize path.
 - **`Services/AgentGrpcService.cs`** (**PR3:** validation+mapping only — `SpawnAgent`/`StopAgent`
   dispatch to the shared `AgentSpawnService` workflow (typed exceptions → status codes via the shared
   `MapLaunchFailure`, incl. the v1
@@ -1087,7 +1091,17 @@
   CLI and a reflow of the daemon's authoritative grid that every other viewer sees); and input is
   **exclusive** via `BoundTerminalSession.TryClaimInput`, claimed lazily on the first keystroke and
   released on detach, so two concurrent attaches can no longer interleave keystrokes into one PTY.
-  Otherwise the per-attach
+  **MG-24 completes F64's other half:** refusing the spectator's resize was right, but it left the
+  client no way to KNOW it had been refused — it kept rendering at the size it asked for while the PTY
+  ran at the size it was spawned with, so 120-column output was parsed into a ~68-column grid with no
+  reflow and the CLI's cursor-addressed redraws landed on the wrong rows (the unreadable worker
+  terminal). A raw attach now leads with a **`geometry`** frame — ahead of the banner and the replay
+  tail, since the replay is raw bytes produced at that size — and streams every later change from
+  `SubscribeGeometry`. That makes two producers on one response stream, so every write goes through
+  `WriteGuardedAsync`'s semaphore (gRPC allows one in-flight `WriteAsync` per stream; the gate is
+  deliberately NOT disposed, because an exception escaping the try can reach the `finally` while a
+  pump is still inside it). The grid pump needs none of this — every `GridUpdate` already carries
+  cols/rows. Otherwise the per-attach
   `PtySession` factory path through `TerminalStreamer`, else — for an agent the session store KNOWS
   but that has no bound CLI — the `DetachedNotice` attach (ISSUES-LOG #23: says so in one unprompted
   frame and discards input, instead of a silent echo that emitted nothing until the user typed and so

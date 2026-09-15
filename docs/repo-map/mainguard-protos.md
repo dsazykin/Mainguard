@@ -42,7 +42,11 @@
     first-class `GridOp` scroll/pop ops, `GridCursor`, `GridModes`
     (alt-screen/bracketed-paste/DECCKM/mouse+SGR); `ClipboardCopy` — daemon-decoded OSC 52 SETs (queries
     never answered); and the `GetScrollback` RPC — lazy absolute-indexed scrollback pages for
-    reattach/recovery/thin clients).
+    reattach/recovery/thin clients. **MG-24 adds `geometry` to the output oneof** — the session's
+    AUTHORITATIVE (cols, rows), sent ahead of the replay tail and on every change. A `grid` client
+    never needed it (every `GridUpdate` carries cols/rows) but a raw client had no way to learn the
+    size at all and assumed its own pane was authoritative — false for a managed worker, whose
+    terminal is input-locked so F64 refuses its resize and the PTY keeps the size it was spawned at).
   - `audit.proto` (P2-15: `AuditService` — `VerifyAudit` (chain + mirror walked daemon-side; head
     seq/hash; `persistent=false` flags the in-memory fallback journal so a heap verify can never
     pass as tamper-evidence) and `ReadAudit` (paged decrypted canonical envelopes) — the audit

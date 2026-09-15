@@ -44,8 +44,25 @@ message TerminalOutput {
     bytes raw = 1;               // PTY bytes (the only variant used by the interim engine)
     GridUpdate grid = 2;         // grid diffs (P2-18 libvterm engine)
     ClipboardCopy clipboard = 3; // OSC 52 copy decoded daemon-side (queries are NEVER answered)
+    Resize geometry = 4;         // this session's AUTHORITATIVE size (see below)
   }
 }
+
+// MG-24, the `geometry` frame: the daemon telling a raw-engine client what size
+// this session actually is — sent once ahead of the replay tail and again on
+// every change, so the client parses PTY bytes against the geometry that
+// produced them.
+//
+// A `grid` client never needed it (every GridUpdate carries cols/rows) but a raw
+// client had no way to learn the size at all, so it assumed its own pane was
+// authoritative. For a managed worker that assumption is simply false: its
+// terminal is input-locked (P2-14), F64 therefore drops the viewer's Resize
+// frames, and the PTY stays at the 120x32 it was spawned with. The client parsed
+// 120-column output into a ~68-column grid with no reflow, so the CLI's
+// cursor-addressed redraws — computed for 120 columns — landed on the wrong rows
+// and overwrote each other, which is what made a worker terminal unreadable. The
+// fix is not to let a spectator reshape a session it does not own; it is to tell
+// it the truth and let it scale to fit.
 
 // The jailed CLI asked the terminal to place text on the clipboard (OSC 52). The
 // daemon decodes and forwards the SET only; a query ("?") is dropped at the

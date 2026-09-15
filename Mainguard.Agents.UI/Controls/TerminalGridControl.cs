@@ -52,6 +52,10 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
 
     private double _cellWidth;
     private double _cellHeight;
+
+    // MG-24: uniform fit-to-pane factor, 1.0 whenever the daemon's grid already fits this pane —
+    // which is every terminal whose resize the daemon honours. See UpdateRenderScale.
+    private double _renderScale = 1.0;
     private int _viewOffset; // rows scrolled back from live (0 = live view)
     private string? _preedit;
     private RenderSnapshot? _renderSnapshot;
@@ -173,6 +177,11 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
         if (geometryChanged)
         {
             _viewOffset = 0;
+
+            // MG-24: the daemon just reported a different grid size. The pane did not move, so
+            // ArrangeOverride will not run — recompute the fit here or the new grid is drawn at the
+            // old scale and overflows (or under-fills) the pane until the next layout pass.
+            UpdateRenderScale(Bounds.Size);
         }
 
         _ime.NotifyCursorMoved();
@@ -197,10 +206,49 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
             {
                 UserResized?.Invoke(this, new TerminalResizeEventArgs(cols, rows));
             }
+
+            // MG-24: whether that ask is granted is the daemon's call. When it is not — an
+            // input-locked managed worker, where F64 refuses to reshape a session the viewer does not
+            // own — the grid stays larger than the pane, and this engine simply CLIPPED it: the right
+            // hand side of a 120-column worker was drawn past the edge and lost. Scale to fit instead.
+            UpdateRenderScale(finalSize);
         }
 
         return result;
     }
+
+    /// <summary>
+    /// The uniform factor that fits the daemon's authoritative grid into this pane — <c>1.0</c>
+    /// whenever it already fits, so an ordinary terminal is never magnified or softened. See the
+    /// matching comment in <c>TerminalControl</c>: scaling only ever shrinks.
+    /// </summary>
+    private void UpdateRenderScale(Size size)
+    {
+        var previous = _renderScale;
+        if (_cellWidth <= 0 || _cellHeight <= 0 || _model.Cols <= 0 || _model.Rows <= 0
+            || size.Width <= 0 || size.Height <= 0)
+        {
+            _renderScale = 1.0;
+        }
+        else
+        {
+            var scaleX = size.Width / (_model.Cols * _cellWidth);
+            var scaleY = size.Height / (_model.Rows * _cellHeight);
+            _renderScale = Math.Max(MinRenderScale, Math.Min(1.0, Math.Min(scaleX, scaleY)));
+        }
+
+        if (_renderScale != previous)
+        {
+            // The IME anchors on a cell rect that is expressed in scaled pixels, so a scale change
+            // moves the composition window even though the cursor has not moved.
+            _ime.NotifyCursorMoved();
+            InvalidateVisual();
+        }
+    }
+
+    /// <summary>Lower bound on <see cref="_renderScale"/>: a pane arranged at a near-zero size
+    /// mid-layout (a collapsed dock, a tab swapping in) is a blank flash, not information.</summary>
+    private const double MinRenderScale = 0.2;
 
     // ---- rendering ----
 
@@ -210,7 +258,15 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
         context.FillRectangle(new SolidColorBrush(Color.FromUInt32(background)), new Rect(Bounds.Size));
 
         _renderSnapshot ??= BuildRenderSnapshot();
-        context.Custom(new GridDrawOperation(new Rect(Bounds.Size), _renderSnapshot, _glyphs));
+
+        // MG-24: one transform for the whole grid, so the draw op keeps working in unscaled cell
+        // units and there is no second set of metrics to keep in step. The op leases the SKCanvas,
+        // whose matrix already carries this transform, so nothing inside it changes. Its bounds are
+        // the UNSCALED grid — the transform is what maps them onto the pane.
+        using var scaled = context.PushTransform(Matrix.CreateScale(_renderScale, _renderScale));
+        var grid = new Rect(
+            0, 0, Bounds.Size.Width / _renderScale, Bounds.Size.Height / _renderScale);
+        context.Custom(new GridDrawOperation(grid, _renderSnapshot, _glyphs));
     }
 
     private void RebuildRenderSnapshotAndInvalidate()
@@ -526,8 +582,13 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
 
     private (int Row, int Col) CellAt(Point position)
     {
-        var col = Math.Clamp((int)(position.X / _cellWidth), 0, Math.Max(0, _model.Cols - 1));
-        var row = Math.Clamp((int)(position.Y / _cellHeight), 0, Math.Max(0, _model.Rows - 1));
+        // MG-24: the pointer arrives in pane pixels, the grid is drawn through _renderScale — undo
+        // it before dividing into cells, or a selection on a scaled-down worker lands on the wrong
+        // cell (increasingly wrong toward the right and bottom edges).
+        var x = position.X / _renderScale;
+        var y = position.Y / _renderScale;
+        var col = Math.Clamp((int)(x / _cellWidth), 0, Math.Max(0, _model.Cols - 1));
+        var row = Math.Clamp((int)(y / _cellHeight), 0, Math.Max(0, _model.Rows - 1));
         return (row, col);
     }
 
@@ -541,8 +602,13 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
         RebuildRenderSnapshotAndInvalidate();
     }
 
+    /// <summary>The cursor cell in PANE pixels — where the IME must place its composition window.
+    /// MG-24: scaled, because that is where the cell is actually drawn.</summary>
     internal Rect CursorCellRect() => new(
-        _model.CursorCol * _cellWidth, _model.CursorRow * _cellHeight, _cellWidth, _cellHeight);
+        _model.CursorCol * _cellWidth * _renderScale,
+        _model.CursorRow * _cellHeight * _renderScale,
+        _cellWidth * _renderScale,
+        _cellHeight * _renderScale);
 
     /// <summary>Minimal IME client: composition anchors at the cursor cell; the preedit renders as
     /// an overlay; committed text flows through the normal <see cref="OnTextInput"/> path once.</summary>
