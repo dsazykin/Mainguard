@@ -31,6 +31,45 @@ public interface IAgentService
     /// <summary>End task: reject the agent's work and tear its sandbox down. The branch is
     /// kept until teardown (V-5 — nothing is silently lost); UI confirms before calling.</summary>
     Task EndAgentAsync(string agentId);
+
+    /// <summary>
+    /// Records the human's own name for an agent, or clears it when <paramref name="name"/> is blank.
+    /// Returns the name as stored — trimmed, newline-collapsed and length-capped — or empty when it was
+    /// cleared, so a caller renders what was really kept rather than what was typed.
+    ///
+    /// <para>Purely local: an agent's name is a label on a row, not something the daemon or the agent
+    /// itself has any use for. The default does nothing and reports that it stored nothing.</para>
+    /// </summary>
+    string RenameAgent(string agentId, string? name) => string.Empty;
+
+    /// <summary>
+    /// <b>Deletes an agent and its work.</b> Stops the jail, removes the worktree, drops the merge-queue
+    /// entry, and deletes <c>refs/heads/agent/&lt;id&gt;</c>.
+    ///
+    /// <para>This is not a stronger <see cref="EndAgentAsync"/>. Ending keeps the branch, because that
+    /// ref is the only name the agent's commits have; this destroys it. Callers MUST confirm with a
+    /// human first, and the confirmation has to say that the commits go — a dialog that only says "are
+    /// you sure" is not consent to losing work.</para>
+    /// </summary>
+    /// <returns>What was destroyed, including the deleted branch's sha — the one handle left on those
+    /// commits, since the mirror's reflog still holds them until it expires.</returns>
+    Task<AgentDeletion> DeleteAgentAsync(string agentId) =>
+        Task.FromResult(AgentDeletion.Refused("this build cannot delete agents"));
+}
+
+/// <summary>What <see cref="IAgentService.DeleteAgentAsync"/> actually did.</summary>
+/// <param name="Deleted">True only when the agent is really gone.</param>
+/// <param name="Reason">Why not, verbatim for display; empty on success. A refusal is an ordinary
+/// answer here — "it is already gone", "the container engine is unreachable" — not an exception.</param>
+/// <param name="BranchDeleted">Whether <c>refs/heads/agent/&lt;id&gt;</c> was really removed. Reported
+/// apart from <paramref name="Deleted"/> because an agent that never published has no branch to delete,
+/// and that is a success with nothing destroyed rather than a partial failure.</param>
+/// <param name="DeletedBranchSha">What the deleted branch pointed at, empty when none was. The mirror's
+/// reflog still holds it, so this is what makes a mistaken delete recoverable at all.</param>
+public sealed record AgentDeletion(
+    bool Deleted, string Reason, bool BranchDeleted, string DeletedBranchSha)
+{
+    public static AgentDeletion Refused(string reason) => new(false, reason, false, string.Empty);
 }
 
 /// <summary>

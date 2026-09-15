@@ -95,6 +95,14 @@ public static class ProComposition
     /// off the desktop lifetime). No-op until wired / when no shell is present.</summary>
     public static Action<string, bool> ShowShellToast { get; set; } = static (_, _) => { };
 
+    /// <summary>
+    /// Put text on the system clipboard. A seam for the same reason <see cref="ShowShellToast"/> is:
+    /// Avalonia resolves the clipboard off a <c>TopLevel</c>, and a view model has no window. No-op
+    /// until wired, and in headless runs — a copy that cannot happen is a copy that did not happen,
+    /// never an exception thrown out of a menu click.
+    /// </summary>
+    public static Func<string, Task> CopyToClipboard { get; set; } = static _ => Task.CompletedTask;
+
     /// <summary>Force-reprovision every sandbox jail image — (log, progress, force). A pure Pro-UI
     /// capability (no shell dependency), so it defaults to <see cref="SandboxImageInstaller.RunAsync"/>
     /// here rather than needing the head to wire it (step 2f).</summary>

@@ -26,6 +26,23 @@ service AgentService {
   // As with DiscardEntry there is also no actor field: the resuming identity is derived daemon-side.
   rpc ResumeAgent(ResumeAgentRequest) returns (ResumeAgentResponse);
   rpc StopAgent(StopAgentRequest) returns (StopAgentResponse);
+  // Delete an agent OUTRIGHT: stop its jail, remove its worktree and per-agent repository, drop its
+  // merge-queue entry, and delete refs/heads/agent/<id> from the mirror.
+  //
+  // It is a different act from StopAgent, not a stronger flag on it. A stop ENDS THE SESSION and
+  // deliberately keeps the branch, because that ref is the only name the agent's commits have — the
+  // documented end of a worker's life is "commit, report, stop", and its work stays reachable. This
+  // deletes the work. So it exists as its own method for the same enforcement reason ResumeAgent does:
+  // RoleInterceptor denies by METHOD, and destroying a co-tenant's commits is strictly the worst power
+  // in this service — an agent able to reach it could erase the evidence of work it competes with, or
+  // simply delete a rival's branch. It is denied to the coordinator role.
+  //
+  // The response reports the branch sha that was destroyed rather than just a bool. That sha is the
+  // only handle left on the deleted commits (they remain in the mirror's reflog until it expires), so a
+  // human who deletes the wrong agent has something to recover from; a delete that says only "done"
+  // leaves them nothing. Refusal-as-response, never a status code: "this agent is already gone" and
+  // "the daemon could not reach Docker" are different answers and both are ordinary.
+  rpc DeleteAgent(DeleteAgentRequest) returns (DeleteAgentResponse);
   // Human per-agent pause/resume (docker pause/unpause on the agent's jail). Distinct from the kill
   // switch: not containment — no terminal lock, one agent, recoverable in place. "Unpause" rather
   // than "Resume" because ResumeAgent is the stranded-entry adoption above. A human pause is STICKY:
@@ -181,6 +198,27 @@ message UnpauseAgentResponse {
 
 message StopAgentRequest {
   string agent_id = 1;
+}
+
+message DeleteAgentRequest {
+  // Both halves of the key, because the daemon's worktree and branch operations are per (repo, agent)
+  // — an agent id alone names a session, not the repository whose mirror carries its branch.
+  string repo_handle = 1;
+  string agent_id = 2;
+}
+
+message DeleteAgentResponse {
+  // True only when the agent is really gone: jail stopped (or already absent), worktree removed, queue
+  // entry dropped. False with a reason is an ordinary answer, not an error.
+  bool deleted = 1;
+  string reason = 2;
+  // Whether refs/heads/agent/<id> was actually removed from the mirror. Reported separately from
+  // `deleted` because the two can honestly differ: an agent whose branch was never published has
+  // nothing to delete, and that is a success with no branch — not a partial failure.
+  bool branch_deleted = 3;
+  // The sha the deleted branch pointed at, empty when no branch was deleted. The mirror's reflog still
+  // holds it until expiry, so this is the one thing that makes a mistaken delete recoverable.
+  string deleted_branch_sha = 4;
 }
 
 message StopAgentResponse {
