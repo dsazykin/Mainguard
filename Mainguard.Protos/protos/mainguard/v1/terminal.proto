@@ -55,14 +55,21 @@ message TerminalOutput {
 //
 // A `grid` client never needed it (every GridUpdate carries cols/rows) but a raw
 // client had no way to learn the size at all, so it assumed its own pane was
-// authoritative. For a managed worker that assumption is simply false: its
-// terminal is input-locked (P2-14), F64 therefore drops the viewer's Resize
-// frames, and the PTY stays at the 120x32 it was spawned with. The client parsed
-// 120-column output into a ~68-column grid with no reflow, so the CLI's
-// cursor-addressed redraws — computed for 120 columns — landed on the wrong rows
-// and overwrote each other, which is what made a worker terminal unreadable. The
-// fix is not to let a spectator reshape a session it does not own; it is to tell
-// it the truth and let it scale to fit.
+// authoritative. It is not, and there are three ways the size a client asks for
+// is not the size it gets:
+//
+//   1. the daemon CLAMPS dimensions (VtermSession.ClampDimension);
+//   2. the replay tail is raw bytes produced at the size BEFORE the resize;
+//   3. a second pane on the same session can win the last write.
+//
+// Guessing through any of those garbles the pane, because the CLI positions its
+// redraws by absolute cursor address computed for its real width: parse those at
+// a different width and they land on the wrong rows and overwrite each other.
+// That is what made a managed worker's terminal unreadable — it was stuck at the
+// 120x32 it was spawned with (P2-14 locked its terminal and F64 then refused the
+// viewer's resize) while the pane rendered ~68 columns. MG-24 narrowed F64 so a
+// locked attach DOES resize — the lock is about input, not geometry — and this
+// frame is what makes the outcome knowable either way.
 
 // The jailed CLI asked the terminal to place text on the clipboard (OSC 52). The
 // daemon decodes and forwards the SET only; a query ("?") is dropped at the
