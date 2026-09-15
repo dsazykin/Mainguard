@@ -14,6 +14,7 @@ internal sealed record ComposedSubstrateParts(
     RepoProvisioner Repos,
     WorktreeManager Worktrees,
     PackageCacheManager PackageCaches,
+    ConversationStoreManager ConversationStores,
     EgressProxyConfigurator Egress,
     DockerSandboxEngine Sandboxes,
     DockerToolchainImageBuilder ToolchainImages);
@@ -80,7 +81,26 @@ internal static class AgentEnvironmentComposition
         // the manager (not just the root) because a retired agent's cache is that agent's, and the one
         // teardown path every caller already goes through is RemoveAgentWorktree.
         var packageCaches = new PackageCacheManager(root);
-        var worktrees = new WorktreeManager(root, audit: audit, packageCaches: packageCaches);
+        // The CONVERSATION store is a sibling of caches/ under the SAME vmRoot, so it inherits the same
+        // MG-17 group-share the boot step provisions. It reaches the worktree manager for the reason the
+        // cache does — a retired agent's store is that agent's, and RemoveAgentWorktree is the one
+        // teardown path every caller already goes through — but with the OPPOSITE default about WHEN:
+        // the cache is released on the resume-rollback path too (expensive, rebuildable), while the
+        // store is released ONLY by the final, branch-deleting teardown, because a preserved branch must
+        // keep the conversation that goes with it.
+        //
+        // Composed HERE rather than in Wsl2AgentEnvironment (where the feature was first written) so the
+        // macos-host substrate gets it on the same terms: the tmpfs $HOME that loses a transcript is a
+        // property of the JAIL, which both substrates run identically.
+        // The reclaimer is the sandbox engine, which is composed further down (it needs the egress
+        // network built between here and there). Bound through the deferred forwarder rather than by
+        // reordering a sequence whose order is load-bearing.
+        DockerSandboxEngine? engineForReclaim = null;
+        var conversationStores = new ConversationStoreManager(
+            root, log: log,
+            reclaimer: new DeferredConversationStoreReclaimer(() => engineForReclaim));
+        var worktrees = new WorktreeManager(
+            root, audit: audit, packageCaches: packageCaches, conversationStores: conversationStores);
 
         // Auto-permit on install: the proxy config also permits the hosts each installed agent CLI
         // declared it needs (read fresh per spawn from the registry markers), so an installed CLI
@@ -124,13 +144,17 @@ internal static class AgentEnvironmentComposition
             // ceiling the Settings page reports as applied — so they get the daemon's log, not just a
             // comment saying the failure is tolerated.
             log: log);
+        // Closes the deferred binding above: from here the conversation store's release can remove what
+        // the jail wrote as its own uid, which this process may not.
+        engineForReclaim = sandboxes;
 
         // The per-repo toolchain layer is built through the SAME Docker client, on the VM's network —
         // deliberately not through the jail's default-deny segment, and touching no allowlist.
         var toolchainImages = new DockerToolchainImageBuilder(docker);
 
         return new ComposedSubstrateParts(
-            root, provisioner, worktrees, packageCaches, egress, sandboxes, toolchainImages);
+            root, provisioner, worktrees, packageCaches, conversationStores, egress, sandboxes,
+            toolchainImages);
     }
 
     /// <summary>Adapter id → declared egress hosts, from the bundled starter channel manifest — the

@@ -58,6 +58,7 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
             log: log);
         Repos = parts.Repos;
         PackageCaches = parts.PackageCaches;
+        ConversationStores = parts.ConversationStores;
         Worktrees = parts.Worktrees;
         Egress = parts.Egress;
         Sandboxes = parts.Sandboxes;
@@ -98,6 +99,8 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
     public Toolchains.ToolchainChannel? Toolchains { get; }
 
     public PackageCacheManager? PackageCaches { get; }
+
+    public ConversationStoreManager? ConversationStores { get; }
 
     public SyncRemote ResolveSyncRemote(string repoHash)
         => new(Wsl2SyncRemoteName, $@"{_uncPrefix}\{repoHash}.git");

@@ -250,7 +250,8 @@ public sealed class SandboxAgentLauncher
         // told the spawn succeeded. That refusal belongs to the coordinator's channel and lives in
         // AgentSpawnService.SpawnWorkerAsync, so this path keeps the behaviour it wants.
         var adapter = _adapters.TryGet(agentKind);
-        var launchCommand = adapter?.Launch;
+        // Reassigned below on the resume path, where the adapter's declared resume argv is appended.
+        IReadOnlyList<string>? launchCommand = adapter?.Launch;
 
         // The role's operating instructions, rendered once and delivered two ways — neither redundant.
         //
@@ -331,6 +332,89 @@ public sealed class SandboxAgentLauncher
                 var usage = caches.Prepare(repoHandle, agentId);
                 packageCachePath = caches.PathFor(repoHandle, agentId);
                 _log.LogInformation("package cache ready: {Path} — {Usage}", packageCachePath, usage.Describe());
+            }
+
+            // This agent's CONVERSATION store, prepared here for the same reason the cache is: mounts are
+            // fixed at container create. Two things are decided together and neither may be inferred from
+            // the other:
+            //
+            //   (a) the mounts — daemon-owned ext4 at the CLI's own $HOME paths, so the transcripts
+            //       survive a jail that dies WITHOUT a clean stop (the case a resume exists for, and the
+            //       case a harvest-on-stop design would miss entirely);
+            //   (b) whether a transcript from a PREVIOUS jail is actually there, asked BEFORE the mount is
+            //       used and answered by looking for files rather than for the directory Prepare just
+            //       created.
+            //
+            // Prepare re-asserts the no-credential-overlap invariant against the MARKER (not the reviewed
+            // manifest — the daemon spawns from the marker), and a violation is a typed failure that stops
+            // the spawn. Deliberately not caught: a conversation store that could hold a token is the one
+            // thing about this feature that must never ship degraded.
+            //
+            // NOT for a repository-less jail. That is the role-locked coordinator, and
+            // BuildCapabilityOnlyMounts gives it the read-only adapters root and the read-only IPC dir
+            // and NOTHING else on purpose: it has no writable bind mount at all, so its only writable
+            // storage is a tmpfs that dies with the container. A conversation store is by definition a
+            // READ-WRITE mount of daemon-owned disk that outlives the jail, so requesting one here would
+            // hand the one role that is deliberately denied durable storage exactly that.
+            //
+            // Found by the fail-closed assert rather than reasoned about in advance: ContainerSpecBuilder
+            // refused the spawn because the store was requested and no mount targeted it
+            // (GatewayConfinementDockerTests.ResumedJail_...). The guard worked — this is the caller
+            // being made to agree with it, not the guard being relaxed.
+            IReadOnlyList<ConversationMount>? conversationMounts = null;
+            var hasPriorConversation = false;
+            if (_environment.ConversationStores is { } conversations && adapter is not null
+                && !withoutRepositoryAccess)
+            {
+                hasPriorConversation = conversations.HasTranscripts(
+                    repoHandle, agentId, adapter.ConversationPaths);
+                conversationMounts = conversations.Prepare(
+                    repoHandle, agentId, adapter.Id, adapter.ConversationPaths, adapter.CredentialPaths);
+                if (conversationMounts.Count > 0)
+                {
+                    _log.LogInformation(
+                        "conversation store ready: paths={Paths} priorConversation={Prior}",
+                        string.Join(",", conversationMounts.Select(m => m.HomeRelativePath)), hasPriorConversation);
+                }
+            }
+
+            // THE OWNER'S ACTUAL COMPLAINT: "i think i managed to resume an agent's session, but i cant
+            // access the previous claude code conversation". A persisted transcript nobody opens does not
+            // fix it — the CLI has to be started back INTO the conversation. Two conditions, both
+            // load-bearing and neither sufficient alone:
+            //
+            //   adopt only        an ordinary spawn is new work on a new branch and must start clean.
+            //                     Resuming there would drop a fresh agent into a stranger's session.
+            //   transcript only   passing a resume flag with no prior session is a WORSE failure than not
+            //                     passing it. Measured for claude-code 2.1.228: `--continue` with no
+            //                     transcript in the cwd exits 0 and starts fresh — but that was print
+            //                     mode, and the jail runs the CLI interactively under a PTY, which was
+            //                     not measured. So the guard stands on the evidence we have rather than
+            //                     on the mode we could not test.
+            //
+            // The flag itself is the adapter's EXISTING ResumeArg — the same one BuildReattachLaunchArgv
+            // passes when a daemon restart re-binds a CLI into a jail that is still running. Deliberately
+            // not a second declaration: there the $HOME tmpfs survived and the flag alone is enough, here
+            // the jail itself is gone and the store is what makes the SAME flag mean something. One
+            // capability, two situations; two fields could only ever disagree by being wrong.
+            if (adoptExistingBranch && hasPriorConversation
+                && adapter?.ResumeArg is { Length: > 0 } resumeArg
+                && launchCommand is { Count: > 0 })
+            {
+                launchCommand = launchCommand.Append(resumeArg).ToArray();
+                _log.LogInformation(
+                    "resume: launching {Adapter} back into its previous conversation ({Args})",
+                    adapter.Id, resumeArg);
+            }
+            else if (adoptExistingBranch && adapter?.ResumeArg is { Length: > 0 })
+            {
+                // Said out loud, because "the resume worked but the conversation is gone" is exactly the
+                // report this feature exists to answer, and the operator deserves the reason in the log
+                // rather than a silent difference in behaviour between two resumes.
+                _log.LogInformation(
+                    "resume: {Adapter} starts a FRESH conversation — no transcript survives in this agent's "
+                    + "store (a jail from before conversation persistence, or a store already released)",
+                    adapter.Id);
             }
 
             // The default-deny network + allowlist proxy must exist before the jail joins the network.
@@ -436,7 +520,11 @@ public sealed class SandboxAgentLauncher
                 // Coordinator surface reports no coordinator for a repo that plainly has one.
                 AgentKind: agentKind,
                 AgentRole: agentRole,
-                AgentParentId: agentParentId), ct).ConfigureAwait(false);
+                AgentParentId: agentParentId,
+                // The conversation stores, bind-mounted at the CLI's own $HOME paths. Nothing here
+                // runs at teardown, which is the point: a crash cannot lose what was never in
+                // flight.
+                ConversationMounts: conversationMounts), ct).ConfigureAwait(false);
 
             // MG-3 (design §7, "fetch trigger: both"): from here on the daemon watches this agent's own
             // refs/heads/agent/<id> and publishes it into the mirror the moment it moves. Started only

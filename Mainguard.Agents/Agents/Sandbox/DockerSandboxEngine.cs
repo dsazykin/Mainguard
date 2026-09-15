@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Docker.DotNet;
 using Docker.DotNet.Models;
 using Mainguard.Agents.Agents.Adapters;
+using Mainguard.Agents.Agents.Bootstrap;
 using Mainguard.Git.Exceptions;
 using Mainguard.Git.Security;
 
@@ -61,7 +62,7 @@ public sealed record SandboxEngineOptions(
 /// diagnostic, no timeout, forever. Failing loudly in 30 seconds with
 /// <see cref="SandboxExecTimeoutException"/> is strictly better than that.</para>
 /// </summary>
-public sealed class DockerSandboxEngine : ISandboxEngine
+public sealed class DockerSandboxEngine : ISandboxEngine, IConversationStoreReclaimer
 {
     /// <summary>
     /// The bound on each fixed-purpose exec on the spawn path (secret write, CLI-credential restore).
@@ -193,6 +194,14 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             var missingCacheMount = !string.IsNullOrEmpty(request.PackageCachePath)
                 && (existing.Mounts is null
                     || existing.Mounts.All(m => m.Destination != PackageCachePolicy.SandboxMount));
+            // The same reasoning for the conversation stores, and here the consequence is silent rather
+            // than loud: a jail created before this feature (or before this adapter declared a path) has
+            // no store mount, and mounts are fixed at create. Reusing it would put the CLI's transcripts
+            // back on the tmpfs $HOME — which works perfectly until the container dies, which is the only
+            // moment anyone finds out.
+            var missingConversationMount = (request.ConversationMounts ?? Array.Empty<ConversationMount>())
+                .Any(c => existing.Mounts is null
+                          || existing.Mounts.All(m => m.Destination != c.SandboxTarget));
             // A jail created before the secrets moved into per-owner directories carries the old flat
             // /run/secrets tmpfs, and tmpfs entries — like mounts — are fixed at create. Reusing one
             // would leave the write path execing as a non-root owner into a directory that does not
@@ -227,7 +236,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 || !SandboxImageDigest.SameImage(existing.Image, request.ImageRef)
                 || missingBareMount || missingAgentRepoMount || writableMirror || missingLayoutPins
                 || stalePin || wrongNetwork
-                || missingCacheMount || posture.MustRecreate)
+                || missingCacheMount || missingConversationMount || posture.MustRecreate)
             {
                 await _docker.Containers.RemoveContainerAsync(existing.ID,
                     new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
@@ -248,6 +257,11 @@ public sealed class DockerSandboxEngine : ISandboxEngine
 
                     if (!string.Equals(existing.State, "running", StringComparison.OrdinalIgnoreCase))
                         await _docker.Containers.StartContainerAsync(existing.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
+
+                    // Before ANY write into $HOME. A restarted jail's tmpfs came back empty, so the
+                    // runtime re-created this jail's mount parents as root exactly as on a fresh
+                    // create — and the credential restore below writes into one of them.
+                    await RepairConversationMountParentsAsync(existing.ID, request, ct).ConfigureAwait(false);
 
                     // F24: the jail's secrets, written FIRST and unconditionally — before the login and
                     // settings restores below, which are the two things this branch already did.
@@ -276,6 +290,11 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                     // failed VM boot can leave the bind mount pointing at a directory that is gone, and a
                     // reused jail is exactly the path that never re-checks anything.
                     await AssertPackageCacheUsableAsync(existing.ID, request, ct).ConfigureAwait(false);
+                    // Same reason, same path: the mount survived (mounts are fixed at create),
+                    // but the tree behind it may not have — a manual cleanup, a half-restored VM.
+                    // A conversation store that silently is not there loses HISTORY rather than
+                    // failing a build, so it is measured here too.
+                    await AssertConversationStoresUsableAsync(existing.ID, request, ct).ConfigureAwait(false);
                     return new SandboxHandle(existing.ID, Reused: true);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
@@ -317,7 +336,8 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // as itself rather than as an anonymous worker.
             AgentKind: request.AgentKind,
             AgentRole: request.AgentRole,
-            AgentParentId: request.AgentParentId);
+            AgentParentId: request.AgentParentId,
+            ConversationMounts: request.ConversationMounts);
 
         var create = ContainerSpecBuilder.Build(spec);
         for (var attempt = 1; ; attempt++)
@@ -340,7 +360,19 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                         + $"{ContainerSpecBuilder.WorkspaceTarget} but does not resolve inside the container");
                 }
 
+                // Before ANY write into $HOME: the runtime created this jail's mount parents as root,
+                // and the credential restore below writes into one of them.
+                await RepairConversationMountParentsAsync(created.ID, request, ct).ConfigureAwait(false);
+
                 await AssertPackageCacheUsableAsync(created.ID, request, ct).ConfigureAwait(false);
+
+                // And the conversation stores, before the CLI can write a single line into the
+                // wrong place. This one belongs in the probe set for a sharper reason than the
+                // cache does: the store is DELETED on release and re-created by Prepare, which is
+                // precisely the delete-and-recreate pattern that produced the stale-inode bind in
+                // the first place (phase-3 decisions §27.3) — so it is in the rebuild-once class
+                // below, not merely reported.
+                await AssertConversationStoresUsableAsync(created.ID, request, ct).ConfigureAwait(false);
 
                 await WriteSecretFileAsync(created.ID, credentials.CredentialPath,
                     Encoding.UTF8.GetBytes(envContent), credentials.AgentUid, ct).ConfigureAwait(false);
@@ -353,6 +385,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             }
             catch (Exception ex) when (attempt == 1
                 && ex is StaleBindMountException or PackageCacheUnavailableException
+                    or ConversationStoreUnavailableException
                 && !ct.IsCancellationRequested)
             {
                 await TryForceRemoveAsync(created.ID).ConfigureAwait(false);
@@ -844,6 +877,210 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         {
             throw new PackageCacheUnavailableException(
                 PackageCachePolicy.SandboxMount, request.PackageCachePath,
+                failure + $" (probe exit {probe.ExitCode.ToString(CultureInfo.InvariantCulture)}, "
+                + $"stderr: {probe.Stderr.Trim()})");
+        }
+    }
+
+    /// <summary>
+    /// Proves, in the started container, that every requested conversation store is present and writable
+    /// by the agent uid; throws <see cref="ConversationStoreUnavailableException"/> otherwise.
+    ///
+    /// <para><b>Why this is fail-closed rather than a warning.</b> The store's mount target sits under the
+    /// tmpfs <c>$HOME</c> — that is where the CLI reads it — so the failure mode of a mount that did not
+    /// take is not an error at all: the CLI happily writes its transcripts to the tmpfs and everything
+    /// works for the entire session. The loss is discovered later, by the person who came back for the
+    /// conversation, with no evidence anywhere of when it stopped working. A feature whose breakage is
+    /// invisible until it matters must refuse loudly at the one moment it can be observed.</para>
+    ///
+    /// <para>A jail with no requested stores is not probed: it has none by design, and
+    /// <see cref="ContainerSpecBuilder"/> has already refused any spec that claims one without mounting
+    /// it.</para>
+    /// </summary>
+    /// <summary>
+    /// Gives the agent back the mount-parent directories the runtime created as <c>root</c> on its
+    /// behalf — <c>/home/agent/.claude</c> for a <c>.claude/projects</c> store — before anything else
+    /// writes into the jail's <c>$HOME</c>.
+    ///
+    /// <para><b>This is a spawn-blocking repair, not a tidy-up.</b> The tmpfs <c>$HOME</c> is mode 0700
+    /// owned by the agent, and a root-owned directory inside it is one the agent cannot write. For
+    /// claude-code that directory is <c>.claude</c>, which is where the CLI credential restore puts
+    /// <c>.credentials.json</c> — so without this, declaring <c>conversationPaths</c> makes every jail of
+    /// that CLI fail its credential restore and the spawn dies with a permission error that names the
+    /// credential and never mentions the conversation store that caused it.</para>
+    ///
+    /// <para>Non-recursive, and deliberately never touching the mount target itself: that is the
+    /// daemon-owned store, whose ownership is the MG-17 group share the boot step provisions. Only the
+    /// intermediate directories the runtime invented are re-owned.</para>
+    ///
+    /// <para>Best-effort by design. A <c>chown</c> that cannot run leaves the jail exactly as it was, and
+    /// the failure surfaces at the restore or the probe — both of which fail closed and name a real
+    /// symptom — rather than here, where it would turn a recoverable ownership quirk into a refused
+    /// spawn on substrates that never had the problem.</para>
+    /// </summary>
+    /// <summary>
+    /// <see cref="IConversationStoreReclaimer.TryEmpty"/> — empties a conversation store of the files the
+    /// jail wrote as its own uid, by running <c>find -mindepth 1 -delete</c> as root in a throwaway
+    /// container with that store bind-mounted, and nothing else.
+    ///
+    /// <para><b>The shape is chosen to keep this from becoming a general primitive.</b> The store path is
+    /// validated HERE against <see cref="ConversationStorePolicy.IsInsideAConversationTree"/> and then
+    /// used only as a MOUNT SOURCE — no part of it is ever interpolated into the command, which names a
+    /// fixed in-container path. So there is no name for a caller to influence and nothing to escape. The
+    /// container gets no network, the pinned jail base image, and no other mount. It does not remove the
+    /// directory itself either: the caller owns that one and <c>rmdir</c>s it, so "delete a directory" is
+    /// not a capability this grants at all.</para>
+    ///
+    /// <para>Synchronous because the teardown it serves is (<c>WorktreeManager.RemoveAgentWorktree</c>),
+    /// and bounded so a wedged engine cannot hang a stop. False on any failure, which the caller reports
+    /// rather than swallows.</para>
+    /// </summary>
+    public bool TryEmpty(string hostPath)
+    {
+        if (string.IsNullOrWhiteSpace(hostPath) || !ConversationStorePolicy.IsInsideAConversationTree(hostPath))
+        {
+            _log?.Invoke(
+                $"refusing to reclaim '{hostPath}': it is not inside a "
+                + $"'{ConversationStorePolicy.ConversationsDirectoryName}/' tree. This step runs as root, "
+                + "so it may only ever be pointed at a conversation store.");
+            return false;
+        }
+
+        if (!Directory.Exists(hostPath))
+        {
+            return true;
+        }
+
+        const string target = "/mnt/mainguard-conversation-store";
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            var created = _docker.Containers.CreateContainerAsync(new CreateContainerParameters
+            {
+                Image = SandboxImages.AgentBase.ImageTag,
+                // No name is passed in: the store is the mount, and the command names only `target`.
+                Cmd = new List<string> { "find", target, "-mindepth", "1", "-delete" },
+                User = "0",
+                NetworkDisabled = true,
+                HostConfig = new HostConfig
+                {
+                    AutoRemove = false,
+                    NetworkMode = "none",
+                    Mounts = new List<Mount>
+                    {
+                        new() { Type = "bind", Source = hostPath, Target = target, ReadOnly = false },
+                    },
+                },
+            }, cts.Token).GetAwaiter().GetResult();
+
+            try
+            {
+                _docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), cts.Token)
+                    .GetAwaiter().GetResult();
+                _docker.Containers
+                    .WaitContainerAsync(created.ID, cts.Token)
+                    .GetAwaiter().GetResult();
+            }
+            finally
+            {
+                TryForceRemoveAsync(created.ID).GetAwaiter().GetResult();
+            }
+
+            // The verdict is the tree, not the exit code: `find -delete` reports a non-zero status for a
+            // path it raced with, and what the caller needs to know is whether anything is still there.
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke(
+                $"could not reclaim the conversation store at '{hostPath}': {ex.GetType().Name}: "
+                + $"{ex.Message}. The store is still on disk and the caller will report it.");
+            return false;
+        }
+    }
+
+    private async Task RepairConversationMountParentsAsync(
+        string containerId, SandboxSpawnRequest request, CancellationToken ct)
+    {
+        var stores = request.ConversationMounts ?? Array.Empty<ConversationMount>();
+        if (stores.Count == 0)
+            return;
+
+        var parents = ConversationStorePolicy.MountParentDirectories(stores.Select(s => s.SandboxTarget));
+        if (parents.Length == 0)
+            return;
+
+        var owner = string.Create(CultureInfo.InvariantCulture, $"{request.AgentUid}:{request.AgentUid}");
+        var cmd = new List<string>
+        {
+            "sh", "-c",
+            // Positional, never interpolated: $1 is the owner, the rest are the directories.
+            "owner=\"$1\"; shift; for d in \"$@\"; do [ -d \"$d\" ] && chown \"$owner\" \"$d\"; done; exit 0",
+            "sh", owner,
+        };
+        cmd.AddRange(parents);
+
+        try
+        {
+            using var exec = new CancellationTokenSource(SecretCleanupTimeout);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, exec.Token);
+            var created = await _docker.Exec.ExecCreateContainerAsync(containerId, new ContainerExecCreateParameters
+            {
+                User = "0",
+                AttachStdout = true,
+                AttachStderr = true,
+                Cmd = cmd,
+            }, linked.Token).ConfigureAwait(false);
+
+            using var stream = await _docker.Exec
+                .StartAndAttachContainerExecAsync(created.ID, tty: false, linked.Token).ConfigureAwait(false);
+            await stream.ReadOutputToEndAsync(linked.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke(
+                $"conversation mount parents could not be re-owned to {owner} in {containerId}: "
+                + $"{ex.GetType().Name}: {ex.Message}. The credential restore or the store probe will "
+                + "report the concrete symptom if this mattered.");
+        }
+    }
+
+    private async Task AssertConversationStoresUsableAsync(
+        string containerId, SandboxSpawnRequest request, CancellationToken ct)
+    {
+        var stores = request.ConversationMounts ?? Array.Empty<ConversationMount>();
+        if (stores.Count == 0)
+            return;
+
+        var targets = stores.Select(s => s.SandboxTarget).ToArray();
+        var sources = string.Join(", ", stores.Select(s => s.HostPath));
+
+        SandboxExecResult probe;
+        try
+        {
+            probe = await ExecAsync(containerId, ConversationStorePolicy.WritabilityProbe(targets), ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new ConversationStoreUnavailableException(
+                ConversationStorePolicy.ConversationsDirectoryName, sources,
+                $"the in-jail probe could not be run at all: {ex.Message}");
+        }
+
+        var failure = ConversationStorePolicy.DescribeProbeFailure(probe.Stdout, probe.ExitCode);
+        if (failure is not null)
+        {
+            throw new ConversationStoreUnavailableException(
+                ConversationStorePolicy.ConversationsDirectoryName, sources,
                 failure + $" (probe exit {probe.ExitCode.ToString(CultureInfo.InvariantCulture)}, "
                 + $"stderr: {probe.Stderr.Trim()})");
         }

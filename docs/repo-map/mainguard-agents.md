@@ -538,8 +538,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       collaborators now come from `AgentEnvironmentComposition`, and what stays here is exactly the
       WSL2-specific part: the UNC prefix and the `WslAdapterInstallHost`-backed toolchain channel).
     - `AgentEnvironmentComposition.cs` (the composition every substrate shares — provisioner,
-      worktrees, package caches, egress, hardened sandbox engine, toolchain-image builder — extracted
-      from the WSL2 ctor when the macos-host substrate arrived; the MG-3/MG-43/MG-17 and
+      worktrees, package caches, **conversation stores** (whose reclaimer is the sandbox engine, bound
+      through `DeferredConversationStoreReclaimer` because the engine is composed after the store), egress, hardened sandbox engine,
+      toolchain-image builder — extracted from the WSL2 ctor when the macos-host substrate arrived. The
+      conversation store is composed HERE rather than per-substrate because the tmpfs `$HOME` that loses
+      a transcript is a property of the JAIL, which both substrates run identically; the MG-3/MG-43/MG-17 and
       allowlist-persistence invariants are documented HERE and bind both substrates. The Docker
       client is lazily created via `DockerEndpointResolver`, so construction needs no live engine).
     - `MacHostAgentEnvironment.cs` (the macos-host impl: `SubstrateId="macos-host"`, capabilities
@@ -1625,6 +1628,45 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `SandboxExecTimeoutException`, because an endpoint that accepts an exec attach and never delivers
       stdin otherwise hangs the spawn forever with nothing to diagnose; on expiry the staged `.partial` is
       unlinked in-jail and, on the create path, the container it was going into is destroyed.
+    - `ConversationStorePolicy.cs` + `ConversationStoreManager.cs` — **the per-agent conversation store**,
+      the answer to the owner's live-testing report *"i think i managed to resume an agent's session, but
+      i cant access the previous claude code conversation"*. The jail's `$HOME` is the same 256 MiB tmpfs
+      the package cache exists to escape, and Claude Code keeps its transcripts under
+      `$HOME/.claude/projects/<escaped-cwd>/<session-uuid>.jsonl` — so a resume adopted the branch and the
+      id, spawned a NEW container, and the CLI came up with no memory of the work the resume existed to
+      recover. **This is deliberately NOT built like `credentialPaths`' harvest-on-stop round trip, and
+      that is the whole design decision.** The event that makes you need the conversation back is the jail
+      dying WITHOUT a clean stop (a VM crash, a `docker rm`, a WSL restart) — the literal definition of a
+      stranded queue entry — and harvest runs inside `StopAsync`, which in that case never runs at all: a
+      harvest-based store would pass every test anyone wrote for it (all of which stop the agent) and fail
+      in every situation a user actually hits. So the declared paths are BIND-MOUNTED read-write from
+      `<vmRoot>/conversations/<repoHash>/<agentId>/<path>` (a sibling of `caches/`, in
+      `MountOwnershipScript`'s group-share loop, reusing `PackageCachePolicy.DecideGrant` rather than
+      copying it because the grant is a property of the MACHINE) straight onto the CLI's own `$HOME` path,
+      so nothing runs at teardown because nothing has to be copied. The mount lines up across jails
+      because every jail's `WorkingDir` is the fixed `/workspace`, so the CLI's escaped-cwd directory is
+      `-workspace` in all of them. **The one hard invariant is that a conversation path may never contain,
+      or be contained by, a declared credential path** — prefix containment, not equality, because the
+      accident being prevented is a manifest declaring `.claude`, which holds the transcripts AND
+      `.credentials.json`. It is a typed `ConversationStoreOverlapException` at BOTH points that matter:
+      `AdapterManifest.Parse` (so a bad edit fails CI) and `ConversationStoreManager.Prepare` on the spawn
+      path (because the daemon spawns from an install MARKER in a user-writable VM path, not from the
+      reviewed manifest), refused rather than filtered so the feature can never look configured while
+      persisting a subset nobody chose. `ContainerSpecBuilder.AssertConversationStores` re-asserts on the
+      finished request that the mount's SOURCE is outside `$HOME` and outside both spellings of the
+      worktree (the *target* is under `$HOME` by necessity — unlike a package cache, a CLI's transcript
+      directory is not configurable), that the target is not under `/workspace`, and that the mount is
+      read-write; `DockerSandboxEngine` re-proves every store from INSIDE the started container on the
+      create AND reuse paths, fail-closed, because a mount that did not take produces no error at all —
+      the CLI just writes to the tmpfs and the loss surfaces only when somebody comes back for the
+      history. `HasTranscripts` asks about FILES, never the directory (`Prepare` creates the directory on
+      every spawn, so a directory check would be permanently true), and it is what gates the adapter's
+      declared `resumeArgs` on the ADOPT path. `Release` runs from `RemoveAgentWorktree` ONLY — the
+      teardown that also deletes the branch — and pointedly not from `RemoveAgentWorktreeKeepingBranch`,
+      the resume rollback: keeping a store past its branch would let a recurring id (the intake's `pr-<n>`)
+      resume into a previous pull-request author's session. No budget and no eviction, unlike the package
+      cache, because a transcript is the one thing here that nothing can rebuild. See
+      [`docs/design/agent-conversation-persistence.md`](../design/agent-conversation-persistence.md).
   - **`Agents/` (P2-08 AI gateway + admission + swarm reconciler — daemon-side, no UI).**
     - `TokenBucket.cs` (pure, injected-clock: two coupled requests/min + tokens/min buckets seeded from
       P2-01 `KeyHealth`; continuous fractional refill; FIFO waiter queue granted in order via `Pump`;
@@ -2689,10 +2731,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       probe, so a marker means 'runnable' — read **fresh per call** (installs happen while the daemon
       runs; caching would make a new CLI unlaunchable until restart) to answer `TryGetLaunch(agentKind)` →
       the argv the daemon execs in the jail. This is the `agentKind`→CLI wiring `SandboxAgentLauncher`
-      used to ignore. The marker also carries `credentialPaths` and `settingsPaths` across the host/VM
-      boundary — the ONLY declarations of what the daemon may restore into / harvest from a jail — plus
-      `instructionsFile`/`systemPromptArg`, (defect C2) `preApprovedCommandArg`/
-      `preApprovedCommandFormat`, and the adoption re-bind's `resumeArg`. **Defect D5a — the marker is no
+      used to ignore. The marker also carries `credentialPaths`, `settingsPaths` and `conversationPaths`
+      across the host/VM boundary — the ONLY declarations of what the daemon may restore into / harvest
+      from / bind-mount into a jail, and the list the spawn path re-checks the no-credential-overlap
+      invariant against, because a marker is an ordinary file in a VM path and may have been written by
+      an older build — plus `instructionsFile`/`systemPromptArg`, (defect C2) `preApprovedCommandArg`/
+      `preApprovedCommandFormat`, and `resumeArg`, which serves BOTH the adoption re-bind (jail still
+      running, tmpfs `$HOME` survived) and the stranded-entry resume (jail gone, `conversationPaths` is
+      what kept the transcript). **Defect D5a — the marker is no
       longer a second source of truth.**
       Those fields being null on an older marker was documented as "re-install to backfill", and on a real
       install nobody does: `~/mainguard/adapters/registry/claude-code.json` carried none of
@@ -2763,7 +2809,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       where the CLI keeps its interactive-login state (validated by
       `AdapterManifest.IsHomeRelativeFilePath`: relative, no `..`/`~`/backslash — the ONE gate every
       restore/harvest path trusts), carried on the install marker so the daemon restores them into the
-      jail's tmpfs home at spawn and harvests them at stop (the CLI login round-trip);
+      jail's tmpfs home at spawn and harvests them at stop (the CLI login round-trip); and later
+      `conversationPaths` + `resumeArgs` — the $HOME-relative DIRECTORIES holding the CLI's conversation
+      transcripts, and the argv that puts the operator back into them on a resume. Those two are
+      deliberately NOT harvested: they are bind-mounted from daemon-owned ext4, because the jail dying
+      without a clean stop is the case they exist for and a harvest never runs then
+      (`ConversationStorePolicy`, `docs/design/agent-conversation-persistence.md`). `Parse` refuses a
+      `conversationPaths` entry that contains — or is contained by — a `credentialPaths` entry, which is
+      why claude-code declares `.claude/projects` and never `.claude`;
     - `IAdapterInstallHost` gained `StagePayloadAsync` and `AdapterChannel` expands the **`{payload}`**
       token to the staged, hash-verified file — **the install must consume the bytes the pin covered**,
       never re-resolve a registry (that would make the pin decorative). **Honest caveat:** npm still

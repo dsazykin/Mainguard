@@ -1349,6 +1349,40 @@
   "this rig never injects one".) Paired with
   `OnceTheCoordinatorIsGone_TheOtherKindsKey_IsDroppedWithItsLastSession`. Mutation watched red: the
   coordinator guard removed — the worker boots with a null key.
+- **`Mainguard.Tests/AdapterConversationPathsTests.cs`** — the manifest half of the conversation store,
+  and above all its ONE invariant: a declared `conversationPaths` entry may never contain, or be
+  contained by, a declared `credentialPaths` entry. Every case is about CONTAINMENT rather than equality,
+  because the accident being prevented is a manifest declaring `.claude` — where the transcripts live,
+  and which also holds `.credentials.json` — which an equality-only check waves through. Both directions
+  are covered, a sibling sharing a prefix (`.claude-backup`) is explicitly NOT an overlap so the guard
+  cannot be dismissed as noisy, and the same rule is asserted through `ConversationStorePolicy` directly
+  because the SPAWN path reads an install marker rather than this file. Plus: the bundled `claude-code`
+  really declares `.claude/projects` and `--continue`; the four CLIs nobody verified really declare
+  NOTHING (honest emptiness, asserted — a guessed path persists nothing while looking configured); and
+  a `resumeArg` without `conversationPaths` is ACCEPTED, deliberately — the same flag is what
+  `BuildReattachLaunchArgv` passes when a daemon restart re-binds a CLI into a jail that is still
+  running, where the tmpfs `$HOME` never died and no store is involved. Adding the new test set also
+  pins the mount-PARENT repair: the runtime invents `/home/agent/.claude` as root, which is where the
+  credential restore writes, so a shared parent is an ownership question the containment rule neither
+  catches nor should be widened to catch.
+- **`Mainguard.Tests/ContainerSpecConversationStoreTests.cs`** — the store as it appears on the create
+  request the daemon really POSTs, one property per test. The two load-bearing ones are about the mount's
+  SOURCE, not its target: not inside the tmpfs `$HOME` (the target is under `$HOME` by necessity, since a
+  CLI's transcript directory is not configurable, so the source is the only thing that makes the feature
+  real) and not inside either spelling of the worktree (or the operator's whole session is one
+  `git add -A` from `main`). Plus read-write, bind-not-volume, both directions of the self-consistency
+  rule, and refusals for a source outside any `conversations/` tree and for a drvfs source.
+- **`Mainguard.Tests/ConversationStoreManagerTests.cs`** — the IO half over real temp directories:
+  `(repo, agent)` scoping (`pr-7` in two repos gets two stores — the collision fixed four times in this
+  codebase), idempotence across a respawn (the second jail MUST land on the first's directory or a resume
+  mounts an empty store), the refusal leaving no credential-shaped directory behind, and the resume guard
+  asking about FILES rather than the directory `Prepare` just created. `Release` drops one pair's store
+  and nothing else — including the same id in another repo.
+- **`Mainguard.Tests/ConversationStoreProbeTests.cs`** — the in-jail probe's pure parser, which carries
+  more weight than its size: because the target sits under the tmpfs `$HOME`, a mount that did not take
+  produces no error at all and the loss surfaces only when somebody comes back for the history. An absent
+  frame is a FAILURE, never a pass; the three verdicts cannot be read out of one another; and the probe
+  refuses to be built with no targets, since a probe over nothing prints OK and proves nothing.
 - **`Mainguard.Tests/CliSettingsStoreTests.cs`** — the host store's scope decision, made testable:
   `ApprovingSomethingInOneRepository_DoesNotApproveItInAnother` is the per-repo rule itself; plus
   per-adapter isolation, a blank scope never acting as a wildcard, merge-not-replace on save, an empty
@@ -1535,6 +1569,47 @@
   starting a jail on a fresh empty branch under the old name. Each test stops the jail it leaves
   running, because the class's own cleanup runs only after every test in it and a jail left standing is
   one the next spawn competes with for admission headroom and the bridge pool.
+  own gate**, and a `queue_entry_resumed` audit event naming the actor and the from-state. The second
+  case is the honest refusal: after a clean `StopAgent` the branch is gone, so the resume must refuse and
+  build nothing rather than start a jail on a fresh empty branch under the old name.
+- **`Mainguard.Server.Tests/ConversationReclaimRefusalTests.cs`** — the one assertion that keeps the
+  conversation-store reclaim from becoming a general "delete any host path as root" primitive.
+  `DockerSandboxEngine.TryEmpty` runs `find -mindepth 1 -delete` as ROOT in a container with the named
+  directory bind-mounted, so every path outside a `conversations/` tree — a mirror, a worktree, a cache,
+  `$HOME`, `/`, empty — must be refused BEFORE any container starts, and a store that does not exist is
+  already empty rather than a container start. Needs no Docker daemon: the refusal precedes the call.
+- **`Mainguard.Server.Tests/Agents/ConversationPersistenceDockerTests.cs`** (`RequiresDocker`) — the
+  decisive leg for the **conversation store**, and it models the CRASH rather than the stop, on purpose:
+  the container is removed through the engine and the session record dropped with no `StopAgent`
+  anywhere, because that is the only state the store's whole design turns on (a harvest-on-stop store
+  would pass a politely-torn-down test and fail every real one). A CLI writes a nonce transcript from
+  INSIDE a real jail at the declared path; after the crash the bytes are asserted on the daemon's own
+  ext4; the resume then has to produce a different container that reads the same bytes back at the same
+  path. Two more: one agent's conversation is not visible inside another's jail (a transcript is the most
+  sensitive thing an agent produces), and a clean `StopAgent` takes the store with the branch — the
+  lifecycle decision measured rather than described, because a recurring id (`pr-<n>`) that kept its
+  store would resume into a previous pull-request author's session. The registry is overridden with a
+  marker declaring a probe CLI's `conversationPaths`, since the daemon persists what an adapter DECLARES.
+- **`Mainguard.Server.Tests/ConversationResumeWiringTests.cs`** — the other half of the same feature with
+  no Docker: does the daemon actually put the operator back IN the conversation? Driven through the
+  SHIPPED `AgentSpawnService` from the daemon's own container, with a REAL `ConversationStoreManager`
+  over a temp VM root (the store is a filesystem feature; a stub would prove only that the stub works),
+  reading the argv off the CLI binder and the mounts off the sandbox engine. The two gates are each
+  tested with the other held fixed: an ordinary spawn carries no resume verb **even with a transcript
+  already planted** (so a green can only be the adopt gate), and a resume with no surviving transcript
+  starts clean **even though `Prepare` has already created the store directory** (the case a
+  directory-existence guard would get wrong). Plus: an adapter with no `resumeArgs` still gets its
+  mounts, another agent's transcript never resumes this one, and a marker whose conversation path could
+  hold a credential fails the spawn typed with no jail built.
+- **`Mainguard.Server.Tests/Agents/ConversationPersistenceDockerTests.cs`** — the conversation store
+  against a real engine, and it models the **crash, not the stop**: the container is removed through the
+  engine and the session record dropped with no `StopAgent` anywhere, then the transcript is asserted on
+  the daemon's disk and read back inside the resumed jail. That ordering is the whole point — a
+  harvest-on-stop design passes every test that stops the agent and fails every situation a user hits.
+  Plus cross-agent isolation and the clean-stop lifecycle. **This suite never ran on the branch that
+  introduced it** (no reachable Docker); running it is what measured the one assumption the design had
+  only reasoned about — that a bind lands on top of a deeper path underneath the tmpfs `$HOME` — and what
+  surfaced the mount-parent ownership defect that broke the CREDENTIAL restore for every claude-code jail.
   `Agents/FixtureRepo.cs` — the tiny **Node** project both Docker merge-queue suites verify (shared
   rather than copied: the verify command and marker are what the assertions compare against, so two
   copies would drift and the stale one would assert provenance against a command the repo no longer

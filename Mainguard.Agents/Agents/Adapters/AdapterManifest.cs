@@ -278,6 +278,25 @@ public sealed record AdapterSpec(
     /// built and stays where phase 2 put it: behind the plan gate.</para>
     /// </summary>
     [property: JsonPropertyName("initialPromptStyle")] string? InitialPromptStyle = null,
+    /// <summary>The <c>$HOME</c>-relative paths where THIS CLI keeps its CONVERSATION state — the
+    /// transcripts of what the operator and the agent actually said (for claude-code,
+    /// <c>.claude/projects</c>). Directories, not files: a CLI writes one transcript per session and
+    /// names them itself, so there is no fixed file to declare.
+    /// <para>Each declared path is bind-mounted into the jail from daemon-owned ext4, so the CLI writes
+    /// its history straight onto disk that OUTLIVES the container. That is the whole design and it is
+    /// not the same as <see cref="CredentialPaths"/>' harvest-on-stop round trip: the event that makes
+    /// you need the conversation back is the jail dying WITHOUT a clean stop, and a harvest never runs
+    /// then. See <see cref="Sandbox.ConversationStorePolicy"/>.</para>
+    /// <para>Must not overlap <see cref="CredentialPaths"/> in either direction —
+    /// <see cref="AdapterManifest.Parse"/> refuses the manifest and the spawn path refuses the marker.
+    /// The store is daemon-owned disk that survives teardown; a credential may only ever live in the
+    /// host OS keychain. Null/empty = this CLI gets no conversation persistence yet, which is an honest
+    /// statement; a WRONG path would silently persist nothing.</para>
+    /// <para><b>The flag that re-enters the conversation is <see cref="ResumeArg"/></b>, declared
+    /// separately and already used when a daemon restart re-binds a CLI into a jail that is still
+    /// running. These paths are the DISK that makes that same flag mean something after the jail
+    /// itself is gone; the two are independently true, so neither implies the other.</para></summary>
+    [property: JsonPropertyName("conversationPaths")] IReadOnlyList<string>? ConversationPaths = null,
     /// <summary>For a CLI whose npm package is only a launcher: where the real executable actually
     /// lives after a script-free install, so <see cref="AdapterChannel.EnsureAsync"/> can place it over
     /// the vendor's placeholder itself instead of running the vendor's postinstall. Null = this CLI's
@@ -557,6 +576,41 @@ public sealed record AdapterManifest(
                             $"Adapter '{a.Id}' lists '{entry.Path}' in BOTH credentialPaths and settingsPaths. "
                             + "Credentials are persisted only to the host OS keychain; settings go to an "
                             + "ordinary per-repo file. A path cannot be both without leaking the credential.");
+                }
+            }
+
+            if (a.ConversationPaths is not null)
+            {
+                foreach (var path in a.ConversationPaths)
+                {
+                    if (!IsHomeRelativeFilePath(path))
+                        throw new AdapterManifestException(AdapterManifestError.Malformed,
+                            $"Adapter '{a.Id}' conversationPaths entry '{path}' must be a $HOME-relative path (no leading '/', '~', '..' segments, backslashes, or control characters).");
+                }
+
+                // THE INVARIANT THAT MAKES CONVERSATION PERSISTENCE SAFE TO SHIP, enforced rather than
+                // documented. A conversation store is daemon-owned ext4 that deliberately OUTLIVES the
+                // jail; a credential may only ever live in the host OS keychain (the owner's standing
+                // rule). One declared path that CONTAINS the other therefore quietly persists a token to
+                // plain disk and remounts it into every later jail for that agent id.
+                //
+                // Containment, not equality: the accident this exists to stop is a manifest that declares
+                // '.claude' — where the transcripts live, and which also contains '.claude/.credentials.json'.
+                // An equality-only check passes that case, which is the only case worth checking.
+                //
+                // Refused, not filtered: dropping the offending path and continuing would leave the
+                // feature looking configured while persisting a subset nobody chose, and would leave the
+                // wrong declaration in the manifest. Sandbox.ConversationStorePolicy owns the rule so the
+                // spawn path (which reads an install MARKER, not this file) asks the same question of the
+                // same implementation.
+                try
+                {
+                    Sandbox.ConversationStorePolicy.AssertNoCredentialOverlap(
+                        a.Id, a.ConversationPaths, a.CredentialPaths);
+                }
+                catch (Git.Exceptions.ConversationStoreOverlapException ex)
+                {
+                    throw new AdapterManifestException(AdapterManifestError.Malformed, ex.Message);
                 }
             }
 
