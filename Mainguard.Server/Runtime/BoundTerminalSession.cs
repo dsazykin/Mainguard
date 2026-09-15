@@ -67,6 +67,7 @@ public sealed class BoundTerminalSession : IDisposable
     private readonly LinkedList<byte[]> _replay = new();
     private readonly List<Channel<byte[]>> _subscribers = new();
     private readonly List<Channel<TerminalOutput>> _gridSubscribers = new();
+    private readonly List<Channel<(int Cols, int Rows)>> _geometrySubscribers = new();
     private readonly List<string> _pendingClipboard = new();
     private readonly VtermSession? _vterm;
     private readonly Func<bool>? _isInputLocked;
@@ -105,6 +106,15 @@ public sealed class BoundTerminalSession : IDisposable
         _session = session ?? throw new ArgumentNullException(nameof(session));
         _isInputLocked = isInputLocked;
         _isInputPaused = isInputPaused;
+
+        // MG-24: the authoritative size is tracked for EVERY engine, not just libvterm. The
+        // interim engine has no daemon-side grid to read it off, and a raw attach previously had
+        // nowhere to learn it from at all — which is the whole defect. Clamped through the same
+        // gate Resize uses so the value published to clients and the value the PTY was spawned at
+        // can never differ.
+        Cols = VtermSession.ClampDimension(cols);
+        Rows = VtermSession.ClampDimension(rows);
+
         if ((engine ?? TerminalEngineConfig.Interim).Engine == TerminalEngineKind.Libvterm)
         {
             _vterm = new VtermSession(cols, rows);
@@ -118,6 +128,16 @@ public sealed class BoundTerminalSession : IDisposable
 
     /// <summary>Whether this session runs the P2-18 libvterm grid engine (grid attaches allowed).</summary>
     public bool GridEnabled => _vterm is not null;
+
+    /// <summary>
+    /// This session's authoritative width in columns — the size the PTY is actually running at, and
+    /// therefore the only size its output means anything against. Read under <c>_gate</c> by
+    /// <see cref="SubscribeGeometry"/>; written only by the constructor and <see cref="Resize"/>.
+    /// </summary>
+    public int Cols { get; private set; }
+
+    /// <summary>This session's authoritative height in rows. See <see cref="Cols"/>.</summary>
+    public int Rows { get; private set; }
 
     /// <summary>Completes when the child exits (the binder marks the session state off this).</summary>
     public Task<int> ExitCode => _session.ExitCode;
@@ -161,6 +181,57 @@ public sealed class BoundTerminalSession : IDisposable
         };
 
         return (replay, channel.Reader);
+    }
+
+    /// <summary>
+    /// MG-24: opens one geometry subscription — the size this session is running at right now, taken
+    /// atomically with enrolment, plus a reader for every later change. A raw attach writes the
+    /// current value as a <c>geometry</c> frame ahead of its replay tail and streams the rest, so the
+    /// client always parses PTY bytes against the geometry that produced them.
+    ///
+    /// <para>The channel holds ONE value and drops the older one when it is full: geometry is a
+    /// latest-value signal, not a log — a client that missed an intermediate size has lost nothing
+    /// as long as it learns the current one, and a slow reader must never stall the resize path.</para>
+    /// </summary>
+    public (int Cols, int Rows, ChannelReader<(int Cols, int Rows)> Live) SubscribeGeometry(
+        out Action unsubscribe)
+    {
+        var channel = Channel.CreateBounded<(int Cols, int Rows)>(new BoundedChannelOptions(1)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropOldest,
+        });
+
+        int cols, rows;
+        lock (_gate)
+        {
+            // Read the size INSIDE the lock that Resize writes it under, so an attach racing a
+            // resize either sees the old size and then the change on the channel, or the new size
+            // and no change — never a size it will not be corrected from.
+            cols = Cols;
+            rows = Rows;
+            if (_completed)
+            {
+                channel.Writer.TryComplete();
+            }
+            else
+            {
+                _geometrySubscribers.Add(channel);
+            }
+        }
+
+        unsubscribe = () =>
+        {
+            lock (_gate)
+            {
+                _geometrySubscribers.Remove(channel);
+            }
+
+            channel.Writer.TryComplete();
+        };
+
+        return (cols, rows, channel.Reader);
     }
 
     /// <summary>
@@ -450,6 +521,23 @@ public sealed class BoundTerminalSession : IDisposable
         rows = VtermSession.ClampDimension(rows);
 
         _session.Resize(cols, rows);
+
+        lock (_gate)
+        {
+            // MG-24: publish the new authoritative size to raw attaches before anything else in this
+            // method can yield. A raw client cannot infer geometry from its own frames (they are just
+            // bytes), so if this fan-out is missed it keeps parsing at the old width indefinitely.
+            if (cols != Cols || rows != Rows)
+            {
+                Cols = cols;
+                Rows = rows;
+                foreach (var subscriber in _geometrySubscribers)
+                {
+                    subscriber.Writer.TryWrite((cols, rows));
+                }
+            }
+        }
+
         if (_vterm is null)
         {
             return;
@@ -672,6 +760,12 @@ public sealed class BoundTerminalSession : IDisposable
             }
 
             _gridSubscribers.Clear();
+            foreach (var subscriber in _geometrySubscribers)
+            {
+                subscriber.Writer.TryComplete();
+            }
+
+            _geometrySubscribers.Clear();
         }
     }
 

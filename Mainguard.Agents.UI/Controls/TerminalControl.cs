@@ -56,6 +56,15 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
     private double _cellWidth;
     private double _cellHeight;
 
+    // MG-24: the size the DAEMON says this session is running at, once it has said so. Null until
+    // the first `geometry` frame arrives — see Resize and UpdateGridSizeFromBounds.
+    private int _authoritativeCols;
+    private int _authoritativeRows;
+
+    // Uniform fit-to-pane factor, 1.0 whenever the grid already fits (the normal case — never a
+    // magnification). See UpdateRenderScale.
+    private double _renderScale = 1.0;
+
     public TerminalControl()
     {
         Focusable = true;
@@ -142,7 +151,19 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
             return;
         }
 
+        // MG-24: this is the DAEMON's authoritative size, not the pane's. The PTY is running at
+        // exactly this geometry, so it is the only geometry its bytes mean anything against — a CLI
+        // TUI positions its redraws by absolute cursor address computed for its own width, and
+        // parsing those against a different width lands them on the wrong rows.
+        //
+        // It is NOT always the size this pane asked for. A managed worker's terminal is input-locked
+        // (P2-14) and F64 therefore drops a viewer's resize, so the session stays at the size it was
+        // spawned with however the operator sizes the pane. From here on layout only scales what is
+        // drawn (UpdateRenderScale); it no longer reshapes the grid.
+        _authoritativeCols = cols;
+        _authoritativeRows = rows;
         _screen.Resize(cols, rows);
+        UpdateRenderScale(Bounds.Size);
         InvalidateVisual();
     }
 
@@ -219,22 +240,68 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
 
         var cols = Math.Max(1, (int)(size.Width / _cellWidth));
         var rows = Math.Max(1, (int)(size.Height / _cellHeight));
+
+        // The pane is always what we ASK the daemon for — that is unchanged, and it is what keeps an
+        // ordinary (unlocked) terminal exactly pane-sized. Whether the ask is granted is the
+        // daemon's call, and its answer arrives as a `geometry` frame through Resize.
+        UserResized?.Invoke(this, new TerminalResizeEventArgs(cols, rows));
+
+        if (_authoritativeCols > 0)
+        {
+            // MG-24: the daemon has told us the real size. Layout no longer touches the grid — it
+            // only decides how large to draw it. Reshaping the grid to the pane here is precisely
+            // what garbled a managed worker's terminal: the ask is refused, the PTY keeps emitting
+            // 120-column output, and the pane parsed it at its own narrower width with no reflow.
+            UpdateRenderScale(size);
+            InvalidateVisual();
+            return;
+        }
+
         if (cols == _screen.Cols && rows == _screen.Rows && !_screen.GeometryPending)
         {
             return;
         }
 
-        // Size the engine from THIS layout pass, not from the ViewModel's debounced round trip: the
-        // debounce exists so a drag-resize does not spam the daemon with SIGWINCH, but it also means
-        // the engine would spend ~50 ms at the wrong width — which is precisely the window a
-        // restart-resume replay lands in. Resizing here also releases any bytes the engine held while
-        // its geometry was still unknown. The ViewModel's later Resize(cols, rows) is then a no-op,
-        // and its SendResizeAsync still tells the daemon, unchanged.
+        // No geometry frame yet — an attach with no bound PTY behind it (the echo, detached-notice
+        // and locked-without-session paths all write raw text and never report a size), or a daemon
+        // older than the frame. Fall back to sizing from THIS layout pass, which is also what
+        // releases any bytes the engine held while its geometry was unknown (ISSUES-LOG #22).
         _screen.Resize(cols, rows);
+        UpdateRenderScale(size);
         InvalidateVisual();
-
-        UserResized?.Invoke(this, new TerminalResizeEventArgs(cols, rows));
     }
+
+    /// <summary>
+    /// The uniform factor that fits the authoritative grid into the pane — <c>1.0</c> whenever it
+    /// already fits, which is every terminal whose resize the daemon honours (the grid is derived
+    /// from the pane, so it cannot overflow it). Scaling only ever shrinks: a session the operator
+    /// cannot resize is shown whole and smaller rather than clipped or garbled, which is the honest
+    /// rendering of "this is 120x32 and it is not yours to reshape".
+    /// </summary>
+    private void UpdateRenderScale(Size size)
+    {
+        if (_cellWidth <= 0 || _cellHeight <= 0 || _screen.Cols <= 0 || _screen.Rows <= 0
+            || size.Width <= 0 || size.Height <= 0)
+        {
+            _renderScale = 1.0;
+            return;
+        }
+
+        var scaleX = size.Width / (_screen.Cols * _cellWidth);
+        var scaleY = size.Height / (_screen.Rows * _cellHeight);
+        _renderScale = Math.Min(1.0, Math.Min(scaleX, scaleY));
+
+        // A pane can be arranged at a near-zero size mid-layout (a collapsed dock, a tab being
+        // swapped in). Rendering at that scale is a blank flash, not information — hold a floor and
+        // let ClipToBounds do the rest for the frame or two it lasts.
+        if (_renderScale < MinRenderScale)
+        {
+            _renderScale = MinRenderScale;
+        }
+    }
+
+    /// <summary>Lower bound on <see cref="_renderScale"/> — see <see cref="UpdateRenderScale"/>.</summary>
+    private const double MinRenderScale = 0.2;
 
     /// <summary>How many lines above the live screen the view is scrolled (0 = live). Clamped to
     /// the scrollback the VtScreen actually holds; any keystroke snaps back to live.</summary>
@@ -280,6 +347,11 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
         var background = ResolveBrush("TerminalBackground", 0xFF0B0D10);
         var foreground = ResolveBrush("TerminalForeground", 0xFFE6E9EF);
         context.FillRectangle(background, new Rect(Bounds.Size));
+
+        // MG-24: one transform for the whole grid, so every cell offset below stays in unscaled cell
+        // units and there is no second set of metrics to keep in step. 1.0 — no transform at all —
+        // in the ordinary case where the grid was derived from this pane.
+        using var scaled = context.PushTransform(Matrix.CreateScale(_renderScale, _renderScale));
 
         // Scrolled view: the viewport ends `_scrollOffset` lines above the live bottom. History is
         // scrollback lines followed by the live screen rows; render the window that ends there.
