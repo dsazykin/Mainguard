@@ -325,6 +325,12 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable, IShellRai
 
     private Views.RepoPickerWindow? _repoPicker;
 
+    /// <summary>The picker window currently on screen, or <c>null</c> when none is open. Exists so
+    /// <c>Headless/EmptyStateOpenRepoTests</c> can assert that activating the empty-state folder icon
+    /// really opened the repo opener (and close it again afterwards) instead of only checking that a
+    /// binding points at the right command.</summary>
+    internal Views.RepoPickerWindow? ActiveRepoPicker => _repoPicker;
+
     /// <summary>The repositories tree, as a picker window on top (revised 2026-07-11 — the
     /// docked sidebar column is gone so the workspace runs full-width). One instance at a time.</summary>
     [RelayCommand]
