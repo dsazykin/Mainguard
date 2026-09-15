@@ -51,6 +51,7 @@ public sealed class MacHostAgentEnvironment : IAgentEnvironment
         _reposRoot = Path.Combine(parts.Root, "repos");
         Repos = parts.Repos;
         PackageCaches = parts.PackageCaches;
+        ConversationStores = parts.ConversationStores;
         Worktrees = parts.Worktrees;
         Egress = parts.Egress;
         Sandboxes = parts.Sandboxes;
@@ -90,6 +91,9 @@ public sealed class MacHostAgentEnvironment : IAgentEnvironment
     public IToolchainImageBuilder? ToolchainImages { get; }
 
     public PackageCacheManager? PackageCaches { get; }
+
+    /// <inheritdoc />
+    public ConversationStoreManager? ConversationStores { get; }
 
     public Toolchains.ToolchainChannel? Toolchains { get; }
 

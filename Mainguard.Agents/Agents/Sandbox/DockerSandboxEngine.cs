@@ -193,6 +193,14 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             var missingCacheMount = !string.IsNullOrEmpty(request.PackageCachePath)
                 && (existing.Mounts is null
                     || existing.Mounts.All(m => m.Destination != PackageCachePolicy.SandboxMount));
+            // The same reasoning for the conversation stores, and here the consequence is silent rather
+            // than loud: a jail created before this feature (or before this adapter declared a path) has
+            // no store mount, and mounts are fixed at create. Reusing it would put the CLI's transcripts
+            // back on the tmpfs $HOME — which works perfectly until the container dies, which is the only
+            // moment anyone finds out.
+            var missingConversationMount = (request.ConversationMounts ?? Array.Empty<ConversationMount>())
+                .Any(c => existing.Mounts is null
+                          || existing.Mounts.All(m => m.Destination != c.SandboxTarget));
             // A jail created before the secrets moved into per-owner directories carries the old flat
             // /run/secrets tmpfs, and tmpfs entries — like mounts — are fixed at create. Reusing one
             // would leave the write path execing as a non-root owner into a directory that does not
@@ -227,7 +235,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 || !SandboxImageDigest.SameImage(existing.Image, request.ImageRef)
                 || missingBareMount || missingAgentRepoMount || writableMirror || missingLayoutPins
                 || stalePin || wrongNetwork
-                || missingCacheMount || posture.MustRecreate)
+                || missingCacheMount || missingConversationMount || posture.MustRecreate)
             {
                 await _docker.Containers.RemoveContainerAsync(existing.ID,
                     new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
@@ -276,6 +284,11 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                     // failed VM boot can leave the bind mount pointing at a directory that is gone, and a
                     // reused jail is exactly the path that never re-checks anything.
                     await AssertPackageCacheUsableAsync(existing.ID, request, ct).ConfigureAwait(false);
+                    // Same reason, same path: the mount survived (mounts are fixed at create),
+                    // but the tree behind it may not have — a manual cleanup, a half-restored VM.
+                    // A conversation store that silently is not there loses HISTORY rather than
+                    // failing a build, so it is measured here too.
+                    await AssertConversationStoresUsableAsync(existing.ID, request, ct).ConfigureAwait(false);
                     return new SandboxHandle(existing.ID, Reused: true);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
@@ -317,7 +330,8 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // as itself rather than as an anonymous worker.
             AgentKind: request.AgentKind,
             AgentRole: request.AgentRole,
-            AgentParentId: request.AgentParentId);
+            AgentParentId: request.AgentParentId,
+            ConversationMounts: request.ConversationMounts);
 
         var create = ContainerSpecBuilder.Build(spec);
         for (var attempt = 1; ; attempt++)
@@ -342,6 +356,14 @@ public sealed class DockerSandboxEngine : ISandboxEngine
 
                 await AssertPackageCacheUsableAsync(created.ID, request, ct).ConfigureAwait(false);
 
+                // And the conversation stores, before the CLI can write a single line into the
+                // wrong place. This one belongs in the probe set for a sharper reason than the
+                // cache does: the store is DELETED on release and re-created by Prepare, which is
+                // precisely the delete-and-recreate pattern that produced the stale-inode bind in
+                // the first place (phase-3 decisions §27.3) — so it is in the rebuild-once class
+                // below, not merely reported.
+                await AssertConversationStoresUsableAsync(created.ID, request, ct).ConfigureAwait(false);
+
                 await WriteSecretFileAsync(created.ID, credentials.CredentialPath,
                     Encoding.UTF8.GetBytes(envContent), credentials.AgentUid, ct).ConfigureAwait(false);
                 await WriteSecretFileAsync(created.ID, credentials.OobKeyPath,
@@ -353,6 +375,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             }
             catch (Exception ex) when (attempt == 1
                 && ex is StaleBindMountException or PackageCacheUnavailableException
+                    or ConversationStoreUnavailableException
                 && !ct.IsCancellationRequested)
             {
                 await TryForceRemoveAsync(created.ID).ConfigureAwait(false);
@@ -844,6 +867,58 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         {
             throw new PackageCacheUnavailableException(
                 PackageCachePolicy.SandboxMount, request.PackageCachePath,
+                failure + $" (probe exit {probe.ExitCode.ToString(CultureInfo.InvariantCulture)}, "
+                + $"stderr: {probe.Stderr.Trim()})");
+        }
+    }
+
+    /// <summary>
+    /// Proves, in the started container, that every requested conversation store is present and writable
+    /// by the agent uid; throws <see cref="ConversationStoreUnavailableException"/> otherwise.
+    ///
+    /// <para><b>Why this is fail-closed rather than a warning.</b> The store's mount target sits under the
+    /// tmpfs <c>$HOME</c> — that is where the CLI reads it — so the failure mode of a mount that did not
+    /// take is not an error at all: the CLI happily writes its transcripts to the tmpfs and everything
+    /// works for the entire session. The loss is discovered later, by the person who came back for the
+    /// conversation, with no evidence anywhere of when it stopped working. A feature whose breakage is
+    /// invisible until it matters must refuse loudly at the one moment it can be observed.</para>
+    ///
+    /// <para>A jail with no requested stores is not probed: it has none by design, and
+    /// <see cref="ContainerSpecBuilder"/> has already refused any spec that claims one without mounting
+    /// it.</para>
+    /// </summary>
+    private async Task AssertConversationStoresUsableAsync(
+        string containerId, SandboxSpawnRequest request, CancellationToken ct)
+    {
+        var stores = request.ConversationMounts ?? Array.Empty<ConversationMount>();
+        if (stores.Count == 0)
+            return;
+
+        var targets = stores.Select(s => s.SandboxTarget).ToArray();
+        var sources = string.Join(", ", stores.Select(s => s.HostPath));
+
+        SandboxExecResult probe;
+        try
+        {
+            probe = await ExecAsync(containerId, ConversationStorePolicy.WritabilityProbe(targets), ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new ConversationStoreUnavailableException(
+                ConversationStorePolicy.ConversationsDirectoryName, sources,
+                $"the in-jail probe could not be run at all: {ex.Message}");
+        }
+
+        var failure = ConversationStorePolicy.DescribeProbeFailure(probe.Stdout, probe.ExitCode);
+        if (failure is not null)
+        {
+            throw new ConversationStoreUnavailableException(
+                ConversationStorePolicy.ConversationsDirectoryName, sources,
                 failure + $" (probe exit {probe.ExitCode.ToString(CultureInfo.InvariantCulture)}, "
                 + $"stderr: {probe.Stderr.Trim()})");
         }

@@ -78,6 +78,13 @@ public sealed record SandboxSecrets(
 /// Mainguard's own briefing, into the user's branch. Separate from <see cref="CliSettingsFiles"/>
 /// precisely because the session that matters most (a first-ever one) has no restore payload to derive
 /// it from.</param>
+/// <param name="ConversationMounts">This agent's CONVERSATION stores — daemon-owned ext4 directories
+/// bind-mounted READ-WRITE at the CLI's own <c>$HOME</c>-relative transcript paths, so the record of
+/// what the operator and the agent said survives a jail that dies without a clean stop. That is the
+/// whole point and the reason it is a mount rather than a stop-time harvest: the crash IS the case
+/// (<see cref="ConversationStorePolicy"/>). Null/empty = this CLI declares no conversation state.
+/// When supplied, <see cref="DockerSandboxEngine"/> proves in the started container that every store is
+/// really present and writable before handing the jail back.</param>
 public sealed record SandboxSpawnRequest(
     string RepoHash,
     string AgentId,
@@ -104,7 +111,8 @@ public sealed record SandboxSpawnRequest(
     IReadOnlyList<string>? ToolchainIds = null,
     string AgentKind = "",
     string AgentRole = "",
-    string AgentParentId = "");
+    string AgentParentId = "",
+    IReadOnlyList<ConversationMount>? ConversationMounts = null);
 
 /// <summary>A running sandbox handle. <see cref="Reused"/> is true when a stopped persistent jail was re-started rather than recreated.</summary>
 public sealed record SandboxHandle(string ContainerId, bool Reused);

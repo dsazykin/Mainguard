@@ -77,7 +77,21 @@ public sealed record InstalledAdapterMarker(
     /// re-bound to a blank CLI, which is the half of "the loop survives a restart" that a process re-bind
     /// alone does not deliver. Null on markers written before this field existed; re-install the CLI to
     /// backfill it, and until then those jails re-bind exactly as they did before.</summary>
-    [property: JsonPropertyName("resumeArg")] string? ResumeArg = null)
+    [property: JsonPropertyName("resumeArg")] string? ResumeArg = null,
+    /// <summary>The $HOME-relative directories this CLI keeps its CONVERSATION transcripts in (see
+    /// <see cref="AdapterSpec.ConversationPaths"/>) — the ONLY paths the daemon will bind-mount from the
+    /// per-agent conversation store, so an agent whose jail DIED still has the session that jail had.
+    /// Null on markers written before this field existed — re-install the CLI to backfill it, and until
+    /// then that CLI simply gets no persistence (never a guessed path).
+    /// <para>The spawn path re-asserts the no-credential-overlap rule against THIS list and
+    /// <see cref="CredentialPaths"/>, because the daemon spawns from this marker rather than from the
+    /// reviewed manifest — a marker is an ordinary file in a VM path, possibly written by an older
+    /// build.</para>
+    /// <para><b>These paths are the disk; <see cref="ResumeArg"/> is the flag.</b> The two are declared
+    /// separately because they are independently true: a live jail re-bound after a daemon restart still
+    /// has its $HOME tmpfs, so <see cref="ResumeArg"/> alone restores it there, and no store is involved.
+    /// This list is what makes the SAME flag mean something after the jail itself is gone.</para></summary>
+    [property: JsonPropertyName("conversationPaths")] IReadOnlyList<string>? ConversationPaths = null)
 {
     /// <summary>The parsed <see cref="InitialPromptStyle"/>; <see cref="AdapterInitialPromptStyle.None"/>
     /// for an older marker or an unreadable spelling. Unlike the manifest, a marker cannot refuse — it is
@@ -114,7 +128,8 @@ public sealed record InstalledAdapterMarker(
         spec.PreApprovedCommandArg,
         spec.PreApprovedCommandFormat,
         spec.InitialPromptStyle,
-        spec.ResumeArg);
+        spec.ResumeArg,
+        spec.ConversationPaths);
 
     /// <summary>
     /// This marker with every <b>manifest-declared</b> field taken from <paramref name="spec"/>, keeping
