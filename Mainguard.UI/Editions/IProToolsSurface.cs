@@ -52,9 +52,10 @@ public interface IProToolsSurface
     /// agent is started with. Daemon state over gRPC, like Agent Jails — the daemon is what spawns, and
     /// for a worker no client is in the loop at all.
     ///
-    /// <para>The plan toggle MOVED here from inside the plan gate, which the control centre renders only
-    /// when it has content. With plan mode on and nothing waiting there was no control anywhere: it could
-    /// be turned back on but never off.</para></summary>
+    /// <para>Plan approval's only control lived inside the plan gate, which the control centre renders
+    /// only when it has content — so with plan mode on and nothing waiting there was no control anywhere:
+    /// it could be turned back on but never off. This page has no such condition. The gate keeps its own
+    /// toggle; both write the same daemon RPC.</para></summary>
     object CreateAgentDefaultsPage();
 
     /// <summary>Settings → Mainguard OS: the repo-onboarding + rebuild-sandbox-images page content,

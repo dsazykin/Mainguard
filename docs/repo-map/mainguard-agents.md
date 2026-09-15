@@ -2401,6 +2401,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       never retroactively authorises a worker blocked at the gate nor strands one already working. Set
       over `PlanApprovalService.SetPlanMode`, which `RoleInterceptor` denies to a coordinator on the same
       boundary as `ApprovePlan`. Design: `docs/design/coordinator-phase-3-decisions.md` §23).
+    - `AgentModelSelection.cs` (**which model an agent is launched with**, per `(role, CLI)` —
+      `AgentModelRole` / `AgentModelChoice` / `AgentModelSwitch` plus the `IAgentModelStore` seam with
+      `JsonAgentModelStore` (a file beside the plan-mode store, for the same reason: the launcher reads it
+      while building a launch line, long before anything that needs a database) and
+      `InMemoryAgentModelStore`. Daemon-side because it could be nowhere else — the model is an argument
+      on the process the daemon starts, and for a WORKER no client is in the loop at all, since the
+      coordinator spawns it from inside its own jail. Per ROLE because a coordinator and a worker are
+      spent differently; per CLI because the vocabularies do not transfer. **No default**: unset means the
+      CLI's own default, and an unreadable store reads as unset, because a corrupt file must not be able
+      to redirect an operator's spend to a model they never picked. Read once per spawn. `Set` audits
+      `agent_model_changed` with from/to, since it changes what every later agent of that kind costs, and
+      is reached over `AgentService.SetAgentModel`, which `RoleInterceptor` denies to a coordinator on the
+      `SetJailLimits` boundary).
     - `WorkerPlanGate.cs` (**phase 2 — the daemon-side enforcement**, separate from the queue above because
       a blocking call an agent can decline to make is a convention, not a boundary (MG-12). `Hold` records
       a spawned worker's task **without giving it to the worker** (persisted through `IHeldTaskStore` —

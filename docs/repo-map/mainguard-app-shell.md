@@ -925,12 +925,13 @@
     save is an error on the page, `FleetNote` words what six workers could take, and Reset restores the
     defaults on the page only until Save), `AgentDefaultsSettingsViewModel`/`AgentModelRowViewModel`
     (+ `Views/AgentDefaultsSettingsView` — the Settings **Agent Defaults** page: how agents are STARTED.
-    Two settings, both daemon state over `IAgentDefaultsGateway`. (1) **Plan approval**, MOVED here out of
-    `PlanGateView`: the control centre renders that gate only when it has content — a pending plan, an
-    escalation, backpressure, or plan mode already OFF — so with plan mode ON and nothing waiting the
-    toggle had no surface at all, and the gate could be turned back on but never off. The gate now shows
-    only the WARNING (and only while off), because "an approval step you may still believe you have is
-    gone" is a fact about the work arriving there. (2) **Models**, per `(role, CLI)`: coordinator and
+    Two settings, both daemon state over `IAgentDefaultsGateway`. (1) **Plan approval**, whose only
+    control lived inside `PlanGateView`: the control centre renders that gate only when it has content —
+    a pending plan, an escalation, backpressure, or plan mode already OFF — so with plan mode ON and
+    nothing waiting there was no control anywhere, and the gate could be turned back on but never off.
+    This page has no such condition. The gate KEEPS its toggle (both write the same daemon RPC, so they
+    cannot disagree, and a control beside the decisions it governs is worth having); what was missing was
+    a way to reach it while the gate is silent. (2) **Models**, per `(role, CLI)`: coordinator and
     workers set separately, a picker of the CLI's KNOWN models plus a free-text box because vendors add
     models faster than Mainguard ships, and a CLI that declares no model flag renders as not settable
     rather than accepting a value that would be dropped at spawn.), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the

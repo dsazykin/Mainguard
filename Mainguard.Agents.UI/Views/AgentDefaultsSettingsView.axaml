@@ -6,10 +6,11 @@
 
   <!-- Settings → Agent Defaults: what every agent spawned from now on gets.
 
-       The plan-approval toggle lives here because its old home could not show it. It sat inside the plan
-       gate, and the control centre renders that gate only when there is gate content — a pending plan, an
-       escalation, backpressure, or plan mode already OFF. With it ON and nothing waiting there was no
-       control anywhere: the gate could be turned back on but never off. -->
+       Plan approval is reachable here because its only other control cannot always be seen: it sits
+       inside the plan gate, and the control centre renders that gate only when there IS gate content — a
+       pending plan, an escalation, backpressure, or plan mode already OFF. With it ON and nothing waiting
+       there was no control anywhere, so the gate could be turned back on but never off. The gate keeps
+       its toggle; this page is the surface with no such condition. -->
 
   <ScrollViewer HorizontalScrollBarVisibility="Disabled">
     <StackPanel Spacing="12">

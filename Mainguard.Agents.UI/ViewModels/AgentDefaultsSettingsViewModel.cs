@@ -15,12 +15,15 @@ namespace Mainguard.Agents.UI.ViewModels;
 /// Settings → Agent Defaults: what every agent spawned from now on gets — whether a worker must have an
 /// approved plan, and which model each role is launched with.
 ///
-/// <para><b>Why the plan toggle moved here.</b> It lived inside the plan gate, which the control centre
-/// only renders when there is gate content — a pending plan, an escalation, backpressure, or plan mode
-/// already being OFF. So with it ON and nothing waiting, the control had no surface at all: a human could
-/// turn the gate back on but never off, which is a one-way door reached by a setting rather than a
-/// decision. A setting that governs future spawns belongs where settings are, not inside a queue of
-/// decisions about work that already exists.</para>
+/// <para><b>Why plan approval is reachable here.</b> Its only control lived inside the plan gate, which
+/// the control centre renders only when there IS gate content — a pending plan, an escalation,
+/// backpressure, or plan mode already being OFF. So with it ON and nothing waiting, the control had no
+/// surface at all: a human could turn the gate back on but never off, a one-way door reached through a
+/// setting rather than a decision. This page is the surface that has no such condition.</para>
+///
+/// <para>The gate KEEPS its toggle — this does not replace it. Both write through the same daemon RPC,
+/// so the two cannot disagree, and a control beside the decisions it governs is worth having when that
+/// is what you are looking at. What was missing was a place to reach it when the gate is silent.</para>
 ///
 /// <para>Daemon state throughout (see <see cref="IAgentDefaultsGateway"/>), so a write re-renders from
 /// what the daemon PERSISTED rather than from what was typed, and an unreachable daemon is an error on

@@ -13,11 +13,12 @@ namespace Mainguard.Tests;
 /// <summary>
 /// Settings → Agent Defaults: the plan-approval gate and the per-(role, CLI) model.
 ///
-/// <para><b>The defect that moved the toggle here.</b> It lived inside the plan gate, and the control
-/// centre renders that gate only when it has content — a pending plan, an escalation, backpressure, or
-/// plan mode already OFF. With plan mode ON and nothing waiting, the toggle had no surface at all: a
-/// human could turn the gate back on but never off. A settings page has no such condition, which is the
-/// whole point of the move.</para>
+/// <para><b>The defect this page closes.</b> Plan approval's only control lived inside the plan gate,
+/// and the control centre renders that gate only when it has content — a pending plan, an escalation,
+/// backpressure, or plan mode already OFF. With plan mode ON and nothing waiting, the control had no
+/// surface at all: a human could turn the gate back on but never off. A settings page has no such
+/// condition, which is the whole point. The gate keeps its toggle too; both write the same daemon
+/// RPC, so they cannot disagree.</para>
 /// </summary>
 public class AgentDefaultsSettingsPageTests
 {
