@@ -82,6 +82,27 @@ public sealed class ConversationResumeWiringTests
         Assert.True(rig.Engine.LastSpawn!.ConversationMounts is null or { Count: 0 });
     }
 
+    [Fact]
+    public async Task ARoleLockedCoordinator_GetsNoConversationStore_BecauseItGetsNoWritableMountAtAll()
+    {
+        // The coordinator's jail is repository-less, and ContainerSpecBuilder.BuildCapabilityOnlyMounts
+        // gives it the read-only adapters root and the read-only IPC dir and NOTHING else on purpose:
+        // no writable bind mount at all, so its only writable storage is a tmpfs that dies with the
+        // container. A conversation store is a READ-WRITE mount of daemon-owned disk that deliberately
+        // OUTLIVES the jail — the exact thing that posture denies this one role.
+        //
+        // Regression, not theory: requesting the store here made ContainerSpecBuilder's fail-closed
+        // assert refuse the spawn outright (the store was requested and no mount targeted it), which is
+        // how this was found. The guard was right; this pins the caller agreeing with it.
+        using var rig = ConversationRig.Create();
+
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Coordinator, CancellationToken.None,
+            agentId: "coordinator-1");
+
+        Assert.True(rig.Engine.LastSpawn!.ConversationMounts is null or { Count: 0 });
+    }
+
     // ---- the resume verb ----------------------------------------------------------------------
 
     [Fact]

@@ -92,6 +92,55 @@ public static class ConversationStorePolicy
         return ContainerSpecBuilder.AgentHome + "/" + homeRelativePath.Trim('/');
     }
 
+    /// <summary>
+    /// The in-jail directories BETWEEN <c>$HOME</c> and each mount target that the container runtime
+    /// creates on this jail's behalf, shallowest first — for <c>.claude/projects</c>, that is
+    /// <c>/home/agent/.claude</c>. Neither <c>$HOME</c> itself nor the mount target is included: the
+    /// first is the tmpfs, already created with the agent's uid/gid, and the second is the bind mount,
+    /// whose ownership belongs to the daemon-side store and its MG-17 group share.
+    ///
+    /// <para><b>Why this exists, measured rather than reasoned.</b> The runtime mkdir's a missing mount
+    /// parent as <c>root</c>, inside a tmpfs <c>$HOME</c> that is mode 0700 and owned by the agent. The
+    /// agent then cannot write anything else into that directory — and for claude-code the directory is
+    /// <c>.claude</c>, which is exactly where <c>RestoreCliCredentialsAsync</c> puts
+    /// <c>.credentials.json</c>. Declaring <c>conversationPaths</c> therefore broke the CREDENTIAL
+    /// restore for every jail of that CLI (<c>sh: cannot create
+    /// /home/agent/.claude/.credentials.json.partial: Permission denied</c>), which is a spawn failure
+    /// and not a conversation-store failure at all.</para>
+    ///
+    /// <para>The no-overlap rule does not catch this and should not be widened to: <c>.claude/projects</c>
+    /// and <c>.claude/.credentials.json</c> genuinely do not contain one another. What they share is a
+    /// PARENT, and a shared parent is a question about ownership rather than about containment.</para>
+    /// </summary>
+    public static ImmutableArray<string> MountParentDirectories(IEnumerable<string> sandboxTargets)
+    {
+        var home = ContainerSpecBuilder.AgentHome;
+        var seen = new SortedSet<string>(StringComparer.Ordinal);
+
+        foreach (var target in sandboxTargets ?? Array.Empty<string>())
+        {
+            if (string.IsNullOrWhiteSpace(target) || !target.StartsWith(home + "/", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            // Walk the segments between $HOME and the target, keeping every intermediate directory and
+            // stopping short of the target itself.
+            var relative = target[(home.Length + 1)..].Trim('/');
+            var segments = relative.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            var current = home;
+            for (var i = 0; i < segments.Length - 1; i++)
+            {
+                current = current + "/" + segments[i];
+                seen.Add(current);
+            }
+        }
+
+        // Shallowest first, so a chown walks down rather than up.
+        return seen.OrderBy(d => d.Count(c => c == '/')).ThenBy(d => d, StringComparer.Ordinal)
+            .ToImmutableArray();
+    }
+
     // ---- Layout (pure) ---------------------------------------------------------------------------
 
     /// <summary><c>&lt;vmRoot&gt;/conversations</c> — the root every store hangs off. Never mounted.</summary>

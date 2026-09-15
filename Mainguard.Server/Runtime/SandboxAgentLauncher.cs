@@ -349,9 +349,22 @@ public sealed class SandboxAgentLauncher
             // manifest — the daemon spawns from the marker), and a violation is a typed failure that stops
             // the spawn. Deliberately not caught: a conversation store that could hold a token is the one
             // thing about this feature that must never ship degraded.
+            //
+            // NOT for a repository-less jail. That is the role-locked coordinator, and
+            // BuildCapabilityOnlyMounts gives it the read-only adapters root and the read-only IPC dir
+            // and NOTHING else on purpose: it has no writable bind mount at all, so its only writable
+            // storage is a tmpfs that dies with the container. A conversation store is by definition a
+            // READ-WRITE mount of daemon-owned disk that outlives the jail, so requesting one here would
+            // hand the one role that is deliberately denied durable storage exactly that.
+            //
+            // Found by the fail-closed assert rather than reasoned about in advance: ContainerSpecBuilder
+            // refused the spawn because the store was requested and no mount targeted it
+            // (GatewayConfinementDockerTests.ResumedJail_...). The guard worked — this is the caller
+            // being made to agree with it, not the guard being relaxed.
             IReadOnlyList<ConversationMount>? conversationMounts = null;
             var hasPriorConversation = false;
-            if (_environment.ConversationStores is { } conversations && adapter is not null)
+            if (_environment.ConversationStores is { } conversations && adapter is not null
+                && !withoutRepositoryAccess)
             {
                 hasPriorConversation = conversations.HasTranscripts(
                     repoHandle, agentId, adapter.ConversationPaths);

@@ -102,4 +102,57 @@ public class ConversationStoreProbeTests
         // shape this whole area refuses.
         => Assert.Throws<ArgumentException>(
             () => ConversationStorePolicy.WritabilityProbe(Array.Empty<string>()));
+
+    // ---- the mount parents ---------------------------------------------------------------------
+
+    [Fact]
+    public void TheMountParent_IsTheDirectoryBetweenHomeAndTheStore()
+        // /home/agent/.claude for a .claude/projects store: the directory the runtime invents, and the
+        // one the CLI credential restore also writes into.
+        => Assert.Equal(
+            new[] { ContainerSpecBuilder.AgentHome + "/.claude" },
+            ConversationStorePolicy.MountParentDirectories(
+                new[] { ContainerSpecBuilder.AgentHome + "/.claude/projects" }));
+
+    [Fact]
+    public void TheStoreItself_IsNeverAParent()
+        // The mount target is the daemon-owned store; its ownership is the MG-17 group share and must
+        // not be re-owned to the agent. Only the invented directories above it are.
+        => Assert.DoesNotContain(
+            ContainerSpecBuilder.AgentHome + "/.claude/projects",
+            ConversationStorePolicy.MountParentDirectories(
+                new[] { ContainerSpecBuilder.AgentHome + "/.claude/projects" }));
+
+    [Fact]
+    public void ATopLevelStore_HasNoParentToRepair()
+        // $HOME itself is the tmpfs, created with the agent's own uid/gid — never chowned, never listed.
+        => Assert.Empty(ConversationStorePolicy.MountParentDirectories(
+            new[] { ContainerSpecBuilder.AgentHome + "/.transcripts" }));
+
+    [Fact]
+    public void ADeepStore_YieldsEveryIntermediate_ShallowestFirst()
+        // Shallowest first so a chown walks down rather than up.
+        => Assert.Equal(
+            new[]
+            {
+                ContainerSpecBuilder.AgentHome + "/a",
+                ContainerSpecBuilder.AgentHome + "/a/b",
+            },
+            ConversationStorePolicy.MountParentDirectories(
+                new[] { ContainerSpecBuilder.AgentHome + "/a/b/c" }));
+
+    [Fact]
+    public void TwoStoresSharingAParent_ListItOnce()
+        => Assert.Equal(
+            new[] { ContainerSpecBuilder.AgentHome + "/.claude" },
+            ConversationStorePolicy.MountParentDirectories(new[]
+            {
+                ContainerSpecBuilder.AgentHome + "/.claude/projects",
+                ContainerSpecBuilder.AgentHome + "/.claude/history",
+            }));
+
+    [Fact]
+    public void APathOutsideHome_IsIgnoredRatherThanChowned()
+        // Nothing outside $HOME is this repair's business, and a chown there would be a real escape.
+        => Assert.Empty(ConversationStorePolicy.MountParentDirectories(new[] { "/etc/ssl/private" }));
 }
