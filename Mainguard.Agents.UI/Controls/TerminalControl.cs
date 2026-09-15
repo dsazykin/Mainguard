@@ -240,16 +240,30 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
     /// the scrollback the VtScreen actually holds; any keystroke snaps back to live.</summary>
     private int _scrollOffset;
 
+    private readonly WheelScrollAccumulator _wheel = new();
+
+    /// <summary>How far back the view is scrolled, for the headless wheel tests (the field itself
+    /// stays private — this is a read, like <see cref="ReadGrid"/>).</summary>
+    internal int ScrollOffset => _scrollOffset;
+
     /// <summary>Wheel-scroll through the VtScreen's scrollback ring. The buffer always existed
     /// (10k lines, unit-tested) — the control just never rendered it, so the terminal LOOKED
-    /// unscrollable. Three lines per notch, the terminal-emulator convention.</summary>
+    /// unscrollable. Lines come from <see cref="WheelScrollAccumulator"/>: one per notch, with a
+    /// trackpad's fractional deltas adding up instead of each one being rounded up to a line (the
+    /// old <c>Math.Round(Delta.Y * 3)</c>-with-a-floor-of-one, which made the pane fly).</summary>
     protected override void OnPointerWheelChanged(Avalonia.Input.PointerWheelEventArgs e)
     {
         base.OnPointerWheelChanged(e);
-        var delta = (int)Math.Round(e.Delta.Y * 3);
+        var delta = _wheel.Accumulate(e.Delta.Y);
         if (delta == 0)
         {
-            delta = e.Delta.Y > 0 ? 1 : e.Delta.Y < 0 ? -1 : 0;
+            // The tick went into the carry rather than nowhere: this pane IS metering the gesture,
+            // so it owns the event. Letting a sub-line tick bubble would hand a slow trackpad
+            // scroll over the terminal to whatever ancestor scrolls — which is not what the old
+            // code did either, because back then every tick was floored to a whole line and
+            // therefore always handled.
+            e.Handled = e.Delta.Y != 0;
+            return;
         }
 
         var next = Math.Clamp(_scrollOffset + delta, 0, _screen.ScrollbackCount);
@@ -391,6 +405,7 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
         if (_scrollOffset != 0)
         {
             _scrollOffset = 0;
+            _wheel.Reset();
             InvalidateVisual();
         }
 

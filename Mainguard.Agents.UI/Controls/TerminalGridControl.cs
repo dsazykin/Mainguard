@@ -48,6 +48,7 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
     private readonly GridSelection _selection = new();
     private readonly GridGlyphCache _glyphs = new(FontSize);
     private readonly GridImeClient _ime;
+    private readonly WheelScrollAccumulator _wheel = new();
 
     private double _cellWidth;
     private double _cellHeight;
@@ -55,6 +56,10 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
     private string? _preedit;
     private RenderSnapshot? _renderSnapshot;
     private bool _leftButtonDown;
+
+    /// <summary>How far back the ring viewport is scrolled, for the headless wheel tests (the
+    /// field stays private — this is a read, nothing else).</summary>
+    internal int ViewOffset => _viewOffset;
 
     public TerminalGridControl()
     {
@@ -451,18 +456,31 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
         base.OnPointerReleased(e);
     }
 
+    /// <summary>All three wheel destinations — the app's own mouse reports, the alt-screen arrow
+    /// shim, and the local ring viewport — spend the SAME accumulated line count
+    /// (<see cref="WheelScrollAccumulator"/>), so none of them can run at a different speed. This
+    /// used to be a hardcoded three everywhere, applied per event regardless of the delta's
+    /// magnitude: a discrete notch looked right, but a trackpad's stream of fractional deltas paid
+    /// three lines per micro-event and the pane flew.</summary>
     protected override void OnPointerWheelChanged(PointerWheelEventArgs e)
     {
         var up = e.Delta.Y > 0;
         var shift = e.KeyModifiers.HasFlag(KeyModifiers.Shift);
+        var lines = _wheel.Accumulate(e.Delta.Y);
+        var steps = Math.Abs(lines);
 
         if (_model.MouseTracking && !shift && _viewOffset == 0)
         {
+            // One report per accumulated line: a notch still sends exactly one, as it always did,
+            // while trackpad micro-ticks coalesce instead of flooding the app with reports.
             var (row, col) = CellAt(e.GetPosition(this));
             var bytes = GridInputEncoder.EncodeWheel(up, col + 1, row + 1, _model.MouseSgr);
             if (bytes is not null)
             {
-                InputAvailable?.Invoke(bytes);
+                for (var i = 0; i < steps; i++)
+                {
+                    InputAvailable?.Invoke(bytes);
+                }
             }
 
             e.Handled = true;
@@ -475,7 +493,7 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
             var arrow = GridInputEncoder.MapKey(up ? Key.Up : Key.Down, KeyModifiers.None, _model.CursorKeysApplication);
             if (arrow is not null)
             {
-                for (var i = 0; i < 3; i++)
+                for (var i = 0; i < steps; i++)
                 {
                     InputAvailable?.Invoke(arrow);
                 }
@@ -486,8 +504,7 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
         }
 
         // Primary screen: scroll the local ring viewport.
-        var step = up ? 3 : -3;
-        var next = Math.Clamp(_viewOffset + step, 0, _model.ScrollbackCount);
+        var next = Math.Clamp(_viewOffset + lines, 0, _model.ScrollbackCount);
         if (next != _viewOffset)
         {
             _viewOffset = next;
@@ -499,6 +516,7 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
 
     private void SnapToLive()
     {
+        _wheel.Reset();
         if (_viewOffset != 0)
         {
             _viewOffset = 0;

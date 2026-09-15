@@ -978,8 +978,11 @@
     `TerminalBackground`/`TerminalForeground`/`TerminalCursor`/`TerminalAnsi0-15` theme tokens, and
     **wheel-scroll through the scrollback ring** — the 10k-line buffer always existed but the control
     never rendered it, so the terminal looked unscrollable (user-reported in the live cycle test):
-    3 lines/notch via `VtScreen.ScrollbackLine` cells, cursor hidden while scrolled (the honest
-    "you are viewing history" signal), any keystroke snaps back to live). **CSI parameter accumulation is
+    one line/notch through `Controls/WheelScrollAccumulator` (it was 3, rounded from `Delta.Y * 3`
+    and floored at one line, which made a trackpad's fractional deltas fly — user-reported) via
+    `VtScreen.ScrollbackLine` cells, cursor hidden while scrolled (the honest
+    "you are viewing history" signal), any keystroke snaps back to live and clears the carry).
+    **CSI parameter accumulation is
     bounded (F61)** by `VtScreen.CsiParamCapChars`: OSC capture was capped at 100k and CSI was not capped
     at all, so `ESC [` plus megabytes of digits grew a `StringBuilder` and then a proportional `Split`, on
     the UI thread, in the parser the DEFAULT engine runs. Past the cap the sequence is ABANDONED rather
@@ -1404,8 +1407,14 @@
   mouse; Ctrl+C stays SIGINT), OSC 52 → host clipboard from daemon-decoded frames, the three paste
   chords via `Controls/GridInputEncoder` (paste reuses the pinned `BuildPasteBytes`; DECCKM-aware
   keys; SGR/X10 mouse encoders), wheel scrollback over the local ring, and a minimal IME preedit
-  overlay at the cursor), `Controls/ITerminalEngineControl` (what `TerminalView` hosts — either engine
-  behind the `TerminalEngine` flag via `Services/TerminalEngineSelection`, zero ViewModel change),
+  overlay at the cursor), `Controls/WheelScrollAccumulator` (the wheel→lines conversion BOTH
+  engines spend — one line per discrete notch, fractional trackpad/precision deltas accumulated with
+  the remainder carried instead of each micro-event being worth a line (interim) or three (grid),
+  which is why the panes used to fly; carry dropped on reversal and snap-to-live, per-event cap. The
+  grid engine spends the same count in all three wheel destinations: ring viewport, alt-screen arrow
+  shim, and the mouse reports a tracking app receives), `Controls/ITerminalEngineControl` (what
+  `TerminalView` hosts — either engine behind the `TerminalEngine` flag via
+  `Services/TerminalEngineSelection`, zero ViewModel change),
   `Converters/AgentStatusBrushConverter`+`DiffLineKindToClassConverter`, the daemon-facing `Services/`
   (`DaemonClient` — the sole gRPC touch-point, G-18 — `DaemonBackedOrchestrator`, `ITerminalGateway`
   (P2-18: with the grid engine selected the attach handshake is `AttachOptions(grid:true)` and
