@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import { useSearchParams } from 'react-router';
+import { Link, useSearchParams } from 'react-router';
 import { Turnstile } from '../components/Turnstile';
 import { SuccessGate } from '../components/SuccessGate';
 import { postJson } from '../lib/api';
@@ -126,6 +126,14 @@ export function Waitlist() {
         <button type="submit" className="btn btn-accent btn-lg" disabled={busy}>
           {busy ? 'Joining…' : 'Join the waitlist'}
         </button>
+
+        {/* GDPR Art. 13: the visitor is told what happens to their data at the
+            moment they hand it over, not only on a page they might go find. */}
+        <p className="form-consent">
+          Joining stores your email so you can be told when Mainguard is available. Nothing else,
+          never sold or shared, and you can ask to be removed at any time. Full detail in the{' '}
+          <Link to="/privacy">privacy policy</Link>.
+        </p>
       </form>
     </div>
   );

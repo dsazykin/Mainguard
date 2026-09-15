@@ -1,4 +1,5 @@
 import { useState, type FormEvent, type KeyboardEvent } from 'react';
+import { Link } from 'react-router';
 import { Turnstile } from '../components/Turnstile';
 import { SuccessGate } from '../components/SuccessGate';
 import { postJson } from '../lib/api';
@@ -271,6 +272,16 @@ export function Contact() {
         </div>
         {step < 3 && <p className="wiz-hint">press Enter to continue</p>}
         {step === 3 && <p className="wiz-hint">Ctrl+Enter to continue</p>}
+
+        {/* GDPR Art. 13: shown on the step where the message is actually sent,
+            so the notice arrives before the data does. */}
+        {step === STEPS.length - 1 && (
+          <p className="form-consent">
+            Sending stores your name, email and message so it can be read and answered. Nothing
+            else, never sold or shared, and you can ask for it to be deleted. Full detail in the{' '}
+            <Link to="/privacy">privacy policy</Link>.
+          </p>
+        )}
       </form>
     </div>
   );

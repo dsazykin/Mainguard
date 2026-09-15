@@ -770,6 +770,16 @@
   overflow-wrap: anywhere;
 }
 
+/* The collection notice sitting under a form's submit button. Quiet, but not
+   so quiet it reads as decoration — it is the Art. 13 notice. */
+.form-consent {
+  margin: var(--space-6) 0 0;
+  max-width: 46ch;
+  font-size: var(--text-sm);
+  line-height: 1.7;
+  color: var(--text-muted);
+}
+
 /* ————— Legal documents (privacy, terms) ————— */
 
 .legal {
