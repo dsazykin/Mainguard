@@ -45,9 +45,18 @@ public sealed class DaemonBackedOrchestrator :
 {
     private const string DefaultCoordinatorId = "coordinator-1";
 
-    /// <summary>The branch the merge queue lands on. The daemon's <c>BeginMerge</c> takes its lease against
-    /// this same name, so the two legs of the RT-D1 conversation must agree on it.</summary>
-    private const string MainBranchName = "main";
+    /// <summary>
+    /// What the integration branch is called when nothing has said otherwise — an empty projection before
+    /// the first queue update lands, and a daemon too old to carry the field. Both mean the same thing:
+    /// that repository integrates on <c>"main"</c>, which is what this was a hard-coded constant for until
+    /// the branch became configurable.
+    ///
+    /// <para>It is a FALLBACK and never the answer when the daemon has given one. <c>BeginMerge</c>'s
+    /// grant names the branch its lease authorizes, and the merge below must move that branch — the two
+    /// legs of the RT-D1 conversation have to agree on it, and the way they agree is that only one of
+    /// them chooses.</para>
+    /// </summary>
+    private const string DefaultMainBranchName = "main";
 
     /// <summary>Delay between a pump's stream ending/faulting and its re-subscribe.</summary>
     /// <remarks>Settable so a reconnect test observes a second subscribe in milliseconds rather than
@@ -209,6 +218,7 @@ public sealed class DaemonBackedOrchestrator :
     /// that is making progress must not be cancelled by another one's quiet.</summary>
     private readonly List<SpawnProgressWatchdog> _spawnWatchdogs = new();
     private string _mainSha = string.Empty;
+    private string _mainBranch = DefaultMainBranchName;
     private long _totalUsdMicros;
     private long _totalTokens;
     private bool _frozen;
@@ -475,6 +485,7 @@ public sealed class DaemonBackedOrchestrator :
             _gate_.Clear();
             _origins.Clear();
             _mainSha = string.Empty;
+            _mainBranch = DefaultMainBranchName;
 
             // The mirror-freshness pair is part of the same projection and was being left behind: after
             // detaching, the rail went on reporting "mirror main refreshed 2 minutes ago" — or the PREVIOUS
@@ -997,6 +1008,10 @@ public sealed class DaemonBackedOrchestrator :
             }
 
             _mainSha = update.MainSha ?? string.Empty;
+            // Empty from a daemon that predates the field, and such a daemon integrates on "main".
+            _mainBranch = string.IsNullOrWhiteSpace(update.MainBranch)
+                ? DefaultMainBranchName
+                : update.MainBranch;
             _mirrorMainRefreshedAt = DateTimeOffset.TryParse(
                 update.MirrorMainRefreshedAt, System.Globalization.CultureInfo.InvariantCulture,
                 System.Globalization.DateTimeStyles.RoundtripKind, out var refreshedAt)
@@ -1900,6 +1915,8 @@ public sealed class DaemonBackedOrchestrator :
 
     public string MainSha { get { lock (_gate) return _mainSha; } }
 
+    public string MainBranch { get { lock (_gate) return _mainBranch; } }
+
     private DateTimeOffset? _mirrorMainRefreshedAt;
     private string? _mirrorMainRefreshError;
 
@@ -1934,6 +1951,84 @@ public sealed class DaemonBackedOrchestrator :
             // Swallowed on purpose: the request is a nudge. Whether the mirror could be refreshed, and why
             // not, arrives on the queue stream's own error field, which is the surface a human reads.
             _ = ex;
+        }
+    }
+
+    /// <summary>
+    /// The integration branch and the mirror's branch list, read from the daemon rather than from the
+    /// user's checkout: the mirror is what agents clone and what the queue measures against, and a branch
+    /// the checkout has but the mirror has not is not yet one work could integrate on.
+    /// </summary>
+    public async Task<IntegrationBranchOptions> GetIntegrationBranchAsync()
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        var current = MainBranch;
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return new IntegrationBranchOptions(current, new[] { current });
+        }
+
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            var state = await _client
+                .GetIntegrationBranchAsync(repoHandle, cts.Token, deadline: TimeSpan.FromSeconds(15))
+                .ConfigureAwait(false);
+            var branch = string.IsNullOrWhiteSpace(state.Branch) ? current : state.Branch;
+            var available = state.Available.Count > 0
+                ? (IReadOnlyList<string>)state.Available.ToList()
+                : new[] { branch };
+            return new IntegrationBranchOptions(branch, available);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // An unreachable or older daemon: report what the queue stream last said, with no alternatives
+            // rather than a fabricated list. The surface renders a picker with one entry, which is honest.
+            _ = ex;
+            return new IntegrationBranchOptions(current, new[] { current });
+        }
+    }
+
+    /// <summary>
+    /// Re-aims the integration branch. Returns the daemon's refusal verbatim, or null when it took.
+    ///
+    /// <para>Nothing is projected here: the branch this adapter reports keeps coming from the queue
+    /// stream, which the daemon republishes as part of the stale cascade this change fires. Writing
+    /// <c>_mainBranch</c> locally would show the new branch before the daemon had actually moved it.</para>
+    /// </summary>
+    public async Task<string?> SetIntegrationBranchAsync(string branch)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return "no repository is active for agents yet";
+        }
+
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            var state = await _client
+                .SetIntegrationBranchAsync(repoHandle, branch, cts.Token, deadline: TimeSpan.FromSeconds(30))
+                .ConfigureAwait(false);
+            return string.IsNullOrEmpty(state.Error) ? null : state.Error;
+        }
+        catch (RpcException ex)
+        {
+            return ex.Status.Detail;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return ex.Message;
         }
     }
 
@@ -2193,6 +2288,15 @@ public sealed class DaemonBackedOrchestrator :
         // daemon just authorized against. K3: the branch sha is what makes `agent/<id>` in this checkout an
         // identity rather than a name, and it is what ConfirmMerge compares the reported post-merge main
         // against.
+        // ...and so does the BRANCH. The grant names the branch the daemon leased against; this merge has
+        // to move that branch and no other. Taking it from the local projection instead would let the two
+        // legs disagree after a re-aim: the lease authorized `develop`, the merge fast-forwarded the
+        // branch this client still thought was current, and ConfirmMerge recorded the second as though the
+        // gate had authorized it. Empty only from a daemon predating the field, which leased against main.
+        var mainBranch = string.IsNullOrWhiteSpace(begun.MainBranch)
+            ? DefaultMainBranchName
+            : begun.MainBranch;
+
         var lease = new Mainguard.Git.Models.MergeLeaseRow
         {
             RepoHash = repoHandle!,
@@ -2200,7 +2304,7 @@ public sealed class DaemonBackedOrchestrator :
             AgentId = agentId,
             ExpectedMainSha = begun.ExpectedMainSha ?? string.Empty,
             ExpectedBranchSha = begun.ExpectedBranchSha ?? string.Empty,
-            MainBranch = MainBranchName,
+            MainBranch = mainBranch,
         };
 
         var mergeRequest = new Mainguard.Agents.Services.ForegroundMergeRequest(
@@ -2208,7 +2312,7 @@ public sealed class DaemonBackedOrchestrator :
             RepoHash: repoHandle!,
             AgentId: agentId,
             ExpectedMainSha: lease.ExpectedMainSha,
-            MainBranch: MainBranchName,
+            MainBranch: mainBranch,
             ExpectedBranchSha: lease.ExpectedBranchSha);
 
         Mainguard.Agents.Services.ForegroundMergeResult result;
@@ -2298,7 +2402,7 @@ public sealed class DaemonBackedOrchestrator :
             // and what the queue does not yet know. The RT-D1 boot reconcile settles the entry against git
             // on the next connect.
             throw new InvalidOperationException(
-                $"{MergeLandedSentence(origin, agentId, result.NewMainSha!)} Mainguard couldn't record it "
+                $"{MergeLandedSentence(origin, agentId, mainBranch, result.NewMainSha!)} Mainguard couldn't record it "
                 + $"with the daemon ({ex.Message}), so the queue entry still shows it as unmerged — it "
                 + "settles itself once the daemon is reachable again.", ex);
         }
@@ -2306,7 +2410,7 @@ public sealed class DaemonBackedOrchestrator :
         // The origin that actually ran the merge, reported with the sha main really moved to. It is the
         // SAME `origin` the transport was chosen by above — read once, under the lock — so what the human
         // is told cannot describe a transport other than the one that ran.
-        return new MergeOutcome(origin, agentId, MainBranchName, result.NewMainSha!);
+        return new MergeOutcome(origin, agentId, mainBranch, result.NewMainSha!);
     }
 
     /// <summary>
@@ -2315,7 +2419,8 @@ public sealed class DaemonBackedOrchestrator :
     /// the same reason <see cref="MergeActionRunner.Confirmation"/> is: an upstream pull request wearing
     /// the local fast-forward's wording describes something that did not happen.
     /// </summary>
-    private static string MergeLandedSentence(MergeEntryOrigin origin, string agentId, string newMainSha)
+    private static string MergeLandedSentence(
+        MergeEntryOrigin origin, string agentId, string mainBranch, string newMainSha)
     {
         var shortSha = newMainSha.Length <= 7 ? newMainSha : newMainSha[..7];
         if (origin == MergeEntryOrigin.External)
@@ -2323,10 +2428,10 @@ public sealed class DaemonBackedOrchestrator :
             var pullRequest = Mainguard.Agents.Services.ExternalPrMergeService.PrNumberFor(agentId) is int number
                 ? $"Pull request #{number}"
                 : "The pull request";
-            return $"{pullRequest} IS merged upstream and {MainBranchName} fast-forwarded onto {shortSha}.";
+            return $"{pullRequest} IS merged upstream and {mainBranch} fast-forwarded onto {shortSha}.";
         }
 
-        return $"agent/{agentId} IS merged into {MainBranchName} ({shortSha}).";
+        return $"agent/{agentId} IS merged into {mainBranch} ({shortSha}).";
     }
 
     /// <summary>

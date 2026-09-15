@@ -17,7 +17,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
 - **`Terminal/`** — the engine-agnostic terminal seam (P2-03).
   - `ITerminalView.cs` (the interface the ViewModel talks to —
     `FeedOutput`/`InputAvailable`/`Resize`/opaque `GetStateSnapshot`/`RestoreState`; never leaks a
-    renderer type so P2-18's libvterm engine swaps in with no ViewModel change).
+    renderer type so P2-18's libvterm engine swaps in with no ViewModel change). **MG-24: `Resize` is
+    the session's AUTHORITATIVE size — the geometry the PTY is actually running at, as reported by the
+    daemon's `geometry` frame — not the size of the pane.** The two coincide for an ordinary terminal
+    and diverge for a managed worker, whose terminal is input-locked (P2-14) so F64 refuses to reshape
+    it for a spectator. An engine that sizes itself from its pane instead parses the CLI's
+    cursor-addressed redraws against the wrong width; fit the pane by scaling what you draw, never by
+    changing the size you parse at.
   - `VtBoundaryDetector.cs` (pure `SafeFlushLength`: Ground/Esc/Csi/Osc/Dcs/Ss3 + UTF-8 continuation
     counting; returns the largest prefix that never splits a VT sequence or UTF-8 codepoint — the
     correctness heart, split-at-every-offset tested).
@@ -1986,7 +1992,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       bridge behind `GetMergeDiff` that reuses the audited git path (`git diff main...agent/<id>` in the
       bare mirror via `AgentGitCommand`) + the pure T-06 `PatchParser`, returning the parsed `FilePatch`
       list the review cockpit's `ReviewCockpitContext.MergeDiff` needs; no new diff algorithm).
-      `MergeQueueProvisioner.cs` (**MG-10 — the missing constructor call.** `new MergeQueue(...)` +
+      `MergeQueueProvisioner.cs` (**the integration branch lives here:** `IntegrationBranch(handle)` is
+      `ResolveDefaultBranch` — the mirror's own `symbolic-ref HEAD` — made public so `BeginMerge` can lease
+      against the branch the merge will actually move; `MirrorBranches(handle)` is the candidate set, read
+      from the MIRROR (a branch the checkout has but the mirror has not is not one agents could integrate
+      on); `SetIntegrationBranch(handle, branch)` re-points that HEAD, refuses a branch the mirror has not
+      got (HEAD at an unresolvable ref is the "main unreadable" state `AlignLeaseMainBranch` repairs),
+      fetches the new branch forward, and fires `NotifyMainMoved` — the stale cascade is the POINT, since
+      every verification in the queue was measured against the old branch's tip. Returns
+      `IntegrationBranchChange`. **MG-10 — the missing constructor call.** `new MergeQueue(...)` +
       `registry.Register(...)` existed ONLY in the test projects, so the registry stayed empty for the
       daemon's whole lifetime and every merge-queue RPC answered NOT_FOUND — the P2-10 guarantees were
       neither enforced nor bypassable, they simply were not running. Builds a repo's queue on the events

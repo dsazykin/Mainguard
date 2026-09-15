@@ -61,6 +61,11 @@ public enum WorkerMergeState
 /// </summary>
 public enum MergeEntryOrigin { Local, External }
 
+/// <summary>The integration branch and the branches a human could re-aim it at.</summary>
+/// <param name="Branch">The branch agent work currently merges into.</param>
+/// <param name="Available">Every branch the daemon's mirror carries, the current one included.</param>
+public sealed record IntegrationBranchOptions(string Branch, IReadOnlyList<string> Available);
+
 /// <summary>
 /// What a confirmed merge actually did (P2-12). The two origins land a merge in two different places — a
 /// <see cref="MergeEntryOrigin.Local"/> entry is fast-forwarded into the user's own checkout, while an

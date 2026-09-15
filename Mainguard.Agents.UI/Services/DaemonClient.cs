@@ -601,6 +601,26 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
             new RefreshMirrorMainRequest { RepoHandle = repoHandle }, CallOptions(ct, deadline));
     }
 
+    /// <summary>The branch agent work merges into, plus the branches it could be changed to.</summary>
+    public async Task<IntegrationBranchState> GetIntegrationBranchAsync(
+        string repoHandle, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.GetIntegrationBranchAsync(
+            new GetIntegrationBranchRequest { RepoHandle = repoHandle }, CallOptions(ct, deadline));
+    }
+
+    /// <summary>Re-aims the integration branch. The response reports what the repository actually holds
+    /// afterwards, so a refusal is read off <c>Error</c> rather than inferred from an exception.</summary>
+    public async Task<IntegrationBranchState> SetIntegrationBranchAsync(
+        string repoHandle, string branch, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.SetIntegrationBranchAsync(
+            new SetIntegrationBranchRequest { RepoHandle = repoHandle, Branch = branch },
+            CallOptions(ct, deadline));
+    }
+
     /// <summary>RT-D1 step 1: take the per-repo merge lease before the human foreground merge.</summary>
     public async Task<BeginMergeResponse> BeginMergeAsync(
         string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)

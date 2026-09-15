@@ -99,6 +99,44 @@ service MergeQueueService {
   // verification against the new main. It loses replay progress and no committed work, which is why it is
   // the deterministic option and why the client puts it behind the same confirmation Discard uses.
   rpc AbortRebase(AbortRebaseRequest) returns (AbortRebaseResponse);
+
+  // ---- The integration branch --------------------------------------------------------------------
+  //
+  // WHICH branch agent work lands on. It was un-chosen and unchangeable: BeginMerge wrote the literal
+  // "main" onto every lease, the client's foreground merge held its own `const MainBranchName = "main"`,
+  // and the only escape was a fallback that fired when "main" did not resolve in the mirror at all. A
+  // repository that integrates on `develop`, `trunk` or a release branch had no way to say so.
+  //
+  // The name is the bare mirror's own HEAD, which is already what the rest of the platform reads as "the
+  // integration branch" — RepoProvisioner, WorktreeManager, AgentRefMediator, QueueSeeder and
+  // MergeBranchDiffService all resolve it with `symbolic-ref --short HEAD`. Setting it re-points that one
+  // ref, so agents branch from, rebase onto and merge into the same branch by construction, and the
+  // choice persists as git state rather than in a second store that could disagree with the mirror.
+  rpc GetIntegrationBranch(GetIntegrationBranchRequest) returns (IntegrationBranchState);
+  // Refused, never forced, when the named branch does not exist in the mirror: pointing HEAD at a ref
+  // that resolves to nothing is exactly the "main unreadable" state AlignLeaseMainBranch exists to
+  // repair, and a queue keyed to an unknown main calls every stale verification fresh.
+  rpc SetIntegrationBranch(SetIntegrationBranchRequest) returns (IntegrationBranchState);
+}
+
+message GetIntegrationBranchRequest {
+  string repo_handle = 1;
+}
+
+message SetIntegrationBranchRequest {
+  string repo_handle = 1;
+  string branch = 2; // a friendly branch name ("develop"), not a ref path
+}
+
+message IntegrationBranchState {
+  // The branch agent work merges into, as the mirror's HEAD now names it. Unchanged from the current
+  // value when a Set was refused — the state reported is always what the mirror actually holds.
+  string branch = 1;
+  // Every branch the mirror carries, so a client can offer the choice without a second round trip and
+  // without reading the user's own checkout (whose branches are not necessarily the mirror's).
+  repeated string available = 2;
+  // Why a Set did nothing, empty on success and on every Get. Rendered verbatim.
+  string error = 3;
 }
 
 message StreamQueueRequest {
@@ -113,6 +151,10 @@ message QueueUpdate {
   // empty when nothing has tried yet. The client renders the age; the daemon states the facts.
   string mirror_main_refreshed_at = 3;
   string mirror_main_refresh_error = 4;
+  // The integration branch main_sha names (see GetIntegrationBranch). Carried so a surface reading
+  // "<branch> <sha>" says which branch it measured rather than assuming "main"; empty from a daemon
+  // that predates the field, which a client reads as "main" for exactly that reason.
+  string main_branch = 5;
 }
 
 message RefreshMirrorMainRequest {
@@ -295,6 +337,15 @@ message BeginMergeResponse {
   // measured branch sha for this entry (a seeded row, or a record from before the field existed); it is
   // read as "not measured" and never as a mismatch.
   string expected_branch_sha = 5;
+  // The branch this lease authorizes a merge ONTO — the repo's integration branch at grant time.
+  //
+  // It comes from the granting daemon for the same reason expected_main_sha does. The client performs
+  // the merge itself, so if it chose the branch name independently the two legs of the RT-D1
+  // conversation could name different branches: the lease would be taken against one ref, the
+  // fast-forward performed on another, and ConfirmMerge would record the second as though the gate had
+  // authorized it. Empty from a daemon that predates the field; read as "main", which is what such a
+  // daemon leased against.
+  string main_branch = 6;
 }
 
 message AbandonMergeRequest {

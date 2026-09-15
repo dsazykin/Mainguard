@@ -183,28 +183,59 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
         System.Threading.CancellationToken ct)
     {
         var (replay, live) = bound.Subscribe(out var unsubscribe);
+        var (cols, rows, geometry) = bound.SubscribeGeometry(out var unsubscribeGeometry);
+
+        // MG-24: there are now two producers for this response stream (PTY frames and geometry
+        // changes) and gRPC allows exactly one in-flight WriteAsync per stream, so every write goes
+        // through this gate. Without it a resize landing inside a frame write throws "the previous
+        // write is in progress" — the same failure the client-side TerminalWriteQueue exists to stop.
+        var writeGate = new System.Threading.SemaphoreSlim(1, 1);
         IDisposable? inputClaim = null;
         try
         {
+            // Geometry FIRST — ahead of the banner and ahead of the replay tail. The replay is raw
+            // PTY bytes produced at this size; a client that parses them before it knows the size
+            // parses them at its own pane width, which is exactly the garbling this frame prevents.
+            await WriteGuardedAsync(responseStream, writeGate, new TerminalOutput
+            {
+                Geometry = new Resize { Cols = (uint)cols, Rows = (uint)rows },
+            }, ct);
+
             if (isLocked())
             {
-                await responseStream.WriteAsync(new TerminalOutput
+                await WriteGuardedAsync(responseStream, writeGate, new TerminalOutput
                 {
                     Raw = ByteString.CopyFromUtf8("[read-only - managed worker]\r\n"),
-                });
+                }, ct);
             }
 
-            // Single writer to the response stream: this pump task emits replay-then-live frames.
+            // Replay-then-live PTY frames.
             var pump = Task.Run(async () =>
             {
                 foreach (var frame in replay)
                 {
-                    await responseStream.WriteAsync(new TerminalOutput { Raw = ByteString.CopyFrom(frame) });
+                    await WriteGuardedAsync(responseStream, writeGate,
+                        new TerminalOutput { Raw = ByteString.CopyFrom(frame) }, ct);
                 }
 
                 await foreach (var frame in live.ReadAllAsync(ct))
                 {
-                    await responseStream.WriteAsync(new TerminalOutput { Raw = ByteString.CopyFrom(frame) });
+                    await WriteGuardedAsync(responseStream, writeGate,
+                        new TerminalOutput { Raw = ByteString.CopyFrom(frame) }, ct);
+                }
+            }, ct);
+
+            // Later size changes. A raw client cannot infer geometry from its own frames, so a
+            // resize driven by anyone else — another attach on a shared session, or this one once
+            // the daemon has honoured it — has to be told, not deduced.
+            var geometryPump = Task.Run(async () =>
+            {
+                await foreach (var (c, r) in geometry.ReadAllAsync(ct))
+                {
+                    await WriteGuardedAsync(responseStream, writeGate, new TerminalOutput
+                    {
+                        Geometry = new Resize { Cols = (uint)c, Rows = (uint)r },
+                    }, ct);
                 }
             }, ct);
 
@@ -274,11 +305,52 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
             {
                 // The client went away mid-write — nothing to salvage; the session lives on.
             }
+
+            // Unsubscribing completes the geometry channel, which is what ends its pump. Observe it
+            // so a write that failed on a vanished client is not an unobserved task exception.
+            unsubscribeGeometry();
+            try
+            {
+                await geometryPump;
+            }
+            catch (Exception)
+            {
+                // Detach / client gone mid-write. Geometry is a latest-value signal on a stream that
+                // is closing: there is nothing to report and nothing to retry.
+            }
         }
         finally
         {
             inputClaim?.Dispose();
             unsubscribe();
+            unsubscribeGeometry();
+
+            // writeGate is deliberately NOT disposed: an exception escaping the try can reach here
+            // while a pump task is still inside WriteGuardedAsync, and disposing under it would turn
+            // a teardown into an unobserved ObjectDisposedException. A SemaphoreSlim that never had
+            // its AvailableWaitHandle touched holds nothing that needs releasing.
+        }
+    }
+
+    /// <summary>
+    /// MG-24: one write to the response stream, serialized against every other producer on it. The
+    /// gate is released even when the write throws, so a failed write ends this attach rather than
+    /// wedging the stream for the frames behind it.
+    /// </summary>
+    private static async Task WriteGuardedAsync(
+        IServerStreamWriter<TerminalOutput> responseStream,
+        System.Threading.SemaphoreSlim gate,
+        TerminalOutput frame,
+        System.Threading.CancellationToken ct)
+    {
+        await gate.WaitAsync(ct);
+        try
+        {
+            await responseStream.WriteAsync(frame);
+        }
+        finally
+        {
+            gate.Release();
         }
     }
 

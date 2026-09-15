@@ -3014,6 +3014,127 @@ public sealed class MergeQueueProvisioner
         return outcome;
     }
 
+    // ---- the integration branch ------------------------------------------------------------------
+
+    /// <summary>
+    /// The branch agent work integrates on — what the mirror's own HEAD names.
+    ///
+    /// <para>This is not a new source of truth. <see cref="ResolveDefaultBranch"/> is what every path in
+    /// this file already consults, and <c>RepoProvisioner</c>, <c>WorktreeManager</c>,
+    /// <c>AgentRefMediator</c>, <c>QueueSeeder</c> and <c>MergeBranchDiffService</c> each resolve the same
+    /// ref the same way. Naming it publicly is what lets <c>BeginMerge</c> lease against the branch the
+    /// merge will actually move instead of the literal <c>"main"</c> it used to write.</para>
+    /// </summary>
+    public string IntegrationBranch(string repoHandle)
+        => ResolveDefaultBranch(_repos.BareRepoPathFor(repoHandle));
+
+    /// <summary>
+    /// The branches the mirror carries, as friendly names, ordered. The candidate set for
+    /// <see cref="SetIntegrationBranch"/> — read from the MIRROR and not from the user's checkout,
+    /// because the mirror is what every agent clones and what the merge queue measures against, and a
+    /// branch the checkout has but the mirror does not is not yet a branch agents could integrate on.
+    /// </summary>
+    public IReadOnlyList<string> MirrorBranches(string repoHandle)
+    {
+        var barePath = _repos.BareRepoPathFor(repoHandle);
+        if (!TryGit(barePath, out var output, "for-each-ref", "--format=%(refname:short)", "refs/heads/"))
+        {
+            return Array.Empty<string>();
+        }
+
+        return output
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Points this repository's integration branch at <paramref name="branch"/> by re-seating the
+    /// mirror's HEAD, and tells the queue that main has moved.
+    ///
+    /// <para><b>Why HEAD and not a settings row.</b> Every consumer of "the integration branch" already
+    /// reads <c>symbolic-ref HEAD</c> on the mirror. A parallel setting would have to be threaded to all
+    /// of them, and could disagree with the ref the mirror actually holds — which is the one state this
+    /// area cannot tolerate, since a lease taken against one branch and a merge performed on another
+    /// records a merge the gate never authorized. Re-pointing the ref moves all of them at once, and
+    /// persists as git state the daemon cannot lose separately from the mirror it describes.</para>
+    ///
+    /// <para><b>The stale cascade is the point, not a side effect.</b> Every verification in the queue was
+    /// measured against the OLD branch's tip; against the new one none of them is evidence. So the queue
+    /// is told main moved, exactly as it is told after a merge — Verified entries go stale, and the
+    /// co-tenant rebases re-parent onto the branch work will now land on.</para>
+    ///
+    /// <para>Refused, changing nothing, when the branch is not one the mirror holds: HEAD pointing at a
+    /// ref that resolves to nothing is the "main unreadable" state <see cref="AlignLeaseMainBranch"/>
+    /// exists to repair, and a queue keyed to an empty sha calls every stale record fresh.</para>
+    /// </summary>
+    public IntegrationBranchChange SetIntegrationBranch(string repoHandle, string branch)
+    {
+        var barePath = _repos.BareRepoPathFor(repoHandle);
+        var current = ResolveDefaultBranch(barePath);
+
+        var wanted = (branch ?? string.Empty).Trim();
+        if (wanted.Length == 0)
+        {
+            return new IntegrationBranchChange(current, false, "no branch was named");
+        }
+
+        // A friendly name, deliberately: accepting "refs/heads/x" here would let a caller aim HEAD at
+        // refs/remotes or refs/tags, neither of which is a branch a merge can fast-forward.
+        if (wanted.StartsWith("refs/", StringComparison.Ordinal) || wanted.Contains(' '))
+        {
+            return new IntegrationBranchChange(current, false, $"'{wanted}' is not a branch name");
+        }
+
+        if (string.Equals(wanted, current, StringComparison.Ordinal))
+        {
+            // Not an error and not a no-op worth a cascade: the branch is already the integration branch.
+            return new IntegrationBranchChange(current, false, null);
+        }
+
+        var sha = RevParse(barePath, $"refs/heads/{wanted}");
+        if (sha.Length == 0)
+        {
+            return new IntegrationBranchChange(
+                current,
+                false,
+                $"the mirror has no branch '{wanted}' — push it, then reopen the repository so Mainguard "
+                + "mirrors it");
+        }
+
+        if (!TryGit(barePath, out var output, "symbolic-ref", "HEAD", $"refs/heads/{wanted}"))
+        {
+            return new IntegrationBranchChange(
+                current, false, $"the mirror's HEAD could not be moved to '{wanted}': {output.Trim()}");
+        }
+
+        // Bring the new integration branch up to date with the user's checkout before anything measures
+        // against it. Unforced and non-fatal: a branch the checkout cannot fast-forward is a real state
+        // (someone rewrote it), and the tip the mirror already holds is still a truthful main to key the
+        // queue to — the periodic refresh reports the failure on its own terms.
+        TryRefreshMirrorMainAfterMerge(repoHandle, force: false, out _);
+        var newSha = RevParse(barePath, $"refs/heads/{wanted}");
+        if (newSha.Length == 0) newSha = sha;
+
+        var context = _registry.Resolve(repoHandle);
+        if (context is not null && !string.Equals(context.Queue.CurrentMainSha, newSha, StringComparison.Ordinal))
+        {
+            context.Queue.NotifyMainMoved(newSha);
+        }
+
+        _log?.Invoke($"integration branch repo={repoHandle} {current} -> {wanted} main={newSha}");
+        _audit.Append(new AuditEvent("integration_branch_changed", new Dictionary<string, string>
+        {
+            ["repo"] = repoHandle,
+            ["from"] = current,
+            ["to"] = wanted,
+            ["main"] = newSha,
+        }));
+
+        context?.Queue.NotifyGateChanged();
+        return new IntegrationBranchChange(wanted, true, null);
+    }
+
     private static string RevParse(string barePath, string reference)
         => TryGit(barePath, out var output, "rev-parse", "--verify", reference) ? output.Trim() : string.Empty;
 
@@ -3052,3 +3173,11 @@ public sealed class MergeQueueProvisioner
 /// <param name="Moved">True when the queue's main advanced (and the stale cascade fired) on this attempt.</param>
 /// <param name="Error">Why the fetch failed, or null when it succeeded.</param>
 public sealed record MirrorMainRefresh(string MainSha, DateTimeOffset At, bool Moved, string? Error);
+
+/// <summary>The outcome of a <see cref="MergeQueueProvisioner.SetIntegrationBranch"/>.</summary>
+/// <param name="Branch">The integration branch AFTER the attempt — unchanged when it was refused, so a
+/// caller can report the repository's real state without a second read.</param>
+/// <param name="Changed">True only when the mirror's HEAD actually moved.</param>
+/// <param name="Error">Why nothing changed, or null. Null with <c>Changed: false</c> means the branch was
+/// already the integration branch.</param>
+public sealed record IntegrationBranchChange(string Branch, bool Changed, string? Error);

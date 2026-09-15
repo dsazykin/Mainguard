@@ -1064,7 +1064,11 @@
   `VtermSession` fed the same 16 ms VT-safe frames under the session gate — `SubscribeGrid` (atomic
   full snapshot + live `GridUpdate`/`ClipboardCopy` frames), `Resize` (PTY + vterm in the same breath,
   then a fresh snapshot — preceded by a ring-only update carrying the reflow's scrollback pushes/pops
-  so the client ring never desyncs), `GetScrollback` (the lazy-fetch RPC's data source).
+  so the client ring never desyncs), `GetScrollback` (the lazy-fetch RPC's data source). **MG-24:**
+  `Cols`/`Rows` track the authoritative size for EVERY engine (not just libvterm — the interim engine
+  has no daemon-side grid to read it off), clamped through the same gate `Resize` uses, and
+  `SubscribeGeometry` hands an attach that size atomically with enrolment plus a latest-value channel
+  (capacity 1, `DropOldest`) of every later change, so a slow reader can never stall the resize path.
 - **`Services/AgentGrpcService.cs`** (**PR3:** validation+mapping only — `SpawnAgent`/`StopAgent`
   dispatch to the shared `AgentSpawnService` workflow (typed exceptions → status codes via the shared
   `MapLaunchFailure`, incl. the v1
@@ -1092,7 +1096,17 @@
   CLI and a reflow of the daemon's authoritative grid that every other viewer sees); and input is
   **exclusive** via `BoundTerminalSession.TryClaimInput`, claimed lazily on the first keystroke and
   released on detach, so two concurrent attaches can no longer interleave keystrokes into one PTY.
-  Otherwise the per-attach
+  **MG-24 completes F64's other half:** refusing the spectator's resize was right, but it left the
+  client no way to KNOW it had been refused — it kept rendering at the size it asked for while the PTY
+  ran at the size it was spawned with, so 120-column output was parsed into a ~68-column grid with no
+  reflow and the CLI's cursor-addressed redraws landed on the wrong rows (the unreadable worker
+  terminal). A raw attach now leads with a **`geometry`** frame — ahead of the banner and the replay
+  tail, since the replay is raw bytes produced at that size — and streams every later change from
+  `SubscribeGeometry`. That makes two producers on one response stream, so every write goes through
+  `WriteGuardedAsync`'s semaphore (gRPC allows one in-flight `WriteAsync` per stream; the gate is
+  deliberately NOT disposed, because an exception escaping the try can reach the `finally` while a
+  pump is still inside it). The grid pump needs none of this — every `GridUpdate` already carries
+  cols/rows. Otherwise the per-attach
   `PtySession` factory path through `TerminalStreamer`, else — for an agent the session store KNOWS
   but that has no bound CLI — the `DetachedNotice` attach (ISSUES-LOG #23: says so in one unprompted
   frame and discards input, instead of a silent echo that emitted nothing until the user typed and so
@@ -1169,7 +1183,16 @@
   **K3/§23.4 merge identity:** `BeginMerge` puts BOTH halves of the identity on the lease — the queue's
   `CurrentMainSha` and `LastVerification(agent)?.BranchSha`, the `agent/<id>` tip the verification was
   measured on — and returns both to the client (`expected_branch_sha`), for the same reason
-  `expected_main_sha` already travelled there: the client's projection is a stream snapshot. `ConfirmMerge`
+  `expected_main_sha` already travelled there: the client's projection is a stream snapshot.
+  **The integration branch travels the same way.** The lease is taken against
+  `MergeQueueProvisioner.IntegrationBranch(handle)` — the mirror's own HEAD — not the literal `"main"`
+  this used to write, and the branch comes back on `BeginMergeResponse.main_branch` so the client
+  fast-forwards the branch the lease authorized rather than choosing one itself. `QueueUpdate.main_branch`
+  carries the same name for the rail. `Get/SetIntegrationBranch` are the read and the write;
+  `SetIntegrationBranch` re-points the mirror's HEAD (so `RepoProvisioner`, `WorktreeManager`,
+  `AgentRefMediator`, `QueueSeeder` and `MergeBranchDiffService` all move with it), refuses a branch the
+  mirror has not got, fires the stale cascade because every verification was measured against the OLD
+  branch, and is denied to the coordinator role. `ConfirmMerge`
   then SCREENS the `new_main_sha` the caller reports, which nothing used to look at even though the daemon
   wrote it into the idempotency record, set the queue's authoritative main to it, and cascaded every
   co-tenant onto it. Three checks, all before the transition and all against the daemon's own records:

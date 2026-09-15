@@ -47,6 +47,11 @@ public partial class AgentDocumentViewModel : ViewModelBase
     [ObservableProperty] private bool _canMerge;
     [ObservableProperty] private string _mergeGateReason = "";
 
+    /// <summary>The Merge button's label. It names the branch the merge will actually land on rather than
+    /// saying "main" at a repository that integrates on something else — the button is the last thing a
+    /// human reads before the one irreversible act on this surface.</summary>
+    [ObservableProperty] private string _mergeButtonText = "Merge to main";
+
     /// <summary>
     /// The verification verdict and its on-demand output (H4) — the SAME child VM the merge-queue row
     /// composes. It replaced a <c>ReviewFactsText</c> that read
@@ -105,6 +110,7 @@ public partial class AgentDocumentViewModel : ViewModelBase
     private void RefreshReview()
     {
         var entry = _queue.GetQueue().FirstOrDefault(q => q.AgentId == AgentId);
+        MergeButtonText = "Merge to " + _queue.MainBranch;
 
         // Updated for the null case too: an agent that left the queue must not keep rendering the verdict
         // of a run it no longer has an entry for.
@@ -120,7 +126,9 @@ public partial class AgentDocumentViewModel : ViewModelBase
             return;
         }
 
-        VerifiedAgainstText = entry.VerifiedMainSha is { Length: > 0 } sha ? $"measured against main@{sha}" : "";
+        VerifiedAgainstText = entry.VerifiedMainSha is { Length: > 0 } sha
+            ? $"measured against {_queue.MainBranch}@{sha}"
+            : "";
 
         // Sync flagged items in place so ack checkmarks don't flicker.
         for (int i = FlaggedItems.Count - 1; i >= 0; i--)

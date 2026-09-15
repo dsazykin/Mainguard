@@ -50,7 +50,11 @@
     first-class `GridOp` scroll/pop ops, `GridCursor`, `GridModes`
     (alt-screen/bracketed-paste/DECCKM/mouse+SGR); `ClipboardCopy` — daemon-decoded OSC 52 SETs (queries
     never answered); and the `GetScrollback` RPC — lazy absolute-indexed scrollback pages for
-    reattach/recovery/thin clients).
+    reattach/recovery/thin clients. **MG-24 adds `geometry` to the output oneof** — the session's
+    AUTHORITATIVE (cols, rows), sent ahead of the replay tail and on every change. A `grid` client
+    never needed it (every `GridUpdate` carries cols/rows) but a raw client had no way to learn the
+    size at all and assumed its own pane was authoritative — false for a managed worker, whose
+    terminal is input-locked so F64 refuses its resize and the PTY keeps the size it was spawned at).
   - `audit.proto` (P2-15: `AuditService` — `VerifyAudit` (chain + mirror walked daemon-side; head
     seq/hash; `persistent=false` flags the in-memory fallback journal so a heap verify can never
     pass as tamper-evidence) and `ReadAudit` (paged decrypted canonical envelopes) — the audit
@@ -129,6 +133,16 @@
     `worktree` is the one deliberate G-14 exception, documented in the proto (it is not an address, nothing
     is looked up by it, and the identical string already reaches a human-facing client verbatim inside
     `AuditService.ReadAudit`'s payload for `keepalive_rebase_conflict`).
+    **The integration branch** — `GetIntegrationBranch` / `SetIntegrationBranch` returning
+    `IntegrationBranchState` (`branch`, `available`, `error`), plus `QueueUpdate.main_branch` and
+    `BeginMergeResponse.main_branch`. WHICH branch agent work lands on was previously the literal
+    `"main"`, written onto every lease by the daemon and held as a `const` by the client. The name is the
+    bare mirror's own HEAD — already what `RepoProvisioner`, `WorktreeManager`, `AgentRefMediator`,
+    `QueueSeeder` and `MergeBranchDiffService` each resolve — so setting it re-points one ref and every
+    consumer moves with it, and the choice persists as git state rather than in a second store that could
+    disagree with the mirror. `main_branch` on the two messages exists so the client never CHOOSES the
+    branch: a lease taken against one branch and a fast-forward performed on another would record a merge
+    the gate never authorized. Empty on either field means a daemon predating them, read as `"main"`.
     **`mergequeue.proto` also carries `PrIntakeService`** — the P2-12
     external-PR-intake configuration surface, hosted here because the intake is the queue's other feeder:
     `GetPrIntakeSettings` (settings + persisted `PrIntakeSource` list), `UpdatePrIntakeSettings` and

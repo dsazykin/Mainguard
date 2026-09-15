@@ -131,6 +131,25 @@ public interface IMergeQueueService
 {
     string MainSha { get; }
 
+    /// <summary>
+    /// The branch <see cref="MainSha"/> names — the repository's integration branch, i.e. the branch agent
+    /// work merges into. Defaults to <c>"main"</c>, which is what it was hard-coded to everywhere before
+    /// it could be chosen and what a daemon predating the wire field still leases against.
+    /// </summary>
+    string MainBranch => "main";
+
+    /// <summary>The integration branch and the branches it could be changed to.</summary>
+    Task<IntegrationBranchOptions> GetIntegrationBranchAsync()
+        => Task.FromResult(new IntegrationBranchOptions(MainBranch, new[] { MainBranch }));
+
+    /// <summary>
+    /// Re-aims the integration branch. Returns null when it changed (or already was that branch), and the
+    /// human-readable reason when the daemon refused — a refusal is a normal answer here, not an
+    /// exception: the common one is naming a branch the daemon's mirror has not got yet.
+    /// </summary>
+    Task<string?> SetIntegrationBranchAsync(string branch)
+        => Task.FromResult<string?>("this build cannot change the integration branch");
+
     /// <summary>When the daemon last tried to pull the mirror's main forward from the checkout, or null
     /// when it has not yet (2026-09-04). The rail renders the age from this; the daemon states the fact.</summary>
     DateTimeOffset? MirrorMainRefreshedAt => null;
