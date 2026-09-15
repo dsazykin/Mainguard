@@ -2744,7 +2744,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       from / bind-mount into a jail, and the list the spawn path re-checks the no-credential-overlap
       invariant against, because a marker is an ordinary file in a VM path and may have been written by
       an older build — plus `instructionsFile`/`systemPromptArg`, (defect C2) `preApprovedCommandArg`/
-      `preApprovedCommandFormat`, and `resumeArg`, which serves BOTH the adoption re-bind (jail still
+      `preApprovedCommandFormat`, **`modelArg`/`models`** (the flag this CLI takes a MODEL on, and its
+      known models as SUGGESTIONS rather than a validator — every shipped adapter's flag was verified
+      against the exact pinned artifact the manifest installs, never inferred from a neighbour, because a
+      wrong flag fails every spawn of that kind with a vendor error that reads as a Mainguard bug), and
+      `resumeArg`, which serves BOTH the adoption re-bind (jail still
       running, tmpfs `$HOME` survived) and the stranded-entry resume (jail gone, `conversationPaths` is
       what kept the transcript). **Defect D5a — the marker is no
       longer a second source of truth.**

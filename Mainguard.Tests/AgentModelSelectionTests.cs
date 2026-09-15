@@ -76,6 +76,36 @@ public class AgentModelSelectionTests
         }
     }
 
+    /// <summary>
+    /// FAILS if the model fields are ever left out of the shipped-manifest projection — defect D5a, the
+    /// one that makes a feature silently inert on the only install that matters.
+    ///
+    /// <para>A marker is an ordinary file written the day the CLI was installed, so every real install
+    /// has one that predates this field. Two shipped fixes were already completely dead that way while
+    /// every test stayed green. <c>WithShippedDescription</c> is what repairs it — a marker keeps only
+    /// the two facts about the INSTALL (its probed version and argv) and takes the CLI's DESCRIPTION
+    /// from the manifest — so the model flag has to travel through it.</para>
+    /// </summary>
+    [Fact]
+    public void AStaleMarker_GetsTheModelFlagBack_FromTheShippedManifest()
+    {
+        var spec = AdapterManifest.Parse(StarterManifest()).Adapters.Single(a => a.Id == "claude-code");
+
+        // A marker as an older build wrote it: probed version and argv, and no model fields at all.
+        var stale = new InstalledAdapterMarker(
+            "claude-code", "2.1.218", new[] { "/opt/mainguard/adapters/bin/claude" });
+        Assert.Null(stale.ModelArg);
+
+        var repaired = stale.WithShippedDescription(spec);
+
+        Assert.Equal("--model", repaired.ModelArg);
+        Assert.NotNull(repaired.Models);
+
+        // And the two install facts are still the marker's own, not the manifest's.
+        Assert.Equal("2.1.218", repaired.Version);
+        Assert.Equal(new[] { "/opt/mainguard/adapters/bin/claude" }, repaired.Launch);
+    }
+
     // ---- the store ------------------------------------------------------------------------------
 
     [Fact]

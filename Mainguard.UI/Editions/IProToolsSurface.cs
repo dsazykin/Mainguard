@@ -48,6 +48,15 @@ public interface IProToolsSurface
     /// decision 2026-09-04). Daemon state over gRPC, like PR Intake — the daemon is what spawns.</summary>
     object CreateJailLimitsPage();
 
+    /// <summary>Settings → Agent Defaults: the plan-approval gate and the per-(role, CLI) model every
+    /// agent is started with. Daemon state over gRPC, like Agent Jails — the daemon is what spawns, and
+    /// for a worker no client is in the loop at all.
+    ///
+    /// <para>The plan toggle MOVED here from inside the plan gate, which the control centre renders only
+    /// when it has content. With plan mode on and nothing waiting there was no control anywhere: it could
+    /// be turned back on but never off.</para></summary>
+    object CreateAgentDefaultsPage();
+
     /// <summary>Settings → Mainguard OS: the repo-onboarding + rebuild-sandbox-images page content,
     /// parented to <paramref name="owner"/> for its folder-picker dialogs. <c>null</c> if the factory
     /// seam isn't wired (mirrors the pre-migration null-tolerant behavior).</summary>

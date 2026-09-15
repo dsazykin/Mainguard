@@ -29,35 +29,27 @@
 
   <StackPanel Spacing="8">
 
-    <!-- THE TOGGLE, and the one state it must never let a human guess at.
+    <!-- THE STATE, without the control.
 
-         The checkbox is the operator's plan-mode switch; the line under it is the DAEMON's own sentence
-         for the state, not a second wording of it. It is rendered at the top of the gate because this is
-         the surface the decisions arrive on, so it is where a missing decision is noticed.
+         The toggle MOVED to Settings → Agent Defaults, because this surface could not show it. The gate
+         renders only when it has content — a pending plan, an escalation, backpressure, or plan mode
+         already OFF — so with plan mode ON and nothing waiting there was no toggle anywhere in the app:
+         it could be turned back on, but never off. A setting that governs future spawns does not belong
+         inside a queue of decisions about work that already exists.
 
-         Read-only binding plus a Command, deliberately: a two-way binding would let the screen show a
-         setting the daemon rejected or never received. The click moves the box, the command tells the
-         daemon, and the refresh puts the daemon's answer back — so what is ticked is what is enforced. -->
+         What stays is the WARNING, and only while the gate is off: an approval step a human may still
+         believe they have is a fact about the work arriving here, so it is stated here. The daemon's own
+         sentence, not a second wording of it. -->
     <Border Classes="Card" Padding="10,8" CornerRadius="8" BorderThickness="1"
-            BorderBrush="{DynamicResource BorderHairline}">
+            BorderBrush="{DynamicResource WarningBrush}"
+            IsVisible="{Binding !PlanModeEnabled}">
       <StackPanel Spacing="3">
-        <CheckBox Content="Require plan approval before a worker starts"
-                  IsChecked="{Binding PlanModeEnabled, Mode=OneWay}"
-                  Command="{Binding TogglePlanModeCommand}"
-                  ToolTip.Tip="On: every worker inspects the repository, writes a plan, and blocks here until you approve it. Off: workers are given their task at spawn and start implementing straight away."/>
+        <TextBlock Text="Plan approval is off" FontSize="12" FontWeight="SemiBold"
+                   Foreground="{DynamicResource WarningBrush}"/>
         <TextBlock Text="{Binding PlanModeSummary}" FontSize="11" TextWrapping="Wrap"
-                   Foreground="{DynamicResource TextMuted}"
-                   IsVisible="{Binding PlanModeEnabled}"/>
-        <!-- Off is the state that costs something, so it is the state that gets the warning hue: an
-             approval step the human may still believe they have is not there. -->
-        <TextBlock Text="{Binding PlanModeSummary}" FontSize="11" TextWrapping="Wrap"
-                   Foreground="{DynamicResource WarningBrush}"
-                   IsVisible="{Binding !PlanModeEnabled}"/>
-        <!-- A toggle the daemon refused or never received. The box has already snapped back to the
-             daemon's answer; this is the reason, on the surface the click happened on. -->
-        <TextBlock Text="{Binding PlanModeErrorText}" FontSize="11" TextWrapping="Wrap"
-                   Foreground="{DynamicResource DangerBrush}"
-                   IsVisible="{Binding HasPlanModeError}"/>
+                   Foreground="{DynamicResource TextMuted}"/>
+        <TextBlock Text="Turn it back on in Settings → Agent Defaults." FontSize="11" TextWrapping="Wrap"
+                   Foreground="{DynamicResource TextMuted}"/>
       </StackPanel>
     </Border>
 

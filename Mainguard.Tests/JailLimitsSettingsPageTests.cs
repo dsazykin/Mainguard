@@ -166,6 +166,7 @@ public sealed class JailLimitsSettingsPageTests
         public object CreateDaemonLogsPage() => throw new NotSupportedException();
         public object CreatePrIntakePage() => throw new NotSupportedException();
         public object CreateJailLimitsPage() => new JailLimitsSettingsViewModel(new RecordingGateway());
+        public object CreateAgentDefaultsPage() => throw new NotSupportedException();
         public object? CreateMainguardOsPage(Avalonia.Controls.Window owner) => null;
         public Task RebuildSandboxImagesAsync() => Task.CompletedTask;
     }
