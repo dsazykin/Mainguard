@@ -222,4 +222,125 @@ public sealed class ConversationStoreManagerTests : IDisposable
             // never fail a test from cleanup
         }
     }
+
+    // ---- The reclaim escalation ---------------------------------------------------------------------
+
+    /// <summary>A reclaimer that records what it was asked and then really empties the tree, standing in
+    /// for the root container the engine runs. It restores write permission first, which is precisely the
+    /// privilege the daemon lacks against a jail-owned directory.</summary>
+    private sealed class RecordingReclaimer : IConversationStoreReclaimer
+    {
+        public string? AskedFor { get; private set; }
+        public bool Succeed { get; init; } = true;
+
+        public bool TryEmpty(string hostPath)
+        {
+            AskedFor = hostPath;
+            if (!Succeed)
+            {
+                return false;
+            }
+
+            RestoreWritePermission(hostPath);
+            foreach (var f in Directory.GetFiles(hostPath, "*", SearchOption.AllDirectories))
+            {
+                File.Delete(f);
+            }
+
+            foreach (var d in Directory.GetDirectories(hostPath))
+            {
+                Directory.Delete(d, recursive: true);
+            }
+
+            return true;
+        }
+    }
+
+    private static void RestoreWritePermission(string dir)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            foreach (var d in Directory.GetDirectories(dir, "*", SearchOption.AllDirectories).Append(dir))
+            {
+                File.SetUnixFileMode(d, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The escalation, on an UNDELETABLE tree — the portable stand-in for the Linux fact that a jail's
+    /// transcripts are owned by a uid the daemon is not, in a directory it cannot chmod. Measured:
+    /// <c>rm: can't remove '.../t.jsonl': Permission denied</c>.
+    /// </summary>
+    [Fact]
+    public void WhenTheManagedDeleteCannotRemoveIt_TheReclaimerIsAskedAndTheStoreGoes()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return; // Unix permission semantics are the whole point of this one.
+        }
+
+        var manager0 = NewManager();
+        var mount = Assert.Single(manager0.Prepare(Repo, "agent-r", "claude-code", ClaudePaths, ClaudeCredentials));
+        var jailDir = Path.Combine(mount.HostPath, "-workspace");
+        Directory.CreateDirectory(jailDir);
+        File.WriteAllText(Path.Combine(jailDir, "t.jsonl"), "{}");
+        // Read+execute only: the directory can be traversed and listed, and nothing in it unlinked —
+        // exactly the drwxr-sr-x a jail leaves behind.
+        File.SetUnixFileMode(jailDir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+
+        var reclaimer = new RecordingReclaimer();
+        var store = Path.Combine(_vmRoot, "conversations", Repo, "agent-r");
+        new ConversationStoreManager(_vmRoot, reclaimer: reclaimer).Release(Repo, "agent-r");
+
+        Assert.Equal(store, reclaimer.AskedFor);
+        Assert.False(Directory.Exists(store),
+            "the release must actually remove the store once the reclaimer has emptied it");
+    }
+
+    [Fact]
+    public void WhenNothingSurvivesTheManagedDelete_TheReclaimerIsNeverAsked()
+    {
+        // The privileged step is a fallback, not a routine. Wherever the daemon owns what the jail wrote
+        // (macOS, a matching uid), no container is started at all.
+        var manager = NewManager();
+        manager.Prepare(Repo, "agent-plain", "claude-code", ClaudePaths, ClaudeCredentials);
+
+        var reclaimer = new RecordingReclaimer();
+        new ConversationStoreManager(_vmRoot, reclaimer: reclaimer).Release(Repo, "agent-plain");
+
+        Assert.Null(reclaimer.AskedFor);
+        Assert.False(Directory.Exists(Path.Combine(_vmRoot, "conversations", Repo, "agent-plain")));
+    }
+
+    [Fact]
+    public void AStoreThatSurvivesEverything_IsReported_NeverSilent()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var lines = new System.Collections.Generic.List<string>();
+        var manager0 = new ConversationStoreManager(_vmRoot, log: lines.Add);
+        var mount = Assert.Single(manager0.Prepare(Repo, "agent-stuck", "claude-code", ClaudePaths, ClaudeCredentials));
+        var jailDir = Path.Combine(mount.HostPath, "-workspace");
+        Directory.CreateDirectory(jailDir);
+        File.WriteAllText(Path.Combine(jailDir, "t.jsonl"), "{}");
+        File.SetUnixFileMode(jailDir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+
+        try
+        {
+            new ConversationStoreManager(
+                _vmRoot, log: lines.Add, reclaimer: new RecordingReclaimer { Succeed = false })
+                .Release(Repo, "agent-stuck");
+
+            // A store that outlives its agent is the pr-<n> reuse trap. Silence here is how it ships.
+            Assert.Contains(lines, l => l.Contains("could NOT be released", StringComparison.Ordinal));
+        }
+        finally
+        {
+            RestoreWritePermission(Path.Combine(_vmRoot, "conversations", Repo, "agent-stuck"));
+        }
+    }
 }

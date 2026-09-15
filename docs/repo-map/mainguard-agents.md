@@ -538,7 +538,8 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       collaborators now come from `AgentEnvironmentComposition`, and what stays here is exactly the
       WSL2-specific part: the UNC prefix and the `WslAdapterInstallHost`-backed toolchain channel).
     - `AgentEnvironmentComposition.cs` (the composition every substrate shares — provisioner,
-      worktrees, package caches, **conversation stores**, egress, hardened sandbox engine,
+      worktrees, package caches, **conversation stores** (whose reclaimer is the sandbox engine, bound
+      through `DeferredConversationStoreReclaimer` because the engine is composed after the store), egress, hardened sandbox engine,
       toolchain-image builder — extracted from the WSL2 ctor when the macos-host substrate arrived. The
       conversation store is composed HERE rather than per-substrate because the tmpfs `$HOME` that loses
       a transcript is a property of the JAIL, which both substrates run identically; the MG-3/MG-43/MG-17 and

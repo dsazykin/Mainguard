@@ -1572,6 +1572,12 @@
   own gate**, and a `queue_entry_resumed` audit event naming the actor and the from-state. The second
   case is the honest refusal: after a clean `StopAgent` the branch is gone, so the resume must refuse and
   build nothing rather than start a jail on a fresh empty branch under the old name.
+- **`Mainguard.Server.Tests/ConversationReclaimRefusalTests.cs`** — the one assertion that keeps the
+  conversation-store reclaim from becoming a general "delete any host path as root" primitive.
+  `DockerSandboxEngine.TryEmpty` runs `find -mindepth 1 -delete` as ROOT in a container with the named
+  directory bind-mounted, so every path outside a `conversations/` tree — a mirror, a worktree, a cache,
+  `$HOME`, `/`, empty — must be refused BEFORE any container starts, and a store that does not exist is
+  already empty rather than a container start. Needs no Docker daemon: the refusal precedes the call.
 - **`Mainguard.Server.Tests/Agents/ConversationPersistenceDockerTests.cs`** (`RequiresDocker`) — the
   decisive leg for the **conversation store**, and it models the CRASH rather than the stop, on purpose:
   the container is removed through the engine and the session record dropped with no `StopAgent`

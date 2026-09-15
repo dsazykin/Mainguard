@@ -31,6 +31,7 @@ public sealed class ConversationStoreManager
 {
     private readonly string _vmRoot;
     private readonly Action<string>? _log;
+    private readonly IConversationStoreReclaimer? _reclaimer;
     private readonly object _gate = new();
 
     /// <summary>Resolved once; see <see cref="Grant"/>.</summary>
@@ -38,10 +39,18 @@ public sealed class ConversationStoreManager
 
     /// <param name="vmRoot">The VM base directory, shared with the provisioner and worktree manager.</param>
     /// <param name="log">Optional milestone sink (the daemon's sandbox log category).</param>
-    public ConversationStoreManager(string? vmRoot = null, Action<string>? log = null)
+    /// <param name="reclaimer">Removes what the jail wrote and this process cannot
+    /// (<see cref="IConversationStoreReclaimer"/>). Null on a substrate with no engine, and on every
+    /// hand-rolled test double — <see cref="Release"/> then falls back to the managed delete and REPORTS
+    /// anything that survives, rather than reporting success it did not achieve.</param>
+    public ConversationStoreManager(
+        string? vmRoot = null,
+        Action<string>? log = null,
+        IConversationStoreReclaimer? reclaimer = null)
     {
         _vmRoot = vmRoot ?? Path.Combine(MainguardPaths.HomeDirectory(), "mainguard");
         _log = log;
+        _reclaimer = reclaimer;
     }
 
     /// <summary>The store root every per-agent store hangs off. Never mounted into any jail.</summary>
@@ -223,6 +232,37 @@ public sealed class ConversationStoreManager
         lock (_gate)
         {
             DeleteTree(path);
+
+            // The managed delete is enough wherever the daemon owns what the jail wrote — macOS, where
+            // Docker Desktop presents bind mounts as the host user, and any substrate whose jail uid
+            // matches. On Linux it is NOT: the jail writes as uid 1000 and the directories it creates
+            // land drwxr-sr-x, group-owned by the daemon but not group-WRITABLE (the jail's umask), so
+            // the daemon cannot unlink their contents and cannot chmod them either — it owns neither.
+            // DeleteTree swallows exactly that error, so without this the release returned having
+            // removed nothing at all.
+            //
+            // Escalate to the reclaimer, which runs as a uid that can, and then remove the now-empty
+            // directory here: this process owns THAT one, so the privileged step never has to be told a
+            // name and never removes a directory itself.
+            if (Directory.Exists(path) && _reclaimer is not null && _reclaimer.TryEmpty(path))
+            {
+                DeleteTree(path);
+            }
+
+            // Never silent. A store that outlives its agent is the trap this release exists to prevent —
+            // pr-<n> ids RECUR, so a survivor is one a later pr-7 mounts and resumes into. If it is still
+            // here, that is an operator-visible fact, not a detail.
+            if (Directory.Exists(path))
+            {
+                _log?.Invoke(
+                    $"conversation store for ({repoHash}, {agentId}) could NOT be released: '{path}' is "
+                    + "still on disk. It holds transcripts written by the jail's uid, which this process "
+                    + "may not remove"
+                    + (_reclaimer is null
+                        ? " and no reclaimer is wired on this substrate."
+                        : " and the reclaimer could not remove them either.")
+                    + " A later agent that reuses this id must NOT be allowed to resume into it.");
+            }
         }
     }
 

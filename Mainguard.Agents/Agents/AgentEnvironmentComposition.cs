@@ -92,7 +92,13 @@ internal static class AgentEnvironmentComposition
         // Composed HERE rather than in Wsl2AgentEnvironment (where the feature was first written) so the
         // macos-host substrate gets it on the same terms: the tmpfs $HOME that loses a transcript is a
         // property of the JAIL, which both substrates run identically.
-        var conversationStores = new ConversationStoreManager(root);
+        // The reclaimer is the sandbox engine, which is composed further down (it needs the egress
+        // network built between here and there). Bound through the deferred forwarder rather than by
+        // reordering a sequence whose order is load-bearing.
+        DockerSandboxEngine? engineForReclaim = null;
+        var conversationStores = new ConversationStoreManager(
+            root, log: log,
+            reclaimer: new DeferredConversationStoreReclaimer(() => engineForReclaim));
         var worktrees = new WorktreeManager(
             root, audit: audit, packageCaches: packageCaches, conversationStores: conversationStores);
 
@@ -138,6 +144,9 @@ internal static class AgentEnvironmentComposition
             // ceiling the Settings page reports as applied — so they get the daemon's log, not just a
             // comment saying the failure is tolerated.
             log: log);
+        // Closes the deferred binding above: from here the conversation store's release can remove what
+        // the jail wrote as its own uid, which this process may not.
+        engineForReclaim = sandboxes;
 
         // The per-repo toolchain layer is built through the SAME Docker client, on the VM's network —
         // deliberately not through the jail's default-deny segment, and touching no allowlist.

@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Docker.DotNet;
 using Docker.DotNet.Models;
 using Mainguard.Agents.Agents.Adapters;
+using Mainguard.Agents.Agents.Bootstrap;
 using Mainguard.Git.Exceptions;
 using Mainguard.Git.Security;
 
@@ -61,7 +62,7 @@ public sealed record SandboxEngineOptions(
 /// diagnostic, no timeout, forever. Failing loudly in 30 seconds with
 /// <see cref="SandboxExecTimeoutException"/> is strictly better than that.</para>
 /// </summary>
-public sealed class DockerSandboxEngine : ISandboxEngine
+public sealed class DockerSandboxEngine : ISandboxEngine, IConversationStoreReclaimer
 {
     /// <summary>
     /// The bound on each fixed-purpose exec on the spawn path (secret write, CLI-credential restore).
@@ -917,6 +918,87 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     /// symptom — rather than here, where it would turn a recoverable ownership quirk into a refused
     /// spawn on substrates that never had the problem.</para>
     /// </summary>
+    /// <summary>
+    /// <see cref="IConversationStoreReclaimer.TryEmpty"/> — empties a conversation store of the files the
+    /// jail wrote as its own uid, by running <c>find -mindepth 1 -delete</c> as root in a throwaway
+    /// container with that store bind-mounted, and nothing else.
+    ///
+    /// <para><b>The shape is chosen to keep this from becoming a general primitive.</b> The store path is
+    /// validated HERE against <see cref="ConversationStorePolicy.IsInsideAConversationTree"/> and then
+    /// used only as a MOUNT SOURCE — no part of it is ever interpolated into the command, which names a
+    /// fixed in-container path. So there is no name for a caller to influence and nothing to escape. The
+    /// container gets no network, the pinned jail base image, and no other mount. It does not remove the
+    /// directory itself either: the caller owns that one and <c>rmdir</c>s it, so "delete a directory" is
+    /// not a capability this grants at all.</para>
+    ///
+    /// <para>Synchronous because the teardown it serves is (<c>WorktreeManager.RemoveAgentWorktree</c>),
+    /// and bounded so a wedged engine cannot hang a stop. False on any failure, which the caller reports
+    /// rather than swallows.</para>
+    /// </summary>
+    public bool TryEmpty(string hostPath)
+    {
+        if (string.IsNullOrWhiteSpace(hostPath) || !ConversationStorePolicy.IsInsideAConversationTree(hostPath))
+        {
+            _log?.Invoke(
+                $"refusing to reclaim '{hostPath}': it is not inside a "
+                + $"'{ConversationStorePolicy.ConversationsDirectoryName}/' tree. This step runs as root, "
+                + "so it may only ever be pointed at a conversation store.");
+            return false;
+        }
+
+        if (!Directory.Exists(hostPath))
+        {
+            return true;
+        }
+
+        const string target = "/mnt/mainguard-conversation-store";
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            var created = _docker.Containers.CreateContainerAsync(new CreateContainerParameters
+            {
+                Image = SandboxImages.AgentBase.ImageTag,
+                // No name is passed in: the store is the mount, and the command names only `target`.
+                Cmd = new List<string> { "find", target, "-mindepth", "1", "-delete" },
+                User = "0",
+                NetworkDisabled = true,
+                HostConfig = new HostConfig
+                {
+                    AutoRemove = false,
+                    NetworkMode = "none",
+                    Mounts = new List<Mount>
+                    {
+                        new() { Type = "bind", Source = hostPath, Target = target, ReadOnly = false },
+                    },
+                },
+            }, cts.Token).GetAwaiter().GetResult();
+
+            try
+            {
+                _docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), cts.Token)
+                    .GetAwaiter().GetResult();
+                _docker.Containers
+                    .WaitContainerAsync(created.ID, cts.Token)
+                    .GetAwaiter().GetResult();
+            }
+            finally
+            {
+                TryForceRemoveAsync(created.ID).GetAwaiter().GetResult();
+            }
+
+            // The verdict is the tree, not the exit code: `find -delete` reports a non-zero status for a
+            // path it raced with, and what the caller needs to know is whether anything is still there.
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke(
+                $"could not reclaim the conversation store at '{hostPath}': {ex.GetType().Name}: "
+                + $"{ex.Message}. The store is still on disk and the caller will report it.");
+            return false;
+        }
+    }
+
     private async Task RepairConversationMountParentsAsync(
         string containerId, SandboxSpawnRequest request, CancellationToken ct)
     {

@@ -66,6 +66,69 @@ public sealed record ConversationMount(string HostPath, string HomeRelativePath)
 /// keeps "logins live only in the host OS keychain" true while a tree that deliberately outlives the jail
 /// exists at all.</para>
 /// </summary>
+/// <summary>
+/// Removes what a jail left in a conversation store that the DAEMON cannot remove itself.
+///
+/// <para><b>Why this seam has to exist, measured on Linux rather than argued.</b> The jail writes its
+/// transcripts as its own uid (a fixed 1000), and the daemon runs as somebody else. The store leaf is
+/// created by the daemon setgid, so a directory the jail creates under it inherits the DAEMON'S GROUP —
+/// but the jail's umask (022) strips the group's write bit, so it lands <c>drwxr-sr-x 1000:daemon</c>.
+/// The daemon is in that group and still cannot unlink anything inside it:</para>
+/// <code>
+/// rm: can't remove '/store/leaf/-workspace/t.jsonl': Permission denied
+/// </code>
+/// <para>and <c>chmod</c> is no escape either, because chmod requires being the file's OWNER. So the
+/// release silently removed nothing, which is the trap the whole lifecycle section exists to prevent: a
+/// clean stop deletes <c>agent/&lt;id&gt;</c>, and <c>pr-&lt;n&gt;</c> ids RECUR, so a surviving store is
+/// one a later <c>pr-7</c> mounts and resumes into — a stranger's session, silently.</para>
+///
+/// <para>Making the WRITER cooperate does not work: <c>docker exec</c> does not inherit a umask from the
+/// image or from PID 1, so every exec path would have to be found and fixed, and the vendor CLI's own
+/// writes are not ours to wrap. The reclaim therefore belongs on the deletion side, and needs a uid the
+/// daemon does not have.</para>
+///
+/// <para>The Docker implementation lives in the engine, so this file and
+/// <see cref="ConversationStoreManager"/> stay free of any container dependency — the manager is pure
+/// filesystem code and a substrate with no engine simply has no reclaimer (null), which is the same
+/// shape <see cref="IAgentEnvironment.PackageCaches"/> uses for "this substrate has none".</para>
+/// </summary>
+public interface IConversationStoreReclaimer
+{
+    /// <summary>
+    /// Empties <paramref name="hostPath"/> of everything the daemon could not remove, leaving the
+    /// directory itself in place for the caller to <c>rmdir</c> (it owns that one). Returns false when
+    /// the reclaim could not be performed at all — a substrate with no engine, an engine that is not
+    /// reachable — which the caller reports rather than swallows.
+    ///
+    /// <para>Implementations MUST refuse a path that is not inside a <c>conversations/</c> tree
+    /// (<see cref="ConversationStorePolicy.IsInsideAConversationTree"/>). This runs privileged, so the
+    /// one thing it must never become is a general "delete any host path as root" primitive.</para>
+    /// </summary>
+    bool TryEmpty(string hostPath);
+}
+
+/// <summary>
+/// An <see cref="IConversationStoreReclaimer"/> that resolves its target when it is USED rather than when
+/// it is constructed.
+///
+/// <para>It exists for an ordering fact in <c>AgentEnvironmentComposition</c> and nothing else: the store
+/// manager is composed before the sandbox engine, because the engine needs the egress network that is
+/// built between them, and the engine is the reclaimer. Rather than reorder a composition whose sequence
+/// is load-bearing, the manager is handed this and the engine is bound into it a few lines later.</para>
+///
+/// <para>An unresolved target is "no reclaimer", not an error — the same null-means-none contract the
+/// manager already has, so a half-built composition degrades to the managed delete and a loud report.</para>
+/// </summary>
+public sealed class DeferredConversationStoreReclaimer : IConversationStoreReclaimer
+{
+    private readonly Func<IConversationStoreReclaimer?> _resolve;
+
+    public DeferredConversationStoreReclaimer(Func<IConversationStoreReclaimer?> resolve)
+        => _resolve = resolve ?? throw new ArgumentNullException(nameof(resolve));
+
+    public bool TryEmpty(string hostPath) => _resolve()?.TryEmpty(hostPath) ?? false;
+}
+
 public static class ConversationStorePolicy
 {
     /// <summary>The <c>&lt;vmRoot&gt;</c> child holding every per-agent conversation store. A sibling of
