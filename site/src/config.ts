@@ -22,7 +22,12 @@ export const GITHUB_REPO_LABEL = 'dsazykin/Mainguard';
  * a registered address; a contact form alone may not be sufficient. That is a
  * question for a lawyer, not for this comment.
  */
-export const LEGAL_ENTITY = 'Daniel Sazykin, trading as Mainguard';
+/**
+ * Full legal name, deliberately spelled Daniil. The anglicised "Daniel" shows
+ * up in the git identity, the notification address and the workers.dev
+ * subdomain; none of those is the legal name, and this field has to be.
+ */
+export const LEGAL_ENTITY = 'Daniil Sazykin, trading as Mainguard';
 export const LEGAL_JURISDICTION = 'the Netherlands';
 /** Governing law for the terms of service. */
 export const LEGAL_GOVERNING_LAW = 'Dutch law';
