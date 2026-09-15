@@ -662,7 +662,12 @@
     control center flips them; the shell hosts it as opaque `AgentRailContent` → `AgentRailView` via
     ViewLocator, so the shell names no Pro rail type), `QueueRailViewModel`/`QueueEntryViewModel` (the
     rail projection over `IMergeQueueService` — **the merge-queue surface the shipped Control Center
-    actually hosts**: state words, `CanMerge` gate line, the header `CountText` ("N in play · N in
+    actually hosts**: state words, `CanMerge` gate line, the header's **integration-branch picker**
+    (`MainBranch` + `IntegrationBranchOptions` + `LoadIntegrationBranchesCommand` /
+    `ChangeIntegrationBranchCommand` — "merges into &lt;branch&gt;", the ONE place a human can change where
+    agent work lands; the branch list is a daemon round trip so it loads when the picker opens, not on
+    every `Refresh`, and nothing is projected locally on the strength of the request — the new branch
+    arrives on the queue stream with the stale cascade the change fires), the header `CountText` ("N in play · N in
     history") that keeps a row scrolled below the fold from reading as a row that vanished (ISSUES-LOG
     #4 and #13 were both filed against rows that were rendering), the verified-against stamp (from the wire's
     `VerifiedMainSha`), the one Review accent on the front-most fresh Verified entry PLUS a
@@ -1057,11 +1062,19 @@
   - `TerminalLauncher.cs` — the single open-a-folder-in-the-OS-terminal path (same hygiene as the
     reveal path): macOS `open -a Terminal`, Windows `wt.exe` falling back to `cmd`, Linux
     `x-terminal-emulator`. Surfaced from the macOS menu bar's Repository menu.
-  - `MacMenuBar.cs` — the macOS top-of-screen menu bar (no-op elsewhere): File / Repository /
-    View / Help built over EXISTING seams — repo actions dispatch through
+  - `MacMenuBar.cs` — the macOS top-of-screen menu bar (no-op elsewhere): File / Branch /
+    Repository / View / Help built over EXISTING seams — repo actions dispatch through
     `MainWindowViewModel.InvokeActionByIdCommand` (the same registry the shortcuts and palette
-    use, so availability rules hold), themes through `ThemeManager` keys ("System" included),
-    reveal/terminal through the launchers above. The menu bar follows the KEY window on macOS,
+    use, so availability rules hold), dashboard-only actions (push options, Update Project,
+    Manage Remotes, Submodules, Git LFS, Worktrees, Reflog, Operation History) through the
+    `RepoDashboardViewModel` commands the in-window flyouts bind, themes through `ThemeManager`
+    keys ("System" included), reveal/terminal through the launchers above. It is the ONLY route
+    to all of those on macOS, where MainWindow's `MenuBarGroup` is hidden outright
+    (`WindowChromePolicy.InWindowMenuVisible`) — an item added there needs one here too.
+    **Branch ▸ Switch To** is the Mac counterpart of the in-window Branch pill: filled in on
+    `NativeMenu.NeedsUpdate` from `BranchBrowserViewModel.ListBranchesForSwitchMenu()` and
+    invoking the same `CheckoutBranchCommand`, rate-limited because AppKit raises `NeedsUpdate`
+    during key-equivalent matching and not only when a menu opens. The menu bar follows the KEY window on macOS,
     so `Attach` is called from MainWindow's ctor and from every `ChromedWindow` via the
     `ChromedWindow.MenuInstaller` seam; `App.axaml` names the application ("Mainguard") because
     Avalonia titles the app menu from `Application.Name`, not the bundle.
@@ -1358,7 +1371,11 @@
   `EditionReferenceGraphTests.Shell_IsReferenceClean_OfTheAgentPlatform`, keyed on assembly identity)
   — which is exactly what lets the Client head's published `.deps.json` exclude the whole agent
   platform. Holds: the composition-root `App.axaml.cs` (edition-agnostic only — DB migrate,
-  `ViewLocator` seed, theme, tray icon, the guarded full-exit
+  `ViewLocator` seed, theme, tray icon — `Assets/avalonia-logo.ico` on Windows,
+  `Assets/tray-icon.png` on Linux, and on macOS `Assets/tray-icon-template.png` (the brand mark
+  minus its opaque plate, black-on-transparent) with `MacOSProperties.SetIsTemplateIcon(…, true)`
+  so the status item is tinted like every other menu-bar glyph instead of rendering in colour —
+  the geometry is `site/public/favicon.svg`'s paths — the guarded full-exit
   `RequestFullExitGuardedAsync`/`RequestFullExit`; the Pro launch/shutdown are reached ONLY through
   the null-until-wired seams `App.ProDesktopStarter` / `App.VisualizedShutdownAsync` /
   `App.AfterInitialize` the Pro head fills — under Client they stay null and the launch is the

@@ -23,9 +23,50 @@
   <Grid RowDefinitions="Auto,*,Auto" Margin="10">
     <StackPanel Grid.Row="0" Spacing="4" Margin="0,0,0,10">
       <TextBlock Text="Merge queue" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
-      <!-- "main <sha>" is another identifier that must not lose characters — wrap, don't clip. -->
+      <!-- "<branch> <sha>" is another identifier that must not lose characters — wrap, don't clip. -->
       <TextBlock Classes="Mono" Text="{Binding MainShaText}" FontSize="12" TextWrapping="Wrap"
                  Foreground="{DynamicResource TextMuted}"/>
+
+      <!-- Which branch agent work lands on. It sits here, under the sha it names, because this is where
+           a human already reads what the queue is measuring against — and because it was previously not
+           a choice at all: the daemon leased every merge against the literal "main". Loading the branch
+           list is a daemon round trip, so it happens when the picker opens, not on every refresh. -->
+      <StackPanel Orientation="Horizontal" Spacing="6">
+        <TextBlock Text="merges into" FontSize="11" VerticalAlignment="Center"
+                   Foreground="{DynamicResource TextMuted}"/>
+        <Button Classes="Secondary" Padding="6,2" FontSize="11"
+                IsEnabled="{Binding !IsChangingIntegrationBranch}"
+                ToolTip.Tip="Change the branch agent work merges into. Every queued verification was measured against the current branch, so changing it sends them all back for re-verification."
+                Command="{Binding LoadIntegrationBranchesCommand}">
+          <StackPanel Orientation="Horizontal" Spacing="4">
+            <TextBlock Text="{Binding MainBranch}" FontWeight="SemiBold" VerticalAlignment="Center"/>
+            <PathIcon Data="{StaticResource ChevronDownIcon}" Width="8" Height="8"
+                      Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center"/>
+          </StackPanel>
+          <Button.Flyout>
+            <Flyout Placement="BottomEdgeAlignedLeft">
+              <ScrollViewer MaxHeight="260" HorizontalScrollBarVisibility="Disabled">
+                <ItemsControl ItemsSource="{Binding IntegrationBranchOptions}" MinWidth="180">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="x:String">
+                      <Button Content="{Binding}" FontSize="12"
+                              HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                              Padding="10,6" Background="{DynamicResource SurfaceHoverGhost}"
+                              BorderThickness="0"
+                              Command="{Binding $parent[ItemsControl].((vm:QueueRailViewModel)DataContext).ChangeIntegrationBranchCommand}"
+                              CommandParameter="{Binding}"/>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </ScrollViewer>
+            </Flyout>
+          </Button.Flyout>
+        </Button>
+      </StackPanel>
+
+      <TextBlock Text="{Binding IntegrationBranchError}" FontSize="11" TextWrapping="Wrap"
+                 Foreground="{DynamicResource WarningBrush}"
+                 IsVisible="{Binding HasIntegrationBranchError}"/>
       <!-- The mirror's age (2026-09-04): the daemon's main is a copy of the checkout, refreshed on an
            interval and when this window regains focus; a human reading "main <sha>" needs to know how
            old that claim is. A failed refresh is a warning, not a footnote. -->
