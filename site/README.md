@@ -75,18 +75,45 @@ site loads, update the policy in the *same commit*. Stale marketing copy is emba
 privacy policy is a legal problem.
 
 Cookie consent (`src/lib/consent.tsx`, `src/lib/consentCategories.ts`, `CookieConsent.tsx`) is
-built, wired and **deliberately dormant**. The site's only browser storage is the theme preference
-the visitor sets and what Turnstile needs on the two form pages — both strictly necessary, both
-exempt from consent, so no banner is shown. Showing one anyway would be misleading.
+**active**, gating the analytics below. `NON_ESSENTIAL` in `consentCategories.ts` is the single
+switch: empty means no banner at all, and adding a category turns on the banner, the preferences
+dialog and the footer "Cookie settings" control together.
 
-To turn it on when analytics or similar is added:
+When adding a future category: add it to `NON_ESSENTIAL`, gate the script on
+`useConsent().hasConsent(...)`, document it in `src/pages/Privacy.tsx` §2 and §4, and bump
+`CONSENT_VERSION` so decisions made under the old category set are re-asked.
 
-1. Add the category to `NON_ESSENTIAL` in `src/lib/consentCategories.ts`. That single edit enables
-   the banner, the preferences dialog and the footer "Cookie settings" control.
-2. Gate the new script on `useConsent().hasConsent('analytics')`, which returns false until the
-   visitor opts in.
-3. Add the cookie to the table in `src/pages/Privacy.tsx` §4.
-4. Bump `CONSENT_VERSION` if the category set changed, so prior decisions are re-asked.
+## Analytics
+
+First-party, opt-in, and deliberately thin. `src/lib/analytics.ts` posts to `/api/event` on the
+site's own worker; rows land in the `events` table in D1.
+
+What makes it defensible, and what must not be quietly eroded:
+
+- **No cookie and no device identifier.** Unique visitors come from `visitor_day`, a salted hash
+  computed server-side that includes the calendar date — it groups one day's hits and is useless
+  for following anyone to the next day. The raw IP is never stored.
+- **Referrer host only**, never the full URL, which can carry search terms.
+- **Fails closed.** `allowed` starts false in `analytics.ts`; a bug that fails to wire consent
+  collects nothing rather than everything.
+- **Can never break the page.** Beacons are fire-and-forget and the worker always answers 204.
+
+Read the numbers with `GET /api/admin/stats?days=30` and an `ADMIN_TOKEN` bearer token — top
+pages, referrers, countries, devices, themes, CTA clicks, daily uniques, and waitlist signups over
+the same window. It returns aggregates only; there is no endpoint that reconstructs one visitor's
+trail, because the data cannot support one.
+
+CTA tracking is by delegation: put `data-cta="some-label"` on any element and the click is counted.
+
+**Applying the schema** (the `events` table must exist before the worker can write to it):
+
+```bash
+cd site/worker
+npx wrangler d1 execute gitloom-site --remote --file=schema.sql
+```
+
+The D1 database is still named `gitloom-site` — that is the real resource name, not a branding
+miss. The statements are all `IF NOT EXISTS`, so re-running is safe.
 
 ## Forms backend
 

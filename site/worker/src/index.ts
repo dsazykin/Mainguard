@@ -5,7 +5,9 @@
  * Endpoints:
  *   POST /api/waitlist            { email, interests?, turnstileToken, website? }
  *   POST /api/contact             { name, email, topic?, message, turnstileToken, website? }
+ *   POST /api/event               { type, path, referrer?, campaign?, theme?, label? }
  *   GET  /api/admin/submissions   Authorization: Bearer <ADMIN_TOKEN>; ?kind=waitlist|contact&limit=N
+ *   GET  /api/admin/stats         Authorization: Bearer <ADMIN_TOKEN>; ?days=N
  *
  * `website` is a honeypot: real users never fill it; bots that do get a fake success.
  * Every real submission is Turnstile-verified, rate-limited per IP, and stored in D1.
@@ -204,6 +206,168 @@ async function handleContact(request: Request, env: Env, origin: string | null):
   return json({ ok: true }, 200, origin);
 }
 
+const EVENT_TYPES = new Set(['pageview', 'cta', 'depth']);
+/** Paths the SPA can legitimately report. Anything else is recorded as 'other'. */
+const KNOWN_PATHS = new Set([
+  '/',
+  '/client',
+  '/pro',
+  '/cloud',
+  '/contact',
+  '/waitlist',
+  '/privacy',
+  '/terms',
+]);
+const VALID_THEMES = new Set(['midnight', 'daylight', 'graphite', 'atelier']);
+/** Per-visitor-day event ceiling, so a loop cannot flood the table. */
+const EVENT_LIMIT_PER_DAY = 300;
+
+/**
+ * A visitor key that is useless tomorrow.
+ *
+ * Salting with the calendar date means the same person hashes differently each
+ * day: good enough to count unique visitors per day, structurally incapable of
+ * following anyone across days. The IP itself is never stored.
+ */
+async function visitorDayHash(ip: string, ua: string): Promise<string> {
+  const day = new Date().toISOString().slice(0, 10);
+  return (await sha256(`mainguard:${day}:${ip}:${ua}`)).slice(0, 32);
+}
+
+/** Desktop / mobile / tablet, which is all the device detail worth keeping. */
+function deviceClass(ua: string): string {
+  if (/iPad|Tablet/i.test(ua)) return 'tablet';
+  if (/Mobi|Android|iPhone/i.test(ua)) return 'mobile';
+  return 'desktop';
+}
+
+/** Referrer host only — a full URL can leak search terms or a private title. */
+function referrerHost(raw: string | undefined, selfHost: string): string | null {
+  if (!raw) return null;
+  try {
+    const host = new URL(raw).hostname.replace(/^www\./, '');
+    return host === selfHost.replace(/^www\./, '') ? null : host.slice(0, 120);
+  } catch {
+    return null;
+  }
+}
+
+interface EventBody {
+  type?: unknown;
+  path?: unknown;
+  referrer?: unknown;
+  campaign?: unknown;
+  theme?: unknown;
+  label?: unknown;
+}
+
+/**
+ * Analytics ingest. Fired only by visitors who opted in — the site does not
+ * call this otherwise. Always answers 204 so a blocked or failed beacon never
+ * shows the visitor an error; analytics must never be able to break the page.
+ */
+async function handleEvent(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const noContent = () => new Response(null, { status: 204, headers: corsHeaders(origin) });
+
+  let body: EventBody;
+  try {
+    body = (await request.json()) as EventBody;
+  } catch {
+    return noContent();
+  }
+
+  const type = str(body.type, 16);
+  if (!type || !EVENT_TYPES.has(type)) return noContent();
+
+  const rawPath = str(body.path, 256) ?? '/';
+  const path = KNOWN_PATHS.has(rawPath) ? rawPath : 'other';
+
+  const ip = request.headers.get('CF-Connecting-IP') ?? '0.0.0.0';
+  const ua = request.headers.get('User-Agent') ?? '';
+  const visitor = await visitorDayHash(ip, ua);
+
+  const { results } = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM events WHERE visitor_day = ?1 AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day')",
+  )
+    .bind(visitor)
+    .all();
+  if (Number((results[0] as { n: number } | undefined)?.n ?? 0) >= EVENT_LIMIT_PER_DAY) {
+    return noContent();
+  }
+
+  const theme = str(body.theme, 16);
+  const selfHost = origin ? new URL(origin).hostname : 'mainguard.dev';
+
+  await env.DB.prepare(
+    `INSERT INTO events (type, path, referrer_host, campaign, country, device, theme, label, visitor_day)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+  )
+    .bind(
+      type,
+      path,
+      referrerHost(str(body.referrer, 2048) ?? undefined, selfHost),
+      str(body.campaign, 64),
+      // Country comes from Cloudflare's edge, so no IP geolocation is done here.
+      (request as Request & { cf?: { country?: string } }).cf?.country ?? null,
+      deviceClass(ua),
+      theme && VALID_THEMES.has(theme) ? theme : null,
+      str(body.label, 64),
+      visitor,
+    )
+    .run();
+
+  return noContent();
+}
+
+/** Aggregates only — this endpoint cannot return a single visitor's trail. */
+async function handleStats(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const auth = request.headers.get('Authorization') ?? '';
+  if (auth !== `Bearer ${env.ADMIN_TOKEN}`) {
+    return json({ ok: false, error: 'Unauthorized.' }, 401, origin);
+  }
+  const url = new URL(request.url);
+  const days = Math.min(Math.max(Number(url.searchParams.get('days')) || 30, 1), 365);
+  const since = `-${days} days`;
+
+  const group = async (sql: string) => {
+    const { results } = await env.DB.prepare(sql).bind(since).all();
+    return results;
+  };
+
+  const [pages, referrers, countries, devices, themes, ctas, daily, totals] = await Promise.all([
+    group(
+      "SELECT path, COUNT(*) AS views, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY path ORDER BY views DESC",
+    ),
+    group(
+      "SELECT COALESCE(referrer_host,'(direct)') AS source, COUNT(*) AS views FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY source ORDER BY views DESC LIMIT 25",
+    ),
+    group(
+      "SELECT COALESCE(country,'??') AS country, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY country ORDER BY visitors DESC LIMIT 40",
+    ),
+    group(
+      "SELECT device, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY device ORDER BY visitors DESC",
+    ),
+    group(
+      "SELECT theme, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND theme IS NOT NULL AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY theme ORDER BY visitors DESC",
+    ),
+    group(
+      "SELECT label, COUNT(*) AS clicks FROM events WHERE type='cta' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY label ORDER BY clicks DESC",
+    ),
+    group(
+      "SELECT substr(created_at,1,10) AS day, COUNT(*) AS views, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY day ORDER BY day DESC",
+    ),
+    group(
+      "SELECT (SELECT COUNT(*) FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)) AS pageviews, (SELECT COUNT(*) FROM submissions WHERE kind='waitlist' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)) AS waitlist_signups",
+    ),
+  ]);
+
+  return json(
+    { ok: true, days, totals: totals[0] ?? {}, pages, referrers, countries, devices, themes, ctas, daily },
+    200,
+    origin,
+  );
+}
+
 async function handleAdmin(request: Request, env: Env, origin: string | null): Promise<Response> {
   const auth = request.headers.get('Authorization') ?? '';
   if (auth !== `Bearer ${env.ADMIN_TOKEN}`) {
@@ -240,8 +404,14 @@ export default {
       if (request.method === 'POST' && pathname === '/api/contact') {
         return await handleContact(request, env, origin);
       }
+      if (request.method === 'POST' && pathname === '/api/event') {
+        return await handleEvent(request, env, origin);
+      }
       if (request.method === 'GET' && pathname === '/api/admin/submissions') {
         return await handleAdmin(request, env, origin);
+      }
+      if (request.method === 'GET' && pathname === '/api/admin/stats') {
+        return await handleStats(request, env, origin);
       }
       return json({ ok: false, error: 'Not found.' }, 404, origin);
     } catch (err) {

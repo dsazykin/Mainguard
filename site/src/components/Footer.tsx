@@ -27,7 +27,7 @@ export function Footer() {
         </nav>
         <nav className="footer-col" aria-label="Company">
           <h4>Get in touch</h4>
-          <Link to="/waitlist">Join the waitlist</Link>
+          <Link to="/waitlist" data-cta="waitlist-footer">Join the waitlist</Link>
           <Link to="/contact">Contact</Link>
         </nav>
         <nav className="footer-col" aria-label="Legal">

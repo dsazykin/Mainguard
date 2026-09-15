@@ -12,6 +12,8 @@ import { Privacy } from './pages/Privacy';
 import { Terms } from './pages/Terms';
 import { NotFound } from './pages/NotFound';
 import { CookieConsent } from './components/CookieConsent';
+import { useConsent } from './lib/consent';
+import { setAnalyticsAllowed, trackCta, trackPageview } from './lib/analytics';
 
 const TITLES: Record<string, string> = {
   '/': 'Mainguard — the native Git client for the agent era',
@@ -26,11 +28,39 @@ const TITLES: Record<string, string> = {
 
 export default function App() {
   const { pathname } = useLocation();
+  const { hasConsent } = useConsent();
+  const analyticsOn = hasConsent('analytics');
 
   useEffect(() => {
     window.scrollTo(0, 0);
     document.title = TITLES[pathname] ?? 'Mainguard';
   }, [pathname]);
+
+  // Keep the beacon's gate in step with the visitor's choice, including the
+  // moment they accept or withdraw — analytics defaults to off until this runs.
+  useEffect(() => {
+    setAnalyticsAllowed(analyticsOn);
+  }, [analyticsOn]);
+
+  // One pageview per route change, and only once consent is in hand. Listing
+  // analyticsOn as a dependency means accepting mid-visit still records the
+  // page being read at that moment, rather than silently missing it.
+  useEffect(() => {
+    if (!analyticsOn) return;
+    trackPageview(pathname);
+  }, [pathname, analyticsOn]);
+
+  // CTA clicks, by delegation: any element carrying data-cta reports its label.
+  // A listener beats threading a callback through every button on the site.
+  useEffect(() => {
+    if (!analyticsOn) return;
+    const onClick = (e: MouseEvent) => {
+      const el = (e.target as HTMLElement | null)?.closest<HTMLElement>('[data-cta]');
+      if (el?.dataset.cta) trackCta(el.dataset.cta, window.location.pathname);
+    };
+    document.addEventListener('click', onClick);
+    return () => document.removeEventListener('click', onClick);
+  }, [analyticsOn]);
 
   return (
     <>

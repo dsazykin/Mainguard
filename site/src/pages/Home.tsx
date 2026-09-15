@@ -20,10 +20,10 @@ export function Home() {
               a control center where agent work becomes trustworthy commits on main.
             </p>
             <div className="hero-ctas">
-              <Link to="/waitlist" className="btn btn-accent btn-lg">
+              <Link to="/waitlist" className="btn btn-accent btn-lg" data-cta="waitlist-home-hero">
                 Join the waitlist
               </Link>
-              <Link to="/client" className="btn btn-quiet btn-lg">
+              <Link to="/client" className="btn btn-quiet btn-lg" data-cta="explore-client-hero">
                 Explore the client
               </Link>
             </div>
@@ -189,7 +189,7 @@ export function Home() {
             <p className="muted" style={{ marginInline: 'auto' }}>
               Be first in line for the download — and early access to Pro.
             </p>
-            <Link to="/waitlist" className="btn btn-accent btn-lg">
+            <Link to="/waitlist" className="btn btn-accent btn-lg" data-cta="waitlist-home-footer">
               Join the waitlist
             </Link>
           </Reveal>

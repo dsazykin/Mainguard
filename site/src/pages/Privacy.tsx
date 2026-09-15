@@ -18,9 +18,10 @@ export function Privacy() {
       <p className="legal-updated">Last updated · {LEGAL_LAST_UPDATED}</p>
       <h1>Privacy policy</h1>
       <p className="lede">
-        Mainguard collects as little as it can get away with. There is no analytics, no advertising,
-        no tracking pixel and no third-party font — the only personal data here is what you type
-        into a form, plus the minimum needed to stop that form being abused by bots.
+        Mainguard collects as little as it can get away with. There is no advertising, no tracking
+        pixel, no third-party analytics and no third-party font. What there is: what you type into
+        a form, the minimum needed to stop that form being abused by bots, and — only if you allow
+        it — first-party page counts that set nothing on your device.
       </p>
 
       <nav className="legal-toc" aria-label="Contents">
@@ -56,7 +57,35 @@ export function Privacy() {
 
       <section id="what">
         <h2>2. What is collected</h2>
-        <p>Nothing at all, until you submit one of the two forms on this site.</p>
+        <p>
+          Nothing at all, unless you submit one of the two forms — or allow analytics, which is off
+          until you say otherwise.
+        </p>
+
+        <h3>If you allow analytics</h3>
+        <p>
+          Aggregate counts, recorded by Mainguard's own server. No third party is involved, and
+          nothing is stored on your device — no analytics cookie, no identifier. Each event holds:
+        </p>
+        <ul>
+          <li><strong>Which page</strong> was viewed, and <strong>which button</strong> was clicked.</li>
+          <li>
+            <strong>The site that linked you here</strong> — the host only, such as
+            "news.ycombinator.com", never the full address, which can carry search terms.
+          </li>
+          <li><strong>A campaign tag</strong>, if the link you followed carried one.</li>
+          <li><strong>Your country</strong> and <strong>device type</strong> (desktop, mobile or tablet).</li>
+          <li><strong>Which colour theme</strong> the page was being read in.</li>
+          <li>
+            <strong>A visitor key that expires daily.</strong> It is a hash including the calendar
+            date, so it can group one day's page views together and is structurally useless for
+            recognising you tomorrow. Your IP address is not stored.
+          </li>
+        </ul>
+        <p>
+          That is the whole list. There is no scroll recording, no mouse tracking, no profile, and
+          nothing that joins these counts to your email address if you later sign up.
+        </p>
 
         <h3>If you join the waitlist</h3>
         <ul>
@@ -122,6 +151,11 @@ export function Privacy() {
                 <td>Rate limiting and spam prevention</td>
                 <td>Legitimate interest in a working form — 6(1)(f)</td>
               </tr>
+              <tr>
+                <td>Analytics counts (page, referrer host, country, device, theme, daily key)</td>
+                <td>To learn which pages are read and which links bring people here</td>
+                <td>Your consent — 6(1)(a)</td>
+              </tr>
             </tbody>
           </table>
         </div>
@@ -135,9 +169,10 @@ export function Privacy() {
       <section id="cookies">
         <h2>4. Cookies and browser storage</h2>
         <p>
-          This site sets <strong>no advertising or analytics cookies</strong>. What it does use is
-          browser storage that is strictly necessary, which under the ePrivacy rules does not
-          require a consent banner — and so you are not shown one.
+          This site sets <strong>no advertising cookies, and no analytics cookie either</strong>.
+          The analytics described above deliberately stores nothing on your device, which is why
+          you will not find it in the table below — consent for it controls whether anything is
+          <em> sent</em>, not whether anything is stored.
         </p>
         <div className="legal-table-wrap">
           <table className="legal-table">
@@ -165,7 +200,7 @@ export function Privacy() {
               <tr>
                 <td><code className="mono">mainguard-consent</code></td>
                 <td>localStorage</td>
-                <td>Records your cookie choices, if there is ever anything to choose. Unused today</td>
+                <td>Records your analytics choice, so you are not asked on every page</td>
                 <td>Until you clear it</td>
               </tr>
               <tr>
@@ -178,9 +213,9 @@ export function Privacy() {
           </table>
         </div>
         <p>
-          None of the above is shared with anyone, and none of it is used to profile you. If
-          analytics is ever added, it will be off until you turn it on, and a consent control will
-          appear here and in the footer at the same time.
+          None of the above is shared with anyone, and none of it is used to profile you. You can
+          change your analytics choice at any time through <strong>Cookie settings</strong> in the
+          footer, and withdrawing is exactly as easy as agreeing was.
         </p>
       </section>
 
@@ -203,8 +238,8 @@ export function Privacy() {
             <tbody>
               <tr>
                 <td>Cloudflare</td>
-                <td>Runs the form backend (Workers), stores submissions (D1), and provides the Turnstile bot check</td>
-                <td>Everything you submit; your IP address at the moment of the bot check</td>
+                <td>Runs the backend (Workers), stores submissions and analytics counts (D1), and provides the Turnstile bot check</td>
+                <td>Everything you submit; your IP address at the moment of the bot check and when an analytics event is received, which is hashed rather than stored</td>
               </tr>
               <tr>
                 <td>Resend</td>
@@ -251,6 +286,11 @@ export function Privacy() {
             <strong>Hashed IPs and user agents</strong> exist for rate limiting and are of no
             further interest once a submission is old.
           </li>
+          <li>
+            <strong>Analytics counts</strong> are kept as aggregate history. They contain no
+            identifier that survives the day they were recorded, so there is nothing in them to
+            delete on request — and nothing that could be traced back to you if there were.
+          </li>
         </ul>
         <p>
           If you want any of it gone sooner, ask through the <Link to="/contact">contact form</Link>
@@ -281,7 +321,13 @@ export function Privacy() {
         <h2>9. What is never done</h2>
         <ul>
           <li>No advertising networks, no tracking pixels, no fingerprinting.</li>
-          <li>No third-party analytics. No session recording or heatmaps.</li>
+          <li>
+            No third-party analytics. The page counts described above are first-party, opt-in, and
+            never leave Mainguard's own infrastructure.
+          </li>
+          <li>No session recording, no heatmaps, no mouse or scroll tracking.</li>
+          <li>No cross-site or cross-day tracking — the visitor key is useless the next day.</li>
+          <li>No linking analytics to your email address, or to anything you submitted.</li>
           <li>No third-party font CDN — the typefaces are served from this site.</li>
           <li>No selling, renting or trading personal data. Ever, under any circumstances.</li>
           <li>No automated decision-making or profiling that produces legal effects.</li>

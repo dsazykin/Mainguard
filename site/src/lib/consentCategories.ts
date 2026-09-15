@@ -27,7 +27,7 @@ export const CATEGORIES: CategoryInfo[] = [
     id: 'analytics',
     label: 'Analytics',
     description:
-      'Would measure which pages get read and where people give up. Nothing of the kind is in use today.',
+      'Counts which pages are read, which link sent you here, your country and device type, and which buttons get clicked. First-party only — it sets nothing on your device and is never shared. Declining costs you nothing.',
     required: false,
   },
   {
@@ -40,17 +40,15 @@ export const CATEGORIES: CategoryInfo[] = [
 ];
 
 /**
- * Categories actually in use that require an opt-in.
+ * Categories actually in use that require an opt-in. This is the single switch
+ * that drives the banner, the preferences dialog and the footer control.
  *
- * EMPTY ON PURPOSE. The site stores nothing that needs consent: the theme
- * preference is set by the visitor, and Turnstile is strictly necessary to
- * keep the two forms usable. Showing a consent banner when there is nothing
- * to consent to is both bad manners and misleading.
- *
- * Adding a category here is the single switch that turns the whole consent UI
- * on — banner, preferences dialog and the footer control all follow from it.
+ * `analytics` is live: first-party, cookieless, aggregate-only page and CTA
+ * counts (see lib/analytics.ts). It sets nothing on the device, so a consent
+ * banner is arguably not required for it at all — it is asked for anyway,
+ * because "we could have skipped asking" is a poor thing to explain later.
  */
-export const NON_ESSENTIAL: ConsentCategory[] = [];
+export const NON_ESSENTIAL: ConsentCategory[] = ['analytics'];
 
 export const CONSENT_STORAGE_KEY = 'mainguard-consent';
 /** Bump when the categories change — an old decision no longer covers the new set. */
