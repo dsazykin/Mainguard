@@ -66,8 +66,14 @@ safe-to-merge.
 
 ## Legal pages and consent
 
-`/privacy` and `/terms` live in `src/pages/`, and both read the operator identity, governing law
-and "last updated" date from `src/config.ts` — change them there, once, not in the prose.
+`/privacy` and `/terms` live in `src/pages/`, and both read the operator identity, contact address,
+governing law and "last updated" date from `src/config.ts` — change them there, once, not in the
+prose.
+
+`LEGAL_CONTACT_EMAIL` is currently a personal address because no `@mainguard.dev` mailbox exists
+yet. Both the GDPR and the Dutch e-commerce rules want a contact that reaches a human quickly, and
+a published address that bounces is worse than a personal one that works. **Swap that one constant
+when the domain mailbox is ready** — every mention on both pages follows from it.
 
 **The privacy policy is a description of what the code does.** If you change what
 `worker/src/index.ts` collects, what `worker/schema.sql` stores, or which third-party script the

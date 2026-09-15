@@ -1,5 +1,5 @@
 import { Link } from 'react-router';
-import { LEGAL_ENTITY, LEGAL_JURISDICTION, LEGAL_LAST_UPDATED } from '../config';
+import { LEGAL_CONTACT_EMAIL, LEGAL_ENTITY, LEGAL_JURISDICTION, LEGAL_LAST_UPDATED } from '../config';
 
 /**
  * Privacy policy for mainguard.dev.
@@ -50,8 +50,17 @@ export function Privacy() {
         </p>
         <p>
           The way to reach a human about any of this — including a request to see or delete your
-          data — is the <Link to="/contact">contact form</Link>. Requests about your own data are
-          answered within 30 days, as the GDPR requires.
+          data — is either the <Link to="/contact">contact form</Link> or email:
+        </p>
+        <p>
+          <a href={`mailto:${LEGAL_CONTACT_EMAIL}`} className="mono">
+            {LEGAL_CONTACT_EMAIL}
+          </a>
+        </p>
+        <p>
+          That is a personal address rather than a company one, because Mainguard is currently one
+          person and a domain mailbox does not exist yet. It is read. Requests about your own data
+          are answered within one month, as the GDPR requires.
         </p>
       </section>
 
@@ -293,8 +302,12 @@ export function Privacy() {
           </li>
         </ul>
         <p>
-          If you want any of it gone sooner, ask through the <Link to="/contact">contact form</Link>
-          {' '}and it will be deleted.
+          If you want any of it gone sooner, ask through the <Link to="/contact">contact form</Link>{' '}
+          or email{' '}
+          <a href={`mailto:${LEGAL_CONTACT_EMAIL}`} className="mono">
+            {LEGAL_CONTACT_EMAIL}
+          </a>{' '}
+          and it will be deleted.
         </p>
       </section>
 
@@ -311,9 +324,13 @@ export function Privacy() {
           <li><strong>Withdraw consent</strong> — at any time, where consent was the basis.</li>
         </ul>
         <p>
-          Use the <Link to="/contact">contact form</Link> for any of these. If the answer is
-          unsatisfactory, you have the right to complain to your local supervisory authority — in
-          the Netherlands, the Autoriteit Persoonsgegevens.
+          Use the <Link to="/contact">contact form</Link> or email{' '}
+          <a href={`mailto:${LEGAL_CONTACT_EMAIL}`} className="mono">
+            {LEGAL_CONTACT_EMAIL}
+          </a>{' '}
+          for any of these — no particular wording is needed, and you will not be asked to justify
+          the request. If the answer is unsatisfactory, you have the right to complain to your
+          local supervisory authority; in the Netherlands that is the Autoriteit Persoonsgegevens.
         </p>
       </section>
 

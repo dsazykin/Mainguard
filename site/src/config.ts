@@ -28,6 +28,17 @@ export const GITHUB_REPO_LABEL = 'dsazykin/Mainguard';
  * subdomain; none of those is the legal name, and this field has to be.
  */
 export const LEGAL_ENTITY = 'Daniil Sazykin, trading as Mainguard';
+/**
+ * Published contact address for privacy requests and legal notices.
+ *
+ * Both the GDPR (controller contact details) and the Dutch implementation of
+ * the E-Commerce Directive want an address that reaches a human quickly; a
+ * contact form on its own probably does not satisfy the latter. A personal
+ * address is used deliberately until an @mainguard.dev mailbox exists — a
+ * published address that bounces is worse than a personal one that works.
+ * Swap this one constant when the domain mailbox is ready.
+ */
+export const LEGAL_CONTACT_EMAIL = 'daniel.sazykin@gmail.com';
 export const LEGAL_JURISDICTION = 'the Netherlands';
 /** Governing law for the terms of service. */
 export const LEGAL_GOVERNING_LAW = 'Dutch law';

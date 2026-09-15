@@ -1,5 +1,6 @@
 import { Link } from 'react-router';
 import {
+  LEGAL_CONTACT_EMAIL,
   LEGAL_ENTITY,
   LEGAL_GOVERNING_LAW,
   LEGAL_JURISDICTION,
@@ -49,9 +50,12 @@ export function Terms() {
       <section id="scope">
         <h2>1. What these terms cover</h2>
         <p>
-          This site is operated by {LEGAL_ENTITY}, based in {LEGAL_JURISDICTION}. By using
-          mainguard.dev you agree to what follows. If you do not, the remedy is simple: stop using
-          the site.
+          This site is operated by {LEGAL_ENTITY}, based in {LEGAL_JURISDICTION}, reachable at{' '}
+          <a href={`mailto:${LEGAL_CONTACT_EMAIL}`} className="mono">
+            {LEGAL_CONTACT_EMAIL}
+          </a>
+          . By using mainguard.dev you agree to what follows. If you do not, the remedy is simple:
+          stop using the site.
         </p>
         <p>
           These terms govern <strong>the website only</strong>. They do not license the Mainguard
@@ -94,8 +98,12 @@ export function Terms() {
           actual terms attached.
         </p>
         <p>
-          You can leave at any time — ask through the <Link to="/contact">contact form</Link> and
-          your entry is deleted. No dark patterns, no retention offer.
+          You can leave at any time — ask through the <Link to="/contact">contact form</Link> or
+          email{' '}
+          <a href={`mailto:${LEGAL_CONTACT_EMAIL}`} className="mono">
+            {LEGAL_CONTACT_EMAIL}
+          </a>{' '}
+          and your entry is deleted. No dark patterns, no retention offer.
         </p>
       </section>
 
@@ -213,7 +221,11 @@ export function Terms() {
           mandatory law of your own country, and you may bring proceedings there.
         </p>
         <p>
-          Questions about any of this go through the <Link to="/contact">contact form</Link>.
+          Questions about any of this go through the <Link to="/contact">contact form</Link> or to{' '}
+          <a href={`mailto:${LEGAL_CONTACT_EMAIL}`} className="mono">
+            {LEGAL_CONTACT_EMAIL}
+          </a>
+          .
         </p>
       </section>
     </div>
