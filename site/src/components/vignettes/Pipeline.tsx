@@ -27,7 +27,7 @@ export function PipelineVignette() {
 
   return (
     <div ref={ref}>
-      <WindowFrame title="mainguard pro — verify & merge">
+      <WindowFrame title="mainguard pro · verify & merge">
         <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
           {GATES.map((label, i) => {
             const st = gateState(i);
@@ -44,8 +44,8 @@ export function PipelineVignette() {
         </div>
         <p className="vg-note" aria-live="polite">
           {merged
-            ? '✓ all gates green — fix/flaky-tests merged to main'
-            : 'merge blocked until every gate passes — nothing lands unverified'}
+            ? '✓ all gates green · fix/flaky-tests merged to main'
+            : 'merge blocked until every gate passes. nothing lands unverified'}
         </p>
         {!reduced && (
           <button type="button" className="vg-replay" style={{ marginTop: 10 }} onClick={() => setTick(0)}>

@@ -16,10 +16,10 @@ import { useConsent } from './lib/consent';
 import { setAnalyticsAllowed, trackCta, trackPageview } from './lib/analytics';
 
 const TITLES: Record<string, string> = {
-  '/': 'Mainguard — the native Git client for the agent era',
-  '/client': 'Git Client — free, native, no login · Mainguard',
-  '/pro': 'Mainguard Pro — where agent work becomes trustworthy commits',
-  '/cloud': 'Mainguard Cloud — describe it, ship it verified',
+  '/': 'Mainguard · the native Git client for the agent era',
+  '/client': 'Git Client · free, native, no login · Mainguard',
+  '/pro': 'Mainguard Pro · where agent work becomes trustworthy commits',
+  '/cloud': 'Mainguard Cloud · describe it, ship it verified',
   '/contact': 'Contact · Mainguard',
   '/waitlist': 'Join the waitlist · Mainguard',
   '/privacy': 'Privacy policy · Mainguard',

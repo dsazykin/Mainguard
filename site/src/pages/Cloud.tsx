@@ -14,12 +14,12 @@ export function Cloud() {
         <p className="lede">
           Mainguard Cloud is for builders who don't want to think about git at all. Tell it what
           you want; coding agents build it in the cloud, every change passes the gate before it
-          counts, and you get a working product — plus a clean, professional history underneath,
-          in case you ever need it.
+          counts, and you get a working product with a clean, professional history underneath in
+          case you ever need it.
         </p>
         <p className="muted" style={{ marginTop: 'var(--space-4)' }}>
-          Cloud is a plan, not a product — this page describes where it's headed, after Pro. The
-          waitlist is how you hear when it's real.
+          Cloud is a plan rather than a product. This page describes where it is headed, after
+          Pro, and the waitlist is how you hear when it is real.
         </p>
         <hr className="thread-rule" />
       </div>
@@ -29,9 +29,9 @@ export function Cloud() {
           <Reveal>
             <h2 data-thread-node>Vibe coding has a trust problem.</h2>
             <p className="lede">
-              AI builders will happily generate an app for you. But when something breaks — and
-              something always breaks — you're left holding ten thousand lines nobody checked, with
-              no record of what changed or why. Cloud keeps the magic and posts a guard on the
+              AI builders will happily generate an app for you. When something breaks, and something
+              always breaks, you are left holding ten thousand lines nobody checked, with no
+              record of what changed or why. Cloud keeps the magic and posts a guard on the
               result.
             </p>
           </Reveal>
@@ -49,8 +49,8 @@ export function Cloud() {
                     <div>
                       <h3>Say what you want</h3>
                       <p>
-                        In plain language. A booking page, an internal tool, a storefront — no
-                        setup, no repositories, no jargon.
+                        In plain language. A booking page, an internal tool, a storefront. No setup, no
+                        repositories, no jargon.
                       </p>
                     </div>
                   </div>
@@ -87,13 +87,13 @@ export function Cloud() {
               <div>
                 <h3 data-thread-node>Iterate the way you talk</h3>
                 <p className="muted">
-                  There is no "edit code" step. Ask for the change the way you'd ask a contractor —
-                  and like a good contractor, Cloud shows you the result, not the rubble. Every
-                  request becomes its own change: checked at the gate, landed, and reversible.
-                  Don't like it? Say so, and it's rolled back.
+                  There is no "edit code" step. Ask for the change the way you would ask a builder, and
+                  like a good builder, Cloud shows you the result rather than the rubble. Every
+                  request becomes its own change: checked at the gate, landed, and reversible. If
+                  you do not like it, say so and it is rolled back.
                 </p>
               </div>
-              <WindowFrame title="mainguard cloud — request: pottery studio">
+              <WindowFrame title="mainguard cloud · request: pottery studio">
                 <div className="vg-grid">
                   <div className="vg-row" style={{ justifyContent: 'flex-start' }}>
                     <span style={{ fontSize: 13.5 }}>
@@ -102,7 +102,7 @@ export function Cloud() {
                   </div>
                   <div className="vg-row" style={{ display: 'block', borderColor: 'var(--accent)' }}>
                     <span className="mono" style={{ fontSize: 11.5, color: 'var(--success)', display: 'block' }}>
-                      ✓ landed — 2 changes · checks passed · preview updated
+                      ✓ landed · 2 changes · checks passed · preview updated
                     </span>
                     <span className="mono" style={{ fontSize: 10.5, color: 'var(--text-muted)', display: 'block', marginTop: 4 }}>
                       undo available · this request can be rolled back any time
@@ -125,7 +125,7 @@ export function Cloud() {
                 <IconCloud style={{ verticalAlign: '-4px', color: 'var(--accent)' }} />{' '}
                 <strong>A live product, not a code dump.</strong>{' '}
                 <span className="muted">
-                  Cloud hosts what it builds — a real URL from day one. Iterate by asking; ship by
+                  Cloud hosts what it builds, with a real URL from day one. Iterate by asking, ship by
                   clicking.
                 </span>
               </p>
@@ -134,7 +134,7 @@ export function Cloud() {
                 <strong>Verified changes, always.</strong>{' '}
                 <span className="muted">
                   The same deterministic gates that power Mainguard Pro run behind every request you
-                  make — tests pass or it doesn't land. Breakage stops at the gate, not on your
+                  make. Tests pass or it does not land, so breakage stops at the gate instead of on your
                   customers.
                 </span>
               </p>
@@ -143,8 +143,7 @@ export function Cloud() {
                 <strong>A real history, for the day you need it.</strong>{' '}
                 <span className="muted">
                   Everything is proper git underneath: clean commits, full provenance, every change
-                  attributed. Hand it to a developer — or to Mainguard Pro — and nothing is a black
-                  box.
+                  attributed. Hand it to a developer, or to Mainguard Pro, and nothing is a black box.
                 </span>
               </p>
             </div>
@@ -159,15 +158,15 @@ export function Cloud() {
             <div className="ledger" role="img" aria-label="The kinds of things Cloud is designed to build">
               <span className="dim">the kind of thing Cloud is built for:</span>
               <br />
-              <span className="ok">·</span> a booking page with deposits and reminder emails — a pottery studio
+              <span className="ok">·</span> a booking page with deposits and reminder emails, for a pottery studio
               <br />
-              <span className="ok">·</span> an inventory tracker with barcode scans — a bike shop
+              <span className="ok">·</span> an inventory tracker with barcode scans, for a bike shop
               <br />
-              <span className="ok">·</span> a members portal with paid tiers — a climbing gym
+              <span className="ok">·</span> a members portal with paid tiers, for a climbing gym
               <br />
-              <span className="ok">·</span> an internal quoting tool replacing four spreadsheets — a joinery
+              <span className="ok">·</span> an internal quoting tool replacing four spreadsheets, for a joinery
               <br />
-              <span className="dim">illustrations, not customers — Cloud has not been built yet</span>
+              <span className="dim">illustrations rather than customers. Cloud has not been built yet</span>
             </div>
           </Reveal>
         </div>
@@ -178,7 +177,7 @@ export function Cloud() {
           <Reveal>
             <h2 data-thread-node>Made for the founders, not the git logs.</h2>
             <p className="lede">
-              Non-technical founders, designers, operators, tinkerers — anyone with something to
+              Non-technical founders, designers, operators, tinkerers. Anyone with something to
               build and no appetite for merge conflicts. And if you outgrow it, nothing is thrown
               away: your project graduates to <Link to="/pro">Pro</Link> with its full history
               intact, ready for the developer you hire. Nothing to migrate, nothing to untangle.

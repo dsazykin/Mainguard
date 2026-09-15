@@ -13,10 +13,10 @@ export function ConflictVignette() {
         ? 'take ours'
         : theirs
           ? 'take theirs'
-          : 'pick a side — nothing is lost either way';
+          : 'pick a side, nothing is lost either way';
 
   return (
-    <WindowFrame title="mainguard — resolve · Router.cs">
+    <WindowFrame title="mainguard · resolve · Router.cs">
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
         <button
           type="button"
@@ -57,10 +57,10 @@ export function ConflictVignette() {
         }}
       >
         <span className="mono" style={{ fontSize: 11, color: ours || theirs ? 'var(--accent)' : 'var(--text-muted)' }}>
-          RESULT — {result}
+          RESULT · {result}
         </span>
       </div>
-      <p className="vg-hint">every choice reversible until you commit — click the panes</p>
+      <p className="vg-hint">every choice stays reversible until you commit. click the panes</p>
     </WindowFrame>
   );
 }

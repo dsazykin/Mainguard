@@ -141,7 +141,7 @@ function ConsentDialog({
                       role="switch"
                       aria-checked={on}
                       disabled={privacyControlActive}
-                      aria-label={`${c.label} — ${
+                      aria-label={`${c.label}: ${
                         privacyControlActive
                           ? 'blocked by Global Privacy Control'
                           : on

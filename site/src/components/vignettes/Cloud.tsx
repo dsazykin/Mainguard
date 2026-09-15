@@ -3,8 +3,8 @@ import { WindowFrame } from './WindowFrame';
 import { useInView, useReducedMotion, useTicker } from '../../lib/hooks';
 
 const PROMPTS = [
-  'A booking page for my pottery studio — calendar, deposits, email reminders.',
-  'An inventory tracker for the shop — barcode scans, low-stock alerts.',
+  'A booking page for my pottery studio, with calendar, deposits and email reminders.',
+  'An inventory tracker for the shop, with barcode scans and low-stock alerts.',
   'A newsletter site with paid subscriptions and a tip jar.',
 ];
 
@@ -50,7 +50,7 @@ export function CloudVignette() {
 
   return (
     <div ref={ref}>
-      <WindowFrame title="mainguard cloud — new request">
+      <WindowFrame title="mainguard cloud · new request">
         <div
           style={{
             border: '1px solid var(--border-hairline)',

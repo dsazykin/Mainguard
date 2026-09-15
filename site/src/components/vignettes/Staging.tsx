@@ -43,7 +43,7 @@ export function StagingVignette() {
   };
 
   return (
-    <WindowFrame title="mainguard — staging · Parser.cs">
+    <WindowFrame title="mainguard · staging · Parser.cs">
       <div style={{ display: 'grid', gap: 6 }}>
         {LINES.map((l, i) =>
           l.kind === 'ctx' ? (
@@ -93,7 +93,7 @@ export function StagingVignette() {
         </div>
         <p className="vg-note" aria-live="polite">
           {committed
-            ? '✓ committed b7e21a4 — exactly the lines you picked'
+            ? '✓ committed b7e21a4 · exactly the lines you picked'
             : `${staged.size} of ${CHANGE_COUNT} changed lines staged · click lines to choose`}
         </p>
       </div>

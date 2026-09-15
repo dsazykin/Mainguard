@@ -50,7 +50,7 @@ export function Waitlist() {
     });
     setBusy(false);
     if (res.ok) setDone(true);
-    else setError((res.error ?? 'Something went wrong.') + ' Your details are still here — please try again.');
+    else setError((res.error ?? 'Something went wrong.') + ' Your details are still here. Try again.');
   }
 
   if (done) {
@@ -58,7 +58,7 @@ export function Waitlist() {
       <div className="container form-page">
         <SuccessGate title="You're on the list.">
           <p className="muted">
-            We'll email you the moment there's something to download — and nothing else. No
+            You get an email the moment there is something to download, and nothing else. No
             newsletters, no drip campaigns.
           </p>
         </SuccessGate>

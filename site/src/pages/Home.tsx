@@ -16,8 +16,8 @@ export function Home() {
             <h1>Agents do the work. The guard holds main.</h1>
             <p className="lede">
               Agent CLIs made it trivial to produce ten branches an hour. Nothing on the market
-              makes it safe to merge them. Mainguard is a native Git client — free, no login — and
-              a control center where agent work becomes trustworthy commits on main.
+              makes it safe to merge them. Mainguard is a native Git client, free and with no
+              account, and a control center where agent work turns into commits you can trust.
             </p>
             <div className="hero-ctas">
               <Link to="/waitlist" className="btn btn-accent btn-lg" data-cta="waitlist-home-hero">
@@ -40,7 +40,7 @@ export function Home() {
             <h2 data-thread-node>Born from one error message.</h2>
             <p className="lede">
               Run two tools against the same repository and sooner or later you meet it. Now
-              multiply by a room full of coding agents.
+              multiply that by a room full of coding agents.
             </p>
           </Reveal>
           <Reveal delay={80}>
@@ -69,7 +69,7 @@ export function Home() {
             <p className="lede">
               Most tools ask the agent whether its work is good. Mainguard never does. The verdict
               is the container's real exit code, read by a trusted daemon from outside the
-              container — so printing "all tests passed" buys an agent nothing.
+              container. Printing "all tests passed" buys an agent nothing.
             </p>
           </Reveal>
           <Reveal delay={80}>
@@ -77,20 +77,20 @@ export function Home() {
               {(
                 [
                   [
-                    'Observed, not reported',
-                    'the daemon reads the exit code from the container runtime — a value the agent never gets to supply',
+                    'Observed by the daemon',
+                    'the exit code is read from the container runtime, a value no agent gets to supply',
                   ],
                   [
-                    'Always against current main',
-                    'when anything merges, every other verified branch is invalidated and re-verified before it is eligible again',
+                    'Checked against current main',
+                    'when anything merges, every other verified branch is invalidated and re-verified before it can land',
                   ],
                   [
-                    'Provenance-pinned',
-                    'the resolved test command and config hash are recorded immutably, so nothing slips through by weakening what "verify" means',
+                    'Pinned to a command',
+                    'the resolved test command and its config hash are recorded immutably, so nothing slips through by quietly weakening what verify means',
                   ],
                   [
                     'Never automatic',
-                    'passing only makes a branch eligible; you approve it, and the merge is an atomic compare-and-swap',
+                    'passing earns a branch the right to be considered. You still approve it, and the merge is an atomic compare-and-swap',
                   ],
                 ] as Array<[string, string]>
               ).map(([t, d]) => (
@@ -121,8 +121,8 @@ export function Home() {
                   </div>
                   <h3>Git Client</h3>
                   <p>
-                    A fast, native Git GUI: 60fps commit graph, partial staging, calm conflict
-                    resolution, worktrees — and none of the Electron heft.
+                    A fast, native Git GUI with a 60fps commit graph, partial staging, calm
+                    conflict resolution and real worktrees. None of the Electron weight.
                   </p>
                 </div>
                 <IconArrowRight className="trio-arrow" />
@@ -152,9 +152,9 @@ export function Home() {
                   </div>
                   <h3>Mainguard Cloud</h3>
                   <p>
-                    Describe what you want built. Agents build it in the cloud, every change
-                    verified before it lands — you get a working product and a clean history, no
-                    git required.
+                    Describe what you want built. Agents build it in the cloud and every change is
+                    verified before it lands. You get a working product with a clean history
+                    underneath, and no git to learn.
                   </p>
                 </div>
                 <IconArrowRight className="trio-arrow" />
@@ -171,9 +171,9 @@ export function Home() {
               <div style={{ maxWidth: '38rem' }}>
                 <h2 data-thread-node style={{ marginBottom: 'var(--space-3)' }}>This page is wearing the app.</h2>
                 <p className="muted" style={{ margin: 0 }}>
-                  Mainguard ships one design system with four switchable palettes — Midnight Loom,
-                  Daylight Loom, Graphite and Atelier. Try them. Everything you're looking at
-                  changes the guard, exactly like the client does.
+                  Mainguard ships one design system with four palettes: Midnight Loom, Daylight
+                  Loom, Graphite and Atelier. Try them. Every surface on this page follows the
+                  switch, the same way the client does.
                 </p>
               </div>
               <ThemeSwitcher large />
@@ -187,7 +187,7 @@ export function Home() {
           <Reveal>
             <h2>The free client is in alpha.</h2>
             <p className="muted" style={{ marginInline: 'auto' }}>
-              Be first in line for the download — and early access to Pro.
+              Be first in line for the download, and for early access to Pro.
             </p>
             <Link to="/waitlist" className="btn btn-accent btn-lg" data-cta="waitlist-home-footer">
               Join the waitlist

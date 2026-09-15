@@ -27,7 +27,7 @@ export const CATEGORIES: CategoryInfo[] = [
     id: 'analytics',
     label: 'Analytics',
     description:
-      'Counts which pages are read, which link sent you here, your country and device type, and which buttons get clicked. First-party only — it sets nothing on your device and is never shared. Declining costs you nothing.',
+      'Counts which pages are read, which link sent you here, your country and device type, and which buttons get clicked. First-party only: it sets nothing on your device and is never shared. Declining costs you nothing.',
     required: false,
   },
   {

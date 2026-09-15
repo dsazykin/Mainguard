@@ -29,7 +29,7 @@ export function ReviewQueueVignette() {
     });
 
   return (
-    <WindowFrame title="mainguard pro — review queue">
+    <WindowFrame title="mainguard pro · review queue">
       <div className="vg-grid">
         {ITEMS.map((it) => {
           const ok = approved.has(it.branch);
@@ -62,9 +62,9 @@ export function ReviewQueueVignette() {
           );
         })}
         <p className="vg-note" aria-live="polite">
-          {approved.size} of {ITEMS.length} approved · every hunk carries provenance — who wrote it, which prompt, which run
+          {approved.size} of {ITEMS.length} approved · every hunk carries provenance: who wrote it, which prompt, which run
         </p>
-        <p className="vg-hint">click a diff to approve it — click again to change your mind</p>
+        <p className="vg-hint">click a diff to approve it, click again to change your mind</p>
       </div>
     </WindowFrame>
   );

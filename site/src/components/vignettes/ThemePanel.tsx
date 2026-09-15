@@ -7,7 +7,7 @@ export function ThemePanelVignette() {
   const { theme, setTheme } = useTheme();
 
   return (
-    <WindowFrame title="mainguard — settings · appearance">
+    <WindowFrame title="mainguard · settings · appearance">
       <div className="vg-grid" role="radiogroup" aria-label="Site theme (live)">
         {THEMES.map((t, i) => (
           <button
@@ -29,7 +29,7 @@ export function ThemePanelVignette() {
             )}
           </button>
         ))}
-        <p className="vg-hint">these rows are wired to the real switcher — the whole page changes the guard</p>
+        <p className="vg-hint">these rows are wired to the real switcher, so the whole page follows</p>
       </div>
     </WindowFrame>
   );
