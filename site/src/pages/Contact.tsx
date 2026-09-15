@@ -1,8 +1,9 @@
-import { useState, type FormEvent, type KeyboardEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { Link } from 'react-router';
 import { Turnstile } from '../components/Turnstile';
 import { SuccessGate } from '../components/SuccessGate';
 import { postJson } from '../lib/api';
+import { trackStep } from '../lib/analytics';
 
 const TOPICS = ['General', 'Early access & beta', 'Partnerships', 'Press', 'Support'];
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
@@ -23,6 +24,16 @@ export function Contact() {
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Report the furthest step reached, once each. Without this, walking back and
+  // forward would report the same step repeatedly and a drop-off funnel would
+  // read as enthusiasm. -1 so step 0 still counts as newly reached.
+  const furthestStep = useRef(-1);
+  useEffect(() => {
+    if (step <= furthestStep.current) return;
+    furthestStep.current = step;
+    trackStep(`${step + 1}-${STEPS[step].toLowerCase()}`, '/contact');
+  }, [step]);
 
   function validate(s: number): string | null {
     if (s === 0 && !name.trim()) return 'Please enter your name.';

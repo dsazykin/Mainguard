@@ -79,6 +79,15 @@ export function Privacy() {
         <ul>
           <li><strong>Which page</strong> was viewed, and <strong>which button</strong> was clicked.</li>
           <li>
+            <strong>How far into the contact form</strong> you got, if you started it — the step
+            number only, never what you typed into it. A form people abandon halfway is usually a
+            form with a bad question in it.
+          </li>
+          <li>
+            <strong>The address you asked for, when a page does not exist</strong>, so broken links
+            pointing here can be found and fixed.
+          </li>
+          <li>
             <strong>The site that linked you here</strong> — the host only, such as
             "news.ycombinator.com", never the full address, which can carry search terms.
           </li>

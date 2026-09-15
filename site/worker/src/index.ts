@@ -206,7 +206,25 @@ async function handleContact(request: Request, env: Env, origin: string | null):
   return json({ ok: true }, 200, origin);
 }
 
-const EVENT_TYPES = new Set(['pageview', 'cta']);
+const EVENT_TYPES = new Set(['pageview', 'cta', 'step']);
+
+/**
+ * Unknown paths are recorded, not bucketed, because the whole value is knowing
+ * WHICH dead URL people are hitting — someone linking /pricing or /download
+ * tells you what the world assumes exists.
+ *
+ * This is the one place attacker-supplied text reaches a stored column, so it
+ * is fenced hard: a strict character class, a short cap, lowercased, and
+ * prefixed with `404:` so these rows can never be mistaken for a real page.
+ * Anything that fails the pattern collapses to a single bucket rather than
+ * being stored.
+ */
+const SAFE_UNKNOWN_PATH = /^\/[a-z0-9/._-]{0,48}$/i;
+
+function unknownPath(raw: string): string {
+  const candidate = raw.slice(0, 49).toLowerCase();
+  return SAFE_UNKNOWN_PATH.test(candidate) ? `404:${candidate}` : '404:(unrecordable)';
+}
 /** Paths the SPA can legitimately report. Anything else is recorded as 'other'. */
 const KNOWN_PATHS = new Set([
   '/',
@@ -304,7 +322,7 @@ async function handleEvent(request: Request, env: Env, origin: string | null): P
   if (!type || !EVENT_TYPES.has(type)) return noContent();
 
   const rawPath = str(body.path, 256) ?? '/';
-  const path = KNOWN_PATHS.has(rawPath) ? rawPath : 'other';
+  const path = KNOWN_PATHS.has(rawPath) ? rawPath : unknownPath(rawPath);
 
   const ip = request.headers.get('CF-Connecting-IP') ?? '0.0.0.0';
   const ua = request.headers.get('User-Agent') ?? '';
@@ -360,6 +378,8 @@ interface Stats {
   devices: unknown[];
   themes: unknown[];
   ctas: unknown[];
+  notFound: unknown[];
+  formSteps: unknown[];
   daily: unknown[];
 }
 
@@ -387,6 +407,8 @@ async function collectStats(env: Env, days: number): Promise<Stats> {
     devices,
     themes,
     ctas,
+    notFound,
+    formSteps,
     daily,
     totals,
     engagement,
@@ -423,6 +445,16 @@ async function collectStats(env: Env, days: number): Promise<Stats> {
     group(
       "SELECT label, COUNT(*) AS clicks FROM events WHERE type='cta' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY label ORDER BY clicks DESC",
     ),
+    // Dead URLs people actually reach. Free product feedback: a stream of hits
+    // on /pricing says something about what the world expects to find.
+    group(
+      "SELECT substr(path, 5) AS url, COUNT(*) AS hits, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND path LIKE '404:%' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY url ORDER BY hits DESC LIMIT 25",
+    ),
+    // Form funnel: how far into a multi-step form people get before leaving.
+    // Ordered by label so the steps read in order, not by popularity.
+    group(
+      "SELECT label, COUNT(DISTINCT visitor_day) AS reached FROM events WHERE type='step' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY label ORDER BY label ASC",
+    ),
     group(
       "SELECT substr(created_at,1,10) AS day, COUNT(*) AS views, COUNT(DISTINCT visitor_day) AS visitors FROM events WHERE type='pageview' AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY day ORDER BY day DESC",
     ),
@@ -448,6 +480,8 @@ async function collectStats(env: Env, days: number): Promise<Stats> {
     devices,
     themes,
     ctas,
+    notFound,
+    formSteps,
     daily,
   };
 }
@@ -536,6 +570,8 @@ async function sendWeeklyDigest(env: Env): Promise<void> {
     'CTA clicks',
     digestRows(s.ctas, 'label', 'clicks'),
     '',
+    // Only worth a line when there is something to fix.
+    ...(s.notFound.length ? ['Dead URLs people hit', digestRows(s.notFound, 'url', 'hits'), ''] : []),
     'Analytics is opt-in, so every figure undercounts. Trends, not totals.',
     'Full detail: cd site/worker && ADMIN_TOKEN=… npm run stats -- 7',
   ].join('\n');

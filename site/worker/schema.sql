@@ -31,10 +31,12 @@ CREATE INDEX IF NOT EXISTS idx_ip_time ON submissions (ip_hash, created_at);
 -- Only written when the visitor has opted in to analytics.
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  -- Only these two. Scroll-depth tracking was considered and dropped: the
-  -- privacy policy promises no scroll tracking, and that promise is worth more
-  -- than knowing how far down the Pro page people get.
-  type TEXT NOT NULL CHECK (type IN ('pageview', 'cta')),
+  -- Scroll-depth tracking was considered and dropped: the privacy policy
+  -- promises no scroll tracking, and that promise is worth more than knowing
+  -- how far down the Pro page people get.
+  type TEXT NOT NULL CHECK (type IN ('pageview', 'cta', 'step')),
+  -- A known route, or '404:<path>' for a URL that does not exist. The prefix
+  -- means a dead URL can never be mistaken for a real page in a report.
   path TEXT NOT NULL,
   -- Referrer HOST only ('news.ycombinator.com'), never the full URL, which can
   -- carry the search terms or a private page title.
@@ -43,7 +45,8 @@ CREATE TABLE IF NOT EXISTS events (
   country TEXT,
   device TEXT,
   theme TEXT,
-  -- 'waitlist-hero', 'waitlist-pro', … for type='cta'. Null for a pageview.
+  -- 'waitlist-hero' for type='cta'; '2-email' for type='step' (how far into a
+  -- form someone got). Null for a pageview.
   label TEXT,
   visitor_day TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))

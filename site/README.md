@@ -116,10 +116,23 @@ What makes it defensible, and what must not be quietly eroded:
   collects nothing rather than everything.
 - **Can never break the page.** Beacons are fire-and-forget and the worker always answers 204.
 
-Only two event types exist, `pageview` and `cta`, and the D1 `CHECK` enforces it. Scroll-depth
-tracking was considered and dropped: the privacy policy promises no scroll tracking, and that
-promise is worth more than knowing how far down the Pro page people scroll. Adding it back means
-changing the policy in the same commit.
+Three event types exist — `pageview`, `cta` and `step` — and the D1 `CHECK` enforces it.
+Scroll-depth tracking was considered and dropped: the privacy policy promises no scroll tracking,
+and that promise is worth more than knowing how far down the Pro page people scroll. Adding it
+back means changing the policy in the same commit.
+
+**`step`** records how far into a multi-step form someone got (`1-name`, `2-email`, …) — the step
+number only, never the field contents. `Contact.tsx` reports the *furthest* step reached, once
+each, via a ref: without that, walking back and forward would report the same step repeatedly and
+a drop-off funnel would read as enthusiasm. Labels are number-prefixed so the report sorts into
+step order rather than by popularity.
+
+**Dead URLs are recorded, not bucketed.** A path that is not a known route is stored as
+`404:<path>`, so a stream of hits on `/pricing` tells you what the world assumes exists. This is
+the only place attacker-supplied text reaches a stored column, so it is fenced hard — a strict
+character class, a 49-character cap, lowercased, and anything failing the pattern collapses to
+`404:(unrecordable)` rather than being stored. The `404:` prefix means these rows can never be
+mistaken for a real page in a report. **If you loosen that pattern, re-run the guard tests first.**
 
 **Reading the numbers:**
 

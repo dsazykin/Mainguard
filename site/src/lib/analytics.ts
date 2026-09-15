@@ -20,7 +20,7 @@ import { API_BASE } from '../config';
  * clicked. What it cannot learn: who you are, or what you did yesterday.
  */
 
-type EventType = 'pageview' | 'cta';
+type EventType = 'pageview' | 'cta' | 'step';
 
 interface EventPayload {
   type: EventType;
@@ -89,4 +89,19 @@ export function trackPageview(path: string): void {
 
 export function trackCta(label: string, path: string): void {
   send({ type: 'cta', path, label, theme: currentTheme() });
+}
+
+/**
+ * How far into a multi-step form someone got.
+ *
+ * Records the furthest step reached, not every transition: going back and
+ * forward would otherwise report the same step repeatedly and make a funnel
+ * look like engagement. The caller owns that de-duplication, since only it
+ * knows the form's lifetime — see Contact.tsx.
+ *
+ * The label is ordered ('1-name', '2-email', …) so the report reads in step
+ * order rather than by popularity.
+ */
+export function trackStep(label: string, path: string): void {
+  send({ type: 'step', path, label });
 }

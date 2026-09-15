@@ -75,6 +75,8 @@ table('Countries', s.countries, 'country', ['visitors']);
 table('Devices', s.devices, 'device', ['visitors']);
 table('Themes', s.themes, 'theme', ['visitors']);
 table('CTA clicks', s.ctas, 'label', ['clicks']);
+table('Contact form — reached', s.formSteps, 'label', ['reached']);
+table('Dead URLs hit', s.notFound, 'url', ['hits', 'visitors']);
 table('By day', s.daily, 'day', ['views', 'visitors']);
 
 console.log(
