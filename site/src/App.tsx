@@ -11,6 +11,7 @@ import { Waitlist } from './pages/Waitlist';
 import { Privacy } from './pages/Privacy';
 import { Terms } from './pages/Terms';
 import { Verification } from './pages/Verification';
+import { Roadmap } from './pages/Roadmap';
 import { NotFound } from './pages/NotFound';
 import { CookieConsent } from './components/CookieConsent';
 import { useConsent } from './lib/consent';
@@ -24,6 +25,7 @@ const TITLES: Record<string, string> = {
   '/contact': 'Contact · Mainguard',
   '/waitlist': 'Join the waitlist · Mainguard',
   '/verification': 'How verification works · Mainguard',
+  '/roadmap': 'Roadmap · Mainguard',
   '/privacy': 'Privacy policy · Mainguard',
   '/terms': 'Terms of service · Mainguard',
 };
@@ -81,6 +83,7 @@ export default function App() {
           <Route path="/contact" element={<Contact />} />
           <Route path="/waitlist" element={<Waitlist />} />
           <Route path="/verification" element={<Verification />} />
+          <Route path="/roadmap" element={<Roadmap />} />
           <Route path="/privacy" element={<Privacy />} />
           <Route path="/terms" element={<Terms />} />
           <Route path="*" element={<NotFound />} />

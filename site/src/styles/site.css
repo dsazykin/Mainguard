@@ -1079,3 +1079,68 @@
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* ————— The "planned, not built" mark ————— */
+
+.planned-mark {
+  font-size: 0.75em;
+  vertical-align: super;
+  line-height: 0;
+  margin-left: 2px;
+  color: var(--warning);
+  text-decoration: none;
+  /* Padded so it is a real tap target on a phone, not a two-pixel glyph. */
+  padding: 0 4px;
+}
+
+.planned-mark:hover {
+  color: var(--text-primary);
+}
+
+.planned-note {
+  margin-top: var(--space-12);
+  padding-top: var(--space-6);
+  border-top: 1px solid var(--border-hairline);
+  max-width: 56ch;
+  font-size: var(--text-sm);
+  line-height: 1.75;
+  color: var(--text-muted);
+}
+
+.planned-note-mark {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+/* ————— Roadmap ————— */
+
+.roadmap-group {
+  margin-top: var(--space-12);
+}
+
+.roadmap-status {
+  display: inline-flex;
+  align-items: center;
+  font: 600 0.72rem / 1 var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 6px 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-hairline);
+  margin-bottom: var(--space-4);
+  color: var(--text-muted);
+}
+
+.roadmap-status.is-shipped {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+.roadmap-status.is-building {
+  color: var(--warning);
+  border-color: var(--warning);
+}
+
+.roadmap-status.is-no {
+  border-style: dashed;
+}
