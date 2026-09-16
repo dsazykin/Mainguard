@@ -268,18 +268,30 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
                             await bound.WriteInputAsync(input.Data.Memory, ct);
                             break;
                         case TerminalInput.InputOneofCase.Resize:
-                            // F64: a read-only attach does not resize. "Window geometry is harmless" was
-                            // wrong twice over — a resize is a write to the managed worker's PTY
-                            // (SIGWINCH into its CLI, and a reflow of the daemon's authoritative grid),
-                            // and it is a shared one: every OTHER viewer of this session, including the
-                            // coordinator driving it, sees the terminal reshape under them because a
-                            // spectator opened a narrow window. The lock means the session is not yours
-                            // to change, and geometry is part of the session.
-                            if (isLocked())
-                            {
-                                break;
-                            }
-
+                            // MG-24 narrows F64 (owner's decision): a locked attach DOES resize.
+                            //
+                            // The lock is about INPUT — nothing may type into a managed worker, and
+                            // that half is untouched above. Geometry is not input: it is how big the
+                            // window you are looking through is, and a pane the operator can drag but
+                            // whose terminal refuses to follow is a broken window, not a safe one.
+                            // Every other pane in this app resizes; this one was the exception, and
+                            // the size it got stuck at (the 120x32 spawn default) is the reason a
+                            // worker terminal was unreadable in the first place.
+                            //
+                            // What F64 worried about does not survive contact with the mechanism:
+                            // Resize is TIOCSWINSZ on the PTY master plus a vterm reflow under the
+                            // session gate. It writes NO bytes to the PTY stream, so it cannot
+                            // interleave with an in-flight WriteInputAsync or split an escape
+                            // sequence — the corruption the input lock exists to prevent is not
+                            // reachable this way. It delivers SIGWINCH and the CLI repaints, which is
+                            // what a resize means. The residual is that SubmitObservation's
+                            // echo/reaction heuristic can see repaint output and read it as a
+                            // reaction; that type already documents itself as report-never-assert and
+                            // says neither field is proof a line became a turn.
+                            //
+                            // Two panes on one session at different sizes are last-writer-wins, as
+                            // they are in every multiplexer. The `geometry` frame is what keeps that
+                            // honest: whoever did not win is TOLD the size that did.
                             bound.Resize((int)input.Resize.Cols, (int)input.Resize.Rows);
                             break;
                     }
@@ -411,14 +423,10 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
                             await bound.WriteInputAsync(input.Data.Memory, ct);
                             break;
                         case TerminalInput.InputOneofCase.Resize:
-                            // F64, and it bites harder on the grid path: a resize reflows the daemon's
-                            // authoritative vterm and pushes a fresh snapshot to EVERY subscriber. A
-                            // read-only spectator must not repaint the session it is watching.
-                            if (isLocked())
-                            {
-                                break;
-                            }
-
+                            // MG-24: locked attaches resize here too — see the long note on the raw
+                            // pump. The grid path costs a bit more (the reflow pushes a fresh snapshot
+                            // to every subscriber) but that is a repaint, not a corruption, and a
+                            // snapshot is exactly how a grid client is supposed to learn a new size.
                             bound.Resize((int)input.Resize.Cols, (int)input.Resize.Rows);
                             break;
                     }
