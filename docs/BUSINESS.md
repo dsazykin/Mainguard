@@ -17,10 +17,14 @@ else is in it, why it holds, and what would break it.
 <summary><b>Ground rules this document is written under</b></summary>
 
 **Honesty contract** (binding, from [`creative/Narrative.md`](creative/Narrative.md) §0). Present-tense
-claims are shipped on `main`. Everything in the agent pipeline is marked **[Horizon]** — "in
-development," never "works today." Capacity is an honest 4–6 agents on a 16 GB laptop, never "swarms of
-50." The audit story is "audit-grade, where procurement is heading," never "legally required." Cloud
-figures are illustrative placeholders and say so at first use.
+claims are shipped on `main`; anything unbuilt is marked **[Horizon]** and says "in development," never
+"works today." Capacity is an honest 4–6 agents on a 16 GB laptop, never "swarms of 50." The audit story
+is "audit-grade, where procurement is heading," never "legally required." Cloud figures are illustrative
+placeholders and say so at first use.
+
+**[`STATUS.md`](STATUS.md) is the authority on what is built** — one row per task, verified against the
+code, and a merged PR is explicitly not evidence there. This document says what each capability is *for*;
+when the two disagree about whether something exists, STATUS wins and this file is the thing to fix.
 
 **Evidence standard.** Market and competitive claims were verified 2026-07-06/07 against primary
 sources; the target-company research is dated 2026-08-20. Competitor claims are "what they publicly say"
@@ -69,12 +73,13 @@ invalidation → risk ranking and provenance → audit trail.
 **Decision rule:** if a proposed feature, partnership, or piece of copy doesn't make a blind merge
 harder or a verified merge easier, it's off-thesis.
 
-**Where we stand (September 2026).** The Git client is shipped and working — 1,042 tests, and the
-`T-01`…`T-33` task IDs quoted throughout are its build log. The phase-2 agent platform is specified and
-in integration on the `phase2` branch. The current stage is **beta-feedback recruitment, not selling** —
-Show HN is held in reserve until a reproducible spawn → verify → review → merge run exists
-([`GTM.md`](GTM.md) §1). Pre-revenue by design. Founder in **Enschede, Netherlands**, which the plan
-treats as a strategic fact rather than an afterthought.
+**Where we stand (September 2026).** The Git client is shipped and working. **So is most of the
+verification pipeline** — sandbox, merge queue, review cockpit, plan approval, audit chain
+([`STATUS.md`](STATUS.md) has the per-task evidence). What is missing is the end-to-end polish and the
+two governance capabilities the Team tier is sold on. The current stage is therefore **beta-feedback
+recruitment, not selling** — Show HN is held in reserve until the full spawn → verify → review → merge
+run is reproducible rather than a manual runbook ([`GTM.md`](GTM.md) §1). Pre-revenue by design. Founder
+in **Enschede, Netherlands**, which the plan treats as a strategic fact rather than an afterthought.
 
 **Why the bet is downstream.** "Run agents in worktrees from a GUI" is not a differentiator — that
 plumbing is native to the agent CLIs and free from every vendor. **Our center of gravity is one step
@@ -88,55 +93,74 @@ weakest.
 
 *Detail: [Master Market Document](business/go-to-market/Mainguard_Master_Market_Document_2026-07.md) Part V (the D-1…D-6 spine); [Feature Inventory](business/market-analysis/Mainguard_Feature_Inventory_2026-07-07.md) (per-competitor gaps, the match/skip rulings, and the full novel-feature list).*
 
-### 2.1 What is shipped, and what is [Horizon]
+### 2.1 What exists
 
-**Shipped (`main`).** A native Git client — Avalonia + Skia on .NET 10, LibGit2Sharp underneath, not an
-Electron shell. A virtualized vector-drawn commit graph that stays smooth on large histories;
-line-level staging validated against `git apply`; a synchronized 3-pane conflict resolver; an operation
-journal making ref moves undoable plus a reflog viewer; branch/tag/worktree porcelain; interactive
-rebase; five themes on one design system. `--force-with-lease`, never a bare `--force`. 1,042 tests.
+*Per-task status, with the file that proves each claim, is [`STATUS.md`](STATUS.md). The summary below
+tracks it; if it drifts, STATUS is right.*
 
-**[Horizon] — the verification pipeline.** plan approval → sandboxed execution → your tests pass in the
-agent's sandbox → risk-ranked, provenance-annotated review → a merge queue that re-verifies whatever
-goes stale → human-gated merge. Specified as `P2-10`/`11`/`14`/`15` — phase-2 task IDs, whose specs live
-in [`phase-2/implementation_plans/`](phase-2/implementation_plans/) — and in integration now.
+**The Git client.** Native — Avalonia + Skia on .NET 10, LibGit2Sharp underneath, not an Electron shell.
+A virtualized vector-drawn commit graph that stays smooth on large histories; line-level staging
+validated against `git apply`; a synchronized 3-pane conflict resolver; an operation journal making ref
+moves undoable plus a reflog viewer; branch/tag/worktree porcelain; interactive rebase; five themes on
+one design system. `--force-with-lease`, never a bare `--force`.
+
+**The verification pipeline — the spine is built.** Plan approval, the hardened sandbox with default-deny
+egress, the merge queue with verification runs, the risk-ranked review cockpit with provenance,
+external-PR intake, and the hash-chained audit log all have shipping implementations (`P2-07`, `P2-10`,
+`P2-11`, `P2-12`, `P2-14`, `P2-15`). **What is not built matters commercially and is named in §2.2:**
+SIEM export and RBAC/SSO/SCIM — the two the Team tier is sold on — plus the repair loop, Diff Guard,
+conflict radar, per-agent signing keys and cloud worktrees.
+
+**The gap between "the parts exist" and "the product works end to end" is the real one.** The full
+spawn → verify → review → merge leg is a manual runbook, several control-centre surfaces are UI over
+inert engines, and that gap — not the task list — is what gates the launch ([`GTM.md`](GTM.md) §1).
 
 ### 2.2 The differentiation spine
 
 Ordered by (defensibility × demand). D-1…D-3 are the product spine; all depend on the Git core, and
-that sequencing must be protected from launch-marketing pressure.
+that sequencing must be protected from launch-marketing pressure. **Each carries what is still missing,
+because in every case the gap is the commercially interesting part.**
 
 **D-1 · The verification & merge control plane** — *the lead feature.* Verification runs recorded as
 `main@<sha>` + pass/fail + artifact, and **stale-verification invalidation**: any merge to main marks
 other "verified" branches stale and auto re-queues them. No competitor GUI models this, and it is pure
-Git mechanics. Plus a **flagged-changes gate** on supply-chain-sensitive paths (lockfiles, CI workflows,
-hooks, `package.json` scripts; post-merge installs run `--ignore-scripts`), **vendor-neutral intake** of
-cloud-agent PRs through the same pipeline, and a **bounded repair loop** — one scoped repair prompt in
-the same sandbox, capped and journaled, in a terminal a human can take over.
+Git mechanics. Plus a **flagged-changes gate** on supply-chain-sensitive paths and **vendor-neutral
+intake** of cloud-agent PRs through the same pipeline.
+*Built: the queue, verification runs, intake. Missing: the bounded repair loop, and the supply-chain gate
+is a lockfile diff with no SPDX check.*
 
 **D-2 · The review cockpit** — *the daily-driver reason to open Mainguard.* Hunks ordered by blast
 radius, not alphabetically. Per-hunk provenance in the blame and diff gutters — which agent, under which
 approved plan, wrote this line — **adopting Agent Trace as the interchange format**, emitting *and*
-rendering it, with commit trailers as fallback. Plus a test-delta view and a diff-size/off-scope policy.
-The metric to market: *"review five agent branches in twenty minutes, safely."*
+rendering it, with commit trailers as fallback. The metric to market: *"review five agent branches in
+twenty minutes, safely."*
+*Built: risk classification and provenance. Missing: review-sprint mode, Diff Guard's size/off-scope
+policy, and comments flowing back to the agent.*
 
 **D-3 · Compliance-grade audit** — *the enterprise unlock.* Hash-chained append-only log of every
-inference, spawn, plan approval and merge decision, **bound to the authorizing OS identity**; SIEM
-export; an `audit verify` CLI; RFC 3161 anchoring may trail the rest. Claim "audit-grade," never
-"EU-required."
+inference, spawn, plan approval and merge decision, **bound to the authorizing OS identity**. Claim
+"audit-grade," never "EU-required."
+*Built: the hash chain and RFC 3161 anchoring. Missing: `audit replay`, and **SIEM export and
+RBAC/SSO/SCIM — the two capabilities the $50+/seat tier is sold on**, which is why that tier is not sold
+yet (§6.1).*
 
 **D-4 · Hardened Windows sandbox** — *the unserved flank.* Default-deny egress via proxy allowlist,
 tmpfs-only credentials, no global auth-dir mounts. Publishing the security architecture is itself the
 sales asset: a boundary you can audit. Docker sbx is an optional maximum-isolation backend.
+*Built. Two residual risks are accepted and stated rather than fixed — read
+[`security-architecture.md`](security-architecture.md) before calling the sandbox airtight.*
 
 **D-5 · Git surgery for agent output** — *unique to a real client.* Interactive rebase tuned for agent
 WIP, the undo journal as the agent safety net, and a cross-worktree conflict radar that warns the moment
 two agents touch overlapping regions — *before* either merges.
+*Built: the client-side rebase and undo journal. Missing: conflict radar and agent-tuned commit-stream
+curation — both unstarted.*
 
 **D-6 · Cost & rate-limit gateway** — *a launch requirement, not an enterprise add-on.* 429-interception
 that pauses the agent's PTY instead of letting the CLI crash, per-agent budgets, concurrency ceilings,
 spend telemetry keyed to task and branch. Entry API tiers throttle at RPM levels a 3-agent swarm exceeds
 instantly; without this, the first session with the headline feature is a retry storm.
+*Built.*
 
 ### 2.3 Parity gaps that cost deals today
 
@@ -443,10 +467,10 @@ including the residual risks we concede — are in [`GTM_Assets.md`](GTM_Assets.
 
 | Tier | Price | What it buys | Why this number |
 |---|---|---|---|
-| **Free** | $0, no login, ever | The full Git client + one sandboxed agent **[Horizon]** | The funnel must be genuinely excellent free. GitKraken's free tier is account-walled and blocks private repos; ours has no wall to hit. A login wall on the tool that sits between a developer and their code is a cost we refuse to pay |
-| **Pro** | **$20/mo** or $199/yr with perpetual fallback | Unlimited local agents, verification pipeline, review cockpit, AI gateway, BYOK **[Horizon]** | $20 is the established individual AI-tool price (Cursor Pro, Claude Pro, Copilot Pro+) — no anchoring fight. BYOK means no inference-margin death. The JetBrains-style fallback is a loyalty signal, support-scoped with a separately versioned adapter channel |
-| **Team / Enterprise** | **$50+/seat** | Merge-queue + re-verification analytics, per-hunk provenance, audit/SIEM, RBAC/SSO/SCIM, budget caps, license scanning **[Horizon]** | Sits credibly above CodeRabbit Pro ($24–48/dev/mo) and Graphite (~$40) because it bundles what they each sell a slice of. **Not sold before the governance features exist** |
-| **Cloud worktrees** | usage-based, 2027 | Hosted execution sessions **[Horizon]** | The usage-revenue lever BYOK deliberately forfeits locally; solves the honest 4–6-agent ceiling |
+| **Free** | $0, no login, ever | The full Git client + one sandboxed agent | The funnel must be genuinely excellent free. GitKraken's free tier is account-walled and blocks private repos; ours has no wall to hit. A login wall on the tool that sits between a developer and their code is a cost we refuse to pay |
+| **Pro** | **$20/mo** or $199/yr with perpetual fallback | Unlimited local agents, verification pipeline, review cockpit, AI gateway, BYOK | $20 is the established individual AI-tool price (Cursor Pro, Claude Pro, Copilot Pro+) — no anchoring fight. BYOK means no inference-margin death. The JetBrains-style fallback is a loyalty signal, support-scoped with a separately versioned adapter channel |
+| **Team / Enterprise** | **$50+/seat** | Merge-queue analytics, per-hunk provenance, audit, budget caps — plus **SIEM export and RBAC/SSO/SCIM, which are unbuilt** (§2.2 D-3) | Sits credibly above CodeRabbit Pro ($24–48/dev/mo) and Graphite (~$40) because it bundles what they each sell a slice of. **Not sold before those two exist** — that is the whole reason this tier is gated |
+| **Cloud worktrees** | usage-based, 2027 | Hosted execution sessions **[Horizon]** — unstarted | The usage-revenue lever BYOK deliberately forfeits locally; solves the honest 4–6-agent ceiling |
 
 ### 6.2 The four refusals
 
@@ -557,27 +581,27 @@ blame. The orchestrator field has none of this. *Retrofit:* orchestrators must b
 has a client but host-level unsandboxed execution; MergeLoom has no client at all. *Erosion:* an incumbent
 **acquires** a client instead of building one (the Cursor–Graphite pattern) → reassess within the quarter.
 
-**Layer 2 — Containment by construction [Horizon].** Sandboxes whose *only* push target is a daemon-owned
+**Layer 2 — Containment by construction (built).** Sandboxes whose *only* push target is a daemon-owned
 quarantine mirror, with no real-remote credential present and default-deny egress — escape structurally
 impossible rather than firewall-blocked. The field's isolation stories stop at worktrees; Sculptor is the
 closest thesis but publishes no egress posture; MergeLoom, a *governance vendor*, publishes no sandbox
 hardening for the thing executing AI-written code. *Erosion:* hardened sandboxes commoditize as
 primitives — partially priced in, because the *integration* is the product.
 
-**Layer 3 — Deterministic verification + the re-verifying queue [Horizon] — the keystone.** Probe-verified
+**Layer 3 — Deterministic verification + the re-verifying queue (built) — the keystone.** Probe-verified
 across the field: every queue re-runs CI; **none re-runs verification on the post-rebase state of agent
 branches**. For GitHub, retrofitting means owning local execution — inverting a cloud product. For
 MergeLoom, staleness is intrinsic. For the review layer, verdicts are LLM opinions by construction.
-*Dependency stated:* this layer's moat value requires shipping it credibly. *Erosion:* **Cursor Origin** —
-if it ships local execution + provenance, re-plan within a quarter.
+*The moat value now depends on demonstrating it, not on building it.* *Erosion:* **Cursor Origin** — if
+it ships local execution + provenance, re-plan within a quarter.
 
-**Layer 4 — Provenance + risk-ranked review [Horizon].** Hunk-level risk ranking exists in production only
+**Layer 4 — Provenance + risk-ranked review (built).** Hunk-level risk ranking exists in production only
 inside Meta. The Agent Trace standard has emitters coming and **no renderer** — being the first means the
 vendors do the emission work while the value accrues to whoever owns the review surface, which requires
 Layer 1. A standards position is cheap to take early and expensive to take late. *Erosion:* the standard
 fragments.
 
-**Layer 5 — The audit chain [Horizon].** Hash-chained, append-only, identity-bound, SIEM-exportable,
+**Layer 5 — The audit chain (built; SIEM export is not).** Hash-chained, append-only, identity-bound, SIEM-exportable,
 offline-verifiable — against the field's nothing.
 
 **Plus two positional assets protecting all five.** **Vendor-neutrality:** every first-party GUI manages

@@ -12,8 +12,10 @@ raise, and the calendar that governs all of it.
 | **The research behind all four** | [`business/`](business/) — each section below links into it |
 
 **Two rules outrank everything else here.** **Gates, not dates** — an act slips before an asset lies. And
-the honesty contract ([`creative/Narrative.md`](creative/Narrative.md) §0): shipped is shipped, everything
-else is **[Horizon]**, and no asset claims the agent platform works today.
+the honesty contract ([`creative/Narrative.md`](creative/Narrative.md) §0): shipped is shipped, anything
+unbuilt is **[Horizon]**, and **no asset claims the agent platform is ready for someone else to rely on
+until the end-to-end run is reproducible.** Most of the pipeline is implemented
+([`STATUS.md`](STATUS.md)); that is not the same as it being ready, and the copy must not blur the two.
 
 ---
 
@@ -22,8 +24,9 @@ else is **[Horizon]**, and no asset claims the agent platform works today.
 *Detail: [GTM Execution](business/go-to-market/GTM_Execution.md) §3b.*
 
 **We are not selling anything. We are recruiting people who will tell us the truth, and paying them in
-early access and founding-user terms.** The Git client works and is worth installing today; the agent
-control center is in integration and is not. Every message says both of those things out loud, because
+early access and founding-user terms.** The Git client works and is worth installing today. The agent
+control center is largely *implemented* but not yet *dependable* — the full leg is a manual runbook and
+several surfaces are still shells — so it is not something to hand someone and walk away from. Every message says both of those things out loud, because
 the people we're writing to can tell the difference in about ten seconds — and the ones who can are
 exactly the ones we want.
 

@@ -35,31 +35,53 @@ public class SpawnWatchdogWiringTests : IDisposable
         State = new Proto.StateChange { State = "Starting", Reason = reason },
     };
 
+    /// <summary>
+    /// A daemon that keeps reporting keeps its spawn alive, however long the build runs.
+    ///
+    /// <para><b>On simulated time, deliberately.</b> This test used to compress the budget to 300 ms and
+    /// post heartbeats every 40 ms on the wall clock. That made it a test of the RUNNER: one GC pause or
+    /// thread-pool stall longer than 300 ms is real silence, so the watchdog tripped correctly and the
+    /// test failed anyway — which it did on CI, at the second beat. Time is stepped by hand here, so
+    /// "twelve budgets' worth of progress" is exact, the assertion is about the event→watchdog wiring,
+    /// and the whole thing runs in microseconds. <see cref="SteppedTime.AdvanceAsync"/> also blocks until
+    /// the watchdog has actually consumed each step, so a watchdog that stopped watching fails loudly
+    /// instead of passing by never running.</para>
+    /// </summary>
     [Fact]
     public async Task LaunchProgressDeltas_KeepASpawnAliveWellPastTheSilenceBudget()
     {
-        DaemonBackedOrchestrator.SpawnSilenceBudget = TimeSpan.FromMilliseconds(300);
+        var budget = TimeSpan.FromMinutes(5); // the real one — nothing here needs it compressed
+        DaemonBackedOrchestrator.SpawnSilenceBudget = budget;
+
+        var time = new SteppedTime();
         var orchestrator = NewOrchestrator();
+        orchestrator.SpawnDelayOverride = time.Delay;
+        orchestrator.SpawnClockOverride = time.Clock;
 
         var call = new NeverEndingCall();
         var spawn = orchestrator.SpawnUnderWatchdogAsync<string>(
             (token, _) => call.RunAsync(token), CancellationToken.None);
 
-        // Two seconds — nearly seven budgets — of the daemon reporting a running toolchain build.
-        var stop = DateTime.UtcNow + TimeSpan.FromSeconds(2);
-        var beat = 0;
-        while (DateTime.UtcNow < stop)
+        // Twenty-four half-budgets — twelve budgets — of the daemon reporting a running toolchain build.
+        for (var beat = 0; beat < 24; beat++)
         {
             orchestrator.ApplyAgentEvent(LaunchProgress(
-                "coordinator-1", $"Still building this repository's toolchain image (dotnet-10) — beat {beat++}"));
-            await Task.Delay(40);
-            Assert.False(spawn.IsCompleted, $"the spawn was cancelled after {beat} progress lines");
+                "coordinator-1", $"Still building this repository's toolchain image (dotnet-10) — beat {beat}"));
+
+            // Advancing by half a budget between every report is what makes this a test of the RESET:
+            // the elapsed total runs far past the budget while the gap between signs of life never does.
+            await time.AdvanceAsync(budget / 2, Patience);
+            Assert.False(spawn.IsCompleted, $"the spawn was cancelled after {beat + 1} progress lines");
         }
 
-        Assert.True(beat > 5); // the loop really did report repeatedly
+        Assert.True(time.Now > budget * 10); // simulated time really did run far past the budget
         call.Complete("agent-1");
-        Assert.Equal("agent-1", await spawn.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("agent-1", await spawn.WaitAsync(Patience));
     }
+
+    /// <summary>How long a step may take in REAL time before the harness calls it stuck. Nothing here
+    /// waits on a budget, so this bounds a deadlock, not a duration.</summary>
+    private static readonly TimeSpan Patience = TimeSpan.FromSeconds(10);
 
     /// <summary>
     /// The same wiring, with the daemon quiet — the half that keeps the test above from being a test of

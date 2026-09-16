@@ -86,14 +86,52 @@ public sealed record MergeOutcome(
     string MainBranch,
     string NewMainSha);
 
+/// <param name="Name"><b>The CLI kind — "claude-code", "codex" — and not an identity.</b> The comment
+/// here used to read "N-4 working name, e.g. Loom-3"; no such name was ever assigned, and the daemon
+/// adapter fills this with the agent kind (falling back to the raw 32-hex id when even that is absent).
+/// Four agents of the same CLI therefore produce four identical values. Anything rendering a row for a
+/// human wants <see cref="DisplayName"/>, never this.</param>
+/// <param name="Title">The worker's brief — the headline its plan was written against — or empty for a
+/// coordinator (which has none) and for a worker that has not presented a plan yet. Taken from the plan
+/// stream the surface already receives rather than from a new wire field, exactly as the resource
+/// monitor takes it.</param>
+/// <param name="UserName">A name the human typed for this agent, or empty. It outranks everything else
+/// by construction: a person who renamed an agent has said what it should be called, and a later plan
+/// revision must not quietly overwrite that.</param>
 public sealed record AgentInfo(
     string AgentId,
-    string Name,             // N-4 working name, e.g. "Loom-3"
+    string Name,
     string Branch,
     AgentLifecycleState State,
     string Detail,           // the one live fact for the list's detail slot (E4)
     DateTimeOffset SpawnedAt,
-    string Role = AgentRoles.Manual); // "", "coordinator", or "managed" (subagent)
+    string Role = AgentRoles.Manual, // "", "coordinator", or "managed" (subagent)
+    string Title = "",
+    string UserName = "")
+{
+    /// <summary>
+    /// What to call this agent in front of a human, in falling order of how much it actually says:
+    /// the name the human chose, then the brief the agent is working to, then role + short id.
+    ///
+    /// <para><b>The last rung is the floor, and it is never a bare id or a bare CLI kind.</b> Those were
+    /// the two things the rail could previously show — a 32-hex string, or "claude-code" repeated once
+    /// per session — and neither distinguishes two agents. "Worker 70b21c13" always does, and it is the
+    /// same vocabulary the resource monitor, the merge queue and the plan cards already use, so one
+    /// agent reads as one agent across every surface.</para>
+    /// </summary>
+    public string DisplayName =>
+        UserName.Length > 0 ? UserName
+        : Title.Length > 0 ? Title
+        : $"{AgentRoles.Word(Role)} {ShortId(AgentId)}";
+
+    /// <summary>True when <see cref="DisplayName"/> is the human's own name for this agent — the one
+    /// case "Reset name" has anything to undo.</summary>
+    public bool IsRenamed => UserName.Length > 0;
+
+    /// <summary>The id shortened to what a person can compare across surfaces without reading 32 hex
+    /// characters; long enough that two live agents do not collide.</summary>
+    public static string ShortId(string agentId) => agentId.Length > 8 ? agentId[..8] : agentId;
+}
 
 /// <summary>
 /// The <b>verdict</b> of an entry's last verification, in exactly the three facts the wire carries (H4:

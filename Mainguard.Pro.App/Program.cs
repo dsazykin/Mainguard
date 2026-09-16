@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
+using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Mainguard.Agents.UI.Editions;
 using Mainguard.Agents.UI.Services;
@@ -86,6 +87,18 @@ internal static class Program
                 && desktop.MainWindow?.DataContext is MainWindowViewModel shell)
             {
                 shell.ShowToast(message, isError);
+            }
+        };
+
+        // Resolved off the main window's TopLevel at CALL time, not captured: the clipboard belongs to
+        // whatever window is up, and the Pro head replaces its MainWindow on startup completion.
+        ProComposition.CopyToClipboard = static async text =>
+        {
+            if (Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop
+                && desktop.MainWindow is { } window
+                && TopLevel.GetTopLevel(window)?.Clipboard is { } clipboard)
+            {
+                await clipboard.SetTextAsync(text);
             }
         };
 

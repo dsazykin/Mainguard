@@ -1880,10 +1880,14 @@
   here. `timeout-minutes: 45` caps a hung leg. Measured on the promoting PR: `Mainguard.Tests`
   4016/4026 (10 skipped, 0 failed, ~20 min) and `Mainguard.Server.Tests` 865/874 (9 skipped, 0 failed,
   ~9 min), daemon smoke green — and **all three `[MacOnlyFact]` tests executed and passed for the
-  first time**. It is a real gate (no `continue-on-error`). One known INTERMITTENT flake is recorded
-  in the file rather than gated around: `SpawnWatchdogWiringTests.LaunchProgressDeltas_...` failed on
-  the first run and passed on the re-run — a 300 ms silence budget beaten every 40 ms, so a cold
-  first iteration on a loaded runner overshoots. The Linux `build-and-test` gate carries a flake of
+  first time**. It is a real gate (no `continue-on-error`). One known INTERMITTENT flake used to be
+  recorded here rather than gated around — `SpawnWatchdogWiringTests.LaunchProgressDeltas_...` failing
+  on the first run and passing on the re-run, a 300 ms silence budget beaten every 40 ms, so a cold
+  iteration on a loaded runner overshoots. **Fixed, not re-rolled:** it recurred on the Linux gate
+  (failing at the SECOND beat, which is how little margin 300 ms over 40 ms really is), and the test
+  now runs on `SteppedTime` through the new `DaemonBackedOrchestrator.SpawnDelayOverride`/
+  `SpawnClockOverride` seams, so it asserts the wiring instead of the runner's scheduling. The Linux
+  `build-and-test` gate carries a flake of
   the same species (`PromptDeliveryBinderTests.WhenTheEchoWaitReturnsInstantly_...`) and blocks
   anyway. Its later steps carry `if: !cancelled()`: a failing step aborts the rest, so that one flake
   stopped the first run before `Mainguard.Server.Tests`, which is where all three `[MacOnlyFact]`
@@ -2039,6 +2043,18 @@
   `ActivityBarRailUsesProjectionTests` — the rail really ROUTES through `AgentListProjection.LifoOrder`
   rather than re-spelling it inline, proved through a same-spawn-instant tie only the helper breaks;
   plus the bulk-snapshot ordering, which the old per-row `Insert(0, …)` reversed),
+  **`AgentDisplayNameTests`** (the naming ladder and its FLOOR: two agents of the same CLI never share a
+  label, and the label is never the bare id nor the bare kind — the two things the rail could previously
+  show; plus the `AgentNameStore` round-trip, its per-repo scoping, blank-clears-rather-than-stores, the
+  newline/length clean, corrupt-file tolerance, and `Forget`/`Prune`),
+  **`AgentRailSelectionTests` + `MainWindowSectionHighlightTests`** (the two halves of "the coordinator
+  stays highlighted when you switch to an agent": rows gaining a selection at all, and `ShowAgent` no
+  longer lighting the Coordinator SECTION row while still routing content there. The second was checked
+  against the pre-fix call and does fail on it. The section half runs under the **Pro** manifest — the
+  Client manifest omits the Coordinator section, so the defect cannot exist there),
+  **`AgentRenameFlowTests`** (menu item → seeded card → confirm → the name the row renders, driven
+  through the shipped view models because the joins are what break: a card opened on the wrong agent, a
+  confirm storing stale box contents, a reset that does not put the derived name back),
   `NotificationSuppressionTests`, `DockLayoutPersistenceTests` (pure),
   **`DockLayoutRestoreTests` (the persistence is actually WIRED: `AgentWorkspaceViewModel` reports its
   pane order, restores a saved one, saves on close before teardown clears the graph, lets the live deck
@@ -2418,7 +2434,13 @@
   wiring half drives the real `ApplyAgentEvent` with real `AgentEvent`s so the daemon→watchdog join
   cannot silently go inert, including that a running agent's chatter does NOT vouch for a wedged spawn.
   Both files avoid `Assert.ThrowsAsync<TimeoutException>(() => task.WaitAsync(budget))`, which goes GREEN
-  for a watchdog that cancels nothing — the helper asserts the task ENDED first) plus, in
+  for a watchdog that cancels nothing — the helper asserts the task ENDED first. **`SteppedTime.cs`** is
+  the simulated clock both files step by hand; it was private to `SpawnProgressWatchdogTests` until the
+  wiring suite's keep-alive test needed it too. That test used to compress the budget to 300 ms and beat
+  it every 40 ms on the WALL clock, which made it a test of the runner — a thread-pool stall longer than
+  the budget is real silence, so the watchdog tripped correctly and CI went red anyway. Only the two
+  tests that assert the watchdog TRIPS still use real time: a slow runner can only make them trip
+  harder, so they are safe by direction) plus, in
   `MergeQueueProvisionerTests`, the drift proof over a REAL bare mirror and REAL agent branch — one
   claim per test on purpose (including `TheWaiverRecord_NamesTheBaselineAndTheReplacement_ReadFromTheMirror`,
   L4's plumbing half: the two committed config trees are the only place the baseline and the replacement

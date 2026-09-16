@@ -78,7 +78,27 @@ public interface IAgentWorktreeManager
     /// throw: a failure to tidy must never take an intake poll down, and residue here is residue, never
     /// lost work.</para>
     /// </summary>
-    bool DiscardAgentBranch(string repoHash, string agentId) => false;
+    bool DiscardAgentBranch(string repoHash, string agentId) =>
+        DiscardAgentBranch(repoHash, agentId, out _);
+
+    /// <summary>
+    /// As <see cref="DiscardAgentBranch(string,string)"/>, additionally reporting the sha the branch
+    /// pointed at.
+    ///
+    /// <para>It exists because a human-driven delete has to be able to say what it destroyed. The
+    /// commits survive in the mirror's reflog until that expires, so the sha is the one handle left on
+    /// them — and a surface that answers "deleted" and nothing else leaves a person who deleted the
+    /// wrong agent with no way back. Empty when there was no branch to delete, which is a success with
+    /// nothing destroyed rather than a failure.</para>
+    ///
+    /// <para>The default answers false and reports nothing, matching the two-argument default: a
+    /// manager with no mirror deleted nothing and says so.</para>
+    /// </summary>
+    bool DiscardAgentBranch(string repoHash, string agentId, out string deletedSha)
+    {
+        deletedSha = string.Empty;
+        return false;
+    }
 
     /// <summary>
     /// Clears an agent's worktree + per-agent repository while <b>leaving
@@ -1019,7 +1039,12 @@ public sealed class WorktreeManager : IAgentWorktreeManager
 
     /// <inheritdoc />
     public bool DiscardAgentBranch(string repoHash, string agentId)
+        => DiscardAgentBranch(repoHash, agentId, out _);
+
+    /// <inheritdoc />
+    public bool DiscardAgentBranch(string repoHash, string agentId, out string deletedSha)
     {
+        deletedSha = string.Empty;
         var barePath = BareRepoPathFor(repoHash);
         var branch = BranchFor(agentId);
         if (!Directory.Exists(barePath))
@@ -1030,7 +1055,9 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         var sha = AgentGitCommand.TryRun(barePath, out var head, "rev-parse", "--verify", "--quiet",
             "refs/heads/" + branch) == 0 ? head.Trim() : string.Empty;
 
-        // Nothing there is success: the caller asked for the branch to be gone and it is.
+        // Nothing there is success: the caller asked for the branch to be gone and it is. No sha is
+        // reported, because nothing was destroyed — reporting one would name a commit this call did not
+        // remove.
         if (sha.Length == 0)
         {
             return true;
@@ -1054,6 +1081,11 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         }));
 
         MirrorMaintenance.AfterAgentDetached(barePath, _agentRepos, repoHash, _warningSink);
+
+        // Reported only now — AFTER `branch -D` succeeded and the deletion is on the audit record. A sha
+        // handed back on a path that had not actually deleted anything would tell a human their commits
+        // were destroyed when they were not.
+        deletedSha = sha;
         return true;
     }
 

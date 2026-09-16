@@ -380,6 +380,41 @@
       </Border>
     </Border>
 
+    <!-- The agent rail's context-menu questions: rename, end, delete. ONE card for all three — they are
+         mutually exclusive by construction (a single pending slot on the VM), and three overlays would
+         be three places for the same Cancel to behave differently. The consequence sentence comes from
+         the prompt record, not from here: ending keeps the work and deleting destroys it, and that
+         difference has to be written where it is known rather than assembled in a template. -->
+    <Border Grid.Row="0" Grid.RowSpan="2" Background="#B0000000"
+            IsVisible="{Binding IsAgentActionPending}">
+      <Border Width="460" VerticalAlignment="Center" HorizontalAlignment="Center"
+              Background="{DynamicResource SurfacePanel}" CornerRadius="12" Padding="20"
+              BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
+        <StackPanel Spacing="12" DataContext="{Binding AgentAction}" x:DataType="vm:AgentActionPrompt">
+          <TextBlock Text="{Binding Title}" FontSize="14" FontWeight="SemiBold"
+                     TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
+          <TextBlock Text="{Binding Message}" FontSize="12" TextWrapping="Wrap"
+                     Foreground="{DynamicResource TextMuted}"/>
+
+          <!-- Rename only. MaxLength matches AgentNameStore.MaxNameLength so the box refuses what the
+               store would have silently truncated — a person should not have to discover the cap by
+               losing the end of what they typed. -->
+          <TextBox IsVisible="{Binding NeedsInput}" MaxLength="60" FontSize="13"
+                   Watermark="A name for this agent"
+                   Text="{Binding $parent[UserControl].((vm:ControlCenterViewModel)DataContext).AgentActionInput, Mode=TwoWay}"/>
+
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+            <Button Content="Cancel" Classes="Secondary" Padding="14,5"
+                    Command="{Binding $parent[UserControl].((vm:ControlCenterViewModel)DataContext).CancelAgentActionCommand}"/>
+            <Button Content="{Binding ConfirmText}" Padding="14,5"
+                    Classes.Danger="{Binding IsDestructive}"
+                    Classes.Primary="{Binding !IsDestructive}"
+                    Command="{Binding $parent[UserControl].((vm:ControlCenterViewModel)DataContext).ConfirmAgentActionCommand}"/>
+          </StackPanel>
+        </StackPanel>
+      </Border>
+    </Border>
+
     <!-- Fix 2: egress block-notification prompt — an agent CLI died on a host the default-deny sandbox
          proxy refused. Names what was blocked + which agent needed it; Unblock adds it to the allowlist
          and retries, Keep blocked leaves the policy as-is (the safe default). -->

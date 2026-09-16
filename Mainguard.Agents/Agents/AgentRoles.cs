@@ -25,4 +25,20 @@ public static class AgentRoles
     /// instead of a private one it could exhaust the machine with.</para>
     /// </summary>
     public const string Managed = "managed";
+
+    /// <summary>
+    /// The role in the word a surface shows a human. One home, because this word is half of what
+    /// identifies an agent on every surface that names one — the agent rail, the resource monitor, the
+    /// merge queue, a plan card's "Written by …" — and two spellings of it would read as two different
+    /// things about the same session.
+    ///
+    /// <para>A manual session is just "Agent": it was started by hand and has no place in the
+    /// coordinator hierarchy, so calling it a worker would claim a relationship it does not have.</para>
+    /// </summary>
+    public static string Word(string role) => role switch
+    {
+        Coordinator => "Coordinator",
+        Managed => "Worker",
+        _ => "Agent",
+    };
 }

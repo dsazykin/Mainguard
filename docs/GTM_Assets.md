@@ -21,9 +21,11 @@ particular moment; check §1 before you send, post or present any of it.
 **Before sending, posting, or presenting anything below, check it against four things.**
 
 1. **The honesty contract** ([`creative/Narrative.md`](creative/Narrative.md) §0). Shipped is shipped;
-   everything in the agent pipeline is **[Horizon]** and says "in development." Capacity is 4–6 agents, not
-   fifty. The audit story is "audit-grade, where procurement is heading," not "legally required." Cloud
-   figures are illustrative placeholders and are flagged at first use.
+   anything unbuilt is **[Horizon]** and says "in development." **Check [`STATUS.md`](STATUS.md) before
+   claiming a capability either way** — most of the pipeline is implemented, but implemented is not the
+   same as dependable, and no asset may blur the two. Capacity is 4–6 agents, not fifty. The audit story
+   is "audit-grade, where procurement is heading," not "legally required." Cloud figures are illustrative
+   placeholders and are flagged at first use.
 2. **The register rules.** Concede what's true before claiming anything. Sourced facts, no adjectives.
    Competitors get respect-then-stop — the enemy is the blind merge, never a company and never "AI." No
    exclamation marks. Leave the line, then stop.
@@ -138,9 +140,13 @@ plainly whether the client is a packaged download or a build-from-source preview
 *Walk it left to right; three stops deserve ten seconds each.* **Test gates, not opinions** — the verdict
 is your own suite passing in the agent's sandbox, a fact rather than an LLM comment. **The re-verifying
 queue** — no product on the market re-runs verification on the post-rebase state. **Provenance per hunk** —
-the Agent Trace standard has emitters coming and no renderer; we intend to ship the first. **Everything on
-this slide is [Horizon] — say so unprompted.** Under-claiming here *is* the credibility play; this audience
-has been vaporware-pitched all year.
+the Agent Trace standard has emitters coming and no renderer; we intend to ship the first.
+
+**Tense discipline, and it cuts both ways.** Every stage on this slide is implemented — check
+[`STATUS.md`](STATUS.md) before the meeting so you can name the file if probed. But say unprompted that
+the full leg is not yet a one-click run, and that SIEM export and RBAC are unbuilt. **Under-claiming is
+the credibility play with this audience** — they have been vaporware-pitched all year, and being the
+founder who volunteers the gap is worth more than the slide.
 
 **Slide 6 — The moat.**
 > Any single feature has a ~2-quarter exclusivity window. The combination doesn't.

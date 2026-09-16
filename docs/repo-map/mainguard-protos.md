@@ -24,6 +24,14 @@
     Mainguard.Server assembly informational version) + `payload_version` (the `/etc/mainguardos-release`
     `MAINGUARDOS_VERSION` stamp, "" when absent), versions only, no paths (G-14) — a daemon that
     predates the RPC answers `Unimplemented`, which the client treats as the skew signal itself;
+    **`DeleteAgent`** is the human's "this agent and its work should not exist": stop the jail, remove
+    the worktree, drop the merge-queue entry, and delete `refs/heads/agent/<id>`. A separate method from
+    `StopAgent` rather than a flag on it, for the `ResumeAgent` reason — `RoleInterceptor` denies by
+    METHOD, and destroying a co-tenant's commits is the worst power in this service, so it is on the
+    coordinator denial list. The response carries `deleted_branch_sha` rather than only a bool because
+    that sha is the one handle left on the deleted commits (the mirror's reflog holds them until
+    expiry), so a mistaken delete is recoverable; `branch_deleted` is reported apart from `deleted`
+    because an agent that never published has no branch, and that is a success with nothing destroyed.
     `AgentEvent` is snapshot-then-deltas; `SpawnAgentRequest.model_api_key` is `// SECRET`; PR3 adds
     `SpawnAgentRequest.role`/`AgentInfo.role` — "", "coordinator", or "managed"; the CLI **login**
     round-trip's `CliCredentialFile{path,content}` (`// SECRET`) on
