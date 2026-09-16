@@ -197,10 +197,10 @@ public sealed class TerminalReplayGeometryTests
     }
 
     /// <summary>
-    /// MG-24 — the managed-worker case, which is #22's sibling and the one that actually shipped
-    /// broken. Here the pane is NARROWER than the session: the daemon reports 120x32 (the size the
-    /// worker's PTY was spawned at, which F64 refuses to change on a spectator's behalf) while the
-    /// docked pane is only ~68 columns wide.
+    /// MG-24 — #22's sibling, and the one that actually shipped broken: the pane NARROWER than the
+    /// session. The daemon reports 120x32 (a worker's spawn default) while the docked pane is only
+    /// ~68 columns wide — the state every terminal passes through between a drag and the daemon's
+    /// answer, and the state a clamped size or a second pane's last write leaves it in.
     ///
     /// <para>The engine must keep parsing at 120 and scale what it draws. Reshaping the grid to the
     /// pane — which is what layout used to do — re-wraps 120-column output at 68 with no reflow, so
