@@ -1,8 +1,10 @@
 # Documentation — start here
 
 Everything under `docs/` is planning, design, and analysis material. **The code is the current
-state; most of these docs are the destination.** Where a doc and the code disagree about what
+state; some of these docs are the destination.** Where a doc and the code disagree about what
 exists today, the code wins — see [`../AGENTS.md`](../AGENTS.md) *What Mainguard Is*.
+
+Anything superseded lives in [`archive/`](archive/README.md) and is not current.
 
 ## New here? Read these four, in order
 
@@ -21,17 +23,13 @@ they carry no rules of their own.
 | Folder | Files | What is in it |
 |---|---:|---|
 | [`repo-map/`](repo-map/README.md) | 10 | Per-file index of the whole repo, split by project. **Update it in the same change whenever you add, move, rename, or delete a file.** |
-| [`design/`](design/README.md) | 22 | UI/UX design output. `README.md` is the design hub — start there. |
+| [`phase-2/`](phase-2/) | 12 | The active agent-platform corpus. `implementation_plans/Mainguard_Master_Implementation_Document_v2.md` is **the binding spec** — where a subordinate doc disagrees, the master doc wins. |
+| [`design/`](design/README.md) | 22 | UI/UX design output and per-feature design records. `README.md` is the design hub — start there. |
 | [`creative/`](creative/README.md) | 9 | Voice, brand, microcopy, motion. `README.md` is the brand hub; the Voice & Delight Bible is the law. Consult it before writing any user-facing string. |
-| [`phase-2/`](phase-2/) | 12 | The active phase-2 agent-platform corpus. `implementation_plans/Mainguard_Master_Implementation_Document_v2.md` is the binding spec. |
-| [`feature-plans/`](feature-plans/) | 16 | Per-task phase-2 feature plans (`P2-01`…`P2-22`). Subordinate to the master implementation doc. |
-| [`review/`](review/) | 10 | Human review guides — what to review, how, and what "correct" looks like. |
-| [`planning/`](planning/) | 8 | Roadmaps and older plans. Aspirational: the destination, not the current code. |
+| [`review/`](review/) | 9 | How to test and review: the phase-1/2/3 hands-on procedures, the agent-cycle runbook, the full test matrix, and the manual user-testing guide. |
 | [`adr/`](adr/) | 1 | Architecture Decision Records. Cross-cutting decisions, `Status → Context → Decision → Consequences`. |
-| [`test_implementation_plan/`](test_implementation_plan/) | 2 | Test strategy and the manual user-testing guide. |
-| [`reports/`](reports/) | 3 | Point-in-time snapshots: implementation reports, session handoffs, audit-log evidence. |
-| [`rebrand/`](rebrand/) | 1 | The GitLoom → Mainguard rename, phased. Brand rules themselves live in `../PRODUCT.md` / `../DESIGN.md`. |
-| [`security-architecture.md`](security-architecture.md) | 1 | The sandbox/daemon threat model and its controls. |
+| [`planning/`](planning/) | 1 | `Mainguard_Backlog.md` — the single source of truth for what is **not** built yet. |
+| [`security-architecture.md`](security-architecture.md) | 1 | The sandbox, egress, and merge-safety threat model. |
 | [`mainguardos-updates.md`](mainguardos-updates.md) | 1 | The Mainguard OS payload update mechanism. |
 
 ## Business
@@ -46,16 +44,20 @@ Not needed to build or review code. Grouped so `docs/` opens with engineering ma
 
 ## Archive
 
-[`archive/`](archive/) — 35 files. Superseded material kept in full for history: the retired
-git-core feature plans (`T-02`…`T-32`), feature-plan triage, `LaunchReserve.md`, and
-`prompt-bundles/` (one-off agent run scripts). **Nothing here is current.** Read it for
-provenance, never as a spec.
+[`archive/`](archive/README.md) — **nothing in it is current.** Superseded material kept in full so
+the reasoning survives: the phase-1 planning corpus, the shipped phase-2 feature plans, the retired
+git-core task plans, point-in-time reports and walkthroughs, and the completed rebrand plan. Read it
+for provenance, never as a spec.
 
 ## Where does a new doc go?
 
 Put it in the matching folder above. A loose new `docs/*.md` is drift — the two that exist
 (`security-architecture.md`, `mainguardos-updates.md`) are long-standing exceptions, not a
-precedent. When a doc is superseded, move it to `archive/` and leave a supersession note in its
-header rather than deleting it.
+precedent.
+
+**When a doc is superseded or its work ships, move it to `archive/` and add a one-line status note
+at the top** saying what replaced it and when. Don't delete it, and don't leave it in place looking
+current — a shipped plan that still reads as a plan is how a new contributor ends up building
+something twice.
 
 Relative links between docs are checked: keep them resolving when you move a file.
