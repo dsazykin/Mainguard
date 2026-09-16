@@ -1,5 +1,7 @@
 # Mainguard — Master Market & Business Document
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-07
 **Status:** Master reference — the single document for running Mainguard as a business. This is the
 **full-depth consolidation**: every finding, table, template, and walkthrough from the market/GTM

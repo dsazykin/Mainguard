@@ -1,5 +1,7 @@
 # GTM Execution — the companion hub
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Strategy lives in [`Mainguard_Master_Market_Document_2026-07.md`](Mainguard_Master_Market_Document_2026-07.md) (the main reference; the [GTM Plan](Mainguard_GTM_Plan_2026-07.md) is the historical source it supersedes). This document is the execution layer over it**: one map of every fundraising, marketing, and sales asset produced in the 2026-07 lane pass (Lanes C, F, G, J), plus the unified timeline. Files keep their own homes; this page is the map. (Consolidated 2026-07-12.)
 
 **Binding on everything indexed here:** the honesty contract in [`../creative/Narrative.md`](../../creative/Narrative.md) §0 — shipped vs **[Horizon]** tense, "audit-grade" never "legally required," honest 4–6-agent capacity. Narrative.md is also the copy of record for positioning, the competitor teardown, the Show HN bodies, and the founder story.

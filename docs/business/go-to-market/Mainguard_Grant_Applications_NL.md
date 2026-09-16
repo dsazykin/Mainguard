@@ -1,5 +1,7 @@
 # Mainguard — Grant & Subsidy Application Drafts (Netherlands / Twente stack)
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-11 · **Status:** Lane-F drafts — ready for a subsidy advisor to hold the pen · **Register:** brand-formal (application prose), with working notes per scheme
 **Reads from:** `Mainguard_Master_Market_Document_2026-07.md` Part X (the funding stack, walkthroughs, and sources), Part IX (Novel-T/ecosystem), Part XI (BV prerequisite), Part XII (hiring/WBSO interaction), and `docs/phase-2/` for the technical substance every application cites.
 **Sequence (locked, Part X):** WBSO now → VFF once an investor intent letter exists → MIT April 2027 → Innovatiebox at first profit → Innovatiekrediet/EIC at scale-up.

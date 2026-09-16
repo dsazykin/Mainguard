@@ -1,5 +1,7 @@
 # Mainguard — Advisor / Board-Update Deck
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-11 · **Register:** brand, working-session tone (Voice Bible rules; this is the least "pitch" deck in the set)
 **Audience & occasions:** (a) the August advisor working session (Master Market Document Part XVI — advice-not-money; the structure below enforces its 70/30 listening ratio), and (b) the recurring advisor/board update thereafter — the report-back cadence that Part XVI calls "the whole game." The same skeleton serves both; §B marks what changes per occasion.
 **Design intent:** a working document, not a performance. Six slides for a 45–60 minute session; the advisor should talk more than the presenter from slide 4 onward. No hero metrics, no adjectives — the numbers are small and honest, and that is the point.

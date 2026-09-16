@@ -1,5 +1,7 @@
 # Mainguard — Outreach Sequences & Pitch Kit
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-11 · **Register:** brand (sales/GTM execution layer)
 **Reads under:** `docs/business/go-to-market/Mainguard_Master_Market_Document_2026-07.md` (personas §4.6,
 design-partner program Part XIII, demo script §15.2, pricing Part VIII) and `docs/creative/Narrative.md`

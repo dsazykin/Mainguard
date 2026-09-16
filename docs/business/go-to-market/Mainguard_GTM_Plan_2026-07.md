@@ -1,5 +1,7 @@
 # Mainguard — Go-To-Market & Startup Execution Plan
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-06
 **Status:** Working plan — revisit after the August advisor meeting and again before launch.
 **Reads alongside:** `docs/business/market-analysis/Mainguard_Market_Research_v2.md` (market/moat/licensing) and

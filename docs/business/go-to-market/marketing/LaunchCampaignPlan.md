@@ -1,5 +1,7 @@
 # Mainguard Launch Campaign Plan — Organic
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Lane G Part 1 · Register: brand · Status: execution plan, keyed to the two-act launch.**
 
 This is the *campaign* layer on top of the locked launch strategy: it decides what each channel carries, in what order, and around which hook. The strategy itself is locked upstream and is not re-litigated here: the two-act launch and channel rankings live in `Mainguard_Master_Market_Document_2026-07.md` Part XIV (which supersedes `Mainguard_GTM_Plan_2026-07.md` §7), the positioning registers in Master Doc §4.1, and all copy of record in [`docs/creative/Narrative.md`](../../../creative/Narrative.md) (Show HN drafts §5.2–5.3, comment kit §5.4, founder story §5.5). Every asset this plan schedules is drafted in the companion Lane G files: [`ContentCalendar.md`](ContentCalendar.md), [`SocialLaunchReserve.md`](SocialLaunchReserve.md), [`Manifesto.md`](Manifesto.md), [`EmailSequences.md`](EmailSequences.md), [`PressKit.md`](PressKit.md), [`VideoScripts.md`](VideoScripts.md).

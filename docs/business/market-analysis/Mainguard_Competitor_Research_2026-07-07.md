@@ -1,5 +1,7 @@
 # Mainguard Competitor Research — July 2026 Refresh
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-07
 **Scope:** Current-state check on every product competitor named in Part 2 of
 `Mainguard_Naming_And_Competitive_Landscape_2026-07.md`, plus Cursor/Codex/Jules/Docker Sandboxes and

@@ -1,5 +1,7 @@
 # Mainguard Video & Demo Scripts
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Lane G Part 5c · Register: brand (VO is founder first-person) · Status: shootable scripts + storyboards.**
 
 Three scripts: the 90-second explainer (Act One), the founder-story film, and the live-demo storyboard that pairs with Lane E's control-center prototype. Production rules for all three: **every frame is the real app or the real prototype** — no motion-graphics recreations of UI, no sped-up fakery (a real 140 ms fade is the brand; see MotionPlaybook); captures on Midnight Loom unless noted, with one deliberate Daylight Loom beat per video so "premium ≠ dark" is shown, not claimed. Music sparse and low; the app's silence is the aesthetic. No exclamation marks in on-screen text; VO reads at a calm, unhurried pace — the register is a person showing you an instrument, not a trailer.

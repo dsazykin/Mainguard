@@ -1,5 +1,7 @@
 # Mainguard Email Sequences — Waitlist → Launch → Onboarding
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Lane G Part 5a · Register: brand (founder first-person, one degree warmer than product; personality unchanged) · Status: ready to load into the sender.**
 
 **The structural constraint, stated first.** Mainguard's free tier requires no account, ever (trust posture, Master Doc §4.4) — so there is no "user email" to drip onto. Email reaches exactly two self-selected lists: the **waitlist** (landing page signups) and the **newsletter opt-in** offered at download. All sequences below are **time-keyed, never telemetry-keyed** — we don't know what a recipient did in the app, and the copy never pretends we do ("if you've already tried X" — never "we noticed you haven't"). This constraint is the trust posture working as designed; the emails say so out loud when relevant.

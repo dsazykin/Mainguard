@@ -34,12 +34,20 @@ they carry no rules of their own.
 
 ## Business
 
-Not needed to build or review code. Grouped so `docs/` opens with engineering material.
+Not needed to build or review code, but these three are the whole business and the place to start for
+anything that isn't code. Consolidated 2026-09-16 from the research corpus in
+[`business/`](business/), which each section links back into for depth.
+
+| Read | What is in it |
+|---|---|
+| [`BUSINESS.md`](BUSINESS.md) | **Strategy.** What we sell and refuse to sell, the product and its differentiation spine, market numbers, the competitive field, ICP and positioning, the objection kit, pricing and unit economics, the moat and its erosion dashboard, risks, metrics. |
+| [`GTM.md`](GTM.md) | **Execution.** The current stage rule, the two-act launch sequence, the founding-user and design-partner programs, channels, the sales motion, funding (NL grants + equity), Dutch company setup, and the gates-before-dates calendar. |
+| [`GTM_Assets.md`](GTM_Assets.md) | **Reusable copy, as templates.** One-pager, investor deck, demo script, outreach sequences, site and email copy, the scored target-company list, grant drafts, Show HN bodies and the first-hour FAQ, press and video material. |
 
 | Folder | Files | What is in it |
 |---|---:|---|
-| [`business/go-to-market/`](business/go-to-market/) | 26 | Market & GTM strategy, decks, marketing, sales. `GTM_Execution.md` is the execution hub. |
-| [`business/market-analysis/`](business/market-analysis/) | 7 | Competitor and market research. |
+| [`business/go-to-market/`](business/go-to-market/) | 26 | The depth behind the three docs above: the master market document, decks, marketing, sales, grants. **Read the summary first** — where the two disagree, the summary wins. |
+| [`business/market-analysis/`](business/market-analysis/) | 7 | Competitor and market research, with the full source lists. |
 | [`business/members/`](business/members/) | 3 | Team structure and intake. |
 
 ## Archive
@@ -51,9 +59,10 @@ for provenance, never as a spec.
 
 ## Where does a new doc go?
 
-Put it in the matching folder above. A loose new `docs/*.md` is drift — the two that exist
-(`security-architecture.md`, `mainguardos-updates.md`) are long-standing exceptions, not a
-precedent.
+Put it in the matching folder above. A loose new `docs/*.md` is drift — the five that exist
+(`BUSINESS.md`, `GTM.md`, `GTM_Assets.md`, `security-architecture.md`, `mainguardos-updates.md`) are
+deliberate top-level entry points, not a precedent. The three business docs sit here on purpose: they
+are the first thing a non-engineering reader should find, and there is exactly one of each.
 
 **When a doc is superseded or its work ships, move it to `archive/` and add a one-line status note
 at the top** saying what replaced it and when. Don't delete it, and don't leave it in place looking

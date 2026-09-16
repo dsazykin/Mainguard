@@ -1,5 +1,7 @@
 # Mainguard — The Swarm Vision Deck *(the ten-year story, told honestly)*
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-11 · **Register:** brand-vision (Voice Bible rules still bind; a vision deck earns the right to be expansive only by staying exact)
 **Audience & occasion:** the second meeting with a lead investor who already believes the wedge; a keynote-length closing section after the seed deck; the "where does this go" conversation with a strategic acquirer or senior hire. **Never the opener** — vision before proof is the register of the dead companies.
 **Vocabulary discipline (binding):** the market docs forbid *leading* with "swarm" — it is commoditized, hardware-dishonest as a today-claim, and the vocabulary of the corpse pile (GTM Plan §2.4; Narrative §3.4). This deck may use the word because it is *explicitly a vision deck*: every capacity claim is tensed, the honest local ceiling (**4–6 agents on 16 GB**) is stated on the slide that scales past it, and the scale answer is the cloud tier's economics, not adjectives.

@@ -1,5 +1,7 @@
 # Mainguard — The Founding User Program
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-08-20 · **Register:** brand · **Status:** proposed — needs one decision from Daniel (§3)
 **Why this exists:** the site already promises *"founding-member terms for Pro and Cloud"* on the waitlist
 page and nowhere defines them. An undefined promise captures nobody and, worse, becomes a thing you have to

@@ -1,5 +1,7 @@
 # Manifesto — *Ungoverned AI merges are a time bomb*
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Lane G Part 4 · Register: brand (founder byline) · Publishes L2 − 3–5 days** (the thesis lands first; the product answers it — [LaunchCampaignPlan §4](LaunchCampaignPlan.md)). The enemy throughout is a practice — the blind merge (Narrative §3.1) — never a company, a product, or the agents themselves. Every figure carries its source; severity rides the facts, not the punctuation. The essay mentions Mainguard once, in a disclosure paragraph, because a manifesto that is secretly an ad persuades no one.
 
 ---

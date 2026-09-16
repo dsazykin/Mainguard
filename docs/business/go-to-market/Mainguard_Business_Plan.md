@@ -1,5 +1,7 @@
 # Mainguard — Business Plan & Financial-Model Narrative
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-11 · **Status:** Lane-F stakeholder document · **Register:** brand (Voice Bible rules apply)
 **What this is.** The business plan as a *story with receipts*: the strategy layer reads from `Mainguard_Master_Market_Document_2026-07.md` (the main GTM reference), and every number in the financial narrative reads from the cost & scaling model in `docs/phase-2/Mainguard_Cloud_Vibe_Companion.md` §5 (revision 2026-07-11.2) — this document adds **no new figures**; it explains why the existing ones are shaped the way they are. Where a claim is a placeholder, it says so; where a capability is unbuilt, it is marked **[Horizon]** (honesty contract, `docs/creative/Narrative.md` §0).
 **Companions:** the pitch decks in `docs/business/go-to-market/decks/` · the defensibility memo (`Mainguard_Defensibility_Memo.md`) · objection handling (`Mainguard_Objection_Handling.md`) · the NL grant drafts (`Mainguard_Grant_Applications_NL.md`).
