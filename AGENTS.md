@@ -10,6 +10,8 @@ Mainguard is a premium, natively-rendered Git GUI (Avalonia + `LibGit2Sharp`) ev
 
 All planning/design/analysis docs live under `docs/`, grouped by purpose. **Put a new doc in the matching folder** so the tree stays navigable — an unsorted top-level `docs/*.md` is drift to fix.
 
+**[`docs/STATUS.md`](docs/STATUS.md) answers "is X done?"** — one row per master-doc task, with the file or type that proves each claim, and explicit `Unknown` rows where the code was ambiguous. This document defines the 63 tasks but does not record their status; `STATUS.md` does. **A PR that finishes a task updates its row there in the same PR**, on the same rule as the repo map.
+
 **[`docs/README.md`](docs/README.md) is the navigational entry point** — a short routing table with per-folder file counts and a four-step reading order for someone new to the repo. The table below is the same map with the full per-folder detail; start at `docs/README.md` if you only need to find something.
 
 | Folder | What goes here |
