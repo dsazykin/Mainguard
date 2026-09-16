@@ -90,6 +90,9 @@ public sealed class ProToolsSurface : IProToolsSurface
 
     public object CreateJailLimitsPage() => new JailLimitsSettingsViewModel(ProComposition.CreateJailLimitsGateway());
 
+    public object CreateAgentDefaultsPage() =>
+        new AgentDefaultsSettingsViewModel(ProComposition.CreateAgentDefaultsGateway());
+
     // Mainguard OS (PR2 follow-up + Item 1 repair action): the post-setup repo-onboarding engine + the
     // user-triggered sandbox-image rebuild, combined into one page since Rebuild has no dialog of its
     // own. The VM is composed by ProComposition.AddReposToOsFactory (pickers parent to the Settings
