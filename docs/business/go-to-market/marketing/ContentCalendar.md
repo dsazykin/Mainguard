@@ -1,5 +1,7 @@
 # Mainguard Content Calendar & Drafted Post Backlog
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Lane G Part 2 · Register: brand · Status: calendar + publish-ready drafts.**
 
 The editorial layer of [`LaunchCampaignPlan.md`](LaunchCampaignPlan.md): what publishes when, and the full drafts. Every piece conforms to the [Voice & Delight Bible](../../../creative/Mainguard_Voice_And_Delight_Bible.md) (brand register — one degree warmer, personality unchanged), honors the honesty contract ([Narrative §0](../../../creative/Narrative.md)), and uses the competitor sentences of Narrative §2 as its public comparison register. Comparison pages exist for a strategic reason on record: contest the category vocabulary before MergeLoom's 161-post SEO wall owns it (Master Doc §14.5 #8; the Nimbalyst playbook — copy their content machine, not their features).

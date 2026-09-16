@@ -1,5 +1,7 @@
 # Mainguard: Multi-Agent Control Center Market Research Report
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Prepared by:** Lead Product Strategist & Research Orchestrator  
 **Contributors:** Market Analyst, UX & Product Researcher, GTM & Pricing Agent, Risk & Security Analyst, Business Strategy Agent
 

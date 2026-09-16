@@ -1,5 +1,7 @@
 # Mainguard — Investor Pitch Deck (Seed / Pre-Seed Master)
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-11 · **Register:** brand (Voice Bible rules apply — no exclamation marks, no hype vocabulary, severity rides the facts)
 **Status:** Deck script — slide copy + speaker notes, ready to be laid out. Use when the Part-X raise trigger fires (3–5 active Track B design-partner teams + retention curve + verified-merges growth, or a competitive forcing event — Master Market Document §10.2).
 **Narrative arc (locked):** problem → why now → the wedge → the moat → traction → market → business model → the ask.

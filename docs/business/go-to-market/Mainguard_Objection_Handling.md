@@ -1,5 +1,7 @@
 # Mainguard — Objection Handling (the live-fire companion to the Defensibility Memo)
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-11 · **Status:** Lane-F stakeholder document · **Register:** brand (Voice Bible: concede what's true, state the fact, never bristle — the register locked by Narrative §5.4's comment kit)
 **How to use.** Each objection is steel-manned first — the *strongest* form a smart skeptic would actually say — then answered in three moves: **concede** (what's true in it), **the fact** (the sourced counter), **the line** (the one sentence to leave in the room). Objections 1–3 are the load-bearing trio and get full treatment; the standing set follows in compressed form. HN-specific phrasings live in Narrative §5.4 and are not duplicated here; this doc is the investor/buyer register.
 **Honesty contract (Narrative §0):** no answer below claims a shipped capability that isn't; [Horizon] items are argued as architecture and sequencing, never as present tense.

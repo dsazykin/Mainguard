@@ -36,12 +36,27 @@ they carry no rules of their own.
 
 ## Business
 
-Not needed to build or review code. Grouped so `docs/` opens with engineering material.
+Not needed to build or review code, but this is the whole business and the place to start for anything
+that isn't code. Consolidated 2026-09-16 from the research corpus in [`business/`](business/), which
+each section links back into for depth.
+
+**Read the first two to understand Mainguard.** The other two are reference you open when doing a
+specific job.
+
+| Read | What is in it |
+|---|---|
+| [`BUSINESS.md`](BUSINESS.md) | **Strategy.** What we sell and refuse to sell, the product and its differentiation spine, market numbers, the competitive field, ICP and positioning, pricing and unit economics, the moat and its erosion dashboard, risks, metrics, open decisions. |
+| [`GTM.md`](GTM.md) | **Execution.** The current stage rule, the two-act launch sequence, the founding-user and design-partner programs, channels, the sales motion, when to raise, and the gates-before-dates calendar. |
+
+| Open when you need it | What is in it |
+|---|---|
+| [`GTM_Assets.md`](GTM_Assets.md) | **The copy, as templates.** One-pager, investor deck, demo script, outreach sequences, site and email copy, the scored target-company list, grant drafts, Show HN bodies, the twelve standing objections and their answers, press and video material. |
+| [`business/NL_Operations.md`](business/NL_Operations.md) | **Dutch lookups.** Grant schemes and deadlines, the fund and angel landscape, incorporating and invoicing, hiring and salary bands, the press and events map. |
 
 | Folder | Files | What is in it |
 |---|---:|---|
-| [`business/go-to-market/`](business/go-to-market/) | 26 | Market & GTM strategy, decks, marketing, sales. `GTM_Execution.md` is the execution hub. |
-| [`business/market-analysis/`](business/market-analysis/) | 7 | Competitor and market research. |
+| [`business/go-to-market/`](business/go-to-market/) | 26 | The research behind the docs above: the master market document, decks, marketing, sales, grants. **Read the summary first** — where the two disagree, the summary wins. |
+| [`business/market-analysis/`](business/market-analysis/) | 7 | Competitor and market research, with the full source lists. |
 | [`business/members/`](business/members/) | 3 | Team structure and intake. |
 
 ## Archive
@@ -53,9 +68,12 @@ for provenance, never as a spec.
 
 ## Where does a new doc go?
 
-Put it in the matching folder above. A loose new `docs/*.md` is drift — the two that exist
-(`security-architecture.md`, `mainguardos-updates.md`) are long-standing exceptions, and `STATUS.md`
-is deliberately at the top level because it is the page people need first.
+Put it in the matching folder above. A loose new `docs/*.md` is drift — the six that exist are
+deliberate top-level entry points, not a precedent: `STATUS.md`, because it is the page people need
+first; `BUSINESS.md`, `GTM.md` and `GTM_Assets.md`, because they are the first thing a non-engineering
+reader should find and there is exactly one of each; and `security-architecture.md` and
+`mainguardos-updates.md`, the long-standing exceptions. Dutch operational lookups live one level down,
+in `business/NL_Operations.md`, because nobody needs them to understand the product.
 
 **When a doc is superseded or its work ships, move it to `archive/` and add a one-line status note
 at the top** saying what replaced it and when. Don't delete it, and don't leave it in place looking

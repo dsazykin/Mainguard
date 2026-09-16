@@ -1,5 +1,7 @@
 # Mainguard — Paid Media Plan (developer & B2B channels)
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-11 · **Register:** brand (sales/GTM execution layer)
 **Reads under:** `docs/business/go-to-market/Mainguard_Master_Market_Document_2026-07.md` (the strategy hub; channel
 priorities §14.5, pricing Part VIII, launch plan Part XIV) and `docs/creative/Narrative.md` (positioning,

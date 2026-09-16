@@ -1,5 +1,7 @@
 # MergeLoom (mergeloom.ai) — Deep Competitive Dive
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-07 · **Prepared for:** Mainguard competitive planning (phase-2 / Master Implementation Doc v2, branch `phase2`)
 **Method:** Direct page fetches of mergeloom.ai (homepage, /product/* ×8, /solutions/* ×4, /pricing, /docs, /docs/getting-started/install-worker, /compare/* ×3, /subprocessors, /terms, /refund-policy, /blog, sitemap), GitHub org fetch, LinkedIn company page fetch, 5 web searches.
 **Evidence standard:** Every claim tagged **[V]** = verified by direct fetch of the cited page, **[S]** = verified only via search snippet, **[I]** = inferred/unverified. Note: fetches were summarized by an extraction model, so exact wording may vary slightly from the live page; feature claims are as-marketed, not independently tested.

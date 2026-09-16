@@ -1,5 +1,7 @@
 # Mainguard Social Launch Reserve — Fully Written
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Lane G Part 3 · Register: brand (founder first-person on social surfaces) · Status: ready to post, gated by the calendar.**
 
 The launch-day operations file: everything postable, in one place, pre-written so launch days are spent in the comment threads, not the drafts folder. **Copy-of-record rule:** the Show HN act-one body and the founder story are owned by [`docs/creative/Narrative.md`](../../../creative/Narrative.md) (§5.2, §5.5) — they are mirrored here for one-stop launch-day use and must be reconciled against Narrative before posting; if they ever disagree, Narrative wins. Everything else in this file (the expanded FAQ, the act-two full body, all threads, the LinkedIn and Bluesky copy, the About-page trim) is original to this file and this is its home.

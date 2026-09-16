@@ -1,5 +1,7 @@
 # Competitive Landscape & Naming Research
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 Research pass covering (1) every company/product already using "Aegis"-family names in the
 AI-agent space, (2) the real product competitors building the same "orchestrate multiple
 coding agents via git worktrees" idea Mainguard's roadmap describes, and (3) a fresh round of

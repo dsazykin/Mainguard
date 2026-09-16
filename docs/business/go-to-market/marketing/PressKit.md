@@ -1,5 +1,7 @@
 # Mainguard Press / PR Kit — One-Pager & Supporting Materials
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Lane G Part 5b · Register: brand · Status: ready to attach to pitches.** Pitch mechanics (who, when, in what order) are locked in Master Doc §14.6 — journalist-first, 5-sentence personal pitch, embargo-free, screenshots + 90-second video attached, 15-minute call offered, Dutch pitches to Dutch outlets, **timed to land the same week as each Show HN** so the story is "launch," not "plans." This kit is what gets attached.
 
 Two variants of the one-pager exist below: **Act One** (the client launch — the only version that exists until L2) and the **Act Two addendum** (appended only when the pipeline demonstrably works). Everything follows the honesty contract; a journalist who fact-checks every line should find every line boring to check.

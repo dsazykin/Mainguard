@@ -1,5 +1,7 @@
 # Mainguard — Technical Deep-Dive Deck: the Safe-to-Merge Guarantee *as* the Moat
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-11 · **Register:** brand-technical (Voice Bible rules; heavier on mechanism, zero hype)
 **Audience:** the technical partner at a dev-tool fund, a diligence engineer, a staff-engineer champion at a design-partner prospect, or a technical advisor. This deck assumes the listener will probe; every slide names the real type, task ID, or invariant so the probe lands on something.
 **Companion to:** `Mainguard_Investor_Deck_Seed.md` (the narrative deck). This one replaces slides 5–7 of that deck with the full mechanism and is 80% mechanism by weight.

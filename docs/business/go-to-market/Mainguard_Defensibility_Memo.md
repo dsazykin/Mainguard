@@ -1,5 +1,7 @@
 # Mainguard — Defensibility Memo (why this doesn't get taken from us)
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-11 · **Status:** Lane-F stakeholder document — the diligence-grade moat argument · **Register:** brand (Voice Bible rules; concessions stated before claims)
 **Audience:** an investor's partner meeting, a diligence engineer, our own roadmap prioritization when a competitor ships something.
 **Method:** every moat claim is paired with (a) the evidence it rests on, cited to `docs/business/market-analysis/` / `docs/business/go-to-market/`, and (b) the **erosion scenario** — what would have to happen for the claim to stop being true, and the tripwire already set for it. A moat memo that can't name its own erosion isn't a memo; it's a wish.

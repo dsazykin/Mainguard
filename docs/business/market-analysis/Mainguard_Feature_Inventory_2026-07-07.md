@@ -1,5 +1,7 @@
 # Mainguard — Complete Competitor Feature Inventory & Gap Analysis
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-07
 **Purpose:** Match-every-feature pass across the full competitive set, classifying each
 competitor feature as SHIPPED / PLANNED / UNPLANNED for Mainguard, plus a consolidated gap

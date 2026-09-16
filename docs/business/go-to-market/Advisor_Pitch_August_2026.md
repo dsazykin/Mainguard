@@ -1,5 +1,7 @@
 # Advisor Engagement Brief — August 2026 Visit
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-06
 **Context:** August trip to visit girlfriend + her parents. Her father is a successful startup
 founder, currently building an AI startup ("Daemon"). Goal: get his help, advice, and — if it

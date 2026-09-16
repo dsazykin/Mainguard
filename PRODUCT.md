@@ -22,8 +22,7 @@ browser assumptions that do not apply.)
 
 ## Users
 
-Adoption runs as a deliberate three-step ladder (`docs/business/go-to-market/Mainguard_GTM_Plan_2026-07.md`
-§3.2), not a single persona:
+Adoption runs as a deliberate three-step ladder (`docs/BUSINESS.md` §5.3), not a single persona:
 
 - **Sam — the agent power user.** Today's actual user. Already runs several agentic CLIs (Claude
   Code, Codex, Gemini CLI, Qwen Code, OpenCode) against one repository and is losing time to them
@@ -39,7 +38,7 @@ Adoption runs as a deliberate three-step ladder (`docs/business/go-to-market/Mai
 
 **ICP:** a 10–100-developer product company or agency, Windows-heavy or mixed-OS, already running
 agentic CLIs, under some compliance pressure. Netherlands / Twente first
-(`docs/business/go-to-market/sales/Target_Company_List_2026-08.md`).
+(`docs/GTM_Assets.md` §7).
 
 **Explicit non-targets:** non-developer "vibe coders" (a later Cloud-phase audience), cloud-only
 agent shops, and free-forever open-source users. The strategic law behind the ladder is that
@@ -67,8 +66,8 @@ evidence to show what was merged and why.
 ## Positioning
 
 The differentiating claim is **safe-to-merge**, not orchestration. The market research is blunt that
-the orchestration framing is dead (`docs/business/market-analysis/Mainguard_Viability_And_Differentiation_2026-07.md`
-§1.1): *"'Mainguard spawns agents in isolated worktrees' is not a product,"* and the original
+the orchestration framing is dead (`docs/BUSINESS.md`
+§1): *"'Mainguard spawns agents in isolated worktrees' is not a product,"* and the original
 headline *"is no longer viable as a differentiator — that window closed in early 2026."* Viability
 is conditional on owning the downstream step: verifying, governing, and merging.
 
@@ -119,7 +118,7 @@ on containers plus verification; CodeRabbit and Greptile are cloud review with n
   always-visible stop control freezes the queue first, then pauses every agent.
 - **Beyond the app.** mainguard.dev carries the public story and a working waitlist. Everything else
   written for launch — press kit, email sequences, Show HN posts — is deliberately held in reserve
-  until the end-to-end run works (`docs/business/go-to-market/GTM_Execution.md` §3b: *"Nothing is sold."*).
+  until the end-to-end run works (`docs/GTM.md` §1: *"Nothing is sold."*).
 
 ## Capabilities and Constraints
 

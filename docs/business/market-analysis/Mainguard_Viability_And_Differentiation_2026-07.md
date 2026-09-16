@@ -1,5 +1,7 @@
 # Mainguard — Viability Re-Assessment & Differentiation Research
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-07-03
 **Question asked:** Is the product still viable now that Claude Code (and others) natively do
 "agents in worktrees"? And what high-end features actually differentiate us?

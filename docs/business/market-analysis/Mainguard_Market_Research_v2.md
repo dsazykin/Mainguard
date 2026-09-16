@@ -1,5 +1,7 @@
 # Mainguard Market Analysis Report v2 (July 2026)
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../BUSINESS.md), [`GTM.md`](../../GTM.md) and [`GTM_Assets.md`](../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Supersedes:** `Mainguard_Market_Research.md` and *Mainguard Market Research Analysis.pdf*
 **What changed in v2:** All technical premises re-verified against official documentation (Docker Sandboxes, WSL2, Git fsmonitor, LibGit2Sharp, Anthropic ToS). Competitive landscape updated for GitKraken 12 Agent Mode, Docker sbx GA behavior, and the April 2026 Anthropic third-party OAuth ban. Positioning, moat definition, licensing, and GTM sequencing revised accordingly. Claims that failed verification have been removed.
 

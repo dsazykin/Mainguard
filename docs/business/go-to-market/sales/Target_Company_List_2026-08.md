@@ -1,5 +1,7 @@
 # Mainguard — Target Company List (built, scored, contactable)
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-08-20 · **Register:** brand (sales execution) · **Status:** working list, refresh quarterly
 **Method:** [`Mainguard_Company_Sourcing_Playbook.md`](Mainguard_Company_Sourcing_Playbook.md) — this file is
 the *output* the playbook always described but never contained. Scoring is the playbook's A/B/C/R/S model.

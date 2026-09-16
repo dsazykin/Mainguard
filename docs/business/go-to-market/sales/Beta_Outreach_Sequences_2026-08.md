@@ -1,5 +1,7 @@
 # Mainguard — Outreach Sequences for the Beta-Feedback Motion
 
+> **Detail source.** The consolidated, current view is [`BUSINESS.md`](../../../BUSINESS.md), [`GTM.md`](../../../GTM.md) and [`GTM_Assets.md`](../../../GTM_Assets.md) — start there. This file is the 2026-07/08 research they were built from: read it for depth, worked examples and its full source list. Where the two disagree, the consolidated docs win.
+
 **Date:** 2026-08-20 · **Register:** brand (sales execution)
 **Supersedes, for this stage only:** the sequences in
 [`Mainguard_Outreach_And_Pitch_Kit.md`](Mainguard_Outreach_And_Pitch_Kit.md) §3. That kit is written for a
