@@ -3,7 +3,8 @@
 The single source of truth for **what's not built yet**. Two parts:
 
 1. **§A — New backlog features** — net-new features proposed and deferred (not started). Each has enough of a
-   sketch to pick up directly, in the same offline-slice style as `docs/feature-plans/T-*.md`.
+   sketch to pick up directly, in the same offline-slice style as the archived
+   `docs/archive/feature-plans/git-core/T-*.md` plans.
 2. **§B — Deferred within shipped features** — the parts of already-merged features that were intentionally
    left for a human (live host-account matrices, unfinished gestures, visual polish). These are indexed
    against `Mainguard_User_Testing_Guide.md` so nothing is lost.
