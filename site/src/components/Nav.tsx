@@ -8,6 +8,9 @@ const LINKS = [
   { to: '/client', label: 'Git Client', tag: 'Free' },
   { to: '/pro', label: 'Pro', tag: null },
   { to: '/cloud', label: 'Cloud', tag: null },
+  // The mechanism page sits in the nav on purpose. The product's whole claim is
+  // that agent work is safe to merge, and this is the page that shows why.
+  { to: '/verification', label: 'How it works', tag: null },
   { to: '/contact', label: 'Contact', tag: null },
 ];
 

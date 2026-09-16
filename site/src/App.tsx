@@ -10,6 +10,7 @@ import { Contact } from './pages/Contact';
 import { Waitlist } from './pages/Waitlist';
 import { Privacy } from './pages/Privacy';
 import { Terms } from './pages/Terms';
+import { Verification } from './pages/Verification';
 import { NotFound } from './pages/NotFound';
 import { CookieConsent } from './components/CookieConsent';
 import { useConsent } from './lib/consent';
@@ -22,6 +23,7 @@ const TITLES: Record<string, string> = {
   '/cloud': 'Mainguard Cloud · describe it, ship it verified',
   '/contact': 'Contact · Mainguard',
   '/waitlist': 'Join the waitlist · Mainguard',
+  '/verification': 'How verification works · Mainguard',
   '/privacy': 'Privacy policy · Mainguard',
   '/terms': 'Terms of service · Mainguard',
 };
@@ -78,6 +80,7 @@ export default function App() {
           <Route path="/weave" element={<Navigate to="/cloud" replace />} />
           <Route path="/contact" element={<Contact />} />
           <Route path="/waitlist" element={<Waitlist />} />
+          <Route path="/verification" element={<Verification />} />
           <Route path="/privacy" element={<Privacy />} />
           <Route path="/terms" element={<Terms />} />
           <Route path="*" element={<NotFound />} />

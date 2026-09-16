@@ -24,6 +24,7 @@ export function Footer() {
           <Link to="/client">Git Client · free</Link>
           <Link to="/pro">Mainguard Pro</Link>
           <Link to="/cloud">Mainguard Cloud</Link>
+          <Link to="/verification">How verification works</Link>
         </nav>
         <nav className="footer-col" aria-label="Company">
           <h4>Get in touch</h4>

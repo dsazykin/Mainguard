@@ -100,7 +100,9 @@ export function Pro() {
                   the trusted daemon from outside the container, never a value the agent supplies.
                   The resolved test command and config hash are pinned immutably, so nothing slips
                   through by quietly weakening what "verify" means. If main moves, every other
-                  verified branch is invalidated and re-verified before it is eligible again.
+                  verified branch is invalidated and re-verified before it is eligible again.{' '}
+                  <Link to="/verification">The full mechanism and its limits</Link> are written
+                  out, threat model included.
                 </p>
               </div>
               <PipelineVignette />
