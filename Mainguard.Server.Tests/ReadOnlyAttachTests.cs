@@ -19,26 +19,46 @@ namespace Mainguard.Server.Tests;
 /// F64 — what "read-only attach" has to mean, and the two ways it did not.
 ///
 /// <list type="number">
-///   <item><b>Resize was forwarded.</b> The bound-session pumps treated a resize as "harmless window
-///   geometry" and passed it straight through, so a read-only spectator drove SIGWINCH into a managed
-///   worker's CLI and reflowed the daemon's authoritative grid — which every OTHER viewer, including the
-///   coordinator mid-turn, then saw repaint under them.</item>
 ///   <item><b>Every concurrent attach could write.</b> Input was not exclusive, and
 ///   <c>BoundTerminalSession.WriteInputAsync</c> did not even serialize write+flush on a shared
 ///   <c>Stream</c>, so two attaches typing at once interleaved at the byte level — splitting escape
 ///   sequences and UTF-8 codepoints.</item>
 /// </list>
 ///
-/// <para>(The third item in the finding — the lock state being captured once per attach — is covered by
+/// <para>(The other item in the finding — the lock state being captured once per attach — is covered by
 /// <see cref="LockAppliedMidAttach_IsHonouredOnTheNextFrame"/>.)</para>
+///
+/// <para><b>MG-24 narrowed this by the owner's decision: the lock is about INPUT, and a locked attach
+/// resizes.</b> F64 originally also refused <c>Resize</c>, on the reasoning that "window geometry is
+/// harmless" was wrong — a resize being a write that every other viewer of a shared session sees. The
+/// mechanism does not bear that out: <c>Resize</c> is TIOCSWINSZ on the PTY master plus a vterm reflow
+/// under the session gate, and writes NO bytes to the PTY stream, so it cannot interleave with an
+/// in-flight <c>WriteInputAsync</c> or split an escape sequence — the corruption the input lock exists
+/// to prevent is not reachable this way. It delivers SIGWINCH and the CLI repaints, which is what a
+/// resize means. What the refusal actually produced was a pane the operator could drag whose terminal
+/// would not follow: stuck at the 120x32 spawn default while the pane rendered ~68 columns, with no
+/// reflow, which is what made a worker terminal unreadable. Geometry is how big the window you look
+/// through is, not something you type into. The input half below is untouched, and is what P2-14
+/// "read-only" means.</para>
 /// </summary>
 public sealed class ReadOnlyAttachTests
 {
     private const string RepoHash = "repo-f64";
     private const string AgentId = "worker-f64";
 
+    /// <summary>The size the session under test is bound at — the daemon's own spawn default, and so
+    /// the size a viewer sees reported before it resizes anything.</summary>
+    private const int BoundCols = 120;
+    private const int BoundRows = 32;
+
+    /// <summary>
+    /// MG-24 (replaces F64's resize refusal): a locked attach CANNOT type and CAN resize. Both halves
+    /// in one test, because the whole point is that they are different things — the lock is about
+    /// input, and geometry is not input. Keeping them in one place also means a future change cannot
+    /// quietly trade one for the other.
+    /// </summary>
     [Fact]
-    public async Task LockedAttach_CannotResizeTheManagedWorkersTerminal()
+    public async Task LockedAttach_CannotType_ButCanStillResize()
     {
         using var fixture = new DaemonFixture();
         using var cli = new RecordingSession();
@@ -49,6 +69,12 @@ public sealed class ReadOnlyAttachTests
         using var call = client.Attach(fixture.AuthHeaders());
 
         await call.RequestStream.WriteAsync(new TerminalInput { AgentId = AgentId });
+
+        // MG-24: geometry leads every raw attach, ahead of the banner and the replay tail — the
+        // client has to know the size before it parses a single byte at it.
+        Assert.True(await call.ResponseStream.MoveNext(CancellationToken.None));
+        Assert.Equal(TerminalOutput.FrameOneofCase.Geometry, call.ResponseStream.Current.FrameCase);
+
         // The read-only banner proves the output stream is open before we test the input direction.
         Assert.True(await call.ResponseStream.MoveNext(CancellationToken.None));
         Assert.Contains("read-only", call.ResponseStream.Current.Raw.ToStringUtf8());
@@ -64,10 +90,99 @@ public sealed class ReadOnlyAttachTests
         await call.RequestStream.WriteAsync(new TerminalInput { Data = ByteString.CopyFromUtf8("x") });
         await call.RequestStream.CompleteAsync();
 
+        // Typing is still refused — this is what the P2-14 lock means and it has not moved.
         var refusal = await Assert.ThrowsAsync<RpcException>(() => DrainAsync(call));
         Assert.Equal(StatusCode.PermissionDenied, refusal.StatusCode);
+        Assert.DoesNotContain("x", cli.WrittenText);
 
-        Assert.Null(cli.LastResize);
+        // The resize, however, reached the CLI: SIGWINCH into a managed worker is a repaint, not a
+        // write, and a pane the operator can drag whose terminal refuses to follow is a broken window.
+        Assert.Equal((40, 10), cli.LastResize);
+    }
+
+    /// <summary>
+    /// MG-24: a locked attach is told the session's authoritative size on attach — the size it was
+    /// BOUND at, not anything this attach chose — and then told the new one once its own resize lands.
+    ///
+    /// <para>The frame still matters now that the resize is honoured, and arguably matters more: the
+    /// daemon clamps dimensions (<c>VtermSession.ClampDimension</c>), the replay tail is raw bytes
+    /// produced at the OLD size, and a second pane on the same session can win the last write. In all
+    /// three the size the client asked for is not the size it got, and guessing is what garbled the
+    /// pane in the first place.</para>
+    /// </summary>
+    [Fact]
+    public async Task LockedAttach_IsToldTheSizeOnAttach_ThenTheNewOneAfterItResizes()
+    {
+        using var fixture = new DaemonFixture();
+        using var cli = new RecordingSession();
+        BindBoundSession(fixture, cli);
+        fixture.Services.GetRequiredService<TerminalLockRegistry>().Lock(AgentId);
+
+        var client = new TerminalService.TerminalServiceClient(fixture.CreateChannel());
+        using var call = client.Attach(fixture.AuthHeaders());
+
+        await call.RequestStream.WriteAsync(new TerminalInput { AgentId = AgentId });
+
+        Assert.True(await call.ResponseStream.MoveNext(CancellationToken.None));
+        var geometry = call.ResponseStream.Current;
+        Assert.Equal(TerminalOutput.FrameOneofCase.Geometry, geometry.FrameCase);
+
+        // The size the session was actually bound at — not a size this attach chose.
+        Assert.Equal(BoundCols, (int)geometry.Geometry.Cols);
+        Assert.Equal(BoundRows, (int)geometry.Geometry.Rows);
+
+        // Now this locked pane resizes itself, and is told the size that took effect.
+        await call.RequestStream.WriteAsync(new TerminalInput
+        {
+            Resize = new Resize { Cols = 68, Rows = 45 },
+        });
+
+        var reported = await ReadGeometryAsync(call, (68, 45));
+        Assert.Equal((68, 45), reported);
+        Assert.Equal((68, 45), cli.LastResize);
+    }
+
+    /// <summary>Reads output frames until geometry reports <paramref name="expected"/>, or the stream
+    /// ends. Raw CLI frames interleave with geometry, so the frame cannot be read by position.</summary>
+    private static async Task<(int Cols, int Rows)> ReadGeometryAsync(
+        AsyncDuplexStreamingCall<TerminalInput, TerminalOutput> call, (int Cols, int Rows) expected)
+    {
+        var reported = (Cols: 0, Rows: 0);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (reported != expected && await call.ResponseStream.MoveNext(timeout.Token))
+        {
+            if (call.ResponseStream.Current.FrameCase == TerminalOutput.FrameOneofCase.Geometry)
+            {
+                var g = call.ResponseStream.Current.Geometry;
+                reported = ((int)g.Cols, (int)g.Rows);
+            }
+        }
+
+        return reported;
+    }
+
+    /// <summary>
+    /// The unlocked counterpart: the resize IS honoured, and the client is told the new authoritative
+    /// size, so an ordinary terminal ends up rendering at exactly the size it asked for.
+    /// </summary>
+    [Fact]
+    public async Task UnlockedAttach_IsToldTheNewSizeAfterItsResizeIsHonoured()
+    {
+        using var fixture = new DaemonFixture();
+        using var cli = new RecordingSession();
+        BindBoundSession(fixture, cli);
+
+        var client = new TerminalService.TerminalServiceClient(fixture.CreateChannel());
+        using var call = client.Attach(fixture.AuthHeaders());
+
+        await call.RequestStream.WriteAsync(new TerminalInput { AgentId = AgentId });
+        await call.RequestStream.WriteAsync(new TerminalInput
+        {
+            Resize = new Resize { Cols = 100, Rows = 30 },
+        });
+
+        Assert.Equal((100, 30), await ReadGeometryAsync(call, (100, 30)));
+        Assert.Equal((100, 30), cli.LastResize);
     }
 
     [Fact]
@@ -192,7 +307,8 @@ public sealed class ReadOnlyAttachTests
 
     private static void BindBoundSession(DaemonFixture fixture, ITerminalSession cli)
         => fixture.Services.GetRequiredService<TerminalSessionManager>()
-            .Bind(new AgentSessionKey(RepoHash, AgentId), new BoundTerminalSession(AgentId, cli));
+            .Bind(new AgentSessionKey(RepoHash, AgentId),
+                new BoundTerminalSession(AgentId, cli, cols: BoundCols, rows: BoundRows));
 
     /// <summary>Polls a condition the server satisfies asynchronously, with a bounded wait.</summary>
     private static async Task WaitForAsync(Func<bool> condition)

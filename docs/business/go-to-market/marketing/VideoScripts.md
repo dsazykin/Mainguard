@@ -43,7 +43,7 @@ Three scripts: the 90-second explainer (Act One), the founder-story film, and th
 
 ## 3. The live-demo storyboard — Act Two (~4:30, pairs with the Lane E prototype)
 
-*Purpose: the act-two launch video, the creator demo, and the design-partner pitch. Every scene names its real surface in [ControlCenterDesign.md](../../design/ControlCenterDesign.md) / [VibeModeDesign.md](../../design/VibeModeDesign.md); the narration uses the specs' own state words (`Verified`, `Stale`, `CanMerge`) so the film and the product never drift. Until each capability ships, its scene carries the prototype lower-third; the storyboard is written so the same shots re-stage against the live product at L2. Arc follows GTM Plan §10.2.*
+*Purpose: the act-two launch video, the creator demo, and the design-partner pitch. Every scene names its real surface in [ControlCenterDesign.md](../../../design/ControlCenterDesign.md) / [VibeModeDesign.md](../../../design/VibeModeDesign.md); the narration uses the specs' own state words (`Verified`, `Stale`, `CanMerge`) so the film and the product never drift. Until each capability ships, its scene carries the prototype lower-third; the storyboard is written so the same shots re-stage against the live product at L2. Arc follows GTM Plan §10.2.*
 
 | # | Time | Picture (surface, per spec) | Narration |
 |---|---|---|---|

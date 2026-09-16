@@ -36,6 +36,8 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
     private CancellationTokenSource? _resizeCts;
     private int _pendingCols;
     private int _pendingRows;
+    private int _authoritativeCols;
+    private int _authoritativeRows;
     private bool _disposed;
 
     // Output can arrive (a rehydrated coordinator's full scrollback replays within milliseconds of
@@ -87,6 +89,22 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
         _gateway = gateway;
         _resizeDebounce = resizeDebounce ?? TimeSpan.FromMilliseconds(50);
         _gateway.OutputReceived += OnOutputReceived;
+        _gateway.GeometryReceived += OnGeometryReceived;
+    }
+
+    /// <summary>
+    /// MG-24: the daemon's authoritative (cols, rows) for this session. Forwarded straight to the
+    /// engine — it is the ONLY caller of <see cref="ITerminalView.Resize"/>, because it is the only
+    /// party that knows the real size. What this pane asked for is a request (see
+    /// <see cref="OnUserResize"/>); this is the answer, and the two differ whenever the daemon clamps
+    /// the size, the replay tail predates the resize, or another pane on the same session won the
+    /// last write.
+    /// </summary>
+    private void OnGeometryReceived(int cols, int rows)
+    {
+        _authoritativeCols = cols;
+        _authoritativeRows = rows;
+        _view?.Resize(cols, rows);
     }
 
     /// <summary>Binds the concrete engine control (the View supplies it — the VM keeps only the interface).</summary>
@@ -99,6 +117,14 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
 
         _view = view;
         _view.InputAvailable += OnInputAvailable;
+
+        // MG-24: the geometry frame leads the replay, so on a pane that binds late it has already
+        // been and gone. Re-apply it BEFORE the buffered output below, or the engine parses that
+        // output at its own default width — the very thing the frame exists to prevent.
+        if (_authoritativeCols > 0 && _authoritativeRows > 0)
+        {
+            view.Resize(_authoritativeCols, _authoritativeRows);
+        }
 
         List<byte[]>? pending;
         lock (_pendingOutputLock)
@@ -145,7 +171,12 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
             return; // a newer resize superseded this one
         }
 
-        _view?.Resize(_pendingCols, _pendingRows);
+        // MG-24: the engine is NOT resized to the pane here any more. This size is a request; the
+        // daemon answers with a `geometry` frame and OnGeometryReceived applies it. Assuming the
+        // answer is what made a managed worker's terminal unreadable — the engine sat at a width the
+        // PTY had never heard of, parsing cursor-addressed redraws onto the wrong rows. Even now that
+        // every terminal's resize is honoured, the answer can still differ from the ask (the daemon
+        // clamps; another pane can win the last write), and the replay tail always predates it.
         try
         {
             await _gateway.SendResizeAsync(_pendingCols, _pendingRows);
@@ -268,6 +299,7 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
         _resizeCts?.Cancel();
         _resizeCts?.Dispose();
         _gateway.OutputReceived -= OnOutputReceived;
+        _gateway.GeometryReceived -= OnGeometryReceived;
         if (_view is not null)
         {
             _view.InputAvailable -= OnInputAvailable;

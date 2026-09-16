@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-11 · **Status:** Lane-F stakeholder document — the diligence-grade moat argument · **Register:** brand (Voice Bible rules; concessions stated before claims)
 **Audience:** an investor's partner meeting, a diligence engineer, our own roadmap prioritization when a competitor ships something.
-**Method:** every moat claim is paired with (a) the evidence it rests on, cited to `docs/market-analysis/` / `docs/go-to-market/`, and (b) the **erosion scenario** — what would have to happen for the claim to stop being true, and the tripwire already set for it. A moat memo that can't name its own erosion isn't a memo; it's a wish.
+**Method:** every moat claim is paired with (a) the evidence it rests on, cited to `docs/business/market-analysis/` / `docs/business/go-to-market/`, and (b) the **erosion scenario** — what would have to happen for the claim to stop being true, and the tripwire already set for it. A moat memo that can't name its own erosion isn't a memo; it's a wish.
 **Companion:** `Mainguard_Objection_Handling.md` — the same material, cut per objection for live use.
 **Honesty contract (Narrative §0):** the pipeline layers are **[Horizon]** — the moat argument is explicitly about *architecture and position*, not shipped features; where a claim depends on shipping, that dependency is stated.
 

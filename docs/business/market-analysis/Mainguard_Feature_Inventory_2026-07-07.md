@@ -4,8 +4,8 @@
 **Purpose:** Match-every-feature pass across the full competitive set, classifying each
 competitor feature as SHIPPED / PLANNED / UNPLANNED for Mainguard, plus a consolidated gap
 list, novel-feature proposals, and a priority ranking.
-**Builds on (does not repeat):** `docs/market-analysis/Mainguard_Viability_And_Differentiation_2026-07.md`
-and `docs/market-analysis/Mainguard_Naming_And_Competitive_Landscape_2026-07.md`.
+**Builds on (does not repeat):** `docs/business/market-analysis/Mainguard_Viability_And_Differentiation_2026-07.md`
+and `docs/business/market-analysis/Mainguard_Naming_And_Competitive_Landscape_2026-07.md`.
 
 ### Scope & mapping notes (read first)
 
@@ -718,4 +718,4 @@ A5 repo groups (lite) · A8 plan/subagent visibility · I3 screenshot verificati
 
 **Internal references:** `docs/planning/Mainguard_Master_Implementation_Document.md` (T-01…T-33 shipped, §1 baseline),
 `docs/planning/Mainguard_Implementation_Strategy.md` (F6/G-7.x/H-8.x/I-9/J/K planned workstreams),
-`docs/market-analysis/Mainguard_Viability_And_Differentiation_2026-07.md` (D-1…D-6).
+`docs/business/market-analysis/Mainguard_Viability_And_Differentiation_2026-07.md` (D-1…D-6).

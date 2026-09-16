@@ -17,6 +17,14 @@ public interface ITerminalGateway : IDisposable
     /// <summary>Raised for each <c>raw</c> output frame the daemon streams from the PTY.</summary>
     event Action<ReadOnlyMemory<byte>>? OutputReceived;
 
+    /// <summary>
+    /// MG-24: raised with the session's AUTHORITATIVE (cols, rows) — once ahead of the replay tail
+    /// and again whenever it changes. This is not an echo of what the client asked for: a managed
+    /// worker's terminal is input-locked, so the daemon refuses the resize and keeps reporting the
+    /// size the PTY is really running at. The engine parses against that size or it parses garbage.
+    /// </summary>
+    event Action<int, int>? GeometryReceived;
+
     /// <summary>Attaches to <paramref name="agentId"/> and begins pumping output until cancelled.</summary>
     Task AttachAsync(string agentId, CancellationToken ct);
 
@@ -86,6 +94,9 @@ public sealed class DaemonTerminalGateway : ITerminalGateway
 
     public event Action<ReadOnlyMemory<byte>>? OutputReceived;
 
+    /// <inheritdoc />
+    public event Action<int, int>? GeometryReceived;
+
     public async Task AttachAsync(string agentId, CancellationToken ct)
     {
         var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -137,6 +148,11 @@ public sealed class DaemonTerminalGateway : ITerminalGateway
                     case TerminalOutput.FrameOneofCase.Grid:
                     case TerminalOutput.FrameOneofCase.Clipboard:
                         OutputReceived?.Invoke(output.ToByteArray());
+                        break;
+                    case TerminalOutput.FrameOneofCase.Geometry:
+                        // Its own event, not the byte channel: on the raw path those bytes ARE the
+                        // PTY stream and anything mixed into them would be parsed as terminal output.
+                        GeometryReceived?.Invoke((int)output.Geometry.Cols, (int)output.Geometry.Rows);
                         break;
                 }
             }

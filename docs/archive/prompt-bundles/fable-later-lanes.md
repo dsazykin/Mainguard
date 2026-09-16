@@ -8,14 +8,14 @@ DESIGN.md / PRODUCT.md / the Voice Bible. Same safeguard discipline: F/G/I/J are
 
 Dependencies: F reads Lane D's cost model; G reads Lane C's voice/GTM — so run F and G after C/D produce
 output (or point them at the in-progress files). H, I, J are independent → fire anytime, in parallel.
-Output homes follow the AGENTS.md taxonomy: business/GTM → docs/go-to-market/ · product/UX → docs/design/ ·
+Output homes follow the AGENTS.md taxonomy: business/GTM → docs/business/go-to-market/ · product/UX → docs/design/ ·
 engineering → code + ADRs. (Everything gets consolidated at the end — see the Consolidation Plan.)
 
 ═══════════════════════════════════════════════════════════════════════════════════════════
 LANE F — Stakeholder & Fundraising Communication  (builds on Lane D's cost model)
-Output: docs/go-to-market/decks/ + docs/go-to-market/Mainguard_Business_Plan.md
+Output: docs/business/go-to-market/decks/ + docs/business/go-to-market/Mainguard_Business_Plan.md
 ═══════════════════════════════════════════════════════════════════════════════════════════
-Read docs/go-to-market/*, docs/phase-2/Mainguard_Cloud_Vibe_Companion.md (the cost model), docs/market-analysis/*.
+Read docs/business/go-to-market/*, docs/phase-2/Mainguard_Cloud_Vibe_Companion.md (the cost model), docs/business/market-analysis/*.
 Part 1 — The investor pitch deck (narrative arc: problem → why now → the wedge → the moat → traction →
 market → business model → the ask), each slide with speaker notes. Plus three variants: a technical
 deep-dive deck (the safe-to-merge guarantee AS the moat), an advisor/board-update deck, and a "swarm
@@ -29,9 +29,9 @@ Part 4 — A defensibility/moat memo + an objection-handling doc (why "just use 
 
 ═══════════════════════════════════════════════════════════════════════════════════════════
 LANE G — Marketing, Content & Launch (organic)  (builds on Lane C's voice/GTM)
-Output: docs/go-to-market/marketing/ (campaign, calendar, drafted posts, social, PR, emails, scripts)
+Output: docs/business/go-to-market/marketing/ (campaign, calendar, drafted posts, social, PR, emails, scripts)
 ═══════════════════════════════════════════════════════════════════════════════════════════
-Read the Voice & Delight Bible, docs/creative/LaunchReserve.md, docs/market-analysis/*, docs/go-to-market/*.
+Read the Voice & Delight Bible, docs/creative/LaunchReserve.md, docs/business/market-analysis/*, docs/business/go-to-market/*.
 Part 1 — The launch campaign plan: channels, sequencing, and the wedge (P2-12 external-PR intake = the
 day-one "useful without changing how you run agents" hook).
 Part 2 — A content calendar + a backlog of DRAFTED posts: comparison pieces (vs GitKraken/Fork/Conductor)
@@ -88,9 +88,9 @@ on-brand visuals (LOAD THE `dataviz` SKILL; conform to the 5-theme tokens).
 
 ═══════════════════════════════════════════════════════════════════════════════════════════
 LANE J — Paid Acquisition & B2B Sales  (ads + how to find and pitch companies)
-Output: docs/go-to-market/sales/ (paid-media plan, sourcing playbook, outreach + pitch kit)
+Output: docs/business/go-to-market/sales/ (paid-media plan, sourcing playbook, outreach + pitch kit)
 ═══════════════════════════════════════════════════════════════════════════════════════════
-Read docs/go-to-market/* (the ICP + the Twente/Enschede target-company map), docs/market-analysis/*.
+Read docs/business/go-to-market/* (the ICP + the Twente/Enschede target-company map), docs/business/market-analysis/*.
 Part 1 — Paid advertising: WHERE to run ads for a developer / B2B-dev tool (not consumer channels) and HOW.
 Cover the fitting channels with a per-channel plan (fit · targeting · budget share · drafted ad creative ·
 measurement): Reddit (r/programming, r/devops, r/git), Hacker News sponsorships + a well-timed Show HN, dev
@@ -121,7 +121,7 @@ manage. Merge related files; update the AGENTS.md taxonomy to point at the hubs.
 - DESIGN HUB (docs/design/): merge Lane A (design system) + B (surfaces/features) + E (control-center/Vibe
   *design*, not the code) + I (product/UX) into one navigable design reference.
 - BRAND & VOICE HUB (docs/creative/): merge the Voice Bible + microcopy + empty states + motion + narrative.
-- GTM HUB (docs/go-to-market/): keep Mainguard_Master_Market_Document as the strategy hub; fold Lane C
+- GTM HUB (docs/business/go-to-market/): keep Mainguard_Master_Market_Document as the strategy hub; fold Lane C
   (positioning/launch narrative) + F (business plan/decks index) + G (marketing/content) + J (ads/sales)
   into a "GTM Execution" companion doc + subfolders (decks/, marketing/, sales/). Decks, blog drafts, and
   the prototype code stay as their own files, indexed from the hub.
@@ -143,7 +143,7 @@ lanes as SUBAGENTS with exactly these dependencies:
 - NOW, in parallel (independent, different outputs): spawn Lane H, Lane I, and Lane J.
 - Spawn Lane F once Lane D's deepened cost model exists (docs/phase-2/Mainguard_Cloud_Vibe_Companion.md
   updated). Spawn Lane G once Lane C's elevated Voice Bible / GTM output exists (docs/creative/ +
-  docs/go-to-market/). If those upstream lanes (C, D) are already finished, spawn F and G now too.
+  docs/business/go-to-market/). If those upstream lanes (C, D) are already finished, spawn F and G now too.
 Each subagent prepends the Master Brief, then executes ONLY its lane block, autonomously — one subagent per
 part, a PHASE REPORT after each part (what changed · self-gate vs the goal · files/tokens/types named),
 then continue. Halt a lane only if a part fails its self-gate twice or a choice contradicts DESIGN.md /

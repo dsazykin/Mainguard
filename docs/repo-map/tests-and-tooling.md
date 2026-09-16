@@ -879,7 +879,13 @@
     that width; the pre-fix parse-then-resize ordering is kept as an explicit garbled witness; a
     same-size resize still releases the buffer; chunk boundaries and the UTF-8 decoder survive the
     hold; the 2 MB cap parses rather than drops; and an `[AvaloniaFact]` drives the whole ordering
-    end to end through a real `TerminalControl` + real arrange pass),
+    end to end through a real `TerminalControl` + real arrange pass. **MG-24 adds #22's sibling —
+    the pane NARROWER than the session,** which is the one that shipped broken: with the daemon
+    reporting 120×32 into a ~620px pane the engine must keep the daemon's width and scale what it
+    draws, asserted as "identical to a native 120-column parse" plus the specific witnesses (the long
+    line intact on one row, row 1 still blank, the absolutely-positioned fragment at its recorded
+    column) — and the paired negative, that an ordinary terminal is still exactly pane-sized, so a fix
+    for the locked case cannot silently shrink every normal terminal),
     `TerminalViewModelTests` (VM forwarding of Ctrl+C→0x03,
     output→engine, debounced resize, plus the `TerminalControl.MapKey` VT-byte table, **and stress
     S1 / G5's observability half: input the gateway cannot deliver surfaces on the pane as
@@ -3261,10 +3267,17 @@
   that level too, and disposing the manager detaches rather than kills. The double mirrors `PtySession`'s
   contract — **Dispose reaps, Release lets go** — because the claim first shipped as prose against doubles
   that killed nothing on disposal, so nothing could tell that detach still ended in `Kill`),
-  `ReadOnlyAttachTests` (**F64** — a locked attach cannot Resize the managed worker's terminal while an
-  unlocked one still can; a lock applied MID-attach is honoured on the next frame, i.e. the lock is read
-  live rather than snapshotted; `TryClaimInput` is exclusive and released on dispose; and concurrent
-  `WriteInputAsync` calls are not interleaved at the byte level),
+  `ReadOnlyAttachTests` (**F64** — a lock applied MID-attach is honoured on the next frame, i.e. the
+  lock is read live rather than snapshotted; `TryClaimInput` is exclusive and released on dispose; and
+  concurrent `WriteInputAsync` calls are not interleaved at the byte level. **MG-24 narrowed F64 by the
+  owner's decision — the lock is about INPUT, and a locked attach resizes** — so the old
+  "cannot Resize" test is inverted into `LockedAttach_CannotType_ButCanStillResize`, which asserts both
+  halves in one place precisely so a later change cannot trade one for the other: the DATA frame is
+  still `PERMISSION_DENIED` and never reaches `WrittenText`, while the Resize DOES reach the CLI.
+  Geometry is then pinned on top: the `geometry` frame leads the stream and reports the size the
+  session was BOUND at rather than anything the attach asked for, and both a locked and an unlocked
+  attach are told the NEW size once their resize lands — read by scanning for the frame rather than by
+  position, since raw CLI frames interleave with it),
   `CoordinatorAllowlistTests` (**F11/F43** — a coordinator token is refused on `SpawnAgent`, `StopAgent`,
   `HarvestAgentCredentials`, `TerminalService/Attach`, `KillSwitchService/Engage`+`Resume`,
   `RunVerification`, `GetVerificationLog`, `GetMergeDiff` and `StreamQueue`, each asserted on the ROLE

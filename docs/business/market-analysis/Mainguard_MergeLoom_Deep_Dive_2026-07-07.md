@@ -274,4 +274,4 @@ Legend: **SHIPPED** = on Mainguard `main` today (v1, T-xx). **PLANNED P2-xx** = 
 
 **Negative results (searched, nothing found):** MergeLoom on HN, Reddit, Crunchbase, funding press, founder names, customer logos, status page, API docs.
 
-**Mainguard internal:** `docs/phase-2/implementation_plans/Mainguard_Master_Implementation_Document_v2.md` (branch `phase2`) — §1.1 baseline, §1.2 market traceability, §3 build order, P2-01…P2-26 specs; `docs/market-analysis/Mainguard_Naming_And_Competitive_Landscape_2026-07.md`.
+**Mainguard internal:** `docs/phase-2/implementation_plans/Mainguard_Master_Implementation_Document_v2.md` (branch `phase2`) — §1.1 baseline, §1.2 market traceability, §3 build order, P2-01…P2-26 specs; `docs/business/market-analysis/Mainguard_Naming_And_Competitive_Landscape_2026-07.md`.

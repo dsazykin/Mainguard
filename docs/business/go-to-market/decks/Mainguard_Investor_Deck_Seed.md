@@ -120,7 +120,7 @@ The moat argument is architectural, not feature-list. Verification and merge gov
 
 The first-party vendors stop structurally, not accidentally: each is incentivized to lock in, each reviews with its own model rather than deterministic local gates, and none models cross-branch staleness (Narrative §2.2). Their agents are the PR firehose our vendor-neutral intake drinks from — Jules and Codex are supply, not competition.
 
-Full defensibility argument, objection by objection, lives in `docs/go-to-market/Mainguard_Defensibility_Memo.md` — bring it to diligence.
+Full defensibility argument, objection by objection, lives in `docs/business/go-to-market/Mainguard_Defensibility_Memo.md` — bring it to diligence.
 
 ---
 

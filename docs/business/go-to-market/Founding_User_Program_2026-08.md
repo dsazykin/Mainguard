@@ -6,7 +6,7 @@ page and nowhere defines them. An undefined promise captures nobody and, worse, 
 either honour generously or walk back publicly. This document defines it before the campaign starts.
 **Reads under:** pricing in `../market-analysis/Mainguard_Market_Research_v2.md` §5.3 and
 [`Mainguard_Business_Plan.md`](Mainguard_Business_Plan.md). **Binding:** the honesty contract,
-[`../creative/Narrative.md`](../creative/Narrative.md) §0.
+[`../creative/Narrative.md`](../../creative/Narrative.md) §0.
 
 ---
 

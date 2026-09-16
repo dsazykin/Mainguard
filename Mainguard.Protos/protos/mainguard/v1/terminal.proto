@@ -44,8 +44,32 @@ message TerminalOutput {
     bytes raw = 1;               // PTY bytes (the only variant used by the interim engine)
     GridUpdate grid = 2;         // grid diffs (P2-18 libvterm engine)
     ClipboardCopy clipboard = 3; // OSC 52 copy decoded daemon-side (queries are NEVER answered)
+    Resize geometry = 4;         // this session's AUTHORITATIVE size (see below)
   }
 }
+
+// MG-24, the `geometry` frame: the daemon telling a raw-engine client what size
+// this session actually is — sent once ahead of the replay tail and again on
+// every change, so the client parses PTY bytes against the geometry that
+// produced them.
+//
+// A `grid` client never needed it (every GridUpdate carries cols/rows) but a raw
+// client had no way to learn the size at all, so it assumed its own pane was
+// authoritative. It is not, and there are three ways the size a client asks for
+// is not the size it gets:
+//
+//   1. the daemon CLAMPS dimensions (VtermSession.ClampDimension);
+//   2. the replay tail is raw bytes produced at the size BEFORE the resize;
+//   3. a second pane on the same session can win the last write.
+//
+// Guessing through any of those garbles the pane, because the CLI positions its
+// redraws by absolute cursor address computed for its real width: parse those at
+// a different width and they land on the wrong rows and overwrite each other.
+// That is what made a managed worker's terminal unreadable — it was stuck at the
+// 120x32 it was spawned with (P2-14 locked its terminal and F64 then refused the
+// viewer's resize) while the pane rendered ~68 columns. MG-24 narrowed F64 so a
+// locked attach DOES resize — the lock is about input, not geometry — and this
+// frame is what makes the outcome knowable either way.
 
 // The jailed CLI asked the terminal to place text on the clipboard (OSC 52). The
 // daemon decodes and forwards the SET only; a query ("?") is dropped at the

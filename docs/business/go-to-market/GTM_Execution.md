@@ -2,7 +2,7 @@
 
 **Strategy lives in [`Mainguard_Master_Market_Document_2026-07.md`](Mainguard_Master_Market_Document_2026-07.md) (the main reference; the [GTM Plan](Mainguard_GTM_Plan_2026-07.md) is the historical source it supersedes). This document is the execution layer over it**: one map of every fundraising, marketing, and sales asset produced in the 2026-07 lane pass (Lanes C, F, G, J), plus the unified timeline. Files keep their own homes; this page is the map. (Consolidated 2026-07-12.)
 
-**Binding on everything indexed here:** the honesty contract in [`../creative/Narrative.md`](../creative/Narrative.md) §0 — shipped vs **[Horizon]** tense, "audit-grade" never "legally required," honest 4–6-agent capacity. Narrative.md is also the copy of record for positioning, the competitor teardown, the Show HN bodies, and the founder story.
+**Binding on everything indexed here:** the honesty contract in [`../creative/Narrative.md`](../../creative/Narrative.md) §0 — shipped vs **[Horizon]** tense, "audit-grade" never "legally required," honest 4–6-agent capacity. Narrative.md is also the copy of record for positioning, the competitor teardown, the Show HN bodies, and the founder story.
 
 ## 1 · Fundraising & stakeholder layer (Lane F)
 
@@ -12,7 +12,7 @@
 | Technical deep-dive deck | [`decks/Mainguard_Deck_Technical_DeepDive.md`](decks/Mainguard_Deck_Technical_DeepDive.md) | The safe-to-merge guarantee *as* the moat, layer by layer with task-ID anchors |
 | Advisor / board-update deck | [`decks/Mainguard_Deck_Advisor_Board_Update.md`](decks/Mainguard_Deck_Advisor_Board_Update.md) | The August working session + the recurring report-back template. Logistics/FAST norms/one-pager for the visit itself: [`Advisor_Pitch_August_2026.md`](Advisor_Pitch_August_2026.md) (the engagement brief — complementary, not superseded) |
 | Swarm-vision deck | [`decks/Mainguard_Deck_Swarm_Vision.md`](decks/Mainguard_Deck_Swarm_Vision.md) | The labeled ten-year vision story, vocabulary-disciplined |
-| Business plan | [`Mainguard_Business_Plan.md`](Mainguard_Business_Plan.md) | The story around the [Cloud Vibe Companion](../phase-2/Mainguard_Cloud_Vibe_Companion.md) §5 numbers: unit economics, BYOK-vs-cloud logic, the four pricing refusals, path to the Team tier. Adds no new figures |
+| Business plan | [`Mainguard_Business_Plan.md`](Mainguard_Business_Plan.md) | The story around the [Cloud Vibe Companion](../../phase-2/Mainguard_Cloud_Vibe_Companion.md) §5 numbers: unit economics, BYOK-vs-cloud logic, the four pricing refusals, path to the Team tier. Adds no new figures |
 | NL grants | [`Mainguard_Grant_Applications_NL.md`](Mainguard_Grant_Applications_NL.md) | WBSO / VFF / MIT drafts + the funding calendar (§5); 2026 parameters, re-verify before filing |
 | Moat memo | [`Mainguard_Defensibility_Memo.md`](Mainguard_Defensibility_Memo.md) | Five moat layers with erosion scenarios + tripwires; §4 the non-moats |
 | Objection handling | [`Mainguard_Objection_Handling.md`](Mainguard_Objection_Handling.md) | Concede→fact→line answers, investor/buyer register (HN phrasings stay in Narrative §5.4) |

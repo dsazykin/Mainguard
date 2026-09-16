@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-11 · **Status:** Lane-F stakeholder document · **Register:** brand (Voice Bible rules apply)
 **What this is.** The business plan as a *story with receipts*: the strategy layer reads from `Mainguard_Master_Market_Document_2026-07.md` (the main GTM reference), and every number in the financial narrative reads from the cost & scaling model in `docs/phase-2/Mainguard_Cloud_Vibe_Companion.md` §5 (revision 2026-07-11.2) — this document adds **no new figures**; it explains why the existing ones are shaped the way they are. Where a claim is a placeholder, it says so; where a capability is unbuilt, it is marked **[Horizon]** (honesty contract, `docs/creative/Narrative.md` §0).
-**Companions:** the pitch decks in `docs/go-to-market/decks/` · the defensibility memo (`Mainguard_Defensibility_Memo.md`) · objection handling (`Mainguard_Objection_Handling.md`) · the NL grant drafts (`Mainguard_Grant_Applications_NL.md`).
+**Companions:** the pitch decks in `docs/business/go-to-market/decks/` · the defensibility memo (`Mainguard_Defensibility_Memo.md`) · objection handling (`Mainguard_Objection_Handling.md`) · the NL grant drafts (`Mainguard_Grant_Applications_NL.md`).
 
 ---
 
@@ -130,6 +130,6 @@ Carried from Part XX without dilution: **platform absorption** (highest — Curs
 - **Numbers:** `docs/phase-2/Mainguard_Cloud_Vibe_Companion.md` §5 (assumptions A1–A9; worked sessions §5.3; pricing §5.4; margin §5.5; break-even §5.6; sensitivity §5.7; business case §5.8). All flagged illustrative pending Stage-4 telemetry.
 - **Strategy & pricing structure:** `Mainguard_Master_Market_Document_2026-07.md` Parts I, II, VIII, IX–XIII, XV, XVIII, XX–XXI; `Mainguard_GTM_Plan_2026-07.md` §§3, 5, 7–9, 12.
 - **Positioning & honesty contract:** `docs/creative/Narrative.md` §§0, 3–4.
-- **Competitor facts:** `docs/market-analysis/Mainguard_MergeLoom_Deep_Dive_2026-07-07.md` (pricing §2), `Mainguard_Competitor_Research_2026-07-07.md`, `Mainguard_Viability_And_Differentiation_2026-07.md` §1.3.
+- **Competitor facts:** `docs/business/market-analysis/Mainguard_MergeLoom_Deep_Dive_2026-07-07.md` (pricing §2), `Mainguard_Competitor_Research_2026-07-07.md`, `Mainguard_Viability_And_Differentiation_2026-07.md` §1.3.
 
 *Self-gate: no figure in this document originates here; every euro/dollar amount, percentage, and date traces to a named section above. Unbuilt capabilities are tensed [Horizon]; illustrative numbers are flagged at first use and again where they'd be most tempting to quote bare (§4.3).*

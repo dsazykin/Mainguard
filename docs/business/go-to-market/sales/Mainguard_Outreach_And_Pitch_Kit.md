@@ -1,7 +1,7 @@
 # Mainguard — Outreach Sequences & Pitch Kit
 
 **Date:** 2026-07-11 · **Register:** brand (sales/GTM execution layer)
-**Reads under:** `docs/go-to-market/Mainguard_Master_Market_Document_2026-07.md` (personas §4.6,
+**Reads under:** `docs/business/go-to-market/Mainguard_Master_Market_Document_2026-07.md` (personas §4.6,
 design-partner program Part XIII, demo script §15.2, pricing Part VIII) and `docs/creative/Narrative.md`
 (positioning §3, pricing logic §4, the honesty contract §0, the first-hour comment kit §5.4 — which this
 document extends into sales objections). Companies come from

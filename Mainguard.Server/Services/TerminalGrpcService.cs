@@ -183,28 +183,59 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
         System.Threading.CancellationToken ct)
     {
         var (replay, live) = bound.Subscribe(out var unsubscribe);
+        var (cols, rows, geometry) = bound.SubscribeGeometry(out var unsubscribeGeometry);
+
+        // MG-24: there are now two producers for this response stream (PTY frames and geometry
+        // changes) and gRPC allows exactly one in-flight WriteAsync per stream, so every write goes
+        // through this gate. Without it a resize landing inside a frame write throws "the previous
+        // write is in progress" — the same failure the client-side TerminalWriteQueue exists to stop.
+        var writeGate = new System.Threading.SemaphoreSlim(1, 1);
         IDisposable? inputClaim = null;
         try
         {
+            // Geometry FIRST — ahead of the banner and ahead of the replay tail. The replay is raw
+            // PTY bytes produced at this size; a client that parses them before it knows the size
+            // parses them at its own pane width, which is exactly the garbling this frame prevents.
+            await WriteGuardedAsync(responseStream, writeGate, new TerminalOutput
+            {
+                Geometry = new Resize { Cols = (uint)cols, Rows = (uint)rows },
+            }, ct);
+
             if (isLocked())
             {
-                await responseStream.WriteAsync(new TerminalOutput
+                await WriteGuardedAsync(responseStream, writeGate, new TerminalOutput
                 {
                     Raw = ByteString.CopyFromUtf8("[read-only - managed worker]\r\n"),
-                });
+                }, ct);
             }
 
-            // Single writer to the response stream: this pump task emits replay-then-live frames.
+            // Replay-then-live PTY frames.
             var pump = Task.Run(async () =>
             {
                 foreach (var frame in replay)
                 {
-                    await responseStream.WriteAsync(new TerminalOutput { Raw = ByteString.CopyFrom(frame) });
+                    await WriteGuardedAsync(responseStream, writeGate,
+                        new TerminalOutput { Raw = ByteString.CopyFrom(frame) }, ct);
                 }
 
                 await foreach (var frame in live.ReadAllAsync(ct))
                 {
-                    await responseStream.WriteAsync(new TerminalOutput { Raw = ByteString.CopyFrom(frame) });
+                    await WriteGuardedAsync(responseStream, writeGate,
+                        new TerminalOutput { Raw = ByteString.CopyFrom(frame) }, ct);
+                }
+            }, ct);
+
+            // Later size changes. A raw client cannot infer geometry from its own frames, so a
+            // resize driven by anyone else — another attach on a shared session, or this one once
+            // the daemon has honoured it — has to be told, not deduced.
+            var geometryPump = Task.Run(async () =>
+            {
+                await foreach (var (c, r) in geometry.ReadAllAsync(ct))
+                {
+                    await WriteGuardedAsync(responseStream, writeGate, new TerminalOutput
+                    {
+                        Geometry = new Resize { Cols = (uint)c, Rows = (uint)r },
+                    }, ct);
                 }
             }, ct);
 
@@ -237,18 +268,30 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
                             await bound.WriteInputAsync(input.Data.Memory, ct);
                             break;
                         case TerminalInput.InputOneofCase.Resize:
-                            // F64: a read-only attach does not resize. "Window geometry is harmless" was
-                            // wrong twice over — a resize is a write to the managed worker's PTY
-                            // (SIGWINCH into its CLI, and a reflow of the daemon's authoritative grid),
-                            // and it is a shared one: every OTHER viewer of this session, including the
-                            // coordinator driving it, sees the terminal reshape under them because a
-                            // spectator opened a narrow window. The lock means the session is not yours
-                            // to change, and geometry is part of the session.
-                            if (isLocked())
-                            {
-                                break;
-                            }
-
+                            // MG-24 narrows F64 (owner's decision): a locked attach DOES resize.
+                            //
+                            // The lock is about INPUT — nothing may type into a managed worker, and
+                            // that half is untouched above. Geometry is not input: it is how big the
+                            // window you are looking through is, and a pane the operator can drag but
+                            // whose terminal refuses to follow is a broken window, not a safe one.
+                            // Every other pane in this app resizes; this one was the exception, and
+                            // the size it got stuck at (the 120x32 spawn default) is the reason a
+                            // worker terminal was unreadable in the first place.
+                            //
+                            // What F64 worried about does not survive contact with the mechanism:
+                            // Resize is TIOCSWINSZ on the PTY master plus a vterm reflow under the
+                            // session gate. It writes NO bytes to the PTY stream, so it cannot
+                            // interleave with an in-flight WriteInputAsync or split an escape
+                            // sequence — the corruption the input lock exists to prevent is not
+                            // reachable this way. It delivers SIGWINCH and the CLI repaints, which is
+                            // what a resize means. The residual is that SubmitObservation's
+                            // echo/reaction heuristic can see repaint output and read it as a
+                            // reaction; that type already documents itself as report-never-assert and
+                            // says neither field is proof a line became a turn.
+                            //
+                            // Two panes on one session at different sizes are last-writer-wins, as
+                            // they are in every multiplexer. The `geometry` frame is what keeps that
+                            // honest: whoever did not win is TOLD the size that did.
                             bound.Resize((int)input.Resize.Cols, (int)input.Resize.Rows);
                             break;
                     }
@@ -274,11 +317,52 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
             {
                 // The client went away mid-write — nothing to salvage; the session lives on.
             }
+
+            // Unsubscribing completes the geometry channel, which is what ends its pump. Observe it
+            // so a write that failed on a vanished client is not an unobserved task exception.
+            unsubscribeGeometry();
+            try
+            {
+                await geometryPump;
+            }
+            catch (Exception)
+            {
+                // Detach / client gone mid-write. Geometry is a latest-value signal on a stream that
+                // is closing: there is nothing to report and nothing to retry.
+            }
         }
         finally
         {
             inputClaim?.Dispose();
             unsubscribe();
+            unsubscribeGeometry();
+
+            // writeGate is deliberately NOT disposed: an exception escaping the try can reach here
+            // while a pump task is still inside WriteGuardedAsync, and disposing under it would turn
+            // a teardown into an unobserved ObjectDisposedException. A SemaphoreSlim that never had
+            // its AvailableWaitHandle touched holds nothing that needs releasing.
+        }
+    }
+
+    /// <summary>
+    /// MG-24: one write to the response stream, serialized against every other producer on it. The
+    /// gate is released even when the write throws, so a failed write ends this attach rather than
+    /// wedging the stream for the frames behind it.
+    /// </summary>
+    private static async Task WriteGuardedAsync(
+        IServerStreamWriter<TerminalOutput> responseStream,
+        System.Threading.SemaphoreSlim gate,
+        TerminalOutput frame,
+        System.Threading.CancellationToken ct)
+    {
+        await gate.WaitAsync(ct);
+        try
+        {
+            await responseStream.WriteAsync(frame);
+        }
+        finally
+        {
+            gate.Release();
         }
     }
 
@@ -339,14 +423,10 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
                             await bound.WriteInputAsync(input.Data.Memory, ct);
                             break;
                         case TerminalInput.InputOneofCase.Resize:
-                            // F64, and it bites harder on the grid path: a resize reflows the daemon's
-                            // authoritative vterm and pushes a fresh snapshot to EVERY subscriber. A
-                            // read-only spectator must not repaint the session it is watching.
-                            if (isLocked())
-                            {
-                                break;
-                            }
-
+                            // MG-24: locked attaches resize here too — see the long note on the raw
+                            // pump. The grid path costs a bit more (the reflow pushes a fresh snapshot
+                            // to every subscriber) but that is a repaint, not a corruption, and a
+                            // snapshot is exactly how a grid client is supposed to learn a new size.
                             bound.Resize((int)input.Resize.Cols, (int)input.Resize.Rows);
                             break;
                     }
