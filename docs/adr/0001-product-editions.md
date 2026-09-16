@@ -101,9 +101,9 @@ freeze prerequisite (audit PR series merged) is now satisfied.
 
 ## References
 
-- [`docs/planning/Product_Editions_And_Structural_Sequencing.md`](../planning/Product_Editions_And_Structural_Sequencing.md)
+- [`docs/archive/planning/Product_Editions_And_Structural_Sequencing.md` (archived — shipped)](../archive/planning/Product_Editions_And_Structural_Sequencing.md)
   — the approved edition plan; §6 is the ordered execution steps this ADR is step 1 of, §7 owns the
   rename-vs-split sequencing.
-- [`docs/rebrand/Mainguard_Rebrand_Plan.md`](../rebrand/Mainguard_Rebrand_Plan.md) — the phased
+- [`docs/archive/Mainguard_Rebrand_Plan.md` (archived)](../archive/Mainguard_Rebrand_Plan.md) — the phased
   `Mainguard → Mainguard` rename; Phase 3 (code identifiers) is the half fused with the assembly
   split per Decision 4.

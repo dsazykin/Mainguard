@@ -142,6 +142,14 @@ public class DataRootIsolationTests
     /// in the developer's real data root would leave the human approval gate off on the next real
     /// daemon start, silently.</para>
     ///
+    /// <para><b>Why it grew again (2026-09-16):</b> <c>ResolveAgentModelPath</c>, for the operator's
+    /// per-(role, CLI) model choice. Same shape as the plan-mode file beside it, and a failure mode in the
+    /// same family: an in-proc test host that wrote a model into the developer's real data root would
+    /// change which model their next real agent spawns with — silently, and on their bill — until they
+    /// happened to look at the Settings page. It takes its <c>tokenPath</c> and uses it, so it satisfies
+    /// <see cref="Every_daemon_store_path_resolver_follows_the_session_token"/>, which is the condition
+    /// this list's own remarks set for widening it.</para>
+    ///
     /// <para><b>Why it grew again (2026-09-03):</b> <c>ResolveHeldTaskStorePath</c>, for the plan gate's
     /// held tasks (<c>JsonHeldTaskStore</c>, beside the plan store). A gate whose held tasks lived only in
     /// memory forgot every one of them on a daemon restart while the jails survived, so the merge backstop
@@ -153,6 +161,7 @@ public class DataRootIsolationTests
         var expected = new[]
         {
             "ResolveAgentIpcRoot",
+            "ResolveAgentModelPath",
             "ResolveDataPath",
             "ResolveHeldTaskStorePath",
             "ResolveJailLimitsPath",

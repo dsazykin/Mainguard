@@ -72,6 +72,20 @@ service AgentService {
   // next jail will actually get. Applies to jails created after the call.
   rpc GetJailLimits(GetJailLimitsRequest) returns (JailLimits);
   rpc SetJailLimits(SetJailLimitsRequest) returns (JailLimits);
+  // WHICH MODEL an agent is launched with, per (role, CLI). Until this existed every jail ran whatever
+  // its CLI defaults to, and there was no way to say otherwise: the model has to be on the launch line,
+  // which the daemon builds — and for a worker no client is even in the loop, since the coordinator
+  // spawns it from inside its own jail over the mainguard-agent shim.
+  //
+  // Per ROLE because a coordinator and a worker are spent differently (one long-running planner versus
+  // many short-lived implementers), and per CLI because the vocabularies do not transfer — "opus" means
+  // nothing to codex, and opencode takes provider/model.
+  //
+  // Set is operator-only at the RoleInterceptor, on the same boundary as SetJailLimits: the model
+  // decides what every subsequent agent of that kind costs, and an agent that could raise it would be
+  // sizing its own successors' spend. Reading is harmless and stays open.
+  rpc GetAgentModels(GetAgentModelsRequest) returns (AgentModelSettings);
+  rpc SetAgentModel(SetAgentModelRequest) returns (AgentModelSettings);
   // Live per-agent CPU/RAM sampled from the container engine, plus whether each agent's spend
   // is measurable at all. The Resource Monitor was built over this data and it did not exist:
   // the client hard-coded CPU/RAM to 0, so the tab showed a convincing zero for every agent
@@ -313,6 +327,43 @@ message JailLimits {
   int64 max_memory_bytes = 6;
   double min_cpus = 7;
   double max_cpus = 8;
+}
+
+message GetAgentModelsRequest {}
+
+message SetAgentModelRequest {
+  // "coordinator" or "worker". A string rather than an enum so an unknown spelling is REFUSED by the
+  // daemon rather than silently coerced to whichever value happened to be zero — applying a model to a
+  // population the operator never chose it for is the one failure here that spends their money.
+  string role = 1;
+  string agent_kind = 2;
+  // Empty CLEARS the choice, returning that role's agents to the CLI's own default. Clearing is a state
+  // an operator returns to, so it is the same call rather than a second RPC.
+  string model = 3;
+}
+
+// One CLI's model settings, as the daemon holds them.
+message AgentModelOption {
+  // The adapter id, e.g. "claude-code" — which is also what the surface renders. There is deliberately
+  // no display_name: the daemon reads the installed MARKER, which carries no such field, so a
+  // display_name here could only be the id under another name.
+  string agent_kind = 1;
+  // Empty when this CLI does not declare how it takes a model, in which case the surface says the model
+  // is not settable rather than offering a picker that would be silently dropped at spawn.
+  string model_arg = 2;
+  // Models this CLI is KNOWN to accept — suggestions, never the complete set. Vendors add models
+  // continuously, so a client must still accept a typed value; an empty list alongside a non-empty
+  // model_arg means "settable, no suggestions".
+  repeated string known_models = 3;
+  // The operator's current choices; empty means the CLI's own default stands.
+  string coordinator_model = 4;
+  string worker_model = 5;
+}
+
+message AgentModelSettings {
+  repeated AgentModelOption options = 1;
+  // Why a Set did nothing, empty on success and on every Get. Rendered verbatim.
+  string error = 2;
 }
 
 // Versions only — no paths, no secrets (G-14).

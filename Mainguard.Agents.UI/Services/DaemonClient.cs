@@ -300,6 +300,26 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
             new SetJailLimitsRequest { MemoryBytes = memoryBytes, Cpus = cpus }, CallOptions(ct, deadline));
     }
 
+    /// <summary>Which model each installed CLI's coordinator and workers are launched with, plus what
+    /// each CLI can actually do (its declared flag and any known models).</summary>
+    public async Task<AgentModelSettings> GetAgentModelsAsync(CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        return await client.GetAgentModelsAsync(new GetAgentModelsRequest(), CallOptions(ct, deadline));
+    }
+
+    /// <summary>Sets one (role, CLI) model, or clears it with an empty <paramref name="model"/>. Returns
+    /// the WHOLE settings block as the daemon now holds it, so a caller renders what was persisted
+    /// rather than what it sent; a refusal arrives on <c>Error</c>, not as a status code.</summary>
+    public async Task<AgentModelSettings> SetAgentModelAsync(
+        string role, string agentKind, string model, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        return await client.SetAgentModelAsync(
+            new SetAgentModelRequest { Role = role, AgentKind = agentKind, Model = model },
+            CallOptions(ct, deadline));
+    }
+
     /// <summary>The agent CLIs installed in the VM the daemon can launch (ids/versions/env-var
     /// names only — never key values). What the "Start coordinator" picker lists.</summary>
     public async Task<IReadOnlyList<InstalledAdapterInfo>> ListInstalledAdaptersAsync(

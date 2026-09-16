@@ -45,9 +45,11 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
         DaemonInfoProvider info, AgentResourceProbe resources, AgentResumeService resumes,
         Mainguard.Server.Auth.IApproverIdentityResolver identity, ILoggerFactory loggerFactory,
         AgentPauseService? pauses = null,
-        Mainguard.Agents.Agents.Sandbox.JailLimitsSettings? jailLimits = null)
+        Mainguard.Agents.Agents.Sandbox.JailLimitsSettings? jailLimits = null,
+        Mainguard.Agents.Agents.Orchestrator.AgentModelSwitch? models = null)
     {
         _jailLimits = jailLimits;
+        _models = models;
         _store = store;
         _spawns = spawns;
         _adapters = adapters;
@@ -62,6 +64,11 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
 
     private readonly AgentPauseService? _pauses;
     private readonly Mainguard.Agents.Agents.Sandbox.JailLimitsSettings? _jailLimits;
+
+    /// <summary>The operator's per-(role, CLI) model choice. Optional on the same terms as
+    /// <see cref="_jailLimits"/>: a daemon built without one answers that no model is settable rather
+    /// than pretending a choice was stored.</summary>
+    private readonly Mainguard.Agents.Agents.Orchestrator.AgentModelSwitch? _models;
 
     /// <summary>The per-jail ceiling the next spawn gets (owner decision 2026-09-04).</summary>
     public override Task<JailLimits> GetJailLimits(GetJailLimitsRequest request, ServerCallContext context)
@@ -92,6 +99,91 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
             "jail limits set: memory={MemoryBytes} cpus={Cpus} (applies to jails created from now on)",
             persisted.MemoryBytes, persisted.Cpus);
         return Task.FromResult(ToWire(_jailLimits));
+    }
+
+    public override Task<AgentModelSettings> GetAgentModels(
+        GetAgentModelsRequest request, ServerCallContext context) =>
+        Task.FromResult(ModelSettings());
+
+    /// <summary>Operator-only (RoleInterceptor). Persists one choice and answers with the whole
+    /// settings block, so a surface renders what the daemon actually holds rather than what it sent.</summary>
+    public override Task<AgentModelSettings> SetAgentModel(
+        SetAgentModelRequest request, ServerCallContext context)
+    {
+        if (_models is null)
+        {
+            var unavailable = ModelSettings();
+            unavailable.Error = "this daemon has no model store bound";
+            return Task.FromResult(unavailable);
+        }
+
+        // Refused, not coerced. Defaulting an unrecognised role would apply a model — and its cost — to
+        // a population the operator never chose it for.
+        if (!Enum.TryParse<Mainguard.Agents.Agents.Orchestrator.AgentModelRole>(
+                request.Role, ignoreCase: true, out var role))
+        {
+            var bad = ModelSettings();
+            bad.Error = $"'{request.Role}' is not a role — expected 'coordinator' or 'worker'";
+            return Task.FromResult(bad);
+        }
+
+        var adapter = _adapters.List().FirstOrDefault(a =>
+            string.Equals(a.Id, request.AgentKind, StringComparison.Ordinal));
+        if (adapter is null)
+        {
+            var unknown = ModelSettings();
+            unknown.Error = $"no installed CLI called '{request.AgentKind}'";
+            return Task.FromResult(unknown);
+        }
+
+        // A CLI with no declared flag cannot carry a model, so storing one would be storing a setting
+        // nothing reads. Refused with the reason, rather than accepted and dropped at spawn.
+        if (string.IsNullOrWhiteSpace(adapter.ModelArg) && !string.IsNullOrWhiteSpace(request.Model))
+        {
+            var notSettable = ModelSettings();
+            notSettable.Error =
+                $"Mainguard cannot set {adapter.Id}'s model — this CLI does not declare a model flag";
+            return Task.FromResult(notSettable);
+        }
+
+        var stored = _models.Set(role, request.AgentKind, request.Model);
+        _log.LogInformation(
+            "agent model set: role={Role} kind={Kind} model={Model} (applies to agents spawned from now on)",
+            role, request.AgentKind, stored.Length == 0 ? "<cli default>" : stored);
+
+        return Task.FromResult(ModelSettings());
+    }
+
+    /// <summary>
+    /// The model settings block: one row per INSTALLED CLI, carrying what that CLI can do (its declared
+    /// flag and known models) beside what the operator chose. Built from the catalogue rather than from
+    /// the stored choices, so a CLI with no choice yet still gets a row — otherwise the surface could
+    /// only offer models for agents somebody had already configured.
+    /// </summary>
+    private AgentModelSettings ModelSettings()
+    {
+        var settings = new AgentModelSettings();
+        foreach (var adapter in _adapters.List().OrderBy(a => a.Id, StringComparer.Ordinal))
+        {
+            var option = new AgentModelOption
+            {
+                AgentKind = adapter.Id,
+                ModelArg = adapter.ModelArg ?? string.Empty,
+                CoordinatorModel = _models?.ModelFor(
+                    Mainguard.Agents.Agents.Orchestrator.AgentModelRole.Coordinator, adapter.Id) ?? string.Empty,
+                WorkerModel = _models?.ModelFor(
+                    Mainguard.Agents.Agents.Orchestrator.AgentModelRole.Worker, adapter.Id) ?? string.Empty,
+            };
+
+            if (adapter.Models is { Count: > 0 } known)
+            {
+                option.KnownModels.AddRange(known);
+            }
+
+            settings.Options.Add(option);
+        }
+
+        return settings;
     }
 
     private static JailLimits ToWire(Mainguard.Agents.Agents.Sandbox.JailLimitsSettings settings)

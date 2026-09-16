@@ -1,0 +1,155 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
+        x:Class="Mainguard.Agents.UI.Views.AgentDefaultsSettingsView"
+        x:DataType="vm:AgentDefaultsSettingsViewModel">
+
+  <!-- Settings → Agent Defaults: what every agent spawned from now on gets.
+
+       Plan approval is reachable here because its only other control cannot always be seen: it sits
+       inside the plan gate, and the control centre renders that gate only when there IS gate content — a
+       pending plan, an escalation, backpressure, or plan mode already OFF. With it ON and nothing waiting
+       there was no control anywhere, so the gate could be turned back on but never off. The gate keeps
+       its toggle; this page is the surface with no such condition. -->
+
+  <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+    <StackPanel Spacing="12">
+
+      <!-- Header -->
+      <Grid ColumnDefinitions="Auto,*">
+        <PathIcon Grid.Column="0" Data="{StaticResource TerminalIcon}" Width="18" Height="18"
+                  Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+        <TextBlock Grid.Column="1" Text="Agent defaults" FontSize="18" FontWeight="Bold"
+                   Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center" TextWrapping="Wrap"/>
+      </Grid>
+      <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"
+                 Text="How agents are started. These belong to the Mainguard daemon — it is what spawns each agent and builds its command line — so they are read from and saved to the daemon, and apply to agents started after you change them. An agent already running keeps what it was started with."/>
+
+      <!-- The daemon's answer to the last write: a refusal, or what was saved. -->
+      <Border Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="12"
+              IsVisible="{Binding HasStatus}">
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <PathIcon Data="{StaticResource WarningIcon}" Width="14" Height="14" VerticalAlignment="Top"
+                    Margin="0,2,0,0" Foreground="{DynamicResource DangerBrush}"
+                    IsVisible="{Binding StatusIsError}"/>
+          <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" FontSize="12">
+            <TextBlock.Styles>
+              <Style Selector="TextBlock"><Setter Property="Foreground" Value="{DynamicResource TextMuted}"/></Style>
+            </TextBlock.Styles>
+          </TextBlock>
+        </StackPanel>
+      </Border>
+
+      <!-- Plan approval -->
+      <Border Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="14">
+        <StackPanel Spacing="8">
+          <TextBlock Text="Plan approval" FontWeight="SemiBold" FontSize="13"
+                     Foreground="{DynamicResource TextPrimary}"/>
+          <!-- Read-only binding plus a Command, as in the gate it moved from: a two-way binding would let
+               the screen show a setting the daemon rejected or never received. -->
+          <CheckBox Content="Require plan approval before a worker starts"
+                    IsChecked="{Binding PlanModeEnabled, Mode=OneWay}"
+                    Command="{Binding TogglePlanModeCommand}"
+                    IsEnabled="{Binding !IsBusy}"
+                    ToolTip.Tip="On: every worker inspects the repository, writes a plan, and blocks for your approval. Off: workers are given their task at spawn and start implementing straight away."/>
+          <!-- The DAEMON's sentence for the state, not a second wording of it. Off is the state that
+               costs something, so off is the state that gets the warning hue. -->
+          <TextBlock Text="{Binding PlanModeSummary}" FontSize="11" TextWrapping="Wrap"
+                     Foreground="{DynamicResource TextMuted}" IsVisible="{Binding PlanModeEnabled}"/>
+          <TextBlock Text="{Binding PlanModeSummary}" FontSize="11" TextWrapping="Wrap"
+                     Foreground="{DynamicResource WarningBrush}" IsVisible="{Binding !PlanModeEnabled}"/>
+        </StackPanel>
+      </Border>
+
+      <!-- Models -->
+      <Border Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="14">
+        <StackPanel Spacing="10">
+          <TextBlock Text="Models" FontWeight="SemiBold" FontSize="13"
+                     Foreground="{DynamicResource TextPrimary}"/>
+          <TextBlock FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"
+                     Text="Which model each CLI is started with. The coordinator and its workers are set separately — a coordinator plans and delegates across a whole session, while workers are many and short-lived. Leave a box empty to use whatever that CLI picks on its own. Suggestions are not a complete list; you can type any model the CLI accepts."/>
+
+          <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"
+                     IsVisible="{Binding HasNoClis}"
+                     Text="No agent CLIs are installed yet — install one on the Agent CLIs page first."/>
+
+          <ItemsControl ItemsSource="{Binding Models}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="vm:AgentModelRowViewModel">
+                <Border Margin="0,0,0,8" Padding="12" CornerRadius="8" BorderThickness="1"
+                        BorderBrush="{DynamicResource BorderHairline}">
+                  <StackPanel Spacing="8">
+                    <TextBlock Text="{Binding AgentKind}" Classes="Mono" FontSize="12" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextPrimary}"/>
+
+                    <!-- A CLI that declares no model flag says so, rather than offering a picker whose
+                         value would be stored and then dropped when the agent is launched. -->
+                    <TextBlock Text="{Binding NotSettableText}" FontSize="11" TextWrapping="Wrap"
+                               Foreground="{DynamicResource TextMuted}"
+                               IsVisible="{Binding !CanSetModel}"/>
+
+                    <StackPanel Spacing="6" IsVisible="{Binding CanSetModel}">
+                      <Grid ColumnDefinitions="90,*,Auto,Auto" >
+                        <TextBlock Grid.Column="0" Text="Coordinator" VerticalAlignment="Center"
+                                   FontSize="12" Foreground="{DynamicResource TextMuted}"/>
+                        <TextBox Grid.Column="1" Text="{Binding CoordinatorModel, Mode=TwoWay}"
+                                 Watermark="the CLI's own default" FontSize="12" Margin="0,0,6,0"/>
+                        <Button Grid.Column="2" Content="▾" Padding="8,4" Margin="0,0,6,0"
+                                IsVisible="{Binding HasKnownModels}" ToolTip.Tip="Known models">
+                          <Button.Flyout>
+                            <Flyout Placement="BottomEdgeAlignedRight">
+                              <ItemsControl ItemsSource="{Binding KnownModels}" MinWidth="150">
+                                <ItemsControl.ItemTemplate>
+                                  <DataTemplate x:DataType="x:String">
+                                    <Button Content="{Binding}" FontSize="12" Padding="10,6"
+                                            HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                                            Background="{DynamicResource SurfaceHoverGhost}" BorderThickness="0"
+                                            Command="{Binding $parent[ItemsControl].((vm:AgentModelRowViewModel)DataContext).PickCoordinatorCommand}"
+                                            CommandParameter="{Binding}"/>
+                                  </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                              </ItemsControl>
+                            </Flyout>
+                          </Button.Flyout>
+                        </Button>
+                        <Button Grid.Column="3" Content="Apply" Classes="Secondary" Padding="12,4"
+                                Command="{Binding ApplyCoordinatorCommand}"/>
+                      </Grid>
+
+                      <Grid ColumnDefinitions="90,*,Auto,Auto">
+                        <TextBlock Grid.Column="0" Text="Workers" VerticalAlignment="Center"
+                                   FontSize="12" Foreground="{DynamicResource TextMuted}"/>
+                        <TextBox Grid.Column="1" Text="{Binding WorkerModel, Mode=TwoWay}"
+                                 Watermark="the CLI's own default" FontSize="12" Margin="0,0,6,0"/>
+                        <Button Grid.Column="2" Content="▾" Padding="8,4" Margin="0,0,6,0"
+                                IsVisible="{Binding HasKnownModels}" ToolTip.Tip="Known models">
+                          <Button.Flyout>
+                            <Flyout Placement="BottomEdgeAlignedRight">
+                              <ItemsControl ItemsSource="{Binding KnownModels}" MinWidth="150">
+                                <ItemsControl.ItemTemplate>
+                                  <DataTemplate x:DataType="x:String">
+                                    <Button Content="{Binding}" FontSize="12" Padding="10,6"
+                                            HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                                            Background="{DynamicResource SurfaceHoverGhost}" BorderThickness="0"
+                                            Command="{Binding $parent[ItemsControl].((vm:AgentModelRowViewModel)DataContext).PickWorkerCommand}"
+                                            CommandParameter="{Binding}"/>
+                                  </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                              </ItemsControl>
+                            </Flyout>
+                          </Button.Flyout>
+                        </Button>
+                        <Button Grid.Column="3" Content="Apply" Classes="Secondary" Padding="12,4"
+                                Command="{Binding ApplyWorkerCommand}"/>
+                      </Grid>
+                    </StackPanel>
+                  </StackPanel>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </StackPanel>
+      </Border>
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

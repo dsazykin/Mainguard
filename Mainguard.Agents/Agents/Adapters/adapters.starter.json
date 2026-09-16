@@ -374,6 +374,8 @@
   "adapters": [
     {
       "id": "claude-code",
+      "modelArg": "--model",
+      "models": ["fable", "opus", "sonnet", "haiku"],
       "displayName": "Claude Code",
       "instructionsFile": "CLAUDE.md",
       "systemPromptArg": "--append-system-prompt",
@@ -411,6 +413,7 @@
     },
     {
       "id": "codex",
+      "modelArg": "--model",
       "displayName": "OpenAI Codex CLI",
       "version": "0.145.0",
       "provenance": "npm-build-provenance",
@@ -428,6 +431,7 @@
     },
     {
       "id": "gemini-cli",
+      "modelArg": "--model",
       "displayName": "Gemini CLI",
       "version": "0.52.0",
       "provenance": "npm-registry-signature",
@@ -447,6 +451,7 @@
     },
     {
       "id": "qwen-code",
+      "modelArg": "--model",
       "displayName": "Qwen Code",
       "version": "0.20.1",
       "provenance": "npm-registry-signature",
@@ -463,6 +468,7 @@
     },
     {
       "id": "opencode",
+      "modelArg": "--model",
       "displayName": "OpenCode",
       "version": "1.18.4",
       "provenance": "npm-registry-signature",

@@ -4,10 +4,10 @@ Turning the polish backlog into precise, buildable taste specs. Every fix is a c
 design-system move — a named token, a scale value, a component class, a motion brief, or a copy
 line — pinned to a real view/control in the [AGENTS.md](../../AGENTS.md) Repository Map and cited
 against [`DESIGN.md`](../../DESIGN.md), [`PRODUCT.md`](../../PRODUCT.md), and the
-[Voice & Delight Bible](../Mainguard_Voice_And_Delight_Bible.md) (rule IDs `V-#`/`E-#`/`C-#`/`T-#`/`TT-#`/`ES-#`/`M-#`/`N-#`).
+[Voice & Delight Bible](Mainguard_Voice_And_Delight_Bible.md) (rule IDs `V-#`/`E-#`/`C-#`/`T-#`/`TT-#`/`ES-#`/`M-#`/`N-#`).
 
 **Source of the backlog.** This spec covers the polish section of
-[`docs/planning/Mainguard_Backlog.md`](../Mainguard_Backlog.md). The backlog labels it **§B-3 — Visual / feel
+[`docs/planning/Mainguard_Backlog.md`](../planning/Mainguard_Backlog.md). The backlog labels it **§B-3 — Visual / feel
 polish (cosmetic; non-blocking)** (there is no literal "B-3" heading beyond the table row; §B-3 is
 that table under "B. Deferred within shipped features"). Its seven rows are specced below, in
 descending taste-leverage order rather than backlog order.
