@@ -56,9 +56,9 @@ Send 3–5 days ahead of any meeting. Keep it to one page.
 > local-first, Windows-first — the category leader is Mac-only and the largest developer OS is unserved.
 >
 > **Business.** Free Git client (no login) as the funnel → $20/mo Pro (verification pipeline, BYO agent
-> subscriptions) → $50+/seat teams (merge governance + audit). The 2026 failure ledger (Bloop, Terragon)
-> proves orchestration alone doesn't monetize; verification and governance price against CodeRabbit
-> ($24–48/dev/mo) and Graphite (~$40).
+> subscriptions) → $50+/seat teams (merge governance + audit). Orchestration alone does not monetize, so
+> we don't sell it; verification and governance price against CodeRabbit ($24–48/dev/mo) and Graphite
+> (~$40).
 >
 > **Status.** Git core shipped (1,042 tests); verification pipeline in development. Pre-revenue by design
 > until design partners validate.
@@ -186,7 +186,7 @@ Twente engineering costs."
 *The two-track anchor is deliberate — decide after launch data, and saying so signals discipline rather
 than indecision.* Use-of-funds ordering mirrors the moat. End on the slide-1 sentence and stop talking.
 
-**Appendix slides (hold ready, don't present):** A — the failure ledger ("why won't you die like the
+**Appendix slides (hold ready, don't present):** A — why orchestration does not monetize and what we charge for instead ("why won't you die like the
 others"). B — the cloud cost model, with the illustrative flag printed on the slide. C — the empty squares
 ("isn't this crowded"). D — the EU/sovereignty angle. E — the demo (§4).
 
@@ -734,7 +734,7 @@ this week.**
 forever, no login — that's the funnel, and it has standalone value, **which is exactly what the dead
 free-orchestration tools lacked.** Revenue is the verification pipeline: Pro at $20/mo (BYOK — your keys,
 no inference markup), teams later at $50+/seat for governance — **and that tier doesn't get sold before
-those features exist.** I wrote up the failure ledger of this category; the pricing is designed against it.
+those features exist.** The pricing is designed against the way this category has failed to monetize elsewhere.
 
 ### 9.3 Show HN — act two
 
@@ -752,43 +752,20 @@ and **the founder story** (also the About-page copy).
 
 ---
 
-## 10. Press kit & video
+## 10. What else is written, and where
 
-*Detail: [Press Kit](business/go-to-market/marketing/PressKit.md); [Video Scripts](business/go-to-market/marketing/VideoScripts.md).*
+The pieces below exist in full; this is the index and their current state.
 
-**Press one-pager — two variants.** Variant 1 (act one): the client, the trust posture, the local-founder
-angle. Variant 2 (act two addendum): the verification pipeline. **A fact sheet for fact-checkers, kept
-current.** Angles by outlet type, including the Dutch list ([`GTM.md`](GTM.md) §4.4). Pre-cleared quotable
-lines used verbatim. **Asset rules:** real captures only, and anything prototype carries a persistent
-`Design prototype — mock data` label.
+| Asset | State | Full text |
+|---|---|---|
+| **The manifesto** — *"Ungoverned AI merges are a time bomb"* | **Finished, and the current anchor piece.** Pure argument, needs no demo | [Manifesto](business/go-to-market/marketing/Manifesto.md) |
+| Comparison pages vs GitKraken / Fork / Conductor | Drafted. Each opens with the concession; the Conductor page is gated present-tense-only | [Content Calendar](business/go-to-market/marketing/ContentCalendar.md) |
+| *"A 60fps commit graph without a chart library"* | Drafted — shipped-code engineering essay, real type names | Content Calendar |
+| *"The merge queue that re-verifies"* | Drafted — design essay, **[Horizon]** tense throughout | Content Calendar |
+| The `.git/index.lock`, WSL2-sandbox, AI-review-fatigue and pricing-logic essays | Outlined, not written | Content Calendar |
+| Press one-pager (two variants), fact sheet, outlet angles, pre-cleared quotes | Ready | [Press Kit](business/go-to-market/marketing/PressKit.md) |
+| 90-second explainer · founder-story film · act-two demo storyboard | Ready to shoot | [Video Scripts](business/go-to-market/marketing/VideoScripts.md) |
 
-**The press FAQ — the five questions every journalist asks:** what is it · who is it for · how is it
-different · what does it cost · who is behind it and where are they.
-
-**Video scripts.** (1) **The 90-second explainer** — the launch video, and the source clip for creator
-outreach. (2) **The founder-story film** (~2:30) — "Why I'm building Mainguard." (3) **The act-two
-live-demo storyboard** (~4:30), narrated in the product's own state words, with the persistent
-prototype label and a 30-second external-PR-intake wedge insert.
-
----
-
-## 11. Content backlog
-
-*Detail: [Manifesto](business/go-to-market/marketing/Manifesto.md); [Content Calendar](business/go-to-market/marketing/ContentCalendar.md) (the drafted pieces in full).*
-
-**The manifesto — "Ungoverned AI merges are a time bomb."** The standalone thesis essay: the blind-merge
-enemy framing as prose, five tool-agnostic defusing properties, a self-discounting disclosure, and a full
-source ledger. **Currently the anchor piece** — it's finished, it's pure argument, and it needs no demo.
-
-**Drafted and ready:**
-- Honest comparison pages vs GitKraken / Fork / Conductor — each opening with the concession and closing
-  with the positioning sentence (the Conductor page gated present-tense-only).
-- *"A 60fps commit graph without a chart library"* — the shipped-code engineering essay, with real type
-  names.
-- *"The merge queue that re-verifies"* — the design essay, in **[Horizon]** tense throughout.
-
-**Outlined, not written:** the `.git/index.lock` essay (also email A2) · the WSL2 sandbox essay ·
-AI-review fatigue · the pricing-logic essay.
-
-**Release notes** follow the Voice Bible's release-notes register: what changed, what it fixes, what it
-breaks — no adjectives.
+**Two rules bind the visual assets:** real captures only, and anything prototype carries a persistent
+`Design prototype — mock data` label. **Release notes** follow the Voice Bible register — what changed,
+what it fixes, what it breaks, no adjectives.

@@ -22,7 +22,7 @@ browser assumptions that do not apply.)
 
 ## Users
 
-Adoption runs as a deliberate three-step ladder (`docs/BUSINESS.md` §5.5), not a single persona:
+Adoption runs as a deliberate three-step ladder (`docs/BUSINESS.md` §5.4), not a single persona:
 
 - **Sam — the agent power user.** Today's actual user. Already runs several agentic CLIs (Claude
   Code, Codex, Gemini CLI, Qwen Code, OpenCode) against one repository and is losing time to them

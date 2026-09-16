@@ -18,7 +18,7 @@ else is **[Horizon]**, and no asset claims the agent platform works today.
 
 ## 1. Where we are: the stage rule
 
-*Detail: [GTM Execution](business/go-to-market/GTM_Execution.md) §3b (the three sequencing changes, on the record).*
+*Detail: [GTM Execution](business/go-to-market/GTM_Execution.md) §3b.*
 
 **We are not selling anything. We are recruiting people who will tell us the truth, and paying them in
 early access and founding-user terms.** The Git client works and is worth installing today; the agent
@@ -26,13 +26,11 @@ control center is in integration and is not. Every message says both of those th
 the people we're writing to can tell the difference in about ten seconds — and the ones who can are
 exactly the ones we want.
 
-The July-2026 plan was written for a *launch*: two acts, a Show HN at each, and a discovery → demo →
-pilot → close sales motion. The August-2026 beta lane narrowed it, and three sequencing changes are on
-the record:
+Three rules govern this stage:
 
-1. **The manifesto moves from launch-minus-one-week to first.** It is finished, it is pure argument, and
-   it needs no demo — which makes it the only anchor available while the pipeline is in integration. The
-   calendar then runs *toward* a launch rather than away from one.
+1. **The manifesto is the anchor, not the launch.** It is finished, it is pure argument, and it needs no
+   demo — which makes it the only substantial thing we can publish while the pipeline is in integration.
+   The calendar runs *toward* a launch rather than away from one.
 2. **Both Show HN bodies stay in the drawer.** Show HN is one shot; spending it before there is a
    reproducible end-to-end run converts the best distribution event available into a mediocre one. **The
    gate is a working spawn → verify → review → merge, not a date.**
@@ -275,7 +273,6 @@ embargo-free, screenshots + video attached, offer a 15-minute call. Dutch pitche
 - **Bitbash**, Info Support HQ Veenendaal, **22–23 Jan 2027** — free, and a talk slot to aim at.
 - **NL MVP circuit** — demo to three Dutch .NET MVPs pre-launch; the ".NET flagship app" story earns free
   advocacy.
-- *TNW Conference is defunct* (events and media shut down end of September 2025). Remove it from all plans.
 
 **Dutch-market nuances:** LinkedIn is disproportionately effective for B2B in NL. Product copy stays
 English; sales conversations in Dutch close Tier-1/2 companies faster. "Mainguard is proof you can build
@@ -433,34 +430,18 @@ discipline rather than indecision.
 
 ### 6.3 The advisor / stakeholder loop
 
-**The pattern that builds an advocate: ask → act on the advice → report back what happened.** The
-report-back is the step most founders skip, and the one that creates an emotional stake.
+**The loop: ask → act on the advice → report back what happened.** Ask for judgment on 2–3 *named*
+decisions rather than for a relationship; close each session with exactly one ask; report back in 2–4
+weeks with what you did and one new question. The report-back is the step that turns an advisor into an
+advocate, and the one most founders skip.
 
-**Running a session.** Ask in advance for a dedicated hour — never pitch in a social setting. Don't open
-with "will you be my advisor?"; ask for judgment on 2–3 *named* decisions (sequencing, first paying
-customers, bootstrap vs raise) and let the role emerge. Structure it ~70/30, their input over your
-context. Demo, then the questions. **Close with exactly one ask** — don't stack them.
+**The best outcome is not money.** It is their engineering team as a design partner — bounded, useful to
+*them*, and it produces evidence instead of promises.
 
-**Rank the outcomes honestly.** (1) A working relationship with a reason to talk again in a month — the
-win condition. (2) Their engineering team as a design partner: concrete, bounded, useful to *them*, and
-it produces evidence instead of promises. (3) A formal advisor role, later. (4) **Money is explicitly not
-a goal in a first conversation** — *"ask for money, get advice; ask for advice, get money twice."*
-
-**Write down** their objections (they preview every investor objection you'll ever hear), names they drop
-— never ask for intros in meeting one, let them offer — and their own workflow pain.
-
-**Afterwards:** thank-you within 48h naming the single most useful thing they said → report back in 2–4
-weeks ("you said X, I did X, here's what happened") plus one new question → repeat monthly.
-
-**Formalizing, once the loop has run 2–3 times — FAST norms** (fi.co/fast; one page, no lawyers). At
-pre-launch stage a standard advisor is **0.25%**, an expert advisor up to **1.0%**; post-launch, 0.20% /
-0.80%. Terms are **2-year monthly vesting with a 3-month cliff** — if it fizzles in the first quarter, no
-equity moved and nothing is awkward. That cliff is exactly why formalizing is *safer* for a
-family-adjacent relationship, not riskier.
-
-**Mistakes to avoid:** overselling product state (honesty about built-vs-planned *is* the credibility
-play — the Git client being real and fast does the impressing); twenty minutes of architecture when they
-care about customers, moat and you; asking for an NDA; skipping the follow-up.
+**Advisor equity, when it is time (FAST norms, fi.co/fast — one page, no lawyers):** at pre-launch stage
+a standard advisor is **0.25%**, an expert advisor up to **1.0%**; post-launch, 0.20% / 0.80%. Terms are
+**2-year monthly vesting with a 3-month cliff**, which is what makes formalizing safe rather than
+awkward: if it fizzles in the first quarter, no equity moved.
 
 ---
 
@@ -554,16 +535,10 @@ Windows/.NET-enterprise + compliance-culture market; Germany is 20 minutes from 
 enterprise with the seed round. **Don't localize the product; localize the sales conversations and case
 studies.** First DACH motion: the same segment map for Germany once 2–3 Dutch logos exist.
 
-### 7.7 Dutch playbooks worth pattern-matching
-
-**Mendix** — €250k from henQ → Dutch enterprise logos → US capital for scale → $730M Siemens exit. The
-Dutch enterprise-software playbook: local seed, Dutch logos first, US capital for scale. **Framer** — a
-world-class Dutch product team mis-aimed the wedge for six years and still won by moving one step toward
-where the money is; our equivalent move (orchestration → verification) is already made on paper — execute
-it. **Weaviate** — open/auditable core + a global developer community + cloud monetization; validates the
-FSL-daemon + free-GUI funnel + cloud sequence. **CodeSandbox** — Enschede can birth a global devtool.
-
-**The common thread: none of them won in the Dutch market — they won *from* it.**
+The Dutch software companies that got large — Mendix, Framer, Weaviate — did not win *in* this market;
+they won *from* it, using local seed money, Dutch enterprise logos and Dutch talent to fund a global,
+developer-led motion. **That is the shape of this plan, and the reason NL traction is treated as evidence
+rather than revenue.**
 
 ---
 

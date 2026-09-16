@@ -44,9 +44,9 @@ that re-verifies stale branches, risk-ranked review with per-hunk agent provenan
 an enterprise can show its compliance team. We are **Windows-first in a Mac-first category** (the
 category leader, Conductor, is Mac-only; Windows is the largest developer OS) and **agent-vendor-neutral
 in a locked-in category** (every first-party GUI manages only its own agents). Free users come for the
-Git client; teams pay for review throughput and governance. The 2025–26 corpse pile (Bloop, Terragon)
-proves orchestration alone monetizes at zero — so we never sell orchestration; we sell *trustworthy
-merges*.
+Git client; teams pay for review throughput and governance. **Orchestration monetizes at zero** — it is
+free from every vendor and no one in this category has ever made it pay — so we never sell it. We sell
+*trustworthy merges*.
 
 **The one-liner:**
 
@@ -75,18 +75,11 @@ Show HN is held in reserve until a reproducible spawn → verify → review → 
 ([`GTM.md`](GTM.md) §1). Pre-revenue by design. Founder in **Enschede, Netherlands**, which the plan
 treats as a strategic fact rather than an afterthought.
 
-**The viability verdict (2026-07, still governing).** The original headline — "run swarms of agents in
-worktrees from a GUI" — is **no longer viable as a differentiator**; that window closed in early 2026
-and the plumbing is now native to the agent CLIs. **The product remains viable because the center of
-gravity moved one step downstream:** from *running* agents to **verifying, governing, and merging what
-they produce**. Every trend increases demand for that layer, and it is exactly where a deep Git engine
-matters and wrapper tools are weakest.
-
-**Naming — resolved.** The product was *GitLoom*, which collided with MergeLoom (mergeloom.ai), a
-governance-positioned competitor in the same category. Renamed across the tree 2026-07-20 as a
-pre-release clean break. **Residual action: USPTO/EUIPO clearance in Nice classes 9 + 42 before GA.**
-*(Passages in the corpus saying "Mainguard collides with MergeLoom" are artifacts of the blanket rename
-— they described GitLoom.)*
+**Why the bet is downstream.** "Run agents in worktrees from a GUI" is not a differentiator — that
+plumbing is native to the agent CLIs and free from every vendor. **Our center of gravity is one step
+later:** not *running* agents but **verifying, governing and merging what they produce.** Every trend
+increases demand for that layer, and it is exactly where a deep Git engine matters and wrapper tools are
+weakest.
 
 ---
 
@@ -152,23 +145,7 @@ preview + sandbox-native port handling**; **scheduled automations landing in the
 working-tree snapshots**; **inline diff comments → agent**; **Agent Trace emit/consume**; **a governed
 AI-reviewer pass**; **GitLab MR parity** (the enterprise/Windows wedge demands non-GitHub).
 
-### 2.4 The strongest unclaimed ideas
-
-Five that compound the thesis and are only buildable on a real Git engine — the rest of the backlog
-lives in [`planning/Mainguard_Backlog.md`](planning/Mainguard_Backlog.md):
-
-- **Quarantine remotes.** The sandbox's only reachable remote is a daemon-owned ephemeral bare repo, so
-  a prompt-injected `git push --force origin main` becomes *structurally* impossible, not firewalled.
-- **Merge-train simulation.** Dry-run the whole queue in a scratch worktree and show what main looks
-  like after all five branches land. Competitors verify one branch at a time against main.
-- **Merge-decision replay.** One command re-derives the full chain for any commit: which plan approved
-  it, which agent wrote it, which verification receipt covered it, who reviewed which hunks.
-- **Per-agent signing identities.** Attribution at the Git-object level, surviving clone and fork —
-  unlike any vendor's side-channel metadata.
-- **Test-impact-ordered verification.** Run the impacted subset first for a fast preliminary verdict,
-  the full suite before merge — the difference between a queue that feels instant and one that doesn't.
-
-### 2.5 What we deliberately do not build
+### 2.4 What we deliberately do not build
 
 Generic "spawn N agents" UX beyond parity (commoditized, now on Windows too) · cloud execution at
 Copilot/Cursor/Jules parity (capital-intensive, off-thesis — *intake* their PRs instead; the 2027 cloud
@@ -179,7 +156,7 @@ computer-use/desktop automation (security-surface explosion inside our own sandb
 multiplayer canvases · DORA/insights dashboards · git-flow automation · full GitButler virtual-branch
 working mode.
 
-### 2.6 Licensing & trust posture (locked)
+### 2.5 Licensing & trust posture (locked)
 
 - **Source-available under the Functional Source License (FSL)** — the headless daemon, sandbox/worktree engine, agent adapters, audit
   schema. Publicly readable and auditable while legally prohibiting competing use; converts to
@@ -396,21 +373,6 @@ Our architecture contains 1–5 and 7 by design; 6 and 8 are specced. **That is 
   useful) and a cloud-only posture. "Your test suite passed in the agent's sandbox" is a fact, not an
   opinion — the antidote to AI-review fatigue. Longer term, integrate one as an optional signal.
 
-### 4.6 The failure ledger (lessons already priced in)
-
-- **Bloop / Vibe Kanban** (dead Apr 2026, 27k stars, thousands of DAU): thin orchestration + free users =
-  no business. Founder's own words: *"the vast majority are free users and we couldn't find a business
-  model."* → We lead with a paid-for job, and the free tier is a *Git client* with independent daily value.
-- **Terragon** (dead Feb 2026): cloud agent-running gets absorbed by platform vendors — its shutdown
-  notice pointed users to Claude Code Web. → We don't run agents in *our* cloud; local-first, their
-  subscriptions.
-- **Kite** (2022) — the canonical case, and the origin of what this plan calls *Kite's law*: individual
-  developers do not pay. → Revenue comes from teams; individuals are the funnel.
-- **Warp:** login walls + closed source + telemetry = a multi-year trust tax; it won its best press by
-  *removing* them. → No-login free tier, FSL daemon, published security architecture from day one.
-- **Omnara** (pivot, Feb 2026): wrapping Claude Code's UI is unmaintainable against its release pace. →
-  Integrate at the CLI/process boundary (PTY + git), never by wrapping vendor UIs.
-
 *What to watch, and what to do about each, is the erosion dashboard in §8.4.*
 
 ---
@@ -434,7 +396,9 @@ Our architecture contains 1–5 and 7 by design; 6 and 8 are specced. **That is 
 > before you review, and merges that never happen without you. Your code stays on your machine; your keys
 > stay in your keyring; every agent action is auditable.
 
-Three deliberate locks: **"several agents"**, not "swarms of 50+" (indefensible on consumer hardware);
+**Never lead with "swarm," "50 agents," or "orchestration."** All three are commoditized, and the first
+two are hardware-dishonest. Three deliberate locks follow from that: **"several agents"**, not "swarms of
+50+" (indefensible on consumer hardware);
 **plan approval in the headline** (the cheapest trust-builder we have); **auditability as core
 messaging**, not an enterprise footnote.
 
@@ -447,17 +411,7 @@ messaging**, not an enterprise footnote.
 | Engineering managers / CTOs (buyers) | "Velocity *with* governance: agents that must pass tests before review, plus an audit trail of every agent action." | Merge queue + re-verification, per-hunk provenance, SIEM export |
 | Investors | "The verification layer for the agent era — the bottleneck moved from writing code to trusting it, and we own the Git-native chokepoint." | 87% distrust; DORA stability degrading; 1M PRs in 5 months |
 
-### 5.3 Framing shortcuts (use deliberately)
-
-- **"Hope is not a merge strategy."** The enemy line — the spine of every talk, essay and post.
-- **"Conductor for Windows — with verification."** Hand journalists the analogy; it flatters twice.
-- **"Your agents' work, test-verified before you see it."** The single feature no shipped competitor has.
-- **"Validated-then-stale is unvalidated."** The named failure mode positioning against MergeLoom and
-  every CI-bound queue.
-- **Never** lead with "swarm," "50 agents," or "orchestration" — commoditized, and the vocabulary of the
-  dead companies.
-
-### 5.4 The ideal customer profile (ICP)
+### 5.3 The ideal customer profile (ICP)
 
 A **10–100 developer product company or agency, Windows-heavy or mixed-OS, already running agentic CLIs**,
 where an EM or staff engineer owns the "our review queue is drowning and I don't trust what the agents
@@ -471,7 +425,7 @@ talks), **B: Windows-first .NET shops** (the underserved flank; very high findab
 orgs** (the audit-trail axis; **sourced and nurtured now, sold to only when the governance tier ships**).
 Companies scoring on two or three axes are the bullseye.
 
-### 5.5 Personas (in adoption order)
+### 5.4 Personas (in adoption order)
 
 1. **"Sam" — the agent power user (launch persona).** Senior IC running 3–6 parallel agent sessions today
    via tmux/worktrees or Conductor-on-Mac. Pain: terminal clutter, agents stepping on each other, a
@@ -484,12 +438,13 @@ Companies scoring on two or three axes are the bullseye.
    governance, facing audit questions she can't answer. Converts on queue metrics, provenance, audit
    export. Pays $50+/seat. **Do not sell to Priya before the governance features exist.**
 
-### 5.6 Explicit non-targets (for now)
+### 5.5 Explicit non-targets (for now)
 
 Vibe coders and non-technical founders (a later cloud product, not a local install — a local Vibe Mode
 requiring admin elevation and a mid-onboarding reboot cannot beat browser-native rivals on
 time-to-first-magic) · teams all-in on cloud agents with no local loop, until external-PR intake ships ·
-OSS maintainers wanting free-forever everything — we serve them a great free client, but Kite's law holds.
+OSS maintainers wanting free-forever everything — we serve them a great free client, but individual
+developers are not the revenue plan.
 
 **The overlap risk worth naming:** any team already using GitKraken or paying for Copilot can get baseline
 functionality at **zero switching cost**. That is the most serious competitive risk independent of
@@ -545,10 +500,11 @@ on a real Git engine — and the free tier exists because the funnel must be exc
 account-walled incumbent. Line: *The client is the foundation, not the pitch — and it has to be excellent
 anyway, because you'll live in it.*
 
-**6. "Orchestration tools all died. Why are you different?"** Concede: they did. Fact: they died selling
-orchestration at $0 to individuals; we never sell orchestration, and the paid tiers price against what
-teams demonstrably pay for adjacent. Line: *The corpse pile is our moat map — every rule it taught is
-priced into the model.*
+**6. "Orchestration tools all died. Why are you different?"** Concede: they did. Fact: they were selling
+orchestration at $0 to individuals. We never sell orchestration; the free tier is a Git client with
+independent daily value, and every paid tier prices against what teams demonstrably already pay for —
+review throughput, merge reliability, governance. Line: *We don't charge for the part that has never been
+worth money.*
 
 **7. "MergeLoom already sells governed AI delivery."** Concede: live, billing, and 6–12 months ahead on
 the governance *story* — the most instructive competitor we have. Fact: structural opposites — no client,
@@ -556,7 +512,7 @@ no review surface, no interactive steering, no merge coordination, no sandbox cl
 integrity, one person. Line: *They stop at "PR opened." We govern the last mile — and a branch validated
 an hour ago, against an older main, is not validated.*
 
-**8. "Individual developers don't pay."** Concede: Kite's law holds. Fact: the funnel's outputs are
+**8. "Individual developers don't pay."** Concede: largely true, and we don't plan on it. Fact: the funnel's outputs are
 distribution, the in-company champion, and the two investor-grade metrics download counts can't fake.
 Line: *Individuals are the funnel; the business is the team tier — and we don't sell it before the
 governance features exist.*
@@ -593,21 +549,24 @@ managed, beats fifty that OOM your laptop — and when you need fifty, that's wh
 
 | Tier | Price | What it buys | Why this number |
 |---|---|---|---|
-| **Free** | $0, no login, ever | The full Git client + one sandboxed agent **[Horizon]** | The funnel must be genuinely excellent free. GitKraken's free tier is account-walled and blocks private repos; ours has no wall to hit. Warp's trust tax is why "no login" is a feature, not an absence |
+| **Free** | $0, no login, ever | The full Git client + one sandboxed agent **[Horizon]** | The funnel must be genuinely excellent free. GitKraken's free tier is account-walled and blocks private repos; ours has no wall to hit. A login wall on the tool that sits between a developer and their code is a cost we refuse to pay |
 | **Pro** | **$20/mo** or $199/yr with perpetual fallback | Unlimited local agents, verification pipeline, review cockpit, AI gateway, BYOK **[Horizon]** | $20 is the established individual AI-tool price (Cursor Pro, Claude Pro, Copilot Pro+) — no anchoring fight. BYOK means no inference-margin death. The JetBrains-style fallback is a loyalty signal, support-scoped with a separately versioned adapter channel |
 | **Team / Enterprise** | **$50+/seat** | Merge-queue + re-verification analytics, per-hunk provenance, audit/SIEM, RBAC/SSO/SCIM, budget caps, license scanning **[Horizon]** | Sits credibly above CodeRabbit Pro ($24–48/dev/mo) and Graphite (~$40) because it bundles what they each sell a slice of. **Not sold before the governance features exist** |
 | **Cloud worktrees** | usage-based, 2027 | Hosted execution sessions **[Horizon]** | The usage-revenue lever BYOK deliberately forfeits locally; solves the honest 4–6-agent ceiling |
 
-### 7.2 The four refusals (each a priced lesson)
+### 7.2 The four refusals
 
-- **We never charge for spawning agents.** The market priced orchestration at zero twice, fatally.
-- **We never resell inference at a flat rate.** A "$25/month, everything included" tier dies when heavy
-  users arrive — one heavy session per day is ~$117/month of model COGS against $25 of revenue. BYOK
+Each is a standing rule, not a preference, and each closes off a way this business could fail.
+
+- **We never charge for spawning agents.** Orchestration is free from every vendor and has never
+  monetized anywhere in this category. We sell the pipeline that makes agent output mergeable.
+- **We never resell inference at a flat rate.** A "$25/month, everything included" tier dies the moment
+  heavy users arrive — one heavy session a day is ~$117/month of model cost against $25 of revenue. BYOK
   locally; metered pass-through in the cloud.
-- **We never sell the Team tier before its features exist.** Selling promises to a compliance buyer is the
-  one unrecoverable trust failure.
-- **We never meter the customer's own hardware.** MergeLoom charges £2–4 per opened PR; our local runs cost
-  tokens only. *No per-PR meter on your own hardware.*
+- **We never sell the Team tier before its features exist.** Selling promises to a compliance buyer is
+  the one unrecoverable trust failure.
+- **We never meter the customer's own hardware.** MergeLoom charges £2–4 per opened PR; our local runs
+  cost tokens only. *No per-PR meter on your own hardware.*
 
 ### 7.3 BYOK vs cloud — the one consequential decision
 
@@ -740,7 +699,7 @@ Windows with queue semantics, never Windows alone.
 **And one cultural asset.** The trust posture — no login, no private-repo wall, local-first, BYOK in the OS
 keyring, source-available daemon, published telemetry and security architecture — is nearly free for us and
 structurally costly for each attacker: GitKraken monetizes the account wall it would have to demolish, the
-first-party vendors monetize the lock-in, and Warp already paid the trust tax that proves the asymmetry. In
+first-party vendors monetize the lock-in, and every closed tool in this space pays for the account wall in adoption. In
 a product whose thesis is "refuse blind trust," the marketing *is* the architecture. This moat can only be
 lost voluntarily.
 
@@ -792,7 +751,7 @@ feature for more than ~2 quarters**.
    broad fragile one.
 6. **NL-specific.** The home market is small — treat NL traction as *evidence*, not *revenue*. Grant
    windows are rigid, so the funding calendar must be maintained like a release calendar. Dutch ecosystem
-   institutions can vanish (TNW's events shut down in 2025) — anchor on communities, not single events.
+   institutions can vanish, so anchor on communities rather than any single event.
 7. **Hardware honesty.** ~4–6 agents on 16 GB is the local ceiling (WSL2 takes 50% of RAM by default);
    rate limits bind earlier. Never re-inflate the "50 agents" claim; cloud worktrees are the scale answer.
 
@@ -808,15 +767,17 @@ No inference margin is an accepted local trade-off, recovered via cloud. Key-han
 by OS-keyring storage, tmpfs injection, and (enterprise) Vault/Secrets-Manager integration — Mainguard
 infrastructure never proxies or observes keys.
 
-### 9.3 Technical assumptions corrected against official docs
+### 9.3 Platform constraints the plan is built on
 
-| Assumption | Verified reality | Consequence |
-|---|---|---|
-| `core.fsmonitor` masks 9P latency in the Linux sandbox | Git's builtin fsmonitor daemon **does not function on Linux** | The bind-mount performance story collapses; agent worktrees move to ext4, Git is the Windows↔Linux sync boundary |
-| Hot reload works natively via a shared bind mount | **inotify does not propagate over 9P mounts** (microsoft/WSL#4739, open) | Fixed by the same ext4-canonical topology |
-| sbx nests inside a private WSL2 distro | On Windows, sbx installs **natively**; nesting would need flaky nested-KVM-in-WSL2 | Two viable engines: Docker Engine in WSL2, or native sbx as a high-security backend. Nested design withdrawn |
-| 50+ concurrent agents | WSL2 defaults to 50% of host RAM; realistic ceiling ~4–6 agents on 16 GB | Marketing claim revised to "several agents, safely"; cloud worktrees are the scale story |
-| Interactive rebase via LibGit2Sharp | **Unsupported in libgit2** (libgit2#6332) | Rebase/worktree operations shell out to the Git CLI; LibGit2Sharp retained for reads/status/commit |
+Four verified limits that bound what can be promised. Each is a fact about the platform, not a
+preference, and each has already shaped the architecture.
+
+| Constraint | Consequence |
+|---|---|
+| **~4–6 concurrent agents on a 16 GB machine** — WSL2 takes 50% of host RAM by default, and API rate limits bind even earlier | The capacity claim is "several agents, safely." Scale beyond the laptop is the cloud tier's job, not a marketing adjective |
+| **inotify does not propagate over 9P mounts**, and Git's builtin fsmonitor daemon does not function on Linux | Agent worktrees live on ext4; Git itself is the Windows↔Linux sync boundary |
+| **Interactive rebase is unsupported in libgit2** | Rebase and worktree operations shell out to the Git CLI; LibGit2Sharp is retained for reads, status and commit |
+| **Docker sbx installs natively on Windows** and cannot be nested inside a private WSL2 distro | Two viable engines: Docker Engine inside WSL2, or native sbx as an optional high-security backend |
 
 ### 9.4 Security posture
 
@@ -874,7 +835,7 @@ concentrate in AI-positioned companies.
 | Decision | State | Where it bites |
 |---|---|---|
 | **Founding-user discount** | Open. Recommended: **50% off Pro for its first two years**, locked per person, honourable at any future price | The number must be identical in the outreach email, the waitlist page and the beta welcome mail — see [`GTM.md`](GTM.md) §3 |
-| **Trademark clearance** | Owed before GA — USPTO/EUIPO, Nice classes 9 + 42 | The rename is done; clearance is not |
+| **Trademark clearance** | Not filed. Owed before GA — USPTO/EUIPO, Nice classes 9 + 42 | Search-engine evidence is not registry data; a collision found after launch is brand damage, not paperwork |
 | **Entity** | Holding BV → Werk-BV not yet incorporated | Gates WBSO for payroll, VFF, and the Innovatiebox — [`GTM.md`](GTM.md) §5–6 |
 | **Download gating while unsigned** | Open. Recommended: **reply-gated** — it gets the conversation, delivers the SmartScreen warning personally, and keeps an unsigned binary off a public button | [`GTM.md`](GTM.md) §3 |
 | **Raise shape** | €750k–1.5M pre-seed (grants extend it ~40%) *or* skip to a $2–4M seed on launch traction. Decide on launch data, not before | [`GTM.md`](GTM.md) §5 |
