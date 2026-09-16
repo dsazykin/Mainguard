@@ -16,8 +16,8 @@
    - [`ThemeRefinement.md`](ThemeRefinement.md) — CVD color-retune spec. **§4.1 lane values superseded by DesignSystem Part 1** (authority note at its top); §4.2 diff backgrounds, §6 Loom Meridian, and §7 shipping gates remain authoritative here.
 6. Brand register (external marketing voice — never in-app copy):
    - [`Narrative.md`](Narrative.md) — **the market & launch narrative layer of record**: the honesty contract (§0, binding on all GTM copy), competitor teardown (§2), positioning + enemy framing (§3), pricing logic (§4), the two-act launch copy — final Show HN drafts, comment kit, founder story (§5) — and the README hero (§6).
-   - Operational launch assets live in the GTM hub: [`../go-to-market/marketing/`](../go-to-market/GTM_Execution.md) (Lane G), which treats Narrative as copy of record.
+   - Operational launch assets live in the GTM hub: [`../go-to-market/marketing/`](../business/go-to-market/GTM_Execution.md) (Lane G), which treats Narrative as copy of record.
 
 ## Archived
 
-- `LaunchReserve.md` → [`../obsolete docs/LaunchReserve.md`](../obsolete%20docs/LaunchReserve.md) (2026-07-12; full content preserved). Show HN / founder story / README hero / comparison tables superseded by Narrative.md §§2/5/6 and `marketing/SocialLaunchReserve.md`; §4 and §6 folded verbatim into Voice Bible Appendices C/D.
+- `LaunchReserve.md` → [`../archive/LaunchReserve.md`](../archive/LaunchReserve.md) (2026-07-12; full content preserved). Show HN / founder story / README hero / comparison tables superseded by Narrative.md §§2/5/6 and `marketing/SocialLaunchReserve.md`; §4 and §6 folded verbatim into Voice Bible Appendices C/D.

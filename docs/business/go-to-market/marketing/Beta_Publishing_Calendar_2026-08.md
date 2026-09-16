@@ -4,7 +4,7 @@
 **Reads under:** [`ContentCalendar.md`](ContentCalendar.md) (the pieces themselves), [`LaunchCampaignPlan.md`](LaunchCampaignPlan.md)
 (the two-act structure), [`SocialLaunchReserve.md`](SocialLaunchReserve.md) (Show HN bodies — **held**, see §1),
 [`Manifesto.md`](Manifesto.md) (the anchor essay, already final).
-**Binding:** the honesty contract, [`../../creative/Narrative.md`](../../creative/Narrative.md) §0 — shipped vs
+**Binding:** the honesty contract, [`../../creative/Narrative.md`](../../../creative/Narrative.md) §0 — shipped vs
 **[Horizon]** tense, "audit-grade" never "legally required," honest 4–6-agent capacity.
 
 ---
@@ -113,7 +113,7 @@ spend your Show HN.
 
 | Item | Channel | Notes |
 |---|---|---|
-| Publish [`docs/security-architecture.md`](../../security-architecture.md) publicly | Site | The proof asset the market research names for exactly this audience: *"this audience converts on verifiable claims."* Publishing it while the product is unfinished is a *stronger* move than publishing it at launch — it says you designed for scrutiny before you needed to survive it |
+| Publish [`docs/security-architecture.md`](../../../security-architecture.md) publicly | Site | The proof asset the market research names for exactly this audience: *"this audience converts on verifiable claims."* Publishing it while the product is unfinished is a *stronger* move than publishing it at launch — it says you designed for scrutiny before you needed to survive it |
 | A post about the egress-proxy design | Blog, LinkedIn, X | Default-deny egress, model APIs and registries reachable, **the git host is not** — so an agent can't clone or exfiltrate. This is the most concrete, most checkable claim you own |
 | Dutch-language LinkedIn post | LinkedIn | The EU-hosting / local-first angle. Every serious Dutch target raised it independently (Topicus: *"Data mag niet naar Big Tech"*). This one post does more for the sales track than anything else on the calendar |
 

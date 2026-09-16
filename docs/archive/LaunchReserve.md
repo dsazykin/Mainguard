@@ -1,5 +1,5 @@
 > **ARCHIVED (2026-07-12 consolidation) — superseded, full content preserved below unchanged.**
-> - §1 Show HN, §2 founder story, §5 README hero → superseded by [`docs/creative/Narrative.md`](../creative/Narrative.md) §5 (copy of record) and operationalized in [`docs/go-to-market/marketing/SocialLaunchReserve.md`](../go-to-market/marketing/SocialLaunchReserve.md)
+> - §1 Show HN, §2 founder story, §5 README hero → superseded by [`docs/creative/Narrative.md`](../creative/Narrative.md) §5 (copy of record) and operationalized in [`docs/business/go-to-market/marketing/SocialLaunchReserve.md`](../business/go-to-market/marketing/SocialLaunchReserve.md)
 > - §3 comparison tables → superseded by `Narrative.md` §2
 > - §4 agent naming → folded verbatim into the [Voice & Delight Bible](../creative/Mainguard_Voice_And_Delight_Bible.md) Appendix C
 > - §6 release-notes voice guide → folded verbatim into the Voice Bible Appendix D
@@ -11,8 +11,8 @@
 Register: **brand** (external marketing), the pass PRODUCT.md flags as out of scope for in-app copy
 and the Voice Bible reserves for launch. Brand register is warmer than product register, but the
 personality does not change: **premium & precise** (PRODUCT.md). Every rule below is cited to the
-[Voice & Delight Bible](../Mainguard_Voice_And_Delight_Bible.md) (`V-#` voice, `N-#` naming) or to
-[DESIGN.md](../DESIGN.md) / [PRODUCT.md](../PRODUCT.md).
+[Voice & Delight Bible](../creative/Mainguard_Voice_And_Delight_Bible.md) (`V-#` voice, `N-#` naming) or to
+[DESIGN.md](../../DESIGN.md) / [PRODUCT.md](../../PRODUCT.md).
 
 ## Honesty contract (read before quoting anything here)
 
@@ -34,7 +34,7 @@ Two standing honesty rules, carried from the market analysis, govern the forward
   agents (about 4–6 on a 16 GB laptop)** — not "100 agents." Competitors who advertise 100 (Superset)
   state it as a *goal*; we state our real ceiling (Competitor Research §5, Viability §1.1).
 
-Sources for every competitor claim: `docs/market-analysis/` — chiefly
+Sources for every competitor claim: `docs/business/market-analysis/` — chiefly
 `Mainguard_Competitor_Research_2026-07-07.md`, `Mainguard_MergeLoom_Deep_Dive_2026-07-07.md`,
 `Mainguard_Viability_And_Differentiation_2026-07.md`, and
 `Mainguard_Naming_And_Competitive_Landscape_2026-07.md`.
@@ -344,7 +344,7 @@ is benefit-first.
   *legally required crypto*. Capacity framed honestly (~4–6 agents on 16 GB, not 100).
 - **Naming.** Agent-name options stay in the loom / weave family and pair name with status (N-2,
   N-3, N-4); mascot/mood/verdict names explicitly rejected.
-- **Sources.** Competitor tables and figures drawn from `docs/market-analysis/` (Competitor Research
+- **Sources.** Competitor tables and figures drawn from `docs/business/market-analysis/` (Competitor Research
   2026-07-07, MergeLoom Deep Dive 2026-07-07, Viability & Differentiation 2026-07, Naming &
   Competitive Landscape 2026-07); no blank cells; every competitor cell reflects those docs'
   findings, including their **unverified** caveats where relevant.

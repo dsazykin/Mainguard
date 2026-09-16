@@ -160,7 +160,7 @@ Unit-economics headline, flagged as illustrative placeholders: platform COGS is 
 **Speaker notes.**
 A negative-space slide closes a technical pitch better than a roadmap slide — it shows the design has a spine. Each line is a priced lesson: auto-merge is the enemy blessed (Composio AO merges when CI is green; *we prove it's still green after everyone else merged* — Narrative §2.2); "50 agents" is the vocabulary of the dead companies and indefensible on consumer hardware (honesty contract §0.3); inference resale is margin death (GTM Plan §8); UI-wrapping is Omnara's pivot (GTM Plan §5.4).
 
-Close by returning to slide 1's invariant, and offer the objection-handling doc (`docs/go-to-market/Mainguard_Objection_Handling.md`) and the red-team plan (`docs/phase-2/Mainguard_Orchestration_RedTeam_Plan.md`) for the deep-diligence follow-up. A technical audience converts on the willingness to be probed.
+Close by returning to slide 1's invariant, and offer the objection-handling doc (`docs/business/go-to-market/Mainguard_Objection_Handling.md`) and the red-team plan (`docs/phase-2/Mainguard_Orchestration_RedTeam_Plan.md`) for the deep-diligence follow-up. A technical audience converts on the willingness to be probed.
 
 ---
 

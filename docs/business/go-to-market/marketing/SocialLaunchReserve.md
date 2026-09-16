@@ -2,7 +2,7 @@
 
 **Lane G Part 3 · Register: brand (founder first-person on social surfaces) · Status: ready to post, gated by the calendar.**
 
-The launch-day operations file: everything postable, in one place, pre-written so launch days are spent in the comment threads, not the drafts folder. **Copy-of-record rule:** the Show HN act-one body and the founder story are owned by [`docs/creative/Narrative.md`](../../creative/Narrative.md) (§5.2, §5.5) — they are mirrored here for one-stop launch-day use and must be reconciled against Narrative before posting; if they ever disagree, Narrative wins. Everything else in this file (the expanded FAQ, the act-two full body, all threads, the LinkedIn and Bluesky copy, the About-page trim) is original to this file and this is its home.
+The launch-day operations file: everything postable, in one place, pre-written so launch days are spent in the comment threads, not the drafts folder. **Copy-of-record rule:** the Show HN act-one body and the founder story are owned by [`docs/creative/Narrative.md`](../../../creative/Narrative.md) (§5.2, §5.5) — they are mirrored here for one-stop launch-day use and must be reconciled against Narrative before posting; if they ever disagree, Narrative wins. Everything else in this file (the expanded FAQ, the act-two full body, all threads, the LinkedIn and Bluesky copy, the About-page trim) is original to this file and this is its home.
 
 Every string honors the honesty contract (Narrative §0), the never-say list (Narrative §3.4), and the five-question gate. Founder-voice surfaces (HN, threads) use "I"; the product never does.
 

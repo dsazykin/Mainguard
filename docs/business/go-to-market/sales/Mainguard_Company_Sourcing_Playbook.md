@@ -1,7 +1,7 @@
 # Mainguard — Target-Company Sourcing Playbook
 
 **Date:** 2026-07-11 · **Register:** brand (sales/GTM execution layer)
-**Reads under:** `docs/go-to-market/Mainguard_Master_Market_Document_2026-07.md` — the ICP (§4.5),
+**Reads under:** `docs/business/go-to-market/Mainguard_Master_Market_Document_2026-07.md` — the ICP (§4.5),
 personas (§4.6), non-targets (§4.7), the Twente/Enschede base and national target map (Part IX), the
 design-partner program (Part XIII), and EU expansion sequencing (Part XVIII). Outreach itself —
 sequences, templates, pitch, pilots — lives in the companion

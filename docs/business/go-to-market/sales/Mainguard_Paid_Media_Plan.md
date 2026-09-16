@@ -1,7 +1,7 @@
 # Mainguard — Paid Media Plan (developer & B2B channels)
 
 **Date:** 2026-07-11 · **Register:** brand (sales/GTM execution layer)
-**Reads under:** `docs/go-to-market/Mainguard_Master_Market_Document_2026-07.md` (the strategy hub; channel
+**Reads under:** `docs/business/go-to-market/Mainguard_Master_Market_Document_2026-07.md` (the strategy hub; channel
 priorities §14.5, pricing Part VIII, launch plan Part XIV) and `docs/creative/Narrative.md` (positioning,
 the honesty contract §0, framing shortcuts §3.3). Every ad string here has passed the Voice Bible
 five-question gate (Appendix A); brand register, no exclamation marks (V-2), concrete objects (V-1),
