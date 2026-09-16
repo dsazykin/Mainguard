@@ -207,10 +207,10 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
                 UserResized?.Invoke(this, new TerminalResizeEventArgs(cols, rows));
             }
 
-            // MG-24: whether that ask is granted is the daemon's call. When it is not — an
-            // input-locked managed worker, where F64 refuses to reshape a session the viewer does not
-            // own — the grid stays larger than the pane, and this engine simply CLIPPED it: the right
-            // hand side of a 120-column worker was drawn past the edge and lost. Scale to fit instead.
+            // MG-24: what that ask BECOMES is the daemon's call, and until its snapshot arrives — or
+            // when it clamps the size, or another pane wins the last write — the grid can be larger
+            // than the pane. This engine simply CLIPPED that: the right-hand side of a 120-column
+            // worker was drawn past the edge and lost. Scale to fit instead.
             UpdateRenderScale(finalSize);
         }
 

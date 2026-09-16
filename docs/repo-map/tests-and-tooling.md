@@ -3258,15 +3258,17 @@
   that level too, and disposing the manager detaches rather than kills. The double mirrors `PtySession`'s
   contract — **Dispose reaps, Release lets go** — because the claim first shipped as prose against doubles
   that killed nothing on disposal, so nothing could tell that detach still ended in `Kill`),
-  `ReadOnlyAttachTests` (**F64** — a locked attach cannot Resize the managed worker's terminal while an
-  unlocked one still can; a lock applied MID-attach is honoured on the next frame, i.e. the lock is read
-  live rather than snapshotted; `TryClaimInput` is exclusive and released on dispose; and concurrent
-  `WriteInputAsync` calls are not interleaved at the byte level. **MG-24 adds F64's other half:** a
-  locked attach is TOLD the authoritative size it may not change — the `geometry` frame leads the
-  stream, reports the size the session was bound at rather than anything the attach asked for, and is
-  not contradicted by a refused resize; the unlocked counterpart is told the NEW size once its resize
-  is honoured, read by scanning for the geometry frame rather than by position, since raw CLI frames
-  interleave with it),
+  `ReadOnlyAttachTests` (**F64** — a lock applied MID-attach is honoured on the next frame, i.e. the
+  lock is read live rather than snapshotted; `TryClaimInput` is exclusive and released on dispose; and
+  concurrent `WriteInputAsync` calls are not interleaved at the byte level. **MG-24 narrowed F64 by the
+  owner's decision — the lock is about INPUT, and a locked attach resizes** — so the old
+  "cannot Resize" test is inverted into `LockedAttach_CannotType_ButCanStillResize`, which asserts both
+  halves in one place precisely so a later change cannot trade one for the other: the DATA frame is
+  still `PERMISSION_DENIED` and never reaches `WrittenText`, while the Resize DOES reach the CLI.
+  Geometry is then pinned on top: the `geometry` frame leads the stream and reports the size the
+  session was BOUND at rather than anything the attach asked for, and both a locked and an unlocked
+  attach are told the NEW size once their resize lands — read by scanning for the frame rather than by
+  position, since raw CLI frames interleave with it),
   `CoordinatorAllowlistTests` (**F11/F43** — a coordinator token is refused on `SpawnAgent`, `StopAgent`,
   `HarvestAgentCredentials`, `TerminalService/Attach`, `KillSwitchService/Engage`+`Resume`,
   `RunVerification`, `GetVerificationLog`, `GetMergeDiff` and `StreamQueue`, each asserted on the ROLE

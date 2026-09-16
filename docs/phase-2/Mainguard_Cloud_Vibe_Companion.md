@@ -278,7 +278,7 @@ Every number in §5.2–5.8 traces to a row here. Change a row, and the sections
 | A6 | **An active cloud user's month** | 12 typical + 4 light + 1 heavy session; 2 GB stored | The profile the per-user math (§5.5) uses. |
 | A7 | **Pricing rules** | Platform units (compute + storage + bandwidth) billed at **3.5× our cost**; model spend passed through at **cost + 10% handling** | The markup is the product revenue; the 10% compensates for carrying the model vendor's bill and its risk (§5.4). |
 | A8 | **Fixed platform cost** at beta scale | \$10,000/month | Front-door fleet, KMS, audit infrastructure, observability, on-call amortization. Grows step-wise with scale, not per-session. |
-| A9 | **GTM price anchors** | Free \$0 · Pro \$20/mo · Team \$50+/seat · Cloud worktrees usage-based (2027) | `docs/go-to-market/Mainguard_GTM_Plan_2026-07.md` §8. Market context: GitHub Copilot moved to metered "AI Credits" (June 2026, Pro \$10 / Pro+ \$39); MergeLoom prices per outcome at £4/PR (`docs/go-to-market/Mainguard_Master_Market_Document_2026-07.md`). |
+| A9 | **GTM price anchors** | Free \$0 · Pro \$20/mo · Team \$50+/seat · Cloud worktrees usage-based (2027) | `docs/business/go-to-market/Mainguard_GTM_Plan_2026-07.md` §8. Market context: GitHub Copilot moved to metered "AI Credits" (June 2026, Pro \$10 / Pro+ \$39); MergeLoom prices per outcome at £4/PR (`docs/business/go-to-market/Mainguard_Master_Market_Document_2026-07.md`). |
 
 ## 5.2 What one session consumes — the full bill of materials
 
