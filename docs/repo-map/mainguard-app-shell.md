@@ -1234,7 +1234,13 @@
     launch-progress delta re-arms it, and a build that keeps reporting runs as long as it needs.
     `DaemonBackedOrchestrator` still passes a 60-minute hard cap as the gRPC deadline, so a daemon that
     chatters without progressing is bounded too — the false timeout was traded for a bounded one, never
-    for an infinite wait. A user's Stop stays an `OperationCanceledException`, never a timeout.)
+    for an infinite wait. A user's Stop stays an `OperationCanceledException`, never a timeout. Its
+    `delay`/`clock` constructor parameters have always been test seams; `DaemonBackedOrchestrator` now
+    forwards its own `SpawnDelayOverride`/`SpawnClockOverride` into them so the WIRING test can reach
+    them too. That was a real gap, not tidiness: `SpawnSilenceBudget` alone only compressed the budget,
+    and a compressed real budget is still a real race — the keep-alive test beat a 300 ms budget every
+    40 ms on the wall clock, so a thread-pool stall longer than the budget was genuine silence, the
+    watchdog tripped correctly, and CI went red on a healthy change.)
   - `DaemonBackedOrchestrator.cs` (**P2-47**: the real, DaemonClient-backed implementation of every
     control-center seam —
     `IAgentService`/`IMergeQueueService`/`ICoordinatorService`/`IKillSwitchService`/`ITelemetryService`/`IVibeService`
