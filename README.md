@@ -125,7 +125,7 @@ docker compose run --rm shell     # interactive toolchain shell (e.g. dotnet ef 
 
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — build, test, run. Start here to work on the code.
 - [`AGENTS.md`](AGENTS.md) — architecture, the design system, conventions, and the hard review rules. The source of truth.
-- [`docs/STATUS.md`](docs/STATUS.md) — **what is built and what is not**, task by task, with the code that proves each claim. The table below is the summary; that page is the detail.
+- [`docs/STATUS.md`](docs/STATUS.md) — **what is built and what is not**, task by task, with the code that proves each claim.
 - [`docs/README.md`](docs/README.md) — **the documentation index**: what is in `docs/`, in what reading order, and where a new doc goes.
 - [`docs/security-architecture.md`](docs/security-architecture.md) — the sandbox, egress, and merge-safety security model.
 - [`docs/phase-2/`](docs/phase-2/) — the multi-agent platform design and the binding implementation spec.

@@ -12,7 +12,7 @@ Anything superseded lives in [`archive/`](archive/README.md) and is not current.
 |---|---|---|
 | 1 | [`../README.md`](../README.md) | What the product is, and what is built vs. planned. |
 | 2 | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) | Build, test, run. The contributor on-ramp. |
-| 3 | [`STATUS.md`](STATUS.md) | **Is X done?** One row per task, status derived from the code rather than from prose. Check here before starting anything. |
+| 3 | [`STATUS.md`](STATUS.md) | **Is X done?** One row per task, verified against the code. Check here before starting anything. |
 | 4 | [`../AGENTS.md`](../AGENTS.md) | **The source of truth** for architecture, conventions, and the hard review rules. |
 | 5 | [`repo-map/README.md`](repo-map/README.md) | Where any given file lives, indexed per project. Use it instead of re-scanning the tree. |
 
@@ -30,7 +30,7 @@ they carry no rules of their own.
 | [`review/`](review/) | 9 | How to test and review: the phase-1/2/3 hands-on procedures, the agent-cycle runbook, the full test matrix, and the manual user-testing guide. |
 | [`adr/`](adr/) | 1 | Architecture Decision Records. Cross-cutting decisions, `Status → Context → Decision → Consequences`. |
 | [`planning/`](planning/) | 1 | `Mainguard_Backlog.md` — the single source of truth for what is **not** built yet. |
-| [`STATUS.md`](STATUS.md) | 1 | **What is built and what is not**, per task, with the file or type that proves each claim. The binding spec does not record status; this does. |
+| [`STATUS.md`](STATUS.md) | 1 | **What is built and what is not**, per task, with the file that proves each claim. |
 | [`security-architecture.md`](security-architecture.md) | 1 | The sandbox, egress, and merge-safety threat model. |
 | [`mainguardos-updates.md`](mainguardos-updates.md) | 1 | The Mainguard OS payload update mechanism. |
 
