@@ -69,7 +69,9 @@ export function Home() {
             <p className="lede">
               Most tools ask the agent whether its work is good. Mainguard never does. The verdict
               is the container's real exit code, read by a trusted daemon from outside the
-              container. Printing "all tests passed" buys an agent nothing.
+              container. Printing "all tests passed" buys an agent nothing.{' '}
+              <Link to="/verification">See the whole mechanism</Link>, including what it does not
+              do.
             </p>
           </Reveal>
           <Reveal delay={80}>
