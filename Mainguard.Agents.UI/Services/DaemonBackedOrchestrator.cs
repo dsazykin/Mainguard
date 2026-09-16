@@ -175,6 +175,25 @@ public sealed class DaemonBackedOrchestrator :
     internal static TimeSpan SpawnSilenceBudget { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// The watchdog's wait primitive and elapsed-time source, per instance, so a test can drive the whole
+    /// event→watchdog wiring on SIMULATED time. Null in production, where the watchdog uses
+    /// <see cref="Task.Delay(TimeSpan, CancellationToken)"/> and a <see cref="System.Diagnostics.Stopwatch"/>.
+    ///
+    /// <para><b>Why this seam has to exist.</b> <see cref="SpawnSilenceBudget"/> alone let the wiring test
+    /// compress five minutes into a few hundred milliseconds, but a compressed REAL budget is still a real
+    /// race: the test proved "progress keeps the spawn alive" by posting heartbeats faster than the budget
+    /// on a wall clock, so one GC pause or thread-pool stall longer than the budget made the watchdog trip
+    /// correctly and the test fail anyway. It was measuring the CI runner's scheduling, not the wiring —
+    /// and it did fail that way. <see cref="SpawnProgressWatchdog"/> has had these two parameters since it
+    /// was written, for exactly this reason; only the orchestrator's own construction of it was hardcoded,
+    /// which put them out of reach of the one test that goes through the orchestrator.</para>
+    /// </summary>
+    internal Func<TimeSpan, CancellationToken, Task>? SpawnDelayOverride { get; set; }
+
+    /// <summary>Elapsed time since the watchdog was created. See <see cref="SpawnDelayOverride"/>.</summary>
+    internal Func<TimeSpan>? SpawnClockOverride { get; set; }
+
+    /// <summary>
     /// The outer bound on a spawn, carried as the gRPC deadline, so removing the false timeout does not
     /// create an unbounded wait. It is deliberately far past any healthy launch (a cold toolchain build
     /// plus a container start), because it exists to stop a pathological case — a daemon that keeps
@@ -958,7 +977,7 @@ public sealed class DaemonBackedOrchestrator :
     internal async Task<T> SpawnUnderWatchdogAsync<T>(
         Func<CancellationToken, TimeSpan, Task<T>> call, CancellationToken ct)
     {
-        var watchdog = new SpawnProgressWatchdog(SpawnSilenceBudget);
+        var watchdog = new SpawnProgressWatchdog(SpawnSilenceBudget, SpawnDelayOverride, SpawnClockOverride);
         lock (_gate)
         {
             _spawnWatchdogs.Add(watchdog);

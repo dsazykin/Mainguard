@@ -6,14 +6,15 @@ exists today, the code wins — see [`../AGENTS.md`](../AGENTS.md) *What Maingua
 
 Anything superseded lives in [`archive/`](archive/README.md) and is not current.
 
-## New here? Read these four, in order
+## New here? Read these five, in order
 
 | # | Read | Why |
 |---|---|---|
 | 1 | [`../README.md`](../README.md) | What the product is, and what is built vs. planned. |
 | 2 | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) | Build, test, run. The contributor on-ramp. |
-| 3 | [`../AGENTS.md`](../AGENTS.md) | **The source of truth** for architecture, conventions, and the hard review rules. |
-| 4 | [`repo-map/README.md`](repo-map/README.md) | Where any given file lives, indexed per project. Use it instead of re-scanning the tree. |
+| 3 | [`STATUS.md`](STATUS.md) | **Is X done?** One row per task, verified against the code. Check here before starting anything. |
+| 4 | [`../AGENTS.md`](../AGENTS.md) | **The source of truth** for architecture, conventions, and the hard review rules. |
+| 5 | [`repo-map/README.md`](repo-map/README.md) | Where any given file lives, indexed per project. Use it instead of re-scanning the tree. |
 
 `../CLAUDE.md`, `../GEMINI.md` and `../CHATGPT.md` are thin per-assistant pointers at `AGENTS.md`;
 they carry no rules of their own.
@@ -29,6 +30,7 @@ they carry no rules of their own.
 | [`review/`](review/) | 9 | How to test and review: the phase-1/2/3 hands-on procedures, the agent-cycle runbook, the full test matrix, and the manual user-testing guide. |
 | [`adr/`](adr/) | 1 | Architecture Decision Records. Cross-cutting decisions, `Status → Context → Decision → Consequences`. |
 | [`planning/`](planning/) | 1 | `Mainguard_Backlog.md` — the single source of truth for what is **not** built yet. |
+| [`STATUS.md`](STATUS.md) | 1 | **What is built and what is not**, per task, with the file that proves each claim. |
 | [`security-architecture.md`](security-architecture.md) | 1 | The sandbox, egress, and merge-safety threat model. |
 | [`mainguardos-updates.md`](mainguardos-updates.md) | 1 | The Mainguard OS payload update mechanism. |
 
@@ -52,8 +54,8 @@ for provenance, never as a spec.
 ## Where does a new doc go?
 
 Put it in the matching folder above. A loose new `docs/*.md` is drift — the two that exist
-(`security-architecture.md`, `mainguardos-updates.md`) are long-standing exceptions, not a
-precedent.
+(`security-architecture.md`, `mainguardos-updates.md`) are long-standing exceptions, and `STATUS.md`
+is deliberately at the top level because it is the page people need first.
 
 **When a doc is superseded or its work ships, move it to `archive/` and add a one-line status note
 at the top** saying what replaced it and when. Don't delete it, and don't leave it in place looking
