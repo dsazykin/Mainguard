@@ -2,7 +2,8 @@
 
 **19 shipped · 5 partial · 6 prototype · 32 planned** — of 62 tasks in the
 [master doc](phase-2/implementation_plans/Mainguard_Master_Implementation_Document_v2.md), which
-does not itself record status.
+does not itself record status. Plus [4 open items](#open-items-outside-the-task-list) that are not
+tasks at all.
 
 `Shipped` implemented · `Partial` some of it is real · `Prototype` UI renders, engine returns
 nothing · `Planned` no code.
@@ -75,6 +76,21 @@ Verified by reading the code. A merged PR is **not** evidence — see [Traps](#t
 | P3-08 | Skills marketplace | Planned | — |
 | P3-09 | CI/CD janitor | Planned | — |
 | P3-10 | Team collaboration | Planned | — |
+
+## Open items outside the task list
+
+Real work, named inside other docs rather than as a `P2-*` task. Listed here so it is not buried.
+
+| Item | State | Source |
+|---|---|---|
+| **App/Server version-lockstep CI guard** | **Unbuilt, and untracked.** No guard exists in `.github/workflows/` or `build/ci/`. The rule it would enforce is *binding* and fails silently: both update tiers deploy on version comparison, not content, so a daemon fix at an unchanged version is never deployed. Review is the only guard. | [mainguardos-updates](mainguardos-updates.md#versioning-discipline-binding) |
+| **`DEBIAN_SNAPSHOT` cadence has lapsed** | Pinned at `20250601T000000Z`; the line has not moved since 2026-07-14, against a documented first-week-of-month bump. Missed security-snapshot advances. | [mainguardos-updates](mainguardos-updates.md#cadence) |
+| **Host-un-forgeable presence factor** | Deferred (OPS §10.1). The mTLS residual: a same-uid process can read `daemon-client.pfx` and impersonate the client. | [security-architecture](security-architecture.md#residuals) |
+| **Approver identity from the client certificate** | Unblocked but not done — the connection now carries a genuine peer credential; deriving approver identity from it was never implemented. | [security-architecture](security-architecture.md#residuals) |
+
+Two further items there are **accepted risks, not work**: the F5 package-proxy exfiltration channel,
+and MG-33 (`kernel.yama.ptrace_scope` is non-namespaced, so it affects the user's other WSL distros).
+Both are stated deliberately — read them before claiming the sandbox is airtight.
 
 ## Traps
 
