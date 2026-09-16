@@ -71,12 +71,18 @@ export function Pro() {
                   <IconWorktree /> Jailed parallel agents
                 </h3>
                 <p className="muted">
-                  Five pinned CLI adapters (Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode), each
-                  running in its own hardened container: no-new-privileges, seccomp, dropped
-                  capabilities, read-only rootfs, user namespaces and per-jail resource limits.
-                  They cannot touch each other's work, and they can never touch your working
-                  directory. On Windows they run in a lightweight background WSL2 VM with no
-                  Docker Desktop dependency. On macOS they run natively.
+                  Five CLI adapters (Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode), each
+                  pinned by version and sha256, each running in its own hardened container:
+                  no-new-privileges, seccomp, dropped capabilities, read-only rootfs, user
+                  namespaces and per-jail limits on CPU, memory and lifetime. They cannot touch
+                  each other's work, and they can never touch your working directory.
+                </p>
+                <p className="muted">
+                  On Windows the jails live on ext4 inside a lightweight background VM rather than
+                  on a Windows filesystem seen through a translation layer, which is where the
+                  usual WSL2 build times go. No Docker Desktop, no licence, nothing in your tray.
+                  On macOS the daemon runs natively and uses whichever engine you already have:
+                  Docker Desktop, OrbStack or Colima.
                 </p>
               </div>
               <AgentsVignette />
@@ -213,6 +219,49 @@ export function Pro() {
         </div>
       </section>
 
+      <section className="section" aria-label="Architecture">
+        <div className="container">
+          <Reveal>
+            <h2 data-thread-node>Two processes, one privilege boundary.</h2>
+            <p className="lede">
+              The window you look at has no privileges. A headless daemon owns everything that
+              matters, and the two talk over a defined gRPC surface. The UI cannot start a
+              container, edit the queue or touch a budget, so a bug in a view cannot become a bug
+              in your repository.
+            </p>
+          </Reveal>
+          <Reveal delay={80}>
+            <dl className="spec-list">
+              {(
+                [
+                  [
+                    'The jail cannot reach your git host',
+                    'default-deny egress. Model APIs and package registries resolve, your host does not, so an agent cannot clone your other repositories or push anywhere',
+                  ],
+                  [
+                    'Only the daemon talks to a host',
+                    'and it does so through a read-only proxy, which is the component an agent has no path to',
+                  ],
+                  [
+                    'Toolchains are baked ahead of time',
+                    'a jail does not fetch at runtime, so a compromised package feed has nothing to poison mid-run',
+                  ],
+                  [
+                    'Your working directory is never in play',
+                    'agents get their own worktrees. The files you have open stay yours, uncommitted changes included',
+                  ],
+                ] as Array<[string, string]>
+              ).map(([t, d]) => (
+                <div key={t}>
+                  <dt>{t}</dt>
+                  <dd>{d}</dd>
+                </div>
+              ))}
+            </dl>
+          </Reveal>
+        </div>
+      </section>
+
       <section className="section" aria-label="The stop control">
         <div className="container">
           <Reveal>
@@ -235,15 +284,17 @@ export function Pro() {
             <dl className="spec-list">
               {(
                 [
-                  ['Default-deny egress', 'model APIs and registries reachable from a jail; your git host is not'],
-                  ['Read-only git proxy', 'only the daemon may reach a host, so an agent cannot clone or exfiltrate'],
-                  ['Pre-baked toolchains', 'declared and built ahead of time, so nothing fetches at runtime'],
-                  ['Conflict parking', 'a branch that can no longer merge cleanly is parked, not silently dropped'],
+                  ['Exactly-once merges', 'an atomic compare-and-swap, so two agents racing cannot both land'],
+                  ['A queue with legal moves only', 'entries move through a defined state machine, never into a state nobody designed'],
+                  ['Conflict parking', 'a branch that can no longer merge cleanly is parked, never silently dropped'],
+                  ['Stranded work recovers', 'an entry that loses its jail gets a live one back instead of becoming a dead row'],
+                  ['Flagged changes need a nod', 'a sensitive diff cannot be approved by reflex. You acknowledge it first'],
                   ['Real terminals', 'genuine OS pseudo-terminals (ConPTY, forkpty), not a pipe pretending'],
                   ['Persistent conversations', "an agent's CLI history survives its jail being rebuilt"],
+                  ['Budgets that actually stop', 'per-agent and per-day token and cost ceilings, enforced before the call goes out'],
+                  ['Honest admission control', 'Pro refuses work it cannot run rather than overselling your hardware'],
                   ['Resource monitor', 'live CPU, memory and jail pressure across the fleet'],
                   ['External PR intake', 'bot-authored PRs enter the same gate as everything else'],
-                  ['Per-jail limits', 'CPU, memory and lifetime ceilings you set, enforced by the daemon'],
                   ['Daemon logs', 'the privileged side is inspectable, not a black box'],
                 ] as Array<[string, string]>
               ).map(([t, d]) => (

@@ -65,9 +65,10 @@ export function Client() {
                   <IconGraph /> A commit graph that moves like the app is native, because it is
                 </h3>
                 <p className="muted">
-                  Branches, merges and tags drawn as colored lanes at a rock-solid 60fps, whether
-                  your history has a hundred commits or a hundred thousand. Scrolling never stutters;
-                  selection never lags.
+                  Branches, merges and tags drawn as colored lanes at a rock-solid 60fps, on a
+                  hundred commits or a hundred thousand. A real DAG lane-routing engine on a
+                  virtualized vector canvas, so the frame cost is what you can see rather than what
+                  the repository holds. Scrolling never stutters and selection never lags.
                 </p>
               </div>
               <GraphVignette />
@@ -83,7 +84,10 @@ export function Client() {
                 <p className="muted">
                   Files, hunks or single lines. Build precise commits out of a messy working
                   directory. The diff view shows whitespace ghosts and word-level changes so
-                  nothing slips through. Try it: stage a few lines and commit them.
+                  nothing slips through, and the patch engine underneath is tested against{' '}
+                  <span className="mono">git apply</span>, because a staging tool that quietly
+                  produces a patch git would reject is worse than no staging tool. Try it: stage a
+                  few lines and commit them.
                 </p>
               </div>
               <StagingVignette />
@@ -97,8 +101,10 @@ export function Client() {
                   <IconMerge /> Conflicts, without the cold sweat
                 </h3>
                 <p className="muted">
-                  Ours, theirs and the merged result side by side. Every choice stays reversible until
-                  you commit, and the safer path is always the obvious one.
+                  Ours, theirs and the merged result side by side, in one synchronized three-pane
+                  editor. Merge, rebase, cherry-pick and pull all route into the same place, so a
+                  conflict is the same job every time instead of four different ones. Every choice
+                  stays reversible until you commit, and the safer path is always the obvious one.
                 </p>
               </div>
               <ConflictVignette />
@@ -234,10 +240,19 @@ export function Client() {
             <h2 data-thread-node>Why free? Honestly:</h2>
             <p className="lede">
               The client is the handshake. It is complete. Nothing is held back behind an upgrade
-              prompt, and it never asks who you are. When you're ready to put coding
-              agents to work, <Link to="/pro">Pro</Link> is where Mainguard earns its keep. Until
-              then, enjoy a Git client that respects you.
+              prompt, and it never asks who you are. When you're ready to put coding agents to
+              work, <Link to="/pro">Pro</Link> is where Mainguard earns its keep. Until then, enjoy
+              a Git client that respects you.
             </p>
+            <div className="legal-callout">
+              <p>
+                The free client is not Pro with the good parts switched off. The two are separate
+                builds, and the agent platform is not in the free one at all. Its dependency
+                closure physically excludes that code, and a CI gate fails the build if it ever
+                creeps back in. There is no dormant paid feature sitting in your binary waiting
+                for a licence check, because there is no licence check anywhere in it.
+              </p>
+            </div>
           </Reveal>
         </div>
       </section>

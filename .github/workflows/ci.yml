@@ -48,3 +48,40 @@ jobs:
       # run `dotnet format` locally once, commit the result, then re-run.
       - name: Verify formatting
         run: dotnet format --verify-no-changes
+
+  # main is the branch mainguard.dev deploys from, and until now nothing under site/ was compiled
+  # or checked on a PR — deploy-site.yml only runs on push to main, i.e. after the merge. A broken
+  # site was therefore only discoverable once it was already live.
+  #
+  # Deliberately NO `paths:` filter. A path filter is how a guard silently stops running.
+  site:
+    name: Site builds & copy keeps its voice
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install (locked)
+        working-directory: site
+        run: npm ci
+
+      # `npm run build` is `tsc -b && vite build`: the type check AND the bundle, the same command
+      # deploy-site.yml runs. A PR that breaks either fails here instead of on main.
+      - name: Build (tsc -b + vite build)
+        working-directory: site
+        run: npm run build
+
+      - name: Lint
+        working-directory: site
+        run: npx oxlint
+
+      # The copy was rewritten once to strip em dashes and stock marketing phrasing, and nothing
+      # stopped the next edit from putting it back. Copy drift is invisible to tsc and to the
+      # bundler. /privacy and /terms are exempt: their register is legal, not marketing.
+      - name: Marketing copy keeps its voice
+        run: node build/ci/check-site-copy.mjs
