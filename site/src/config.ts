@@ -53,3 +53,6 @@ export const LEGAL_LAST_UPDATED = '15 September 2026';
  * the product moved. A stale technical page is worse than none.
  */
 export const VERIFICATION_REVIEWED = '16 September 2026';
+
+/** Shown on /roadmap. Move it whenever a feature changes group. */
+export const ROADMAP_REVIEWED = '16 September 2026';

@@ -4,6 +4,7 @@ import { PatrolSpine } from '../components/PatrolSpine';
 import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { Reveal } from '../lib/Reveal';
 import { IconArrowRight } from '../components/Icons';
+import { Planned, PlannedFootnote } from '../components/Planned';
 
 export function Home() {
   return (
@@ -152,7 +153,11 @@ export function Home() {
                   <div className="trio-meta">
                     <span className="pill pill-accent">Planned · cloud · waitlist open</span>
                   </div>
-                  <h3>Mainguard Cloud</h3>
+                  <h3>
+                    Mainguard Cloud
+                    {/* The whole card is already a link, so this one must not be. */}
+                    <Planned what="Mainguard Cloud" linked={false} />
+                  </h3>
                   <p>
                     Describe what you want built. Agents build it in the cloud and every change is
                     verified before it lands. You get a working product with a clean history
@@ -197,6 +202,10 @@ export function Home() {
           </Reveal>
         </div>
       </section>
+
+      <div className="container">
+        <PlannedFootnote />
+      </div>
       </div>
     </>
   );

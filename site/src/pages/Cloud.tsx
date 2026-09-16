@@ -2,6 +2,7 @@ import { Link } from 'react-router';
 import { Reveal } from '../lib/Reveal';
 import { PatrolSpine } from '../components/PatrolSpine';
 import { CloudVignette, WindowFrame } from '../components/vignettes';
+import { Planned, PlannedFootnote } from '../components/Planned';
 import { IconCloud, IconShield, IconThreads, IconArrowRight } from '../components/Icons';
 
 export function Cloud() {
@@ -10,7 +11,10 @@ export function Cloud() {
       <PatrolSpine />
       <div className="container page-hero">
         <span className="pill pill-accent">Planned · cloud · waitlist open</span>
-        <h1 style={{ marginTop: 'var(--space-4)' }}>Describe it. Ship it verified.</h1>
+        <h1 style={{ marginTop: 'var(--space-4)' }}>
+          Describe it. Ship it verified.
+          <Planned what="Mainguard Cloud" />
+        </h1>
         <p className="lede">
           Mainguard Cloud is for builders who don't want to think about git at all. Tell it what
           you want; coding agents build it in the cloud, every change passes the gate before it
@@ -18,8 +22,9 @@ export function Cloud() {
           case you ever need it.
         </p>
         <p className="muted" style={{ marginTop: 'var(--space-4)' }}>
-          Cloud is a plan rather than a product. This page describes where it is headed, after
-          Pro, and the waitlist is how you hear when it is real.
+          Cloud is a plan rather than a product. Nothing on this page is built yet, so read all of
+          it as intent. It comes after Pro, it sits in the planned group on the{' '}
+          <Link to="/roadmap">roadmap</Link>, and the waitlist is how you hear when it is real.
         </p>
         <hr className="thread-rule" />
       </div>
@@ -204,6 +209,10 @@ export function Cloud() {
           </Reveal>
         </div>
       </section>
+
+      <div className="container">
+        <PlannedFootnote />
+      </div>
     </div>
   );
 }

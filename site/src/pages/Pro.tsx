@@ -10,6 +10,7 @@ import {
   AuditVignette,
   WindowFrame,
 } from '../components/vignettes';
+import { Planned, PlannedFootnote } from '../components/Planned';
 import { IconShield, IconEye, IconKey, IconWorktree, IconMerge, IconGraph, IconLock } from '../components/Icons';
 
 export function Pro() {
@@ -316,7 +317,8 @@ export function Pro() {
             <h2 data-thread-node>Honestly, not yet</h2>
             <p className="lede">
               Named because a roadmap is not a feature list. These are designed and intended, and
-              none of them is in the product today.
+              none of them is in the product today. Each one carries the mark wherever this site
+              mentions it, and all of them sit on the <Link to="/roadmap">roadmap</Link>.
             </p>
             <dl className="spec-list">
               {(
@@ -328,7 +330,10 @@ export function Pro() {
                 ] as Array<[string, string]>
               ).map(([t, d]) => (
                 <div key={t}>
-                  <dt>{t}</dt>
+                  <dt>
+                    {t}
+                    <Planned what={t} />
+                  </dt>
                   <dd>{d}</dd>
                 </div>
               ))}
@@ -393,6 +398,10 @@ export function Pro() {
           </Reveal>
         </div>
       </section>
+
+      <div className="container">
+        <PlannedFootnote />
+      </div>
     </div>
   );
 }
