@@ -76,12 +76,14 @@ public partial class AgentDocumentViewModel : ViewModelBase
     {
         var info = _agents.ListAgents().FirstOrDefault(a => a.AgentId == AgentId);
         if (info is null) return;
-        Title = $"{info.Name} · {info.Branch}";
+        // The document header names WHICH agent this is, so it leads with the row's label rather than
+        // the CLI kind — the branch after it already carries the id.
+        Title = $"{info.DisplayName} · {info.Branch}";
         StateWord = info.State.ToString();
         ComposerHint = !CanPromptDirectly
             ? "Managed by the Coordinator — steer from the Coordinator chat."
             : info.State == AgentLifecycleState.Working
-                ? $"{info.Name} is streaming — messages queue until it's idle."
+                ? $"{info.DisplayName} is streaming — messages queue until it's idle."
                 : "Send a follow-up prompt";
 
         TerminalText = string.Join("\n", _agents.GetTerminalTail(AgentId));

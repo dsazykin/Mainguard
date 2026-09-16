@@ -656,7 +656,22 @@
     badge-geometry key + a single `AgentStatus` the View colours through the one
     `AgentStatusBrushConverter`; `NeedsAttention` from `AttentionPolicy`; no color and no second
     status→brush map in the VM — P2-13; `RefreshBadgeBrush()` re-runs the converter on live theme
-    switch), `AgentRailViewModel` (2d — the Pro agent rail as its own surface: a thin view over
+    switch. **`DisplayName`** is what the row is labelled — `AgentInfo.DisplayName`: the human's name,
+    else the worker's brief, else `RoleWord + ShortId` ("Worker 70b21c13"). It bound `Name` (the CLI
+    kind) until then, so four claude-code sessions rendered four identical rows. **`IsSelected`** drives
+    `Classes.active`; the row had no selection state at all, which is half of why the highlight never
+    moved off the coordinator. The row also owns the **context menu** — open / rename / reset name /
+    review / verify / verification log / copy id / copy branch / pause-resume / end / delete — as thin
+    dispatches through `IAgentRowActions`, implemented by `ControlCenterViewModel` because every one of
+    them needs a confirmation, a daemon seam or a toast that a recyclable list item must not own),
+    `AgentActionPrompt.cs` (`AgentActionKind` + the one pending question the agent-action card asks —
+    rename / end / delete. **The consequence sentence is a field on the record, not something the view
+    composes**, because the three differ in exactly the way a human needs told and a dialog is worst at
+    conveying: ending keeps the work, deleting destroys it, renaming touches nothing. A shared "are you
+    sure?" over a variable verb would make the destructive one look like the recoverable one, so each
+    carries its own words written where the difference is known — including the branch NAME in the
+    delete copy, since "its branch" is abstract and `agent/70b21c13` is the thing about to stop
+    existing), `AgentRailViewModel` (2d — the Pro agent rail as its own surface: a thin view over
     `ControlCenterViewModel` exposing its `Agents` list + the kill-switch
     `IsFrozen`/`KillSwitchLabel`/`ToggleKillSwitchCommand`, re-raising the two derived readouts when the
     control center flips them; the shell hosts it as opaque `AgentRailContent` → `AgentRailView` via
@@ -1333,6 +1348,17 @@
     harvest under the outcome's OWN `RepoHandle` — the sweep walks every agent on the daemon, so filing
     by "whichever repo is open" is exactly how one repo's allowlist would land under another's name.
     See [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md).
+    `AgentNameStore.cs` — the names a human typed for individual agents, one JSON file per repository
+    under `<data root>/agent-names/`, following `CliSettingsStore` (and reusing its `ScopeSegment`) for
+    the same reason: a name is not a credential, it is something the owner should be able to read, edit
+    and delete, and "forget every name I gave in this repo" is then one file. Keyed on the AGENT ID
+    deliberately, and that is the opposite of `DockLayoutPersistence`'s choice — a layout is meant to
+    survive into the next agent of the same kind, whereas a name names *this* session, so carrying it
+    forward would attach a person's label to work they never saw. The consequence (entries outlive their
+    agents) is handled by `Forget` on delete and `Prune(repo, liveIds)` against the live listing.
+    `Clean` collapses newlines and caps at `MaxNameLength` — a pasted paragraph must not either wrap a
+    rail row to four lines or be clipped while the store holds something else — and is applied on READ
+    too, so a hand-edited file cannot introduce a name the app would never have written.
     `VmExitGuard.cs` — the pure full-exit-warning decision
     (`ShouldConfirm(stopVmOnExit, liveAgents)`) + dialog copy: a VM-stopping full exit under live agents
     confirms first; `App.RequestFullExitGuardedAsync` is the guarded path every user-facing exit takes

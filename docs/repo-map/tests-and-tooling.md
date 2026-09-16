@@ -2043,6 +2043,18 @@
   `ActivityBarRailUsesProjectionTests` — the rail really ROUTES through `AgentListProjection.LifoOrder`
   rather than re-spelling it inline, proved through a same-spawn-instant tie only the helper breaks;
   plus the bulk-snapshot ordering, which the old per-row `Insert(0, …)` reversed),
+  **`AgentDisplayNameTests`** (the naming ladder and its FLOOR: two agents of the same CLI never share a
+  label, and the label is never the bare id nor the bare kind — the two things the rail could previously
+  show; plus the `AgentNameStore` round-trip, its per-repo scoping, blank-clears-rather-than-stores, the
+  newline/length clean, corrupt-file tolerance, and `Forget`/`Prune`),
+  **`AgentRailSelectionTests` + `MainWindowSectionHighlightTests`** (the two halves of "the coordinator
+  stays highlighted when you switch to an agent": rows gaining a selection at all, and `ShowAgent` no
+  longer lighting the Coordinator SECTION row while still routing content there. The second was checked
+  against the pre-fix call and does fail on it. The section half runs under the **Pro** manifest — the
+  Client manifest omits the Coordinator section, so the defect cannot exist there),
+  **`AgentRenameFlowTests`** (menu item → seeded card → confirm → the name the row renders, driven
+  through the shipped view models because the joins are what break: a card opened on the wrong agent, a
+  confirm storing stale box contents, a reset that does not put the derived name back),
   `NotificationSuppressionTests`, `DockLayoutPersistenceTests` (pure),
   **`DockLayoutRestoreTests` (the persistence is actually WIRED: `AgentWorkspaceViewModel` reports its
   pane order, restores a saved one, saves on close before teardown clears the graph, lets the live deck

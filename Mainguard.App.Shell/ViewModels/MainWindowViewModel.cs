@@ -187,11 +187,19 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable, IShellRai
     /// that resolves <c>ResourceMonitorView</c> via ViewLocator.</summary>
     [ObservableProperty] private object? _resourceMonitor;
 
-    private void ActivateSection(string section)
+    /// <param name="section">The section to route content to.</param>
+    /// <param name="lit">The section row to LIGHT, when it differs from the one being routed to.
+    /// They differ in exactly one case, and it is the reason this parameter exists: viewing an agent
+    /// is routed to the Coordinator section — the agent's workspace is a panel inside it — but the
+    /// coordinator is not what the human is looking at. Lighting the routed section unconditionally
+    /// is what left the Coordinator row highlighted after switching to an agent, with no other row
+    /// ever taking the highlight from it.</param>
+    private void ActivateSection(string section, string? lit = null)
     {
         SelectedSectionId = section;
         if (!IsHostSectionActive) HostSectionContent = null;
-        foreach (var s in RailSections) s.IsActive = s.Id == section;
+        var active = lit ?? section;
+        foreach (var s in RailSections) s.IsActive = s.Id == active;
     }
 
     /// <summary>Route a data-driven rail row's activation to the matching section command — the exact
@@ -300,8 +308,18 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable, IShellRai
     private void ShowAgent(string agentId)
     {
         ControlCenter?.SelectAgent(agentId);
-        ActivateSection("Coordinator");
+
+        // Routed to the Coordinator section (that is where an agent workspace is hosted) but lighting
+        // NOTHING in the section rail: the agent's own row in the agent rail below is what is selected
+        // now, and it lights itself. Passing a section id that no row carries is deliberate — "none of
+        // these" is the honest state for the section rail while an agent is being viewed.
+        ActivateSection("Coordinator", lit: NoSectionLit);
     }
+
+    /// <summary>A section id no rail row has, used to mean "light none of them". A sentinel rather than
+    /// a nullable because <see cref="ActivateSection"/>'s <c>lit: null</c> already means "the routed
+    /// section", and the two states are different.</summary>
+    private const string NoSectionLit = "\u0000none";
 
     /// <summary>Direct-to-agent prompting (File menu → Agent prompting). "Direct" lets the
     /// composer in an agent document send straight to that agent; "Through the Coordinator"

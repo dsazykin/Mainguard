@@ -22,7 +22,8 @@ namespace Mainguard.Agents.UI.ViewModels;
 /// interfaces, so the mock can later be swapped for a DaemonClient with zero View changes.
 /// Refresh model: OPS §3.4 — events refresh the projection; every gate re-reads state.
 /// </summary>
-public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Mainguard.UI.Editions.IAgentPlatformSurface
+public partial class ControlCenterViewModel
+    : ViewModelBase, IDisposable, Mainguard.UI.Editions.IAgentPlatformSurface, IAgentRowActions
 {
     private readonly IAgentService _agents;
     private readonly IMergeQueueService _queue;
@@ -425,7 +426,9 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
     // ---- projections ----
 
-    private void RefreshAgents()
+    /// <remarks>Internal rather than private so the rail's reconcile — the pass that rebuilds and
+    /// reorders rows — can be driven directly by a test asserting that the selection survives it.</remarks>
+    internal void RefreshAgents()
     {
         // The coordinator is NOT a row among the workers: it is its own entity, owned by the
         // coordinator surface (the card below). Only worker/manual agents populate the rail.
@@ -454,7 +457,7 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             var at = IndexOfAgent(info.AgentId);
             if (at < 0)
             {
-                Agents.Insert(rank, new AgentRowViewModel(info));
+                Agents.Insert(rank, new AgentRowViewModel(info, this));
             }
             else
             {
@@ -462,10 +465,17 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                 if (at != rank) Agents.Move(at, rank);
             }
 
+            // The NOTIFICATION says which agent wants you, so it gets the row's label rather than the
+            // CLI kind — "claude-code needs you" names nothing when three of them are running.
             _attentionNotifications.OnStatusChanged(
-                info.AgentId, info.Name,
+                info.AgentId, info.DisplayName,
                 Mainguard.Agents.UI.ViewModels.Agents.AgentStatusMap.FromLifecycle(info.State));
         }
+
+        // Rows are created and reordered above, so the highlight is re-applied AFTER: a row inserted by
+        // this pass has IsSelected false, and the selected agent may be one of them (its first snapshot
+        // can arrive after the click that selected it).
+        RefreshRowSelection();
 
         RefreshAttention();
     }
@@ -1297,6 +1307,41 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         Workspace.ShowAgent(agentId, terminal, doc, null);
 
         IsCoordinatorFocus = false;
+        RefreshRowSelection();
+    }
+
+    [RelayCommand]
+    public void FocusCoordinator()
+    {
+        IsCoordinatorFocus = true;
+
+        // CLEARED, not merely shadowed. `SelectedAgentId` used to keep naming the last agent viewed
+        // after the human went back to the coordinator, so "which surface is being viewed" had two
+        // answers at once and every reader had to know which of them outranked the other.
+        SelectedAgentId = null;
+        RefreshRowSelection();
+    }
+
+    /// <summary>
+    /// Lights exactly the row being viewed, and nothing else.
+    ///
+    /// <para>This is the half of the highlight the rail never had. An agent row carried no selection
+    /// state at all, so selecting an agent lit nothing — while the Coordinator section row stayed lit,
+    /// because showing an agent is routed as "the Coordinator section with a different panel inside
+    /// it". The visible result was a highlight that never moved off the coordinator.</para>
+    ///
+    /// <para>Driven from <see cref="SelectedAgentId"/> and <see cref="IsCoordinatorFocus"/> together
+    /// rather than toggled at each call site: a selection set in one place and cleared in three is how
+    /// the two got out of step to begin with.</para>
+    /// </summary>
+    private void RefreshRowSelection()
+    {
+        var selected = IsCoordinatorFocus ? null : SelectedAgentId;
+        foreach (var row in Agents)
+        {
+            row.IsSelected = selected is not null
+                && string.Equals(row.AgentId, selected, StringComparison.Ordinal);
+        }
     }
 
     /// <summary>The workspace-layout bucket for an agent: its KIND (e.g. <c>claude-code</c>), falling back
@@ -1350,8 +1395,6 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         }
     }
 
-    [RelayCommand]
-    public void FocusCoordinator() => IsCoordinatorFocus = true;
 
     /// <summary>Wires a task-manager resource monitor onto the same backing services; the owner disposes
     /// the returned VM. Kept returning the concrete type for direct (test/harness) callers — the shell
@@ -1529,6 +1572,186 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// <summary>Dismiss the review cockpit overlay.</summary>
     [RelayCommand]
     public void CloseReview() => ReviewCockpit = null;
+
+    // ---- IAgentRowActions: the agent rail's context menu ------------------------------------------
+    //
+    // The rail's rows raise intent; everything that needs a confirmation, a daemon call or a sentence
+    // for a human happens here, beside the surfaces that already own those things.
+
+    /// <summary>What the pending agent-action card is asking about, or null when nothing is pending.
+    /// One slot, not one per kind: two confirmations open at once would be two questions about the
+    /// same fleet with no stated order between them.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsAgentActionPending))]
+    private AgentActionPrompt? _agentAction;
+
+    public bool IsAgentActionPending => AgentAction is not null;
+
+    /// <summary>The text in the rename box while a rename is pending. Separate from the prompt record
+    /// so typing does not rebuild it on every keystroke.</summary>
+    [ObservableProperty] private string _agentActionInput = "";
+
+    void IAgentRowActions.Open(string agentId) => SelectAgent(agentId);
+
+    async Task IAgentRowActions.PauseOrResumeAsync(string agentId)
+    {
+        // Re-read the live state rather than trusting the label the row rendered: the menu may have
+        // been open while the agent paused itself, and "Pause" on a paused jail is a refusal a human
+        // would read as a bug.
+        var paused = _agents.ListAgents()
+            .FirstOrDefault(a => a.AgentId == agentId)?.State == AgentLifecycleState.Paused;
+        try
+        {
+            if (paused)
+            {
+                await _agents.ResumeAgentAsync(agentId).ConfigureAwait(true);
+            }
+            else
+            {
+                await _agents.PauseAgentAsync(agentId).ConfigureAwait(true);
+            }
+        }
+        catch (Exception ex)
+        {
+            // The daemon's refusal is the sentence — it knows why (an in-flight machine hold, a jail
+            // that is already gone) and this layer does not.
+            Editions.ProComposition.ShowShellToast(ex.Message, true);
+        }
+
+        RefreshAgents();
+    }
+
+    void IAgentRowActions.BeginRename(string agentId)
+    {
+        var info = _agents.ListAgents().FirstOrDefault(a => a.AgentId == agentId);
+        // Seeded with the name in force — the typed one if there is one, otherwise the derived one, so
+        // "rename" starts from what the person is actually looking at rather than an empty box.
+        AgentActionInput = info?.DisplayName ?? string.Empty;
+        AgentAction = AgentActionPrompt.Rename(agentId, info?.DisplayName ?? agentId);
+    }
+
+    void IAgentRowActions.ResetName(string agentId)
+    {
+        _agents.RenameAgent(agentId, null);
+        RefreshAgents();
+    }
+
+    void IAgentRowActions.Review(string agentId) => OpenReview(agentId);
+
+    async Task IAgentRowActions.VerifyAsync(string agentId)
+    {
+        var outcome = await _queue.RunVerificationAsync(agentId).ConfigureAwait(true);
+        // The daemon's own sentence, and warning-coloured unless the run actually happened AND passed:
+        // a refusal and a red suite are both things the human has to act on.
+        Editions.ProComposition.ShowShellToast(outcome.Reason, !outcome.Ran || !outcome.Passed);
+        Queue.Refresh();
+    }
+
+    async Task IAgentRowActions.ViewVerificationLogAsync(string agentId)
+    {
+        // Routed to the agent's OWN document, whose verification panel already owns the log — its
+        // fetch, its truncation notice and its "couldn't read the artifact" wording. A second renderer
+        // would be a second place for those to be got wrong, and the panel is on screen anyway once the
+        // agent is selected.
+        SelectAgent(agentId);
+        if (SelectedDocument?.Verification is { } panel && !panel.IsExpanded)
+        {
+            await panel.ToggleCommand.ExecuteAsync(null).ConfigureAwait(true);
+        }
+    }
+
+    async Task IAgentRowActions.CopyAsync(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return;
+        }
+
+        await Editions.ProComposition.CopyToClipboard(value).ConfigureAwait(true);
+        Editions.ProComposition.ShowShellToast($"Copied {value}", false);
+    }
+
+    void IAgentRowActions.ConfirmEnd(string agentId)
+    {
+        var info = _agents.ListAgents().FirstOrDefault(a => a.AgentId == agentId);
+        AgentAction = AgentActionPrompt.End(agentId, info?.DisplayName ?? agentId);
+    }
+
+    void IAgentRowActions.ConfirmDelete(string agentId)
+    {
+        var info = _agents.ListAgents().FirstOrDefault(a => a.AgentId == agentId);
+        AgentAction = AgentActionPrompt.Delete(
+            agentId, info?.DisplayName ?? agentId, info?.Branch ?? $"agent/{agentId}");
+    }
+
+    [RelayCommand]
+    private void CancelAgentAction()
+    {
+        AgentAction = null;
+        AgentActionInput = "";
+    }
+
+    [RelayCommand]
+    private async Task ConfirmAgentActionAsync()
+    {
+        if (AgentAction is not { } pending)
+        {
+            return;
+        }
+
+        var input = AgentActionInput;
+        AgentAction = null;
+        AgentActionInput = "";
+
+        switch (pending.Kind)
+        {
+            case AgentActionKind.Rename:
+                // The STORED name is what gets reported, not what was typed: it is trimmed, collapsed
+                // and capped, and a person who pasted something long should see what was kept.
+                var stored = _agents.RenameAgent(pending.AgentId, input);
+                Editions.ProComposition.ShowShellToast(
+                    stored.Length > 0 ? $"Renamed to '{stored}'" : "Name cleared", false);
+                break;
+
+            case AgentActionKind.End:
+                try
+                {
+                    await _agents.EndAgentAsync(pending.AgentId).ConfigureAwait(true);
+                    Editions.ProComposition.ShowShellToast($"Ended {pending.Label}", false);
+                }
+                catch (Exception ex)
+                {
+                    Editions.ProComposition.ShowShellToast($"Couldn't end {pending.Label} — {ex.Message}", true);
+                }
+
+                break;
+
+            case AgentActionKind.Delete:
+                var result = await _agents.DeleteAgentAsync(pending.AgentId).ConfigureAwait(true);
+                if (!result.Deleted)
+                {
+                    Editions.ProComposition.ShowShellToast(
+                        $"Couldn't delete {pending.Label} — {result.Reason}", true);
+                    break;
+                }
+
+                // The sha is reported BECAUSE the delete succeeded. It is the only handle left on those
+                // commits — the mirror's reflog still holds them — so a human who deleted the wrong
+                // agent has something to act on. A bare "deleted" leaves them nothing.
+                Editions.ProComposition.ShowShellToast(
+                    result.BranchDeleted && result.DeletedBranchSha.Length > 0
+                        ? $"Deleted {pending.Label}. Its branch was at "
+                          + $"{Shorten(result.DeletedBranchSha)} — still in the mirror's reflog if you need it back."
+                        : $"Deleted {pending.Label}.",
+                    false);
+                break;
+        }
+
+        RefreshAgents();
+        Queue.Refresh();
+    }
+
+    private static string Shorten(string sha) => sha.Length > 8 ? sha[..8] : sha;
 
     /// <summary>P2-47 #1: point the live merge-queue projection at the daemon-provisioned repo handle so
     /// the merge rail + review cockpit reflect that repo's queue. No-op on the mock/design harness.</summary>

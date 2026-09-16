@@ -61,10 +61,44 @@
               <!-- Name it explicitly: the row's text is expanded-state only, and Avalonia does not
                    use ToolTip.Tip as an accessible-name fallback, so a collapsed rail row would be
                    an unnamed button to a screen reader. -->
-              <Button Classes="railItem" Opacity="{Binding RowOpacity}" ToolTip.Tip="{Binding Tooltip}"
-                      AutomationProperties.Name="{Binding Name}"
+              <Button Classes="railItem" Classes.active="{Binding IsSelected}"
+                      Opacity="{Binding RowOpacity}" ToolTip.Tip="{Binding Tooltip}"
+                      AutomationProperties.Name="{Binding DisplayName}"
                       Command="{Binding $parent[Window].((uivm:IShellRailHost)DataContext).ShowAgentCommand}"
                       CommandParameter="{Binding AgentId}">
+                <!-- The row's actions. Right-clicking an agent previously did nothing at all, so the
+                     only reachable per-agent controls were on the Resources tab — a human looking at an
+                     agent had no way to act on the agent they were looking at. Ordered by blast radius:
+                     navigation, then naming, then review, then the two that end things, with the one
+                     that destroys work last and coloured as such. -->
+                <Button.ContextMenu>
+                  <ContextMenu>
+                    <ContextMenu.Styles>
+                      <!-- Per-item hover highlight, never the whole box — matching the Resources rows. -->
+                      <Style Selector="MenuItem:selected /template/ Border#PART_LayoutRoot">
+                        <Setter Property="Background" Value="{DynamicResource SurfaceHover}"/>
+                      </Style>
+                      <Style Selector="MenuItem"><Setter Property="Padding" Value="12,6"/></Style>
+                    </ContextMenu.Styles>
+                    <MenuItem Header="Open" Command="{Binding OpenCommand}"/>
+                    <Separator/>
+                    <MenuItem Header="Rename…" Command="{Binding RenameCommand}"/>
+                    <MenuItem Header="Reset name" Command="{Binding ResetNameCommand}"/>
+                    <Separator/>
+                    <MenuItem Header="Review changes…" Command="{Binding ReviewCommand}"/>
+                    <MenuItem Header="Verify now" Command="{Binding VerifyCommand}"/>
+                    <MenuItem Header="View verification log" Command="{Binding ViewVerificationLogCommand}"/>
+                    <Separator/>
+                    <MenuItem Header="Copy agent ID" Command="{Binding CopyAgentIdCommand}"/>
+                    <MenuItem Header="Copy branch name" Command="{Binding CopyBranchCommand}"/>
+                    <Separator/>
+                    <MenuItem Header="{Binding PauseMenuLabel}" Command="{Binding PauseOrResumeCommand}"/>
+                    <MenuItem Header="End task" Command="{Binding EndCommand}"
+                              Foreground="{DynamicResource DangerBrush}"/>
+                    <MenuItem Header="Delete agent…" Command="{Binding DeleteCommand}"
+                              Foreground="{DynamicResource DangerBrush}"/>
+                  </ContextMenu>
+                </Button.ContextMenu>
                 <Grid ColumnDefinitions="14,*,Auto">
                   <Panel Grid.Column="0" Width="10" Height="10" VerticalAlignment="Center">
                     <PathIcon Classes="railBadge"
@@ -73,7 +107,13 @@
                   </Panel>
                   <StackPanel Grid.Column="1" Margin="8,0,0,0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center"
                               IsVisible="{Binding $parent[Window].((uivm:IShellRailHost)DataContext).IsRailExpanded}">
-                    <TextBlock Classes="Mono" Text="{Binding Name}" FontSize="12" Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
+                    <!-- The row's LABEL, not the CLI kind. This used to bind Name — the kind — so every
+                         claude-code session rendered the identical word and the rail could not tell four
+                         agents apart. DisplayName is the human's name, else the agent's brief, else
+                         "Worker 70b21c13". Not Mono any more: two of those three are prose, and a
+                         proportional face fits more of a brief in the same rail width. -->
+                    <TextBlock Text="{Binding DisplayName}" FontSize="12" Foreground="{DynamicResource TextPrimary}"
+                               VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="150"/>
                     <!-- PR3: the orchestration role as a quiet word ("coordinator" / "subagent"), never a color -->
                     <TextBlock Text="{Binding RoleLabel}" FontSize="9" Foreground="{DynamicResource TextMuted}"
                                VerticalAlignment="Center" IsVisible="{Binding HasRoleLabel}"/>

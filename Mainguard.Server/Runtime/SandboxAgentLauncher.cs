@@ -845,6 +845,19 @@ public sealed class SandboxAgentLauncher
         catch { /* best effort */ }
     }
 
+    /// <summary>
+    /// Deletes <c>refs/heads/agent/&lt;id&gt;</c> from the mirror on the caller's say-so, reporting the
+    /// sha it removed.
+    ///
+    /// <para><b>Not best-effort, unlike everything else on the teardown path.</b> The swallowing above is
+    /// right for housekeeping — residue is better than a failed stop. Here the caller is a human who
+    /// asked for the work to be destroyed and is about to be TOLD it was, so a failure has to reach
+    /// them: reporting a delete that did not happen is how a branch everyone believes is gone turns up
+    /// later, and reporting a sha nobody destroyed is worse.</para>
+    /// </summary>
+    public bool DiscardAgentBranch(string repoHash, string agentId, out string deletedSha) =>
+        _environment.Worktrees.DiscardAgentBranch(repoHash, agentId, out deletedSha);
+
     /// <summary>The resume path's rollback: clear the worktree, keep <c>agent/&lt;id&gt;</c>. A manager
     /// that cannot do that throws rather than falling back — and this swallows the throw, so the outcome
     /// is residue, never a deleted branch.</summary>

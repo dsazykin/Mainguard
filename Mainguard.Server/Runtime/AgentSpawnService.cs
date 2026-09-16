@@ -27,6 +27,24 @@ public sealed record AgentStopResult(
     IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile> CliSettings,
     string RepoHandle = "");
 
+/// <summary>What <see cref="AgentSpawnService.DeleteAsync"/> did.</summary>
+/// <param name="Deleted">True when the agent is gone — jail stopped, worktree removed, entry dropped.
+/// It can be true while <paramref name="BranchDeleted"/> is false: the branch step runs last and its
+/// failure leaves an agent that really is deleted with a ref that really is still there, and saying so
+/// is more useful than calling the whole thing a failure.</param>
+/// <param name="Reason">Why not, or what went wrong after the point of no return; empty on a clean
+/// delete. Phrased for a human — this value is shown verbatim.</param>
+/// <param name="BranchDeleted">Whether <c>refs/heads/agent/&lt;id&gt;</c> was really removed. False with
+/// <paramref name="Deleted"/> true and an empty reason means there was no branch to remove.</param>
+/// <param name="DeletedBranchSha">What that branch pointed at, empty when none was deleted. The
+/// mirror's reflog still holds it, so this is the only thing that makes a mistaken delete recoverable
+/// — which is why it travels all the way to the toast rather than only into the audit record.</param>
+public sealed record AgentDeleteResult(
+    bool Deleted, string Reason, bool BranchDeleted, string DeletedBranchSha)
+{
+    public static AgentDeleteResult Refused(string reason) => new(false, reason, false, string.Empty);
+}
+
 /// <summary>
 /// May what a jail holds — the CLI's approved-command list, and its login-state files — flow back OUT
 /// to the host stores that seed every later agent in this repository?
@@ -828,6 +846,111 @@ public sealed class AgentSpawnService
         // nothing and reports Stopped=false, because tearing down the wrong repo's jail is unrecoverable.
         var session = _store.Find(agentId);
         return StopAsync(session?.Key ?? new AgentSessionKey(string.Empty, agentId), ct);
+    }
+
+    /// <summary>
+    /// <b>Deletes an agent and its work</b>: stops the jail, removes the worktree, drops the merge-queue
+    /// entry, and deletes <c>refs/heads/agent/&lt;id&gt;</c>.
+    ///
+    /// <para><b>Composed here rather than in the client.</b> Every step of this already existed —
+    /// <see cref="StopAsync(AgentSessionKey,CancellationToken)"/> (which tears the worktree down),
+    /// <c>MergeQueue.TryDiscard</c>, <c>WorktreeManager.DiscardAgentBranch</c> — and a client driving
+    /// them as three RPCs would have three places to fail in between, each leaving a different partial
+    /// state: a stopped agent with a live queue entry, an entry discarded against a branch that still
+    /// exists, or a deleted branch whose entry still offers Verify. The daemon owns all three, so it
+    /// owns the order.</para>
+    ///
+    /// <para><b>The order is deliberate.</b> The stop goes first because the branch cannot be deleted
+    /// while a worktree is checked out on it, and the branch deletion goes LAST because it is the
+    /// irreversible step — everything that could refuse has already run by then, so a delete that gets
+    /// as far as the branch is a delete that will complete. The queue entry is dropped between them:
+    /// after the jail is gone (so nothing re-verifies into it) and before the branch is (so the entry's
+    /// terminal record is written while the ref it names still resolves).</para>
+    /// </summary>
+    public async Task<AgentDeleteResult> DeleteAsync(string repoHandle, string agentId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(agentId))
+        {
+            return AgentDeleteResult.Refused("no agent was named");
+        }
+
+        // The (repo, agent) key, resolved the same way StopAsync resolves it. A caller-supplied handle
+        // is preferred — the client knows which repository its rail is showing — and the session's own
+        // is the fallback for an agent whose record is still around.
+        var session = _store.Find(agentId);
+        var repoHash = !string.IsNullOrWhiteSpace(repoHandle)
+            ? repoHandle
+            : session?.RepoHash ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(repoHash))
+        {
+            // Without a repository there is no mirror to delete a branch from, and guessing one would
+            // risk deleting a same-named branch somewhere else.
+            return AgentDeleteResult.Refused(
+                "this agent is not bound to a repository, so its branch cannot be located");
+        }
+
+        // 1. The jail and the worktree. A stop that finds nothing is not an error here: deleting an
+        //    agent that has already died is exactly the case this exists for — its row is what the human
+        //    is trying to be rid of.
+        try
+        {
+            await StopAsync(session?.Key ?? new AgentSessionKey(repoHash, agentId), ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Surfaced rather than pressed on through. Past this point the next step deletes a branch,
+            // and doing that while a jail may still be live on its worktree is how the delete leaves a
+            // container running against a ref that no longer exists.
+            _spawnLog.LogWarning(ex, "delete: agent={Agent} could not be stopped", agentId);
+            return AgentDeleteResult.Refused($"the agent could not be stopped: {ex.Message}");
+        }
+
+        // 2. The queue entry. Best-effort and never fatal: a repo with no live queue has no entry to
+        //    drop, and an entry left behind is a stale row, not lost work — whereas refusing here would
+        //    leave the agent stopped and the human unable to finish what they asked for.
+        try
+        {
+            _mergeQueues.EnsureQueue(repoHash)?.Queue.TryDiscard(
+                agentId, discardedBy: "human", reason: "the agent was deleted", out _);
+        }
+        catch (Exception ex)
+        {
+            _spawnLog.LogWarning(ex, "delete: agent={Agent} queue entry could not be dropped", agentId);
+        }
+
+        // 3. The branch — the irreversible one, last. Its failure IS reported: the caller is about to
+        //    tell a human what was destroyed.
+        var branchDeleted = false;
+        var deletedSha = string.Empty;
+        try
+        {
+            branchDeleted = _launcher.DiscardAgentBranch(repoHash, agentId, out deletedSha);
+        }
+        catch (Exception ex)
+        {
+            _spawnLog.LogWarning(ex, "delete: agent={Agent} branch could not be deleted", agentId);
+            return new AgentDeleteResult(
+                Deleted: true,
+                Reason: $"the agent is gone, but its branch could not be deleted: {ex.Message}",
+                BranchDeleted: false,
+                DeletedBranchSha: string.Empty);
+        }
+
+        _audit.Append(new AuditEvent("agent_deleted", new Dictionary<string, string>
+        {
+            ["repo"] = repoHash,
+            ["agent"] = agentId,
+            ["branch_deleted"] = branchDeleted ? "true" : "false",
+            ["sha"] = deletedSha,
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+
+        _spawnLog.LogInformation(
+            "delete: agent={Agent} repo={Repo} branchDeleted={Deleted} sha={Sha}",
+            agentId, repoHash, branchDeleted, deletedSha);
+
+        return new AgentDeleteResult(true, string.Empty, branchDeleted, deletedSha);
     }
 
     /// <summary>The repo-scoped stop. Every caller that knows which repository the agent belongs to —

@@ -256,6 +256,23 @@ public sealed class DaemonBackedOrchestrator :
     /// <summary>Where a repository's saved CLI settings live between agents. Per repo by construction —
     /// approving a command here must not pre-approve it somewhere else.</summary>
     private readonly CliSettingsStore _cliSettings;
+
+    /// <summary>Where the names a human typed for individual agents live. Per repo, like the settings
+    /// store above and for a milder version of the same reason: a name is about one session in one
+    /// repository.</summary>
+    private readonly AgentNameStore _agentNameStore;
+
+    /// <summary>
+    /// The active repository's stored names, by agent id — a memory copy of the store's file.
+    ///
+    /// <para>Cached because <see cref="ListAgents"/> is called on EVERY refresh of every surface that
+    /// shows an agent, and reading a JSON file per refresh to answer "what is this row called" is a
+    /// disk read on the UI thread's critical path. Refilled when the active repository changes and
+    /// written through on every rename, so the copy and the file cannot drift.</para>
+    ///
+    /// <para>Guarded by <see cref="_gate"/>.</para>
+    /// </summary>
+    private Dictionary<string, string> _agentNames = new(StringComparer.Ordinal);
     private Task? _queuePump;
     private Task? _loginHarvestPump;
     private CancellationTokenSource? _queuePumpCts;
@@ -295,9 +312,11 @@ public sealed class DaemonBackedOrchestrator :
         Func<Mainguard.Git.Services.IOperationJournal>? journalFactory = null,
         Func<Mainguard.Agents.Services.IHostPullRequestGateway>? hostPullRequests = null,
         TimeSpan? loginHarvestInterval = null,
-        CliSettingsStore? cliSettings = null)
+        CliSettingsStore? cliSettings = null,
+        AgentNameStore? agentNames = null)
     {
         _cliSettings = cliSettings ?? new CliSettingsStore();
+        _agentNameStore = agentNames ?? new AgentNameStore();
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _loginHarvestInterval = loginHarvestInterval is { } interval && interval > TimeSpan.Zero
             ? interval
@@ -538,6 +557,13 @@ public sealed class DaemonBackedOrchestrator :
             }
 
             _repoHandle = repoHandle;
+
+            // The names belong to the repository being opened, so they are read HERE and not lazily on
+            // first use: a rail that rendered once with the previous repo's names (or with none) and
+            // corrected itself a moment later would be showing one agent under another's label.
+            _agentNames = new Dictionary<string, string>(
+                _agentNameStore.Load(repoHandle), StringComparer.Ordinal);
+
             _queuePumpCts?.Cancel();
             _queuePumpCts?.Dispose();
             _queuePumpCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
@@ -1302,6 +1328,11 @@ public sealed class DaemonBackedOrchestrator :
         {
             RaiseIsolated(() => Changed?.Invoke());
         }
+
+        // The one place with an AUTHORITATIVE listing in hand, which is exactly what a prune needs: the
+        // stream's deltas can lag, and pruning against a projection that has merely not heard about an
+        // agent yet would delete a name whose agent is alive.
+        PruneAgentNames();
     }
 
     /// <summary>
@@ -1413,11 +1444,177 @@ public sealed class DaemonBackedOrchestrator :
 
     // ---- IAgentService (LIVE) -------------------------------------------
 
+    /// <summary>
+    /// The fleet, each row carrying what a human can actually call it by.
+    ///
+    /// <para>The brief and the human's chosen name are folded in HERE rather than written into
+    /// <c>_agents</c>, because neither of them is a fact the agent stream carries: the brief comes from
+    /// the plan stream and changes when a worker revises its plan, the name comes from the local store
+    /// and changes when a person types one. Merging them into the projection would mean every plan
+    /// revision and every rename rewriting agent records the daemon owns, and the next snapshot
+    /// silently dropping both.</para>
+    /// </summary>
     public IReadOnlyList<AgentInfo> ListAgents()
     {
         lock (_gate)
         {
-            return _agents.Values.OrderByDescending(a => a.SpawnedAt).ToArray();
+            var titles = WorkerTitles();
+            return _agents.Values
+                .OrderByDescending(a => a.SpawnedAt)
+                .Select(a => a with
+                {
+                    Title = titles.TryGetValue(a.AgentId, out var title) ? title : string.Empty,
+                    UserName = _agentNames.TryGetValue(a.AgentId, out var name) ? name : string.Empty,
+                })
+                .ToArray();
+        }
+    }
+
+    /// <summary>
+    /// The worker briefs, by agent id, taken from the plan stream this surface already receives rather
+    /// than from a new wire field: a plan's Title IS the brief its worker was spawned against, and it is
+    /// the only human-legible name any of these sessions has on its own.
+    ///
+    /// <para>The LAST plan wins, because a worker that revised its plan is working to the revision.</para>
+    ///
+    /// <para>Callers hold <see cref="_gate"/>.</para>
+    /// </summary>
+    private Dictionary<string, string> WorkerTitles() =>
+        _workerPlans
+            .Where(p => p.WorkerAgentId.Length > 0 && p.Title.Length > 0)
+            .GroupBy(p => p.WorkerAgentId, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.Last().Title, StringComparer.Ordinal);
+
+    /// <summary>
+    /// Records the human's own name for an agent, or clears it when <paramref name="name"/> is blank —
+    /// the same call, because "rename to nothing" and "reset the name" are the same intent and two code
+    /// paths for them could disagree about what an empty box means.
+    /// </summary>
+    /// <returns>The name as stored (trimmed, collapsed, capped), or empty when it was cleared.</returns>
+    public string RenameAgent(string agentId, string? name)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle) || string.IsNullOrWhiteSpace(agentId))
+        {
+            return string.Empty;
+        }
+
+        var stored = _agentNameStore.Save(repoHandle!, agentId, name);
+
+        lock (_gate)
+        {
+            // Written through rather than re-read: the store just told us what it wrote, and re-loading
+            // the file would make a rename's visible result depend on a second disk read that can fail.
+            if (stored.Length == 0)
+            {
+                _agentNames.Remove(agentId);
+            }
+            else
+            {
+                _agentNames[agentId] = stored;
+            }
+        }
+
+        Changed?.Invoke();
+        return stored;
+    }
+
+    /// <summary>
+    /// Deletes an agent and its work. The daemon performs all of it — see the RPC's comment for why the
+    /// three steps are not driven from here as three calls.
+    ///
+    /// <para>The agent's stored NAME is forgotten too, and only after the daemon confirms the delete: a
+    /// name dropped ahead of a refusal would leave the row on the rail wearing a label the human had
+    /// already been told was gone.</para>
+    /// </summary>
+    public async Task<AgentDeletion> DeleteAgentAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return AgentDeletion.Refused("no repository is active for agents yet");
+        }
+
+        Proto.DeleteAgentResponse response;
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            response = await _client.DeleteAgentAsync(repoHandle!, agentId, cts.Token).ConfigureAwait(false);
+        }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.Unimplemented)
+        {
+            return AgentDeletion.Refused("this daemon is too old to delete agents — update Mainguard OS");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return AgentDeletion.Refused(ex.Message);
+        }
+
+        if (response.Deleted)
+        {
+            _agentNameStore.Forget(repoHandle!, agentId);
+            lock (_gate)
+            {
+                _agentNames.Remove(agentId);
+                // Dropped from the projection immediately rather than waiting for the next listing: the
+                // row is what the human asked to be rid of, and leaving it until a stream tick arrives
+                // is how a confirmed delete looks like it did nothing.
+                _agents.Remove(agentId);
+            }
+
+            Changed?.Invoke();
+        }
+
+        return new AgentDeletion(
+            response.Deleted, response.Reason ?? string.Empty,
+            response.BranchDeleted, response.DeletedBranchSha ?? string.Empty);
+    }
+
+    /// <summary>Drops every stored name whose agent the daemon no longer lists, so the file stays the
+    /// size of the fleet rather than the size of its history. Best effort and never on the critical
+    /// path of anything — a name left behind is residue, not a fault.</summary>
+    private void PruneAgentNames()
+    {
+        string? repoHandle;
+        string[] liveIds;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+            if (_agentNames.Count == 0)
+            {
+                return;
+            }
+
+            liveIds = _agents.Keys.ToArray();
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle) || liveIds.Length == 0)
+        {
+            // No listing yet is not evidence that every agent is gone — pruning against an empty
+            // projection would delete every name the moment the app started.
+            return;
+        }
+
+        if (_agentNameStore.Prune(repoHandle!, liveIds) > 0)
+        {
+            lock (_gate)
+            {
+                var live = new HashSet<string>(liveIds, StringComparer.Ordinal);
+                foreach (var stale in _agentNames.Keys.Where(id => !live.Contains(id)).ToList())
+                {
+                    _agentNames.Remove(stale);
+                }
+            }
         }
     }
 
@@ -2971,14 +3168,9 @@ public sealed class DaemonBackedOrchestrator :
     {
         lock (_gate)
         {
-            // The worker briefs, taken from the plan stream the surface is already receiving rather than
-            // from a new wire field: the plan's Title IS the brief a worker was spawned against, and it is
-            // the only human-legible name any of these sessions has. Without it the resource monitor can
-            // only print the CLI kind, which is identical for every agent of that kind.
-            var titles = _workerPlans
-                .Where(p => p.WorkerAgentId.Length > 0 && p.Title.Length > 0)
-                .GroupBy(p => p.WorkerAgentId, StringComparer.Ordinal)
-                .ToDictionary(g => g.Key, g => g.Last().Title, StringComparer.Ordinal);
+            // The worker briefs — the same projection the agent rail names its rows from, so the two
+            // surfaces cannot end up calling one agent two different things.
+            var titles = WorkerTitles();
 
             return _agents.Values
                 .Select(a =>

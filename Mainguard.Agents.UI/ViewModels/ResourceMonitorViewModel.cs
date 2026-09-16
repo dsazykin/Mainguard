@@ -332,17 +332,14 @@ public partial class AgentUsageRowViewModel : ViewModelBase
 
     /// <summary>The id, shortened to what a human can compare across surfaces without reading 32 hex
     /// characters. Short enough to scan, long enough that two live agents do not collide.</summary>
-    public static string ShortId(string agentId) =>
-        agentId.Length > 8 ? agentId[..8] : agentId;
+    /// <remarks>Delegates so this surface and the agent rail cannot shorten the same id to two
+    /// different lengths — the short id is how a human matches a row here against a row there.</remarks>
+    public static string ShortId(string agentId) => AgentInfo.ShortId(agentId);
 
-    /// <summary>The role, in the word the surface uses for it. Manual sessions are just "Agent" — they
-    /// were started by hand and have no place in the coordinator hierarchy.</summary>
-    public static string RoleWord(string role) => role switch
-    {
-        AgentRoles.Coordinator => "Coordinator",
-        AgentRoles.Managed => "Worker",
-        _ => "Agent",
-    };
+    /// <summary>The role, in the word the surface uses for it. Delegates to <see cref="AgentRoles.Word"/>
+    /// for the same reason <see cref="ShortId"/> does: one vocabulary, or two surfaces describe the same
+    /// session differently.</summary>
+    public static string RoleWord(string role) => AgentRoles.Word(role);
 
     public void Update(AgentResourceUsage usage)
     {

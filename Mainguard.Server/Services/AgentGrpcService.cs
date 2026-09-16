@@ -462,6 +462,33 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
         return response;
     }
 
+    /// <summary>
+    /// Deletes an agent and its work. See the RPC's own comment for why this is a separate method from
+    /// <see cref="StopAgent"/> rather than a flag on it.
+    /// </summary>
+    public override async Task<DeleteAgentResponse> DeleteAgent(
+        DeleteAgentRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.AgentId))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "agent_id is required."));
+        }
+
+        // Refusal-as-response, not a status code: "already gone" and "the engine is unreachable" are
+        // ordinary answers a human acts on differently, and a status code flattens both into an error.
+        var result = await _spawns
+            .DeleteAsync(request.RepoHandle, request.AgentId, context.CancellationToken)
+            .ConfigureAwait(false);
+
+        return new DeleteAgentResponse
+        {
+            Deleted = result.Deleted,
+            Reason = result.Reason,
+            BranchDeleted = result.BranchDeleted,
+            DeletedBranchSha = result.DeletedBranchSha,
+        };
+    }
+
     /// <summary>One harvested settings file on the wire. The root travels as its declared spelling —
     /// the client stores per (repo, root, path), so an ordinal mismatch here would split one file's
     /// history into two entries.</summary>
