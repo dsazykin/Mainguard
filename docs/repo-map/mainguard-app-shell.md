@@ -923,7 +923,18 @@
     a `UserControl` page — 2026-09-04, owner decision: the Settings **Agent Jails** page, memory GiB and CPUs
     per jail over `IJailLimitsGateway`; a save re-renders from what the daemon PERSISTED (clamped), a refused
     save is an error on the page, `FleetNote` words what six workers could take, and Reset restores the
-    defaults on the page only until Save), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the
+    defaults on the page only until Save), `AgentDefaultsSettingsViewModel`/`AgentModelRowViewModel`
+    (+ `Views/AgentDefaultsSettingsView` — the Settings **Agent Defaults** page: how agents are STARTED.
+    Two settings, both daemon state over `IAgentDefaultsGateway`. (1) **Plan approval**, whose only
+    control lived inside `PlanGateView`: the control centre renders that gate only when it has content —
+    a pending plan, an escalation, backpressure, or plan mode already OFF — so with plan mode ON and
+    nothing waiting there was no control anywhere, and the gate could be turned back on but never off.
+    This page has no such condition. The gate KEEPS its toggle (both write the same daemon RPC, so they
+    cannot disagree, and a control beside the decisions it governs is worth having); what was missing was
+    a way to reach it while the gate is silent. (2) **Models**, per `(role, CLI)`: coordinator and
+    workers set separately, a picker of the CLI's KNOWN models plus a free-text box because vendors add
+    models faster than Mainguard ships, and a CLI that declares no model flag renders as not settable
+    rather than accepting a value that would be dropped at spawn.), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the
     Settings **PR Intake** page — the on/off switch, poll cadence, shared bot-author list and the
     subscribed `(host, owner, repo, author-filter)` sources. **All of it is DAEMON state, edited over
     gRPC through `IPrIntakeGateway`** — `Load`/`Save`/`AddSource` are round trips, `Save` re-renders from
@@ -1184,6 +1195,12 @@
     daemon's per-jail ceiling — `JailLimitsView` in GiB/CPUs plus the band the daemon clamps to; the shipped
     gateway is `AgentService.GetJailLimits`/`SetJailLimits` over the same lazy loopback `DaemonClient` as
     intake, built via `ProComposition.JailLimitsGatewayFactory`.)
+  - `IAgentDefaultsGateway.cs` / `DaemonAgentDefaultsGateway.cs` (the Agent Defaults page's seam: the
+    plan-mode pair on `PlanApprovalService` and the model pair on `AgentService`, over the same lazy
+    loopback `DaemonClient`, built via `ProComposition.AgentDefaultsGatewayFactory`. Every write returns
+    the DAEMON's state, never an echo of the request — a page that rendered what it sent could show an
+    approval step the daemon never accepted. `CanSetModel` is `modelArg` being non-empty: the declared
+    flag is what makes a model reachable at all.)
   - `DaemonPrIntakeGateway.cs` (the SHIPPED `IPrIntakeGateway`, over `PrIntakeService`'s
     `GetPrIntakeSettings`/`UpdatePrIntakeSettings`/`SubscribePrIntakeSource`. Stateless — every load is a
     fresh read, and a save returns the daemon's PERSISTED values (clamped cadence, defaulted bot list),
@@ -1217,7 +1234,13 @@
     launch-progress delta re-arms it, and a build that keeps reporting runs as long as it needs.
     `DaemonBackedOrchestrator` still passes a 60-minute hard cap as the gRPC deadline, so a daemon that
     chatters without progressing is bounded too — the false timeout was traded for a bounded one, never
-    for an infinite wait. A user's Stop stays an `OperationCanceledException`, never a timeout.)
+    for an infinite wait. A user's Stop stays an `OperationCanceledException`, never a timeout. Its
+    `delay`/`clock` constructor parameters have always been test seams; `DaemonBackedOrchestrator` now
+    forwards its own `SpawnDelayOverride`/`SpawnClockOverride` into them so the WIRING test can reach
+    them too. That was a real gap, not tidiness: `SpawnSilenceBudget` alone only compressed the budget,
+    and a compressed real budget is still a real race — the keep-alive test beat a 300 ms budget every
+    40 ms on the wall clock, so a thread-pool stall longer than the budget was genuine silence, the
+    watchdog tripped correctly, and CI went red on a healthy change.)
   - `DaemonBackedOrchestrator.cs` (**P2-47**: the real, DaemonClient-backed implementation of every
     control-center seam —
     `IAgentService`/`IMergeQueueService`/`ICoordinatorService`/`IKillSwitchService`/`ITelemetryService`/`IVibeService`

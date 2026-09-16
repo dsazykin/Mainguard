@@ -108,6 +108,11 @@ public partial class SettingsViewModel : ViewModelBase
             // machine can shrink what every spawn is created with.
             Pages.Add(new SettingsPageRowViewModel("AgentJails", "Agent Jails", "ShieldIcon",
                 proTools.CreateJailLimitsPage, ActivateRow));
+            // How agents are STARTED: the plan-approval gate and which model each role runs. The gate's
+            // toggle used to live inside the plan gate, which the control center renders only when it has
+            // content — so with the gate on and nothing waiting, there was no way to turn it off.
+            Pages.Add(new SettingsPageRowViewModel("AgentDefaults", "Agent Defaults", "TerminalIcon",
+                proTools.CreateAgentDefaultsPage, ActivateRow));
             Pages.Add(new SettingsPageRowViewModel("MainguardOs", "Mainguard OS", "FolderIcon",
                 () => proTools.CreateMainguardOsPage(OwnerWindow!) ?? new object(), ActivateRow));
             Pages.Add(new SettingsPageRowViewModel("DaemonLogs", "Daemon Logs", "TerminalIcon",

@@ -134,49 +134,7 @@ public class SpawnProgressWatchdogTests
         return failure!;
     }
 
-    /// <summary>
-    /// Simulated time the test steps by hand: the watchdog's wait blocks until the test posts an advance,
-    /// and <see cref="AdvanceAsync"/> does not return until the watchdog has actually consumed it. Real
-    /// sleeps would make these tests both slow and racy — and a race here would silently weaken the
-    /// property, since a watchdog that never gets to run also never trips.
-    /// </summary>
-    private sealed class SteppedTime
-    {
-        private readonly Channel<TimeSpan> _pending = Channel.CreateUnbounded<TimeSpan>();
-        private readonly Channel<bool> _consumed = Channel.CreateUnbounded<bool>();
-        private long _ticks;
-
-        public TimeSpan Now => TimeSpan.FromTicks(Interlocked.Read(ref _ticks));
-
-        public Func<TimeSpan, CancellationToken, Task> Delay => async (_, ct) =>
-        {
-            var step = await _pending.Reader.ReadAsync(ct);
-            Interlocked.Add(ref _ticks, step.Ticks);
-            await _consumed.Writer.WriteAsync(true, CancellationToken.None);
-        };
-
-        /// <summary>Post an advance without waiting for it — for the step that is expected to trip the
-        /// watchdog, which then never reports back.</summary>
-        public void Post(TimeSpan by) => _pending.Writer.TryWrite(by);
-
-        public async Task AdvanceAsync(TimeSpan by, TimeSpan patience)
-        {
-            Post(by);
-            using var cts = new CancellationTokenSource(patience);
-            try
-            {
-                await _consumed.Reader.ReadAsync(cts.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                // The watchdog stopped waiting on time — it gave up on the spawn instead of re-arming.
-                // Said plainly here, because as a bare cancellation it reads like a test-harness fault.
-                throw new InvalidOperationException(
-                    "the watchdog never consumed the advance — it stopped watching, which means it "
-                    + "tripped instead of re-arming on the progress just reported");
-            }
-        }
-    }
+    // SteppedTime moved to its own file when SpawnWatchdogWiringTests needed the same simulated clock.
 
     /// <summary>Stands in for the SpawnAgent RPC: never returns on its own, ends when the caller's token
     /// is cancelled (which is what the real gRPC call does) or when the test completes it.</summary>

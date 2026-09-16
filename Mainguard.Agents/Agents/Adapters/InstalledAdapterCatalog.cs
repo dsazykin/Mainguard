@@ -91,7 +91,17 @@ public sealed record InstalledAdapterMarker(
     /// separately because they are independently true: a live jail re-bound after a daemon restart still
     /// has its $HOME tmpfs, so <see cref="ResumeArg"/> alone restores it there, and no store is involved.
     /// This list is what makes the SAME flag mean something after the jail itself is gone.</para></summary>
-    [property: JsonPropertyName("conversationPaths")] IReadOnlyList<string>? ConversationPaths = null)
+    [property: JsonPropertyName("conversationPaths")] IReadOnlyList<string>? ConversationPaths = null,
+    /// <summary>The launch flag this CLI takes a MODEL on (see <see cref="AdapterSpec.ModelArg"/>).
+    /// Carried across the host/VM boundary for the same reason the pre-approval flag is: the daemon reads
+    /// the MARKER, not the manifest, so a field that stopped at the manifest would leave every jail
+    /// launching on its CLI's default model with the setting silently ignored. Null on markers written
+    /// before this field existed — re-install the CLI to backfill it, and until then that CLI's model is
+    /// reported as not settable rather than set and dropped.</summary>
+    [property: JsonPropertyName("modelArg")] string? ModelArg = null,
+    /// <summary>The models this CLI is known to accept (see <see cref="AdapterSpec.Models"/>), for the
+    /// picker's suggestions. Never a validator — a typed value is always allowed.</summary>
+    [property: JsonPropertyName("models")] IReadOnlyList<string>? Models = null)
 {
     /// <summary>The parsed <see cref="InitialPromptStyle"/>; <see cref="AdapterInitialPromptStyle.None"/>
     /// for an older marker or an unreadable spelling. Unlike the manifest, a marker cannot refuse — it is
@@ -129,7 +139,9 @@ public sealed record InstalledAdapterMarker(
         spec.PreApprovedCommandFormat,
         spec.InitialPromptStyle,
         spec.ResumeArg,
-        spec.ConversationPaths);
+        spec.ConversationPaths,
+        spec.ModelArg,
+        spec.Models);
 
     /// <summary>
     /// This marker with every <b>manifest-declared</b> field taken from <paramref name="spec"/>, keeping
