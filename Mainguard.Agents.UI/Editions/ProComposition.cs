@@ -74,6 +74,13 @@ public static class ProComposition
 
     public static IJailLimitsGateway CreateJailLimitsGateway() => JailLimitsGatewayFactory();
 
+    /// <summary>The Agent Defaults page's seam onto the daemon's plan-approval gate and per-(role, CLI)
+    /// model — same shape and same reason as the two factories above.</summary>
+    public static Func<IAgentDefaultsGateway> AgentDefaultsGatewayFactory { get; set; } =
+        () => new DaemonAgentDefaultsGateway(SharedIntakeClient.Value);
+
+    public static IAgentDefaultsGateway CreateAgentDefaultsGateway() => AgentDefaultsGatewayFactory();
+
     // ---- shell capabilities the shell wires at startup (all inert until then) ----
 
     /// <summary>The app settings service (was <c>App.Settings</c>) — the control center reads/writes its

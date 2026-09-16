@@ -231,6 +231,27 @@ public sealed record AdapterSpec(
     /// </summary>
     [property: JsonPropertyName("systemPromptArg")] string? SystemPromptArg = null,
     /// <summary>
+    /// The launch flag THIS CLI takes a MODEL on. Null = Mainguard cannot choose this CLI's model, and
+    /// the surface says so rather than offering a picker that does nothing.
+    ///
+    /// <para>Vendor knowledge, declared per adapter exactly like <see cref="SystemPromptArg"/>, and
+    /// VERIFIED per adapter rather than assumed — the five shipped adapters were each checked against the
+    /// exact pinned artifact this manifest installs: claude-code's own <c>--help</c>; codex's clap arg
+    /// table (value-name <c>MODEL</c>, "Model the agent should use"); gemini-cli's and qwen-code's yargs
+    /// <c>.option("model", …)</c>; and opencode's, which additionally documents its value as
+    /// <c>provider/model</c>. A wrong flag here does not degrade — it fails every spawn of that kind, so
+    /// guessing one would turn a vendor's argument parser into a Mainguard bug report.</para>
+    /// </summary>
+    [property: JsonPropertyName("modelArg")] string? ModelArg = null,
+    /// <summary>
+    /// Models this CLI is known to accept, offered as the picker's choices. <b>Never treated as the
+    /// complete set</b>: vendors add models continuously, so the surface always allows a value typed by
+    /// hand and this list is a convenience, not a validator. An empty list with a
+    /// <see cref="ModelArg"/> present is therefore legal — it means "we can set the model, we just have
+    /// no suggestions".
+    /// </summary>
+    [property: JsonPropertyName("models")] IReadOnlyList<string>? Models = null,
+    /// <summary>
     /// The launch flag THIS CLI takes a PRE-APPROVED COMMAND list on (<c>--allowedTools</c> for
     /// claude-code). Paired with <see cref="PreApprovedCommandFormat"/>; declaring one without the other
     /// is refused (<see cref="AdapterManifestError.BadPreApproval"/>).

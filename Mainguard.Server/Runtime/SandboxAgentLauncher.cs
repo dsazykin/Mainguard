@@ -63,12 +63,20 @@ public sealed class SandboxAgentLauncher
     private readonly Gateway.AgentGatewayCredentials? _credentials;
     private readonly Gateway.GatewayConfinementOptions? _gatewayOptions;
 
+    /// <summary>The operator's per-(role, CLI) model choice. Optional for the same reason
+    /// <see cref="_jailLimits"/> is — the direct-construction tests build a launcher without one, and
+    /// absent simply means every CLI keeps its own default model, which is what shipped before the
+    /// setting existed.</summary>
+    private readonly Mainguard.Agents.Agents.Orchestrator.AgentModelSwitch? _models;
+
     public SandboxAgentLauncher(
         IAgentEnvironment environment, InstalledAdapterCatalog? adapters = null, ILoggerFactory? loggerFactory = null,
         Gateway.AgentGatewayCredentials? credentials = null,
         Gateway.GatewayConfinementOptions? gatewayOptions = null,
-        JailLimitsSettings? jailLimits = null)
+        JailLimitsSettings? jailLimits = null,
+        Mainguard.Agents.Agents.Orchestrator.AgentModelSwitch? models = null)
     {
+        _models = models;
         // The operator's per-jail ceiling (2026-09-04); absent ⇒ SandboxLimits.Default, as before.
         _jailLimits = jailLimits;
         // Optional so the many direct-construction tests (and the RequiresDocker spawn tests) keep
@@ -268,8 +276,17 @@ public sealed class SandboxAgentLauncher
         // The launch line the jail's CLI is actually started with: the first turn, the instructions, and
         // the one pre-approved command, assembled in ONE place because their ORDER is load-bearing (see
         // BuildLaunchArgv).
+        // The model this agent's ROLE is configured with. Read here, at spawn, and never afterwards: the
+        // CLI's process is started with the flag, so a later change could not move a running agent's
+        // model anyway — re-reading would only let the surface disagree with the jails.
+        var model = _models?.ModelFor(
+            string.Equals(agentRole, AgentRoles.Coordinator, StringComparison.Ordinal)
+                ? Mainguard.Agents.Agents.Orchestrator.AgentModelRole.Coordinator
+                : Mainguard.Agents.Agents.Orchestrator.AgentModelRole.Worker,
+            agentKind);
+
         launchCommand = BuildLaunchArgv(
-            launchCommand, adapter, ipcDirPath, instructionsRole, instructions, planMode);
+            launchCommand, adapter, ipcDirPath, instructionsRole, instructions, planMode, model);
 
         // THREE cases, and the order is the point — phase 3's role lock is asked FIRST.
         //
@@ -1414,13 +1431,25 @@ public sealed class SandboxAgentLauncher
         AgentIpcEndpointRole role,
         string instructions,
         Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode planMode =
-            Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Gated)
+            Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Gated,
+        string? model = null)
     {
         launchCommand = ApplyInitialPrompt(launchCommand, adapter, ipcDirPath, role, planMode);
 
         if (launchCommand is { Count: > 0 } && adapter?.SystemPromptArg is { Length: > 0 } promptArg)
         {
             launchCommand = launchCommand.Append(promptArg).Append(instructions).ToList();
+        }
+
+        // The operator's model choice, when they made one and this CLI declares how it takes one.
+        // BOTH halves are required and neither is inferred: a model with no declared flag is a setting
+        // that would be silently dropped, and a flag with no model means the CLI's own default stands,
+        // which is what shipped before this was configurable.
+        if (launchCommand is { Count: > 0 }
+            && adapter?.ModelArg is { Length: > 0 } modelArg
+            && !string.IsNullOrWhiteSpace(model))
+        {
+            launchCommand = launchCommand.Append(modelArg).Append(model!.Trim()).ToList();
         }
 
         // Telling a CLI its shim exists is not the same as letting it run one. A real coordinator followed

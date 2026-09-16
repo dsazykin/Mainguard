@@ -130,6 +130,13 @@ public static class DaemonHost
         builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Sandbox.JailLimitsSettings(
             new Mainguard.Agents.Agents.Sandbox.JsonJailLimitsStore(ResolveJailLimitsPath(tokenPath)),
             sp.GetRequiredService<IAuditLog>()));
+        // The operator's model choice per (role, CLI) — a file beside the others for the same reason: the
+        // launcher reads it while building a launch line, long before anything that needs a database.
+        // Unreadable ⇒ no choice ⇒ every CLI keeps its own default model, which is exactly the behaviour
+        // that shipped before this setting existed. It cannot fail into someone else's model.
+        builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Orchestrator.AgentModelSwitch(
+            store: new Mainguard.Agents.Agents.Orchestrator.JsonAgentModelStore(ResolveAgentModelPath(tokenPath)),
+            audit: sp.GetRequiredService<IAuditLog>()));
         // Phase 2: the daemon-side plan gate — it withholds each worker's task until that worker's own
         // plan is approved, denies steering/verification at the gate, and is ANDed into the merge queue as
         // an IMergeGate so unauthorised work cannot reach main even if it somehow got written.
@@ -530,6 +537,20 @@ public static class DaemonHost
     /// Where the operator's plan-mode setting lands — beside the (test-isolated) session token, exactly
     /// like the plan store, so an in-proc test host never turns the real daemon's gate off.
     /// </summary>
+    private static string ResolveAgentModelPath(string? tokenPath)
+    {
+        if (!string.IsNullOrEmpty(tokenPath))
+        {
+            var dir = Path.GetDirectoryName(tokenPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                return Path.Combine(dir, "mainguard-agent-models.json");
+            }
+        }
+
+        return Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "mainguard-agent-models.json");
+    }
+
     private static string ResolvePlanModePath(string? tokenPath)
     {
         if (!string.IsNullOrEmpty(tokenPath))

@@ -148,6 +148,10 @@ public sealed class RoleInterceptor : Interceptor
         // The per-jail ceiling is the operator's lever over the machine's memory. A coordinator that could
         // raise it would size its own workers' jails (2026-09-04); reading it is harmless.
         "/mainguard.v1.AgentService/SetJailLimits",
+        // The model is the operator's lever over what the fleet COSTS, and it applies to every agent
+        // spawned afterwards. A coordinator that could set it would be choosing its own successors' spend
+        // — the money equivalent of sizing their jails, on exactly the boundary above. Reading stays open.
+        "/mainguard.v1.AgentService/SetAgentModel",
         // Resuming a stranded entry ADOPTS an existing agent id: it attaches a fresh, writable jail to
         // somebody else's `agent/<id>` branch and puts that branch back in front of the daemon's
         // verification. That is strictly more power than the merge RPCs above — an agent able to invoke it

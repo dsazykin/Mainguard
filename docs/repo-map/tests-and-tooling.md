@@ -2230,7 +2230,18 @@
   and a hand-edited zero is clamped on read), `JailLimitsSettingsPageTests` (the `"AgentJails"` row under the
   agent platform and absent without it, the View resolves to a `UserControl`, Load renders the daemon's
   ceiling, Save re-renders the CLAMPED persisted value, a refused save is an error, Reset touches only the
-  page), `PrIntakeSettingsPageTests` (the page is REACHABLE — a `"PrIntake"`
+  page), **`AgentModelSelectionTests`** (the per-`(role, CLI)` model: every shipped adapter declares its
+  VERIFIED `--model` flag, claude-code suggests the ALIASES its own help documents rather than pinned ids,
+  the other four offer no unverified suggestions, role and kind are separate choices, blank clears, the
+  JSON store round-trips, a corrupt store reads as NO choice — never someone else's model — and
+  **a stale marker gets the flag back from the shipped manifest**, which is defect D5a, the one that makes
+  a new adapter field inert on every real install), **`AgentDefaultsSettingsPageTests`** (the
+  `"AgentDefaults"` page: plan approval can be turned OFF **with nothing waiting in the gate** — the
+  direction that was unreachable while the toggle lived inside `PlanGateView`, which renders only when it
+  has content — a daemon refusal leaves the toggle where the DAEMON has it, coordinator and worker models
+  are set separately, picking a suggestion applies it in one gesture, an empty model clears, a CLI with no
+  declared flag says so, and an unreachable daemon is an error rather than a silent success),
+  `PrIntakeSettingsPageTests` (the page is REACHABLE — a `"PrIntake"`
   row in `SettingsViewModel.Pages` under the agent platform and absent without it, which is the
   assertion that would have failed for the whole life of the feature — the ViewModel has **no
   gateway-less constructor** to fall back to, Save/Subscribe go through `IPrIntakeGateway` and re-render
@@ -2687,6 +2698,14 @@
   frozen jail is skipped (`docker exec` into a SIGSTOPped container blocks) and a session that already has
   a live CLI is left alone. Driving `TryBind` with a hand-written argv instead passes with the entire hook
   deleted, which is why the entry point is the one under test),**
+  **`AgentModelLaunchArgvTests`** (the operator's model choice reaching the CLI's ACTUAL launch line —
+  the half that decides whether the setting is real or decorative, since a model that is stored, rendered
+  and never appended is a picker that changes nothing. Asserts ADJACENCY of flag and value rather than
+  mere presence; that no choice leaves the line byte-identical to the pre-feature one; that a blank is
+  treated as no choice; that an adapter declaring no flag gets nothing even WITH a model supplied — the
+  guess that would turn a vendor's argument parser into a failed spawn for every agent of that kind — and
+  that the model disturbs neither the first turn, the instructions nor the one pre-approved command,
+  whose order is load-bearing).
   **`PlanModeToggleDaemonTests`** (the plan-mode toggle AT THE DAEMON, on its own `PlanGateRig` so the
   switch it flips is its own host's: with the toggle off the worker's `task` op answers at once and the
   coordinator is told "Working"; with it on the same op is refused and then answers after an approval,
