@@ -1,7 +1,8 @@
 # Mainguard — GTM Assets
 
 **The copy, kept ready.** One-pager, pitch decks, demo script, outreach sequences, site and email copy,
-the scored target-company list, grant drafts, launch-day posts, press and video material.
+the scored target-company list, grant drafts, launch-day posts, the standing objections and their
+answers, press and video material.
 
 **Everything here is a template to update, not a finished artifact.** Each was written against a
 particular moment; check §1 before you send, post or present any of it.
@@ -10,6 +11,7 @@ particular moment; check §1 before you send, post or present any of it.
 |---|---|
 | **The strategy it expresses** | [`BUSINESS.md`](BUSINESS.md) |
 | **When each one fires** | [`GTM.md`](GTM.md) |
+| **Dutch lookups** | [`business/NL_Operations.md`](business/NL_Operations.md) |
 | **The full originals** | [`business/`](business/) — each section below links to its own |
 
 ---
@@ -167,7 +169,7 @@ matters more than the CAGR: **willingness-to-pay already proven adjacent** (Code
 Mergify $8+, Graphite ~$40). For Dutch/EU investors add the NL sub-slide with the honest caveat: **NL is a
 beachhead, not a market.**
 
-**Slide 10 — Business model.** The [`BUSINESS.md`](BUSINESS.md) §7.1 tier table, closing on **BYOK = no
+**Slide 10 — Business model.** The [`BUSINESS.md`](BUSINESS.md) §6.1 tier table, closing on **BYOK = no
 inference-margin death. We charge for trust, not tokens.** Raise both cloud caveats *yourself* before a
 diligence associate does: the numbers are placeholders pending beta telemetry, and the cloud revenue line
 is mostly pass-through — **quote gross-margin dollars, never the revenue column as ARR.**
@@ -752,7 +754,95 @@ and **the founder story** (also the About-page copy).
 
 ---
 
-## 10. What else is written, and where
+## 10. Objections (concede → fact → line)
+
+*Detail: [Objection Handling](business/go-to-market/Mainguard_Objection_Handling.md) (full steel-manned treatment); HN phrasings live in [Narrative.md](creative/Narrative.md) §5.4.*
+
+The register: concede first (every objection contains a true fact; agreeing buys the credibility the
+counter spends — never open with "actually"), sourced facts with no adjectives, never a villain, tense
+discipline under pressure, and **leave the line, then stop**.
+
+**1. "Just use GitHub's merge queue."** Concede: it's real, good at what it does, and right for keeping
+CI green on `main` under high PR volume. Fact: three structural gaps — it re-runs **CI, not
+verification** (no queue on the market re-runs your test suite in the agent's sandbox on the post-rebase
+state); it gates *after* push, on GitHub's runners, while we gate before anything reaches the remote, on
+branches from any vendor, including repos not on GitHub; and it carries **no agent semantics** at all.
+Line: *GitHub's queue keeps CI green on the batch. Mainguard keeps the promise that nothing lands on main
+that wasn't verified — your tests, the agent's sandbox — against the main it lands on.*
+
+**2. "Conductor already exists."** Concede: it's the funded category leader, small and fast, and deserves
+the lead on orchestration — conceded as strategy, not courtesy. Fact: macOS-only with no Windows signals
+anywhere in its changelog; worktree-only isolation with no verification layer; and free means unmonetized
+in a category where free orchestration already killed two companies. State the caution before the
+investor does — $22M can fund a Windows port any quarter, which is why the defense is Windows *paired
+with* queue semantics they'd have to re-architect to follow. Line: *"Conductor for Windows — with
+verification." The analogy flatters twice.*
+
+**3. "Agents will get good enough to not need this."** Concede: they will keep getting better — we're
+counting on it, and some of today's babysitting UX will age out. Fact: as capability rose through
+2025–26, trust *fell* and delivery stability still correlates negatively; **verification demand scales
+with volume, not error rate**, so ten branches an hour against a fixed review ceiling gets *worse* as
+agents improve; the most capable organizations verify the most (Meta built RADAR); and half the product
+isn't about model quality at all — attribution, audit evidence, budget governance and merge coordination
+hold even for flawless agents. *Residual risk, owned:* if agents become near-perfect **and** organizations
+stop caring about attribution, this shrinks to coordination plumbing — we consider the second condition
+the less likely one. Line: *Better agents produce more branches, not more trust. The gap between "merged"
+and "verified" grows with every agent seat sold — by anyone.*
+
+**4. "GitHub / Anthropic / Cursor will just ship this."** Concede: they're shipping generation
+aggressively, and any single feature has a ~2-quarter window. Fact: each is single-vendor *by incentive*;
+none reviews with deterministic local gates; none models cross-branch staleness. The one announced
+exception is named as our tripwire in writing. Line: *Vendor-neutral verification is structurally
+Switzerland's job — and we've published the tripwire for the day that changes.*
+
+**5. "The Git-client market is commoditized."** Concede: fair, and Fork proves craft alone earns $59.99
+once, not a company. Fact: the client is the wedge and the *prerequisite* — verification is only buildable
+on a real Git engine — and the free tier exists because the funnel must be excellent against an
+account-walled incumbent. Line: *The client is the foundation, not the pitch — and it has to be excellent
+anyway, because you'll live in it.*
+
+**6. "Orchestration tools all died. Why are you different?"** Concede: they did. Fact: they were selling
+orchestration at $0 to individuals. We never sell orchestration; the free tier is a Git client with
+independent daily value, and every paid tier prices against what teams demonstrably already pay for —
+review throughput, merge reliability, governance. Line: *We don't charge for the part that has never been
+worth money.*
+
+**7. "MergeLoom already sells governed AI delivery."** Concede: live, billing, and 6–12 months ahead on
+the governance *story* — the most instructive competitor we have. Fact: structural opposites — no client,
+no review surface, no interactive steering, no merge coordination, no sandbox claims, audit without
+integrity, one person. Line: *They stop at "PR opened." We govern the last mile — and a branch validated
+an hour ago, against an older main, is not validated.*
+
+**8. "Individual developers don't pay."** Concede: largely true, and we don't plan on it. Fact: the funnel's outputs are
+distribution, the in-company champion, and the two investor-grade metrics download counts can't fake.
+Line: *Individuals are the funnel; the business is the team tier — and we don't sell it before the
+governance features exist.*
+
+**9. "The EU AI Act doesn't actually require any of this."** Concede: correct — Art. 12 mandates logging
+and traceability, not cryptography, and the Omnibus moved high-risk obligations to Dec 2027. We say so
+unprompted. Fact: the pitch is audit-grade evidence and where procurement is heading; auditors are already
+asking. Line: *We sell what procurement is starting to ask for — not a deadline scare. If we're early,
+early is where trust features have to be.*
+
+**10. "Your cloud revenue is mostly pass-through — the ARR is fake."** Concede: at 10,000 active cloud
+users, ~$212K of ~$228K monthly revenue would be model spend passing through our invoice, and our own cost
+model says quoting it unflagged would flatter the business. Fact: the tier runs on gross-margin dollars,
+break-even ≈ 3,200 active users, and the GA gate is "beta unit economics match the model within
+tolerance." Line: *We flagged that number ourselves before you found it — the tier is priced on margin
+dollars, not revenue optics.*
+
+**11. "Windows-first is a niche bet."** Concede: the loud devtool market is Mac-first. Fact: Windows is
+the *largest* developer OS and the entire polished wave skipped it; WSL2 depth is the unglamorous work
+Mac-first teams fund last. Line: *Mac-first is where the demos are; Windows is where the developers are.*
+
+**12. "4–6 agents is too small a swarm to matter."** Concede: that's the honest local ceiling on 16 GB,
+and we refuse to claim more. Fact: 4–6 *governed* agents already breaks every workflow on the market, and
+scale beyond the laptop is the cloud tier's job on the same binary. Line: *A few agents, perfectly
+managed, beats fifty that OOM your laptop — and when you need fifty, that's what the cloud tier is for.*
+
+---
+
+## 11. What else is written, and where
 
 The pieces below exist in full; this is the index and their current state.
 

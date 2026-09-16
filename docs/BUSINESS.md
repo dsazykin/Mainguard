@@ -6,11 +6,12 @@ else is in it, why it holds, and what would break it.
 
 | | |
 |---|---|
-| **Execution** — launch, channels, sales, funding, calendar | [`GTM.md`](GTM.md) |
-| **Reusable copy** — decks, posts, emails, outreach, target list, grant drafts | [`GTM_Assets.md`](GTM_Assets.md) |
-| **The research behind all three** | [`business/`](business/) — each section below links into it |
+| **Execution** — launch, channels, sales, when to raise, the calendar | [`GTM.md`](GTM.md) |
+| **Reusable copy** — decks, posts, emails, outreach, target list, objections | [`GTM_Assets.md`](GTM_Assets.md) |
+| **Dutch lookups** — grants, funds, incorporating, hiring, press | [`business/NL_Operations.md`](business/NL_Operations.md) |
+| **The research behind all four** | [`business/`](business/) — each section below links into it |
 
-**In two minutes:** §1 is the whole thesis. §7.1 is the price list. §11 is what's still undecided.
+**In two minutes:** §1 is the whole thesis. §6.1 is the price list. §10 is what's still undecided.
 
 <details>
 <summary><b>Ground rules this document is written under</b></summary>
@@ -239,21 +240,17 @@ paid share), Tower (enterprise niche), Fork ($59.99 one-time, fast, native, no A
 client is our **trust wedge and daily surface, not the business** — and GitKraken's free tier blocks
 private repos and requires an account while ours doesn't. That asymmetry is the top-of-funnel play.
 
-**The Netherlands (researched 2026-07-07) — beachhead, not market.** ~575,000 people in ICT occupations
-(CBS, Q4 2025); ~106,000 registered ICT companies; ICT investment €35.5B in 2024. **1 in 6 Dutch
-companies used AI in 2025 — double 2023 — and 66% among 250+-employee firms**; NL is top-5 in the EU for
-enterprise AI adoption and has **Europe's highest AI talent density (10.9 per 10,000)**. The biggest
-stated barrier for non-adopters is "lack of experience" (74.6%) — precisely a governed-adoption pitch.
-€2.64B VC invested in Dutch tech in 2025 (+26.2% YoY) across 11,301 active tech companies, though deal
-count fell 14.5%.
+**The Netherlands — a beachhead, not a market.** It over-indexes for Mainguard on exactly the axes that
+matter: **.NET density** (Dutch finance, government, healthcare and manufacturing are built on the
+Microsoft stack, and Mainguard is itself a .NET flagship app), **Windows-heavy enterprises** where the
+"Dana" persona is the default developer, **compliance culture**, and a **trust gap** — high AI adoption
+paired with "lack of experience" as the top stated barrier, which is precisely a governed-adoption pitch.
 
-NL over-indexes for Mainguard specifically because of **.NET density** (Dutch finance, government,
-healthcare and manufacturing built on the Microsoft ecosystem; Techorama NL is one of Europe's largest
-Microsoft-stack conferences, and Mainguard is itself a .NET flagship app), **Windows-heavy enterprises**
-(the "Dana" persona is the default Dutch enterprise developer), **compliance culture**, and the **trust
-gap** created by high adoption plus the experience barrier. **Honest caveat:** 575k ICT workers is <1.5%
-of the world's developers. NL is where design partners, subsidies, talent and first enterprise logos come
-from — not where the ARR ceiling is. The revenue plan stays global and English-first.
+**The caveat is load-bearing:** ~575k ICT workers is under 1.5% of the world's developers. NL is where
+design partners, subsidies, talent and the first enterprise logos come from — **not where the revenue
+ceiling is.** The plan stays global and English-first. *(Market sizing, adoption and VC figures with
+sources: [Master Market Document](business/go-to-market/Mainguard_Master_Market_Document_2026-07.md)
+§2.5.)*
 
 ---
 
@@ -345,20 +342,11 @@ blog dated essentially one day.
 3. **Per-hunk provenance rendered in a review UI** — the Agent Trace RFC has emitters coming and **no
    consumer/renderer exists**. First GUI to paint trace records into diff/blame gutters defines the
    category.
-4. **Integrated compliance-grade audit inside a dev tool** — standalone audit vendors exist because
-   demand is real, but none can attribute actual code changes. The Git side is unclaimed.
-5. **Productized default-deny egress on Windows** — primitives shipped (Docker sbx, Claude Code
-   sandbox); the integrated GUI + git + audit product does not exist. Claim sharpened from "nobody has
-   it" to **"nobody has productized it."**
-6. **AI rate-limit/budget gateway for parallel local agents** — the "9 agents, one quota, everything
-   429s" failure is documented; gateway vendors solve API traffic, nobody solves it inside an
-   orchestration desktop app.
-7. **Hard plan-approval gate with identity records** — everyone has soft steering; nobody binds "which
-   human approved which plan" into an auditable gate. The linchpin that makes #4 sellable.
-8. **Cross-worktree conflict radar** — nobody ships live conflict prediction across N agent worktrees.
-   Fast-follow, not lead.
+Behind those three, five more squares are empty and specced into the plan: compliance-grade audit inside
+a dev tool, productized default-deny egress on Windows, a rate-limit and budget gateway for parallel
+agents, a hard plan-approval gate bound to identity, and cross-worktree conflict radar.
 
-Our architecture contains 1–5 and 7 by design; 6 and 8 are specced. **That is the product story.**
+**Our architecture contains all of them by design. That is the product story.**
 
 ### 4.5 How we beat each class
 
@@ -373,7 +361,7 @@ Our architecture contains 1–5 and 7 by design; 6 and 8 are specced. **That is 
   useful) and a cloud-only posture. "Your test suite passed in the agent's sandbox" is a fact, not an
   opinion — the antidote to AI-review fatigue. Longer term, integrate one as an optional signal.
 
-*What to watch, and what to do about each, is the erosion dashboard in §8.4.*
+*What to watch, and what to do about each, is the erosion dashboard in §7.4.*
 
 ---
 
@@ -402,16 +390,7 @@ two are hardware-dishonest. Three deliberate locks follow from that: **"several 
 **plan approval in the headline** (the cheapest trust-builder we have); **auditability as core
 messaging**, not an enterprise footnote.
 
-### 5.2 Message hierarchy
-
-| Audience | Lead message | Supporting proof |
-|---|---|---|
-| Agent power users | "Never let an agent break your working directory again. Review five agent branches in twenty minutes, safely." | Sandboxes, worktree isolation, test gates, risk-ranked cockpit |
-| Windows / .NET enterprise devs | "The premium native Git client Windows never got — and the only agent runner built for WSL2." | Native Avalonia perf, no Electron, no login, local-first |
-| Engineering managers / CTOs (buyers) | "Velocity *with* governance: agents that must pass tests before review, plus an audit trail of every agent action." | Merge queue + re-verification, per-hunk provenance, SIEM export |
-| Investors | "The verification layer for the agent era — the bottleneck moved from writing code to trusting it, and we own the Git-native chokepoint." | 87% distrust; DORA stability degrading; 1M PRs in 5 months |
-
-### 5.3 The ideal customer profile (ICP)
+### 5.2 The ideal customer profile (ICP)
 
 A **10–100 developer product company or agency, Windows-heavy or mixed-OS, already running agentic CLIs**,
 where an EM or staff engineer owns the "our review queue is drowning and I don't trust what the agents
@@ -425,7 +404,7 @@ talks), **B: Windows-first .NET shops** (the underserved flank; very high findab
 orgs** (the audit-trail axis; **sourced and nurtured now, sold to only when the governance tier ships**).
 Companies scoring on two or three axes are the bullseye.
 
-### 5.4 Personas (in adoption order)
+### 5.3 Personas (in adoption order)
 
 1. **"Sam" — the agent power user (launch persona).** Senior IC running 3–6 parallel agent sessions today
    via tmux/worktrees or Conductor-on-Mac. Pain: terminal clutter, agents stepping on each other, a
@@ -438,7 +417,7 @@ Companies scoring on two or three axes are the bullseye.
    governance, facing audit questions she can't answer. Converts on queue metrics, provenance, audit
    export. Pays $50+/seat. **Do not sell to Priya before the governance features exist.**
 
-### 5.5 Explicit non-targets (for now)
+### 5.4 Explicit non-targets (for now)
 
 Vibe coders and non-technical founders (a later cloud product, not a local install — a local Vibe Mode
 requiring admin elevation and a mid-onboarding reboot cannot beat browser-native rivals on
@@ -451,101 +430,16 @@ functionality at **zero switching cost**. That is the most serious competitive r
 anything else, and it means Mainguard needs a clear reason to switch — the verification pipeline plus
 native depth plus neutrality *is* that reason; single features are not.
 
----
-
-## 6. Objections (concede → fact → line)
-
-*Detail: [Objection Handling](business/go-to-market/Mainguard_Objection_Handling.md) (full steel-manned treatment); HN phrasings live in [Narrative.md](creative/Narrative.md) §5.4.*
-
-The register: concede first (every objection contains a true fact; agreeing buys the credibility the
-counter spends — never open with "actually"), sourced facts with no adjectives, never a villain, tense
-discipline under pressure, and **leave the line, then stop**.
-
-**1. "Just use GitHub's merge queue."** Concede: it's real, good at what it does, and right for keeping
-CI green on `main` under high PR volume. Fact: three structural gaps — it re-runs **CI, not
-verification** (no queue on the market re-runs your test suite in the agent's sandbox on the post-rebase
-state); it gates *after* push, on GitHub's runners, while we gate before anything reaches the remote, on
-branches from any vendor, including repos not on GitHub; and it carries **no agent semantics** at all.
-Line: *GitHub's queue keeps CI green on the batch. Mainguard keeps the promise that nothing lands on main
-that wasn't verified — your tests, the agent's sandbox — against the main it lands on.*
-
-**2. "Conductor already exists."** Concede: it's the funded category leader, small and fast, and deserves
-the lead on orchestration — conceded as strategy, not courtesy. Fact: macOS-only with no Windows signals
-anywhere in its changelog; worktree-only isolation with no verification layer; and free means unmonetized
-in a category where free orchestration already killed two companies. State the caution before the
-investor does — $22M can fund a Windows port any quarter, which is why the defense is Windows *paired
-with* queue semantics they'd have to re-architect to follow. Line: *"Conductor for Windows — with
-verification." The analogy flatters twice.*
-
-**3. "Agents will get good enough to not need this."** Concede: they will keep getting better — we're
-counting on it, and some of today's babysitting UX will age out. Fact: as capability rose through
-2025–26, trust *fell* and delivery stability still correlates negatively; **verification demand scales
-with volume, not error rate**, so ten branches an hour against a fixed review ceiling gets *worse* as
-agents improve; the most capable organizations verify the most (Meta built RADAR); and half the product
-isn't about model quality at all — attribution, audit evidence, budget governance and merge coordination
-hold even for flawless agents. *Residual risk, owned:* if agents become near-perfect **and** organizations
-stop caring about attribution, this shrinks to coordination plumbing — we consider the second condition
-the less likely one. Line: *Better agents produce more branches, not more trust. The gap between "merged"
-and "verified" grows with every agent seat sold — by anyone.*
-
-**4. "GitHub / Anthropic / Cursor will just ship this."** Concede: they're shipping generation
-aggressively, and any single feature has a ~2-quarter window. Fact: each is single-vendor *by incentive*;
-none reviews with deterministic local gates; none models cross-branch staleness. The one announced
-exception is named as our tripwire in writing. Line: *Vendor-neutral verification is structurally
-Switzerland's job — and we've published the tripwire for the day that changes.*
-
-**5. "The Git-client market is commoditized."** Concede: fair, and Fork proves craft alone earns $59.99
-once, not a company. Fact: the client is the wedge and the *prerequisite* — verification is only buildable
-on a real Git engine — and the free tier exists because the funnel must be excellent against an
-account-walled incumbent. Line: *The client is the foundation, not the pitch — and it has to be excellent
-anyway, because you'll live in it.*
-
-**6. "Orchestration tools all died. Why are you different?"** Concede: they did. Fact: they were selling
-orchestration at $0 to individuals. We never sell orchestration; the free tier is a Git client with
-independent daily value, and every paid tier prices against what teams demonstrably already pay for —
-review throughput, merge reliability, governance. Line: *We don't charge for the part that has never been
-worth money.*
-
-**7. "MergeLoom already sells governed AI delivery."** Concede: live, billing, and 6–12 months ahead on
-the governance *story* — the most instructive competitor we have. Fact: structural opposites — no client,
-no review surface, no interactive steering, no merge coordination, no sandbox claims, audit without
-integrity, one person. Line: *They stop at "PR opened." We govern the last mile — and a branch validated
-an hour ago, against an older main, is not validated.*
-
-**8. "Individual developers don't pay."** Concede: largely true, and we don't plan on it. Fact: the funnel's outputs are
-distribution, the in-company champion, and the two investor-grade metrics download counts can't fake.
-Line: *Individuals are the funnel; the business is the team tier — and we don't sell it before the
-governance features exist.*
-
-**9. "The EU AI Act doesn't actually require any of this."** Concede: correct — Art. 12 mandates logging
-and traceability, not cryptography, and the Omnibus moved high-risk obligations to Dec 2027. We say so
-unprompted. Fact: the pitch is audit-grade evidence and where procurement is heading; auditors are already
-asking. Line: *We sell what procurement is starting to ask for — not a deadline scare. If we're early,
-early is where trust features have to be.*
-
-**10. "Your cloud revenue is mostly pass-through — the ARR is fake."** Concede: at 10,000 active cloud
-users, ~$212K of ~$228K monthly revenue would be model spend passing through our invoice, and our own cost
-model says quoting it unflagged would flatter the business. Fact: the tier runs on gross-margin dollars,
-break-even ≈ 3,200 active users, and the GA gate is "beta unit economics match the model within
-tolerance." Line: *We flagged that number ourselves before you found it — the tier is priced on margin
-dollars, not revenue optics.*
-
-**11. "Windows-first is a niche bet."** Concede: the loud devtool market is Mac-first. Fact: Windows is
-the *largest* developer OS and the entire polished wave skipped it; WSL2 depth is the unglamorous work
-Mac-first teams fund last. Line: *Mac-first is where the demos are; Windows is where the developers are.*
-
-**12. "4–6 agents is too small a swarm to matter."** Concede: that's the honest local ceiling on 16 GB,
-and we refuse to claim more. Fact: 4–6 *governed* agents already breaks every workflow on the market, and
-scale beyond the laptop is the cloud tier's job on the same binary. Line: *A few agents, perfectly
-managed, beats fifty that OOM your laptop — and when you need fifty, that's what the cloud tier is for.*
+**When someone pushes back on any of this**, the twelve standing objections and their honest answers —
+including the residual risks we concede — are in [`GTM_Assets.md`](GTM_Assets.md) §10.
 
 ---
 
-## 7. Pricing & unit economics
+## 6. Pricing & unit economics
 
 *Detail: [Business Plan](business/go-to-market/Mainguard_Business_Plan.md) (the reasoning); [Cloud Vibe Companion](phase-2/Mainguard_Cloud_Vibe_Companion.md) §5 (the arithmetic, assumptions A1–A9).*
 
-### 7.1 The tiers (locked structure)
+### 6.1 The tiers (locked structure)
 
 | Tier | Price | What it buys | Why this number |
 |---|---|---|---|
@@ -554,7 +448,7 @@ managed, beats fifty that OOM your laptop — and when you need fifty, that's wh
 | **Team / Enterprise** | **$50+/seat** | Merge-queue + re-verification analytics, per-hunk provenance, audit/SIEM, RBAC/SSO/SCIM, budget caps, license scanning **[Horizon]** | Sits credibly above CodeRabbit Pro ($24–48/dev/mo) and Graphite (~$40) because it bundles what they each sell a slice of. **Not sold before the governance features exist** |
 | **Cloud worktrees** | usage-based, 2027 | Hosted execution sessions **[Horizon]** | The usage-revenue lever BYOK deliberately forfeits locally; solves the honest 4–6-agent ceiling |
 
-### 7.2 The four refusals
+### 6.2 The four refusals
 
 Each is a standing rule, not a preference, and each closes off a way this business could fail.
 
@@ -568,7 +462,7 @@ Each is a standing rule, not a preference, and each closes off a way this busine
 - **We never meter the customer's own hardware.** MergeLoom charges £2–4 per opened PR; our local runs
   cost tokens only. *No per-PR meter on your own hardware.*
 
-### 7.3 BYOK vs cloud — the one consequential decision
+### 6.3 BYOK vs cloud — the one consequential decision
 
 **The desktop product earns nothing from usage, on purpose.** Locally the user brings their own key; the
 model bill goes straight from vendor to user. What that buys: no inference cost on our books, no exposure
@@ -583,7 +477,7 @@ than 4–6 agents, and the non-technical founder for whom cloud + managed key is
 door into the product. Two modes, because two audiences: *managed-key* (+10% handling) and *cloud-BYOK*
 (model spend drops out of our revenue and our risk; we bill platform units only).
 
-### 7.4 Cloud unit economics — illustrative, and the caveat we volunteer
+### 6.4 Cloud unit economics — illustrative, and the caveat we volunteer
 
 **Every figure here is an illustrative placeholder chosen to show the shape of the math — not a quote, not
 a committed price.** Real numbers come from beta telemetry, and the GA gate is literally "beta unit
@@ -606,18 +500,16 @@ are the product**, marked up 3.5× — and because they're cents, that markup is
 container packing, aggressive idle reclamation, storage crypto-shred discipline, and one metered number so
 the dashboard and the invoice can never disagree.
 
-**The caveat we carry into every pitch.** At 10,000 users, **$212K of the $228.5K monthly revenue is the
-model vendor's money passing through our invoice.** Quoting that as ARR would flatter the business, so
+**The caveat we carry into every pitch.** At 10,000 users, **$212K of the $228.5K monthly revenue would be
+the model vendor's money passing through our invoice.** Quoting that as ARR would flatter the business, so
 every internal target is set against the gross-margin column. In a category that died of over-claiming,
 volunteering this before diligence finds it is itself a moat.
 
-**Sensitivity.** Model prices falling 50% is the biggest exposure (margin → $2.16, break-even → ~4,600
-users), mitigated because usage expands as prices fall and the platform markup is untouched — the model is
-volume-and-markup driven by design. Prompt caching is upside either way. A flat instead of nested topology
-roughly triples platform COGS, which is why nested is the default and per-agent pods are a *paid isolation
-capability*. Failed idle reclamation is both a margin leak and a trust breach.
+**The biggest exposure is model prices falling**, which halves the handling margin — mitigated because
+usage expands as prices fall and the platform markup, the lever we control, is untouched. *(Full
+sensitivity analysis and the assumptions ledger: Cloud Vibe Companion §5.7.)*
 
-### 7.5 Desktop funnel math, kept honest
+### 6.5 Desktop funnel math, kept honest
 
 Devtool freemium converts 1–3%. At 2% of 10,000 active free users × $20/mo ≈ **$50K ARR** — which is the
 argument, not the disappointment: **real money lives in team seats**. The desktop funnel's job is
@@ -625,7 +517,7 @@ distribution and trust, the in-company champion who becomes the Team-tier deal, 
 investors can't get from download counts. Adjacent willingness-to-pay anchors: CodeRabbit $24–48/dev/mo,
 Graphite ~$40, Mergify $8+, governance premiums above all.
 
-### 7.6 The path from $20 seats to $50+ seats
+### 6.6 The path from $20 seats to $50+ seats
 
 **Step 1 — Land.** Individuals adopt the free client; power users convert to Pro. Individuals are the
 funnel, not the revenue plan. **Step 2 — Prove willingness-to-pay before building the enterprise layer.**
@@ -642,11 +534,11 @@ marketplace (deferred; needs ecosystem scale that doesn't exist).
 
 ---
 
-## 8. Defensibility
+## 7. Defensibility
 
 *Detail: [Defensibility Memo](business/go-to-market/Mainguard_Defensibility_Memo.md) (layer-by-layer retrofit cost and erosion scenarios).*
 
-### 8.1 The thesis
+### 7.1 The thesis
 
 Defensibility is not any single feature — **any single feature has a ~2-quarter exclusivity window**. The
 moat is the *stack*: five layers that compound because each requires the one below it, and the bottom
@@ -655,7 +547,7 @@ layer — a real Git engine — is the one thing no competitor class possesses o
 One sentence for the partner meeting: **everyone else must either build a Git client, betray their
 platform incentive, or re-architect a shipped product to follow us — and most must do two of the three.**
 
-### 8.2 The five layers, with retrofit cost and erosion
+### 7.2 The five layers, with retrofit cost and erosion
 
 **Layer 1 — The Git engine (shipped; the prerequisite).** Every downstream differentiator is a Git-engine
 problem: stale re-verification *is* rebase machinery; curating agent WIP *is* interactive rebase + partial
@@ -703,7 +595,7 @@ first-party vendors monetize the lock-in, and every closed tool in this space pa
 a product whose thesis is "refuse blind trust," the marketing *is* the architecture. This moat can only be
 lost voluntarily.
 
-### 8.3 What is *not* a moat (kept honest, so the rest is believed)
+### 7.3 What is *not* a moat (kept honest, so the rest is believed)
 
 Native rendering vs Fork (Fork is native, fast and loved; against Fork the edge is the agent thesis, not
 the renderer) · orchestration (commoditized, free, and the vocabulary of the dead companies) · "agents in
@@ -711,7 +603,7 @@ worktrees" (a checkbox since Claude Code v2.1.49) · the name (every positioning
 design) · speed alone (Sublime Merge is the fastest client in the market, and dormant) · **any single
 feature for more than ~2 quarters**.
 
-### 8.4 Erosion dashboard (the standing watch)
+### 7.4 Erosion dashboard (the standing watch)
 
 | Watch item | Signal | Response |
 |---|---|---|
@@ -728,11 +620,11 @@ feature for more than ~2 quarters**.
 
 ---
 
-## 9. Risks & registers
+## 8. Risks & registers
 
 *Detail: [Master Market Document](business/go-to-market/Mainguard_Master_Market_Document_2026-07.md) Parts VII and XX.*
 
-### 9.1 Risks, stated honestly
+### 8.1 Risks, stated honestly
 
 1. **Platform absorption (highest).** Claude Code Desktop ships worktrees + autoVerify + diff review; the
    Copilot app is GA with Agent Merge; Cursor Origin aims at agent-scale review; Kepler is free during
@@ -755,7 +647,7 @@ feature for more than ~2 quarters**.
 7. **Hardware honesty.** ~4–6 agents on 16 GB is the local ceiling (WSL2 takes 50% of RAM by default);
    rate limits bind earlier. Never re-inflate the "50 agents" claim; cloud worktrees are the scale answer.
 
-### 9.2 BYOK risk register (load-bearing)
+### 8.2 BYOK risk register (load-bearing)
 
 Anthropic's ToS (enforced 4 Apr 2026) says OAuth tokens from consumer plans may not be used "in any other
 product, tool, or service" — Mainguard drives the *official* binary (permitted), but a commercial
@@ -767,7 +659,7 @@ No inference margin is an accepted local trade-off, recovered via cloud. Key-han
 by OS-keyring storage, tmpfs injection, and (enterprise) Vault/Secrets-Manager integration — Mainguard
 infrastructure never proxies or observes keys.
 
-### 9.3 Platform constraints the plan is built on
+### 8.3 Platform constraints the plan is built on
 
 Four verified limits that bound what can be promised. Each is a fact about the platform, not a
 preference, and each has already shaped the architecture.
@@ -779,7 +671,7 @@ preference, and each has already shaped the architecture.
 | **Interactive rebase is unsupported in libgit2** | Rebase and worktree operations shell out to the Git CLI; LibGit2Sharp is retained for reads, status and commit |
 | **Docker sbx installs natively on Windows** and cannot be nested inside a private WSL2 distro | Two viable engines: Docker Engine inside WSL2, or native sbx as an optional high-security backend |
 
-### 9.4 Security posture
+### 8.4 Security posture
 
 The container boundary is necessary but not sufficient. The dominant real-world threat is
 **prompt-injection-driven exfiltration and host-side code execution through legitimate channels** —
@@ -797,11 +689,11 @@ enterprises will ask for software-composition analysis and strict HITL gates for
 
 ---
 
-## 10. Metrics & the seed bar
+## 9. Metrics & the seed bar
 
 *Detail: [Master Market Document](business/go-to-market/Mainguard_Master_Market_Document_2026-07.md) Parts XVII and X §10.2.*
 
-### 10.1 Product KPIs
+### 9.1 Product KPIs
 
 1. **Weekly active repos** (free-tier health) — instrument before any launch.
 2. **Agent runs verified per week**, and **% of merges executed against non-stale verification**
@@ -817,7 +709,7 @@ enterprises will ask for software-composition analysis and strict HITL gates for
 **The investor-grade pair:** weekly active repos + agent runs verified/merged per week — the two numbers
 investors cannot get from download counts.
 
-### 10.2 The seed bar
+### 9.2 The seed bar
 
 **Conventional (2026):** ~5,000+ MAU **or** 500 paying customers **or** ~$300–500K ARR; burn multiple < 2×.
 **AI-infra reality:** growth rate (15–20%+ MoM, organic) and logo quality outweigh absolutes — GitButler
@@ -830,12 +722,12 @@ concentrate in AI-positioned companies.
 
 ---
 
-## 11. Open decisions
+## 10. Open decisions
 
 | Decision | State | Where it bites |
 |---|---|---|
 | **Founding-user discount** | Open. Recommended: **50% off Pro for its first two years**, locked per person, honourable at any future price | The number must be identical in the outreach email, the waitlist page and the beta welcome mail — see [`GTM.md`](GTM.md) §3 |
 | **Trademark clearance** | Not filed. Owed before GA — USPTO/EUIPO, Nice classes 9 + 42 | Search-engine evidence is not registry data; a collision found after launch is brand damage, not paperwork |
-| **Entity** | Holding BV → Werk-BV not yet incorporated | Gates WBSO for payroll, VFF, and the Innovatiebox — [`GTM.md`](GTM.md) §5–6 |
+| **Entity** | Holding BV → Werk-BV not yet incorporated | Gates WBSO for payroll, VFF, and the Innovatiebox — [`business/NL_Operations.md`](business/NL_Operations.md) §§1, 3 |
 | **Download gating while unsigned** | Open. Recommended: **reply-gated** — it gets the conversation, delivers the SmartScreen warning personally, and keeps an unsigned binary off a public button | [`GTM.md`](GTM.md) §3 |
 | **Raise shape** | €750k–1.5M pre-seed (grants extend it ~40%) *or* skip to a $2–4M seed on launch traction. Decide on launch data, not before | [`GTM.md`](GTM.md) §5 |
