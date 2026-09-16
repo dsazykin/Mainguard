@@ -780,7 +780,9 @@
   color: var(--text-muted);
 }
 
-/* ————— Legal documents (privacy, terms) ————— */
+/* ————— Long-form prose (privacy, terms, verification) —————
+   Named .legal for historical reasons; it is the reading layout for any page
+   that is mostly text, not a statement about the content's register. */
 
 .legal {
   max-width: 46rem;

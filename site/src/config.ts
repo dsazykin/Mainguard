@@ -46,3 +46,10 @@ export const LEGAL_GOVERNING_LAW = 'Dutch law';
 export const LEGAL_VENUE = 'the competent court in the Netherlands';
 /** Bump whenever either legal page changes in substance. */
 export const LEGAL_LAST_UPDATED = '15 September 2026';
+
+/**
+ * Shown on /verification. Move this whenever the mechanism that page describes
+ * changes, so a reader can tell at a glance whether it has been checked since
+ * the product moved. A stale technical page is worse than none.
+ */
+export const VERIFICATION_REVIEWED = '16 September 2026';
